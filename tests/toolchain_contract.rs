@@ -1,10 +1,48 @@
 use std::{fs, path::Path};
 
+const EXPECTED_CI_TOOLCHAIN: &str = "1.98.0";
+
 fn workspace_file(path: &str) -> String {
     let workspace = Path::new(env!("CARGO_MANIFEST_DIR"));
     fs::read_to_string(workspace.join(path)).unwrap_or_else(|error| {
         panic!("{path} must exist and be readable: {error}");
     })
+}
+
+fn ci_toolchain_contract_holds(ci: &str) -> bool {
+    let selectors: Vec<_> = ci
+        .lines()
+        .filter_map(|line| {
+            line.trim_start()
+                .strip_prefix("- uses: dtolnay/rust-toolchain@")
+                .and_then(|selector| selector.split_whitespace().next())
+        })
+        .collect();
+    let has_alternate_toolchain_input = ci.lines().map(str::trim_start).any(|line| {
+        line.starts_with("toolchain:")
+            || line.contains("rustup toolchain install")
+            || line.contains("rustup default")
+    });
+
+    selectors == [EXPECTED_CI_TOOLCHAIN]
+        && !has_alternate_toolchain_input
+        && ci.contains("cargo clippy --workspace --all-targets --all-features -- -D warnings")
+}
+
+#[test]
+fn ci_toolchain_contract_rejects_duplicate_different_and_floating_selectors() {
+    let good = "- uses: dtolnay/rust-toolchain@1.98.0\n- run: cargo clippy --workspace --all-targets --all-features -- -D warnings";
+    let duplicate = format!("{good}\n- uses: dtolnay/rust-toolchain@1.98.0");
+    let different = format!("{good}\n- uses: dtolnay/rust-toolchain@1.99.0");
+    let floating = format!("{good}\n- uses: dtolnay/rust-toolchain@beta");
+    let alternate_input = format!("{good}\n  toolchain: stable");
+    let rustup_install = format!("{good}\n- run: rustup toolchain install stable");
+
+    assert!(!ci_toolchain_contract_holds(&duplicate));
+    assert!(!ci_toolchain_contract_holds(&different));
+    assert!(!ci_toolchain_contract_holds(&floating));
+    assert!(!ci_toolchain_contract_holds(&alternate_input));
+    assert!(!ci_toolchain_contract_holds(&rustup_install));
 }
 
 #[test]
@@ -45,16 +83,5 @@ fn rust_toolchain_contract_is_pinned_consistently_across_local_and_ci_builds() {
     assert!(components.contains(&"clippy"));
 
     let ci = workspace_file(".github/workflows/ci.yml");
-    assert!(
-        ci.contains("dtolnay/rust-toolchain@1.98.0"),
-        "CI must select the exact project toolchain rather than a floating channel"
-    );
-    assert!(
-        !ci.contains("dtolnay/rust-toolchain@stable"),
-        "CI must not retain a floating Rust toolchain selector"
-    );
-    assert!(
-        ci.contains("cargo clippy --workspace --all-targets --all-features -- -D warnings"),
-        "CI must exercise the pinned clippy component with warnings denied"
-    );
+    assert!(ci_toolchain_contract_holds(&ci));
 }
