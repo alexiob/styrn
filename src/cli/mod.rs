@@ -38,6 +38,30 @@ pub(crate) struct ParsedCli {
     policy: AnsiPolicy,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum MachineAction {
+    Manifest,
+    Init,
+}
+
+impl ParsedCli {
+    pub(crate) fn machine_action(&self) -> Option<MachineAction> {
+        match &self.cli.command {
+            RootCommand::Machine {
+                command: MachineCommand::Manifest,
+            } => Some(MachineAction::Manifest),
+            RootCommand::Machine {
+                command: MachineCommand::Init,
+            } => Some(MachineAction::Init),
+            _ => None,
+        }
+    }
+
+    pub(crate) const fn json_output(&self) -> bool {
+        self.cli.json
+    }
+}
+
 #[derive(Debug)]
 pub(crate) struct ParseFailure {
     error: clap::Error,

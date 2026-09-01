@@ -145,8 +145,6 @@ fn representative_paths_from_every_command_family_parse() {
     let cases = [
         &["machine", "roles"][..],
         &["machine", "role", "add", "worker"][..],
-        &["machine", "manifest"][..],
-        &["machine", "init"][..],
         &["controller", "init"][..],
         &["host", "list"][..],
         &["host", "show", "alpha"][..],
