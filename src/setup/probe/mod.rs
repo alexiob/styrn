@@ -5,152 +5,12 @@
 //! mediates conversion into serializable output.
 
 use crate::setup::ObservedState;
-use serde::Serialize;
 use std::collections::HashSet;
-use std::fmt;
 use thiserror::Error;
 
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
-#[serde(transparent)]
-pub(crate) struct ProbeId(String);
-
-impl ProbeId {
-    pub(crate) fn parse(value: &str) -> Result<Self, ProbeIdError> {
-        if value.split('.').count() < 2 || !value.split('.').all(valid_probe_id_segment) {
-            return Err(ProbeIdError::Invalid);
-        }
-        Ok(Self(value.to_owned()))
-    }
-
-    pub(crate) fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
-impl fmt::Display for ProbeId {
-    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        self.0.fmt(formatter)
-    }
-}
-
-fn valid_probe_id_segment(segment: &str) -> bool {
-    let bytes = segment.as_bytes();
-    matches!(bytes.first(), Some(b'a'..=b'z'))
-        && matches!(bytes.last(), Some(b'a'..=b'z' | b'0'..=b'9'))
-        && bytes
-            .iter()
-            .all(|byte| matches!(byte, b'a'..=b'z' | b'0'..=b'9' | b'-'))
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Error)]
-pub(crate) enum ProbeIdError {
-    #[error("probe ID must contain lowercase dot-namespaced segments")]
-    Invalid,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum FindingSeverity {
-    Info,
-    Warning,
-    Error,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum StyrnCommand {
-    MachineInit,
-}
-
-impl StyrnCommand {
-    pub(crate) fn args(self) -> &'static [&'static str] {
-        match self {
-            Self::MachineInit => &["machine", "init"],
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct RemediationSpec {
-    summary: String,
-    command: Option<StyrnCommand>,
-}
-
-impl RemediationSpec {
-    pub(crate) fn new(
-        summary: impl Into<String>,
-        command: Option<StyrnCommand>,
-    ) -> Result<Self, RemediationSpecError> {
-        let summary = summary.into();
-        if !super::validate_probe_static_text(&summary) {
-            return Err(RemediationSpecError::UnsafeSummary);
-        }
-        Ok(Self { summary, command })
-    }
-
-    pub(crate) fn summary(&self) -> &str {
-        &self.summary
-    }
-
-    pub(crate) fn command(&self) -> Option<StyrnCommand> {
-        self.command
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Error)]
-pub(crate) enum RemediationSpecError {
-    #[error("remediation summary is unsafe")]
-    UnsafeSummary,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ProbeDescriptorSpec {
-    id: ProbeId,
-    label: String,
-    failure_severity: FindingSeverity,
-    remediation: Option<RemediationSpec>,
-}
-
-impl ProbeDescriptorSpec {
-    pub(crate) fn new(
-        id: ProbeId,
-        label: impl Into<String>,
-        failure_severity: FindingSeverity,
-        remediation: Option<RemediationSpec>,
-    ) -> Result<Self, ProbeDescriptorSpecError> {
-        let label = label.into();
-        if !super::validate_probe_static_text(&label) {
-            return Err(ProbeDescriptorSpecError::UnsafeLabel);
-        }
-        Ok(Self {
-            id,
-            label,
-            failure_severity,
-            remediation,
-        })
-    }
-
-    pub(crate) fn id(&self) -> &ProbeId {
-        &self.id
-    }
-
-    pub(crate) fn label(&self) -> &str {
-        &self.label
-    }
-
-    pub(crate) fn failure_severity(&self) -> FindingSeverity {
-        self.failure_severity
-    }
-
-    pub(crate) fn remediation(&self) -> Option<&RemediationSpec> {
-        self.remediation.as_ref()
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Error)]
-pub(crate) enum ProbeDescriptorSpecError {
-    #[error("probe label is unsafe")]
-    UnsafeLabel,
-}
+pub(crate) use super::probe_values::{
+    FindingSeverity, ProbeDescriptorSpec, ProbeId, RemediationSpec, StyrnCommand,
+};
 
 mod worker_probe_only {
     pub(crate) trait Sealed {}
@@ -239,6 +99,9 @@ impl ProbeCatalog {
     pub(crate) fn new(probes: Vec<Box<dyn WorkerProbe>>) -> Result<Self, ProbeCatalogError> {
         let mut ids = HashSet::with_capacity(probes.len());
         for probe in &probes {
+            if !probe.descriptor().is_valid() {
+                return Err(ProbeCatalogError::InvalidDescriptor);
+            }
             let id = probe.descriptor().id().clone();
             if !ids.insert(id.clone()) {
                 return Err(ProbeCatalogError::DuplicateId(id));
@@ -254,6 +117,8 @@ impl ProbeCatalog {
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub(crate) enum ProbeCatalogError {
+    #[error("worker-local probe descriptor is invalid")]
+    InvalidDescriptor,
     #[error("duplicate worker-local probe ID: {0}")]
     DuplicateId(ProbeId),
 }
@@ -268,6 +133,7 @@ mod tests {
     };
     use std::{
         collections::BTreeMap,
+        fs,
         path::{Path, PathBuf},
         process::Command,
         sync::OnceLock,
@@ -322,6 +188,17 @@ mod tests {
                 Self {
                     descriptor: descriptor("tool.descendant"),
                 }
+            }
+
+            pub(super) fn rejects_untrusted_descriptor_inputs() -> bool {
+                ProbeId::parse("tool.invalid-").is_err()
+                    && ProbeDescriptorSpec::new(
+                        ProbeId::parse("tool.safe").expect("safe test ID"),
+                        "Bearer=secret-credential",
+                        FindingSeverity::Error,
+                        None,
+                    )
+                    .is_err()
             }
         }
 
@@ -429,6 +306,7 @@ mod tests {
             observed.doctor_findings()[0].state(),
             DoctorFindingState::Pass
         );
+        assert!(legitimate_descendant::ChildProbe::rejects_untrusted_descriptor_inputs());
     }
 
     #[test]
@@ -658,7 +536,19 @@ mod tests {
             assert!(!remediation.to_string().contains(secret));
             assert!(!descriptor.to_string().contains(secret));
         }
-        assert!(RemediationSpec::new("Inspect local service state.", None).is_ok());
+        for ordinary_text in [
+            "Inspect local service state.",
+            "Diagnostic: local version 1.2.3 is healthy.",
+        ] {
+            assert!(RemediationSpec::new(ordinary_text, None).is_ok());
+            assert!(ProbeDescriptorSpec::new(
+                ProbeId::parse("tool.safe").unwrap(),
+                ordinary_text,
+                FindingSeverity::Info,
+                None,
+            )
+            .is_ok());
+        }
     }
 
     fn secret_examples() -> &'static [&'static str] {
@@ -667,6 +557,7 @@ mod tests {
             "--auth=abc123",
             "auth token do-not-leak",
             "authorization=Bearer abc123",
+            "Bearer=abc123",
             "Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.signature",
             "secret=do-not-leak",
             "sk_live_do-not-leak",
@@ -675,50 +566,170 @@ mod tests {
             "tskey-do-not-leak",
             "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.signature",
             "diagnostic: eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.signature",
+            "diagnostic=eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.signature",
             "-----BEGIN PRIVATE KEY-----",
         ]
     }
 
     #[test]
     fn only_the_worker_probe_module_can_implement_worker_probe() {
-        assert_fixture_fails("sealed_worker_probe.rs", &["Sealed"]);
+        assert_fixture_fails(
+            "sealed_worker_probe.rs",
+            &[FixtureExpectation::new(
+                "E0277",
+                "the trait bound `ControllerCheck: Sealed` is not satisfied",
+                13,
+                "unsatisfied trait bound",
+            )],
+        );
     }
 
     #[test]
     fn raw_probe_status_cannot_be_serialized_directly() {
-        assert_fixture_fails("raw_status_serialization.rs", &["ProbeStatus", "Serialize"]);
+        assert_fixture_fails(
+            "raw_status_serialization.rs",
+            &[FixtureExpectation::new(
+                "E0277",
+                "the trait bound `ProbeStatus: serde::Serialize` is not satisfied",
+                5,
+                "unsatisfied trait bound",
+            )],
+        );
     }
 
     #[test]
     fn raw_probe_status_cannot_be_hidden_in_a_serialization_proxy() {
         assert_fixture_fails(
             "proxy_status_serialization.rs",
-            &["ProbeStatus", "Serialize"],
+            &[FixtureExpectation::new(
+                "E0277",
+                "the trait bound `ProbeStatus: serde::Serialize` is not satisfied",
+                13,
+                "unsatisfied trait bound",
+            )],
         );
     }
 
     #[test]
     fn remediation_cannot_accept_arbitrary_argv() {
-        assert_fixture_fails("closed_remediation.rs", &["StyrnCommand", "Vec"]);
+        assert_fixture_fails(
+            "closed_remediation.rs",
+            &[FixtureExpectation::new(
+                "E0308",
+                "mismatched types",
+                7,
+                "expected `StyrnCommand`, found `Vec<String>`",
+            )],
+        );
     }
 
     #[test]
     fn guarded_wire_dtos_cannot_be_constructed_by_a_probe_implementation() {
-        assert_fixture_fails("wire_dto_construction.rs", &["private"]);
+        assert_fixture_fails(
+            "wire_dto_construction.rs",
+            &[
+                FixtureExpectation::new(
+                    "E0451",
+                    "fields `descriptor` and `status` of struct `ProbeObservation` are private",
+                    10,
+                    "private field",
+                ),
+                FixtureExpectation::new(
+                    "E0451",
+                    "fields `id`, `state`, `severity`, `message` and `remediation` of struct `DoctorFinding` are private",
+                    17,
+                    "private field",
+                ),
+            ],
+        );
     }
 
-    fn assert_fixture_fails(fixture_name: &str, required_diagnostics: &[&str]) {
+    #[test]
+    fn compile_fixture_rejects_source_echoes_that_are_not_primary_diagnostics() {
+        assert!(
+            verify_fixture_failure(
+                "raw_status_serialization.rs",
+                &[FixtureExpectation::new(
+                    "E0277",
+                    "the trait bound `ProbeStatus: serde::Serialize` is not satisfied",
+                    5,
+                    "to_value",
+                )],
+            )
+            .is_err(),
+            "a source echo must not satisfy a primary diagnostic expectation"
+        );
+    }
+
+    #[test]
+    fn fixture_artifact_cache_is_process_independent() {
+        let cache = fixture_artifact_cache_dir();
+        assert_eq!(
+            cache,
+            std::env::temp_dir().join("styrn-probe-compile-fixture-cache-v1")
+        );
+        assert_eq!(
+            cache.file_name().and_then(|name| name.to_str()),
+            Some("styrn-probe-compile-fixture-cache-v1")
+        );
+    }
+
+    #[test]
+    fn scoped_fixture_output_is_removed_when_its_guard_drops() {
+        let output_path;
+        {
+            let output = ScopedFixtureOutput::new();
+            output_path = output.path.clone();
+            fs::write(&output_path, "test artifact").unwrap();
+            assert!(output_path.exists());
+        }
+        assert!(!output_path.exists());
+    }
+
+    #[derive(Clone, Copy)]
+    struct FixtureExpectation {
+        code: &'static str,
+        message: &'static str,
+        line: u64,
+        primary_label: &'static str,
+    }
+
+    impl FixtureExpectation {
+        const fn new(
+            code: &'static str,
+            message: &'static str,
+            line: u64,
+            primary_label: &'static str,
+        ) -> Self {
+            Self {
+                code,
+                message,
+                line,
+                primary_label,
+            }
+        }
+    }
+
+    fn assert_fixture_fails(fixture_name: &str, expectations: &[FixtureExpectation]) {
+        if let Err(problem) = verify_fixture_failure(fixture_name, expectations) {
+            panic!("{fixture_name} must report the expected primary diagnostic: {problem}");
+        }
+    }
+
+    fn verify_fixture_failure(
+        fixture_name: &str,
+        expectations: &[FixtureExpectation],
+    ) -> Result<(), String> {
         let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
         let fixture = manifest_dir
             .join("src/setup/probe/fixtures")
             .join(fixture_name);
         let artifacts = cargo_managed_artifacts(&manifest_dir);
-        let output_path = artifacts
-            .target_dir
-            .join(format!("{fixture_name}.compile-fail-output"));
+        let output_path = ScopedFixtureOutput::new();
         let mut command = Command::new("rustc");
         command
             .arg("--edition=2021")
+            .arg("--error-format=json")
             .arg(&fixture)
             .arg("-L")
             .arg(format!("dependency={}", artifacts.deps_dir.display()));
@@ -730,24 +741,69 @@ mod tests {
         }
         let output = command
             .arg("-o")
-            .arg(output_path)
+            .arg(&output_path.path)
             .output()
             .expect("rustc must be available for compile-fail boundary tests");
-        assert!(
-            !output.status.success(),
-            "{fixture_name} unexpectedly compiled"
-        );
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        for diagnostic in required_diagnostics {
-            assert!(
-                stderr.contains(diagnostic),
-                "{fixture_name} did not fail for {diagnostic:?}:\n{stderr}"
-            );
+        if output.status.success() {
+            return Err("fixture unexpectedly compiled".to_owned());
         }
+        let diagnostics = String::from_utf8_lossy(&output.stderr)
+            .lines()
+            .map(|line| {
+                serde_json::from_str::<serde_json::Value>(line).map_err(|error| error.to_string())
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if diagnostics
+            .iter()
+            .any(|diagnostic| diagnostic["level"] == "warning")
+        {
+            return Err("fixture emitted a compiler warning".to_owned());
+        }
+        if diagnostics.iter().any(|diagnostic| {
+            diagnostic["level"] == "error"
+                && diagnostic["code"].is_null()
+                && !diagnostic["message"]
+                    .as_str()
+                    .is_some_and(|message| message.starts_with("aborting due to"))
+        }) {
+            return Err("fixture emitted an unexpected non-diagnostic compiler error".to_owned());
+        }
+        let errors = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic["level"] == "error" && !diagnostic["code"].is_null())
+            .collect::<Vec<_>>();
+        if errors.len() != expectations.len() {
+            return Err(format!(
+                "expected {} coded compiler errors, got {}",
+                expectations.len(),
+                errors.len()
+            ));
+        }
+        for expectation in expectations {
+            if !errors.iter().any(|diagnostic| {
+                diagnostic["code"]["code"] == expectation.code
+                    && diagnostic["message"] == expectation.message
+                    && diagnostic["spans"].as_array().is_some_and(|spans| {
+                        spans.iter().any(|span| {
+                            span["is_primary"] == true
+                                && span["file_name"]
+                                    .as_str()
+                                    .is_some_and(|name| name.ends_with(fixture_name))
+                                && span["line_start"] == expectation.line
+                                && span["label"] == expectation.primary_label
+                        })
+                    })
+            }) {
+                return Err(format!(
+                    "missing {} at {fixture_name}:{} with primary label {:?}",
+                    expectation.code, expectation.line, expectation.primary_label
+                ));
+            }
+        }
+        Ok(())
     }
 
     struct CargoArtifacts {
-        target_dir: PathBuf,
         deps_dir: PathBuf,
         paths: BTreeMap<String, PathBuf>,
     }
@@ -755,10 +811,7 @@ mod tests {
     fn cargo_managed_artifacts(manifest_dir: &Path) -> &'static CargoArtifacts {
         static ARTIFACTS: OnceLock<CargoArtifacts> = OnceLock::new();
         ARTIFACTS.get_or_init(|| {
-            let target_dir = std::env::temp_dir().join(format!(
-                "styrn-probe-compile-fixtures-{}",
-                std::process::id()
-            ));
+            let target_dir = fixture_artifact_cache_dir();
             let output = Command::new("cargo")
                 .current_dir(manifest_dir)
                 .args([
@@ -808,11 +861,34 @@ mod tests {
                 );
             }
             let deps_dir = target_dir.join("debug/deps");
-            CargoArtifacts {
-                target_dir,
-                deps_dir,
-                paths,
-            }
+            CargoArtifacts { deps_dir, paths }
         })
+    }
+
+    fn fixture_artifact_cache_dir() -> PathBuf {
+        std::env::temp_dir().join("styrn-probe-compile-fixture-cache-v1")
+    }
+
+    struct ScopedFixtureOutput {
+        path: PathBuf,
+    }
+
+    impl ScopedFixtureOutput {
+        fn new() -> Self {
+            static NEXT_OUTPUT: AtomicUsize = AtomicUsize::new(0);
+            Self {
+                path: std::env::temp_dir().join(format!(
+                    "styrn-probe-rustc-output-{}-{}",
+                    std::process::id(),
+                    NEXT_OUTPUT.fetch_add(1, Ordering::Relaxed)
+                )),
+            }
+        }
+    }
+
+    impl Drop for ScopedFixtureOutput {
+        fn drop(&mut self) {
+            let _ = fs::remove_file(&self.path);
+        }
     }
 }

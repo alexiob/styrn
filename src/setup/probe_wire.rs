@@ -364,17 +364,27 @@ fn looks_secret_shaped(value: &str) -> bool {
 }
 
 fn contains_bearer_credential(value: &str) -> bool {
-    value
-        .split_whitespace()
-        .zip(value.split_whitespace().skip(1))
-        .any(|(first, second)| {
-            first.trim_matches(|character: char| !character.is_ascii_alphabetic()) == "bearer"
-                && !second.is_empty()
-        })
+    let candidates = credential_candidates(value);
+    candidates
+        .windows(2)
+        .any(|pair| pair[0].eq_ignore_ascii_case("bearer") && !pair[1].is_empty())
 }
 
 fn contains_embedded_compact_jwt(value: &str) -> bool {
-    value.split_whitespace().any(is_compact_jwt)
+    credential_candidates(value).into_iter().any(is_compact_jwt)
+}
+
+fn credential_candidates(value: &str) -> Vec<&str> {
+    value
+        .split(|character: char| {
+            character.is_whitespace()
+                || matches!(
+                    character,
+                    ':' | '=' | ',' | ';' | '(' | ')' | '[' | ']' | '{' | '}'
+                )
+        })
+        .filter(|candidate| !candidate.is_empty())
+        .collect()
 }
 
 fn is_compact_jwt(value: &str) -> bool {

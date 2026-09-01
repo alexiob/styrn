@@ -5,14 +5,11 @@ mod worker_implementation {
     use super::setup::{DoctorFinding, DoctorFindingState, ProbeObservation};
     use super::setup::probe::{FindingSeverity, ProbeId, ProbeStatus};
 
-    fn fabricate_observation() {
+    pub(super) fn fabricate() {
         let _ = ProbeObservation {
-            descriptor: unsafe { std::mem::zeroed() },
+            descriptor: fixture_value(),
             status: ProbeStatus::Absent,
         };
-    }
-
-    fn fabricate_finding() {
         let _ = DoctorFinding {
             id: ProbeId::parse("tool.fake").unwrap(),
             state: DoctorFindingState::Pass,
@@ -21,6 +18,12 @@ mod worker_implementation {
             remediation: None,
         };
     }
+
+    fn fixture_value<T>() -> T {
+        panic!("compile-fail fixture never runs")
+    }
 }
 
-fn main() {}
+fn main() {
+    worker_implementation::fabricate();
+}
