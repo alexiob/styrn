@@ -9,6 +9,7 @@ mod jobs;
 mod manifest;
 mod mcp;
 mod notification;
+#[allow(dead_code)]
 mod output;
 mod platform;
 mod project;
