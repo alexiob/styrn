@@ -5,7 +5,7 @@ mod output;
 mod fixture_builder;
 
 use chrono::{TimeZone, Utc};
-use jsonschema::JSONSchema;
+use jsonschema::Validator;
 use serde_json::{json, Value};
 use std::fs;
 use std::path::PathBuf;
@@ -16,7 +16,7 @@ fn timestamp() -> chrono::DateTime<Utc> {
     Utc.with_ymd_and_hms(2026, 9, 1, 12, 0, 0).single().unwrap()
 }
 
-fn validator() -> JSONSchema {
+fn validator() -> Validator {
     let schema: Value = serde_json::from_str(
         &fs::read_to_string(concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -25,17 +25,19 @@ fn validator() -> JSONSchema {
         .unwrap(),
     )
     .unwrap();
-    JSONSchema::compile(&schema).unwrap()
+    jsonschema::validator_for(&schema).unwrap()
 }
 
 fn assert_schema_valid(value: &Value) {
-    if let Err(errors) = validator().validate(value) {
+    let validator = validator();
+    let errors = validator
+        .iter_errors(value)
+        .map(|error| error.to_string())
+        .collect::<Vec<_>>();
+    if !errors.is_empty() {
         panic!(
             "envelope must validate against schemas/command-v1.schema.json:\n{}",
-            errors
-                .map(|error| error.to_string())
-                .collect::<Vec<_>>()
-                .join("\n")
+            errors.join("\n")
         );
     }
 }

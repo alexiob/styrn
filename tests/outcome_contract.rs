@@ -4,7 +4,7 @@ mod output;
 
 mod fixture_builder;
 
-use jsonschema::JSONSchema;
+use jsonschema::Validator;
 use serde_json::Value;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -53,7 +53,7 @@ const EXPECTED_REGISTRY: [(&str, i32); 37] = [
 
 const EXPECTED_EXITS: [i32; 14] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13];
 
-fn validator() -> JSONSchema {
+fn validator() -> Validator {
     let schema: Value = serde_json::from_str(
         &fs::read_to_string(concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -62,17 +62,19 @@ fn validator() -> JSONSchema {
         .unwrap(),
     )
     .unwrap();
-    JSONSchema::compile(&schema).unwrap()
+    jsonschema::validator_for(&schema).unwrap()
 }
 
 fn assert_schema_valid(value: &Value) {
-    if let Err(errors) = validator().validate(value) {
+    let validator = validator();
+    let errors = validator
+        .iter_errors(value)
+        .map(|error| error.to_string())
+        .collect::<Vec<_>>();
+    if !errors.is_empty() {
         panic!(
             "envelope must validate against schemas/command-v1.schema.json:\n{}",
-            errors
-                .map(|error| error.to_string())
-                .collect::<Vec<_>>()
-                .join("\n")
+            errors.join("\n")
         );
     }
 }

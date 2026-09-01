@@ -60,7 +60,7 @@ fn ci_toolchain_contract_rejects_duplicate_different_and_floating_selectors() {
 
 #[test]
 fn rust_toolchain_contract_is_pinned_consistently_across_local_and_ci_builds() {
-    let cargo: toml::Value = workspace_file("Cargo.toml")
+    let cargo: toml::Table = workspace_file("Cargo.toml")
         .parse()
         .expect("Cargo.toml must be valid TOML");
     let cargo_msrv = cargo
@@ -69,7 +69,7 @@ fn rust_toolchain_contract_is_pinned_consistently_across_local_and_ci_builds() {
         .and_then(toml::Value::as_str)
         .expect("Cargo.toml [package].rust-version must be set");
 
-    let toolchain: toml::Value = workspace_file("rust-toolchain.toml")
+    let toolchain: toml::Table = workspace_file("rust-toolchain.toml")
         .parse()
         .expect("rust-toolchain.toml must be valid TOML");
     let toolchain_config = toolchain

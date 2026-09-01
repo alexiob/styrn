@@ -4,7 +4,7 @@ mod platform;
 #[path = "../src/manifest/mod.rs"]
 mod manifest;
 
-use jsonschema::JSONSchema;
+use jsonschema::Validator;
 use manifest::{MachineManifest, MachineManifestStore};
 use serde_json::Value;
 use std::fs;
@@ -15,7 +15,7 @@ use uuid::Uuid;
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
-fn schema_validator() -> JSONSchema {
+fn schema_validator() -> Validator {
     let schema: Value = serde_json::from_str(
         &fs::read_to_string(concat!(
             env!("CARGO_MANIFEST_DIR"),
@@ -24,17 +24,19 @@ fn schema_validator() -> JSONSchema {
         .unwrap(),
     )
     .unwrap();
-    JSONSchema::compile(&schema).unwrap()
+    jsonschema::validator_for(&schema).unwrap()
 }
 
 fn assert_schema_valid(value: &Value) {
-    if let Err(errors) = schema_validator().validate(value) {
+    let validator = schema_validator();
+    let errors = validator
+        .iter_errors(value)
+        .map(|error| error.to_string())
+        .collect::<Vec<_>>();
+    if !errors.is_empty() {
         panic!(
             "machine JSON must validate against the checked-in schema:\n{}",
-            errors
-                .map(|error| error.to_string())
-                .collect::<Vec<_>>()
-                .join("\n")
+            errors.join("\n")
         );
     }
 }
