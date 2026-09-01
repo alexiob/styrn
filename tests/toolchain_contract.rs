@@ -41,6 +41,7 @@ fn ci_toolchain_contract_rejects_duplicate_different_and_floating_selectors() {
     let floating = format!("{good}\n- uses: dtolnay/rust-toolchain@beta");
     let alternate_input = format!("{good}\n  toolchain: stable");
     let rustup_install = format!("{good}\n- run: rustup toolchain install stable");
+    let rustup_default = format!("{good}\n- run: rustup default stable");
     let multiline_selector =
         format!("{good}\n- name: install a different Rust\n  uses: dtolnay/rust-toolchain@stable");
     let rustup_override = format!("{good}\n- run: rustup override set stable");
@@ -52,6 +53,7 @@ fn ci_toolchain_contract_rejects_duplicate_different_and_floating_selectors() {
     assert!(!ci_toolchain_contract_holds(&floating));
     assert!(!ci_toolchain_contract_holds(&alternate_input));
     assert!(!ci_toolchain_contract_holds(&rustup_install));
+    assert!(!ci_toolchain_contract_holds(&rustup_default));
     assert!(!ci_toolchain_contract_holds(&rustup_override));
     assert!(!ci_toolchain_contract_holds(&rustup_run));
 }
