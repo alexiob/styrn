@@ -104,7 +104,10 @@ pub(crate) fn to_json(envelope: &Envelope) -> Result<String, OutputError> {
 }
 
 pub(crate) fn write_json(mut writer: impl Write, envelope: &Envelope) -> Result<(), OutputError> {
-    serde_json::to_writer(&mut writer, envelope).map_err(OutputError::Serialize)
+    let json = to_json(envelope)?;
+    writer
+        .write_all(json.as_bytes())
+        .map_err(OutputError::Write)
 }
 
 #[derive(Debug)]
@@ -116,6 +119,7 @@ pub(crate) enum OutputError {
     EmptyDiagnosticMessage,
     InvalidDiagnosticDetails,
     Serialize(serde_json::Error),
+    Write(std::io::Error),
 }
 
 impl fmt::Display for OutputError {
@@ -138,6 +142,7 @@ impl fmt::Display for OutputError {
             Self::Serialize(error) => {
                 write!(formatter, "could not serialize command envelope: {error}")
             }
+            Self::Write(error) => write!(formatter, "could not write command envelope: {error}"),
         }
     }
 }

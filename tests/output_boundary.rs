@@ -146,6 +146,11 @@ fn compile_fixture() -> PathBuf {
         "fixture must compile:\n{}",
         String::from_utf8_lossy(&output.stderr)
     );
+    assert!(
+        output.stderr.is_empty(),
+        "fixture compiler must not emit warnings:\n{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
     executable
 }
 
