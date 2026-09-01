@@ -328,41 +328,62 @@ fn looks_secret_shaped(value: &str) -> bool {
     let normalized = value.to_ascii_lowercase();
     value.chars().any(char::is_control)
         || normalized.contains("-----begin")
-        || contains_bearer_credential(&normalized)
+        || contains_sensitive_marker_value(value)
         || contains_embedded_compact_jwt(value)
-        || contains_sensitive_assignment(value)
-        || contains_auth_token_phrase(value)
         || contains_credential_prefix(value)
-}
-
-fn contains_bearer_credential(value: &str) -> bool {
-    let candidates = credential_candidates(value);
-    lexical_tokens(value).iter().any(|token| {
-        assignment_pair(token).is_some_and(|(name, continuation)| {
-            normalized_marker(name) == "bearer" && looks_credential_continuation(continuation)
-        })
-    }) || candidates.windows(2).any(|pair| {
-        normalized_marker(pair[0]) == "bearer" && looks_credential_continuation(pair[1])
-    })
 }
 
 fn contains_embedded_compact_jwt(value: &str) -> bool {
     credential_candidates(value).into_iter().any(is_compact_jwt)
 }
 
-fn contains_sensitive_assignment(value: &str) -> bool {
-    lexical_tokens(value).iter().any(|token| {
-        assignment_pair(token).is_some_and(|(name, continuation)| {
-            is_sensitive_marker(name) && !continuation.is_empty()
-        })
-    })
-}
-
-fn contains_auth_token_phrase(value: &str) -> bool {
-    credential_candidates(value).windows(3).any(|words| {
-        normalized_marker(words[0]) == "auth"
-            && normalized_marker(words[1]) == "token"
-            && looks_credential_continuation(words[2])
+fn contains_sensitive_marker_value(value: &str) -> bool {
+    let tokens = marker_tokens(value);
+    tokens.iter().enumerate().any(|(index, token)| {
+        let MarkerToken::Word(marker) = token else {
+            return false;
+        };
+        let marker = normalized_marker(marker);
+        let Some((next_index, next)) = tokens
+            .iter()
+            .enumerate()
+            .skip(index + 1)
+            .find(|(_, token)| !matches!(token, MarkerToken::Gap))
+        else {
+            return false;
+        };
+        let (has_separator, continuation_index) = match next {
+            MarkerToken::Separator => {
+                let Some((continuation_index, _)) = tokens
+                    .iter()
+                    .enumerate()
+                    .skip(next_index + 1)
+                    .find(|(_, token)| !matches!(token, MarkerToken::Gap))
+                else {
+                    return false;
+                };
+                (true, continuation_index)
+            }
+            MarkerToken::Word(_) => (false, next_index),
+            _ => return false,
+        };
+        let Some(MarkerToken::Word(continuation)) = tokens.get(continuation_index) else {
+            return false;
+        };
+        if continuation.is_empty() {
+            return false;
+        }
+        if marker == "bearer" {
+            let begins_clause = tokens[..index]
+                .iter()
+                .rev()
+                .find(|token| !matches!(token, MarkerToken::Gap))
+                .is_none_or(|previous| {
+                    matches!(previous, MarkerToken::Boundary | MarkerToken::Separator)
+                });
+            return (begins_clause || has_separator) && !continuation.is_empty();
+        }
+        is_sensitive_marker(&marker)
     })
 }
 
@@ -387,35 +408,40 @@ fn contains_credential_prefix(value: &str) -> bool {
     })
 }
 
-fn looks_credential_continuation(value: &str) -> bool {
-    let value = value.trim_matches(
-        |character: char| !matches!(character, 'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.'),
-    );
-    !value.is_empty()
-        && (is_compact_jwt(value)
-            || contains_credential_prefix(value)
-            || (value.len() >= 6
-                && value.bytes().all(
-                    |byte| matches!(byte, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_'),
-                )
-                && value
-                    .bytes()
-                    .any(|byte| byte.is_ascii_digit() || matches!(byte, b'-' | b'_'))))
+#[derive(Clone, Copy)]
+enum MarkerToken<'a> {
+    Word(&'a str),
+    Separator,
+    Boundary,
+    Gap,
 }
 
-fn lexical_tokens(value: &str) -> Vec<&str> {
-    value
-        .split(|character: char| {
-            character.is_whitespace()
-                || matches!(character, ',' | ';' | '(' | ')' | '[' | ']' | '{' | '}')
-        })
-        .filter(|token| !token.is_empty())
-        .collect()
-}
-
-fn assignment_pair(token: &str) -> Option<(&str, &str)> {
-    let separator = token.find(['=', ':'])?;
-    Some((&token[..separator], &token[separator + 1..]))
+fn marker_tokens(value: &str) -> Vec<MarkerToken<'_>> {
+    let mut tokens = Vec::new();
+    let mut word_start = None;
+    for (index, character) in value.char_indices() {
+        let is_separator = matches!(character, ':' | '=');
+        let is_gap = character.is_whitespace();
+        let is_boundary = matches!(character, ',' | ';' | '(' | ')' | '[' | ']' | '{' | '}');
+        if !is_separator && !is_gap && !is_boundary {
+            word_start.get_or_insert(index);
+            continue;
+        }
+        if let Some(start) = word_start.take() {
+            tokens.push(MarkerToken::Word(&value[start..index]));
+        }
+        tokens.push(if is_separator {
+            MarkerToken::Separator
+        } else if is_gap {
+            MarkerToken::Gap
+        } else {
+            MarkerToken::Boundary
+        });
+    }
+    if let Some(start) = word_start {
+        tokens.push(MarkerToken::Word(&value[start..]));
+    }
+    tokens
 }
 
 fn normalized_marker(value: &str) -> String {
