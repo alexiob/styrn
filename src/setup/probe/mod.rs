@@ -1,14 +1,11 @@
-//! Read-only worker-local capability observations shared by setup and doctor.
+//! Read-only worker-local probe inputs.
 //!
-//! Controller-relational checks deliberately do not have a type in this module:
-//! `ProbeCatalog` accepts only sealed `WorkerProbe` implementations, so a
-//! controller-side sibling cannot register itself as a worker-local probe.
+//! Guarded observations and doctor wire DTOs live in sibling `setup::probe_wire`.
+//! Implementations can supply only specs and raw statuses; the setup parent
+//! mediates conversion into serializable output.
 
-use base64::{
-    engine::general_purpose::{URL_SAFE, URL_SAFE_NO_PAD},
-    Engine as _,
-};
-use serde::{ser::SerializeStruct, Serialize, Serializer};
+use crate::setup::ObservedState;
+use serde::Serialize;
 use std::collections::HashSet;
 use std::fmt;
 use thiserror::Error;
@@ -19,8 +16,7 @@ pub(crate) struct ProbeId(String);
 
 impl ProbeId {
     pub(crate) fn parse(value: &str) -> Result<Self, ProbeIdError> {
-        let valid = value.split('.').count() >= 2 && value.split('.').all(valid_probe_id_segment);
-        if !valid {
+        if value.split('.').count() < 2 || !value.split('.').all(valid_probe_id_segment) {
             return Err(ProbeIdError::Invalid);
         }
         Ok(Self(value.to_owned()))
@@ -38,17 +34,17 @@ impl fmt::Display for ProbeId {
 }
 
 fn valid_probe_id_segment(segment: &str) -> bool {
-    let mut chars = segment.bytes();
-    matches!(chars.next(), Some(b'a'..=b'z'))
-        && chars
-            .clone()
+    let bytes = segment.as_bytes();
+    matches!(bytes.first(), Some(b'a'..=b'z'))
+        && matches!(bytes.last(), Some(b'a'..=b'z' | b'0'..=b'9'))
+        && bytes
+            .iter()
             .all(|byte| matches!(byte, b'a'..=b'z' | b'0'..=b'9' | b'-'))
-        && matches!(chars.last(), Some(b'a'..=b'z' | b'0'..=b'9'))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub(crate) enum ProbeIdError {
-    #[error("probe ID must contain at least two lowercase dot-namespaced segments")]
+    #[error("probe ID must contain lowercase dot-namespaced segments")]
     Invalid,
 }
 
@@ -66,7 +62,7 @@ pub(crate) enum StyrnCommand {
 }
 
 impl StyrnCommand {
-    fn args(self) -> &'static [&'static str] {
+    pub(crate) fn args(self) -> &'static [&'static str] {
         match self {
             Self::MachineInit => &["machine", "init"],
         }
@@ -74,134 +70,57 @@ impl StyrnCommand {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct Remediation {
+pub(crate) struct RemediationSpec {
     summary: String,
     command: Option<StyrnCommand>,
 }
 
-impl Remediation {
+impl RemediationSpec {
     pub(crate) fn new(
         summary: impl Into<String>,
         command: Option<StyrnCommand>,
-    ) -> Result<Self, RemediationError> {
+    ) -> Result<Self, RemediationSpecError> {
         let summary = summary.into();
-        if !valid_safe_text(&summary) {
-            return Err(RemediationError::UnsafeSummary);
+        if !super::validate_probe_static_text(&summary) {
+            return Err(RemediationSpecError::UnsafeSummary);
         }
-
         Ok(Self { summary, command })
     }
-}
 
-impl Serialize for Remediation {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        let mut output =
-            serializer.serialize_struct("Remediation", usize::from(self.command.is_some()) + 1)?;
-        output.serialize_field("summary", &self.summary)?;
-        if let Some(command) = self.command {
-            output.serialize_field("styrn_args", command.args())?;
-        }
-        output.end()
+    pub(crate) fn summary(&self) -> &str {
+        &self.summary
+    }
+
+    pub(crate) fn command(&self) -> Option<StyrnCommand> {
+        self.command
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
-pub(crate) enum RemediationError {
+pub(crate) enum RemediationSpecError {
     #[error("remediation summary is unsafe")]
     UnsafeSummary,
 }
 
-fn valid_safe_text(value: &str) -> bool {
-    !value.is_empty() && !value.chars().any(char::is_control) && !looks_secret_shaped(value)
-}
-
-fn looks_secret_shaped(value: &str) -> bool {
-    let normalized = value.to_ascii_lowercase();
-    let compact = normalized
-        .bytes()
-        .filter(u8::is_ascii_alphanumeric)
-        .map(char::from)
-        .collect::<String>();
-
-    value.chars().any(char::is_control)
-        || normalized.contains("-----begin")
-        || has_compact_jwt_header(value)
-        || [
-            "apikey",
-            "authkey",
-            "authtoken",
-            "token",
-            "password",
-            "privatekey",
-            "secret",
-            "accesskey",
-            "credential",
-        ]
-        .iter()
-        .any(|needle| compact.contains(needle))
-        || [
-            "sk-",
-            "sk_",
-            "ghp_",
-            "gho_",
-            "ghu_",
-            "ghs_",
-            "github_pat_",
-            "tskey-",
-            "tskey_",
-        ]
-        .iter()
-        .any(|prefix| normalized.contains(prefix))
-}
-
-fn has_compact_jwt_header(value: &str) -> bool {
-    let mut segments = value.split('.');
-    let Some(header) = segments.next() else {
-        return false;
-    };
-    let (Some(payload), Some(signature), None) =
-        (segments.next(), segments.next(), segments.next())
-    else {
-        return false;
-    };
-    if payload.is_empty() || signature.is_empty() {
-        return false;
-    }
-
-    let decoded = URL_SAFE_NO_PAD
-        .decode(header)
-        .or_else(|_| URL_SAFE.decode(header));
-    decoded
-        .ok()
-        .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
-        .and_then(|header| header.as_object().cloned())
-        .is_some_and(|header| header.contains_key("alg"))
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub(crate) struct ProbeDescriptor {
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ProbeDescriptorSpec {
     id: ProbeId,
     label: String,
     failure_severity: FindingSeverity,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    remediation: Option<Remediation>,
+    remediation: Option<RemediationSpec>,
 }
 
-impl ProbeDescriptor {
+impl ProbeDescriptorSpec {
     pub(crate) fn new(
         id: ProbeId,
         label: impl Into<String>,
         failure_severity: FindingSeverity,
-        remediation: Option<Remediation>,
-    ) -> Result<Self, ProbeDescriptorError> {
+        remediation: Option<RemediationSpec>,
+    ) -> Result<Self, ProbeDescriptorSpecError> {
         let label = label.into();
-        if !valid_safe_text(&label) {
-            return Err(ProbeDescriptorError::UnsafeLabel);
+        if !super::validate_probe_static_text(&label) {
+            return Err(ProbeDescriptorSpecError::UnsafeLabel);
         }
-
         Ok(Self {
             id,
             label,
@@ -213,10 +132,22 @@ impl ProbeDescriptor {
     pub(crate) fn id(&self) -> &ProbeId {
         &self.id
     }
+
+    pub(crate) fn label(&self) -> &str {
+        &self.label
+    }
+
+    pub(crate) fn failure_severity(&self) -> FindingSeverity {
+        self.failure_severity
+    }
+
+    pub(crate) fn remediation(&self) -> Option<&RemediationSpec> {
+        self.remediation.as_ref()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
-pub(crate) enum ProbeDescriptorError {
+pub(crate) enum ProbeDescriptorSpecError {
     #[error("probe label is unsafe")]
     UnsafeLabel,
 }
@@ -225,13 +156,8 @@ mod worker_probe_only {
     pub(crate) trait Sealed {}
 }
 
-/// The only extensibility point accepted by the worker-local catalog.
-///
-/// Implementations are observational: the trait deliberately exposes no
-/// mutable state, elevation, command execution, or action/apply capability.
-/// It is sealed so a controller-side sibling cannot become a worker probe.
 pub(crate) trait WorkerProbe: worker_probe_only::Sealed + Send + Sync {
-    fn descriptor(&self) -> &ProbeDescriptor;
+    fn descriptor(&self) -> &ProbeDescriptorSpec;
     fn observe(&self) -> Result<ProbeStatus, ProbeFailure>;
 }
 
@@ -253,7 +179,7 @@ pub(crate) enum ProbeStatus {
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct ProbeFailure {
     kind: ProbeFailureKind,
-    detail: ProbeFailureDetail,
+    detail: String,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -265,53 +191,36 @@ enum ProbeFailureKind {
     ObservationFailed,
 }
 
-#[derive(Clone, PartialEq, Eq)]
-struct ProbeFailureDetail(String);
-
-impl ProbeFailureDetail {
-    fn was_supplied(&self) -> bool {
-        !self.0.is_empty()
-    }
-}
-
 impl ProbeFailure {
     pub(crate) fn permission_denied(detail: impl Into<String>) -> Self {
-        Self {
-            kind: ProbeFailureKind::PermissionDenied,
-            detail: ProbeFailureDetail(detail.into()),
-        }
+        Self::new(ProbeFailureKind::PermissionDenied, detail)
     }
 
     pub(crate) fn unreadable(detail: impl Into<String>) -> Self {
-        Self {
-            kind: ProbeFailureKind::Unreadable,
-            detail: ProbeFailureDetail(detail.into()),
-        }
+        Self::new(ProbeFailureKind::Unreadable, detail)
     }
 
     pub(crate) fn malformed_output(detail: impl Into<String>) -> Self {
-        Self {
-            kind: ProbeFailureKind::MalformedOutput,
-            detail: ProbeFailureDetail(detail.into()),
-        }
+        Self::new(ProbeFailureKind::MalformedOutput, detail)
     }
 
     pub(crate) fn missing_prerequisite(detail: impl Into<String>) -> Self {
-        Self {
-            kind: ProbeFailureKind::MissingPrerequisite,
-            detail: ProbeFailureDetail(detail.into()),
-        }
+        Self::new(ProbeFailureKind::MissingPrerequisite, detail)
     }
 
     pub(crate) fn observation_failed(detail: impl Into<String>) -> Self {
+        Self::new(ProbeFailureKind::ObservationFailed, detail)
+    }
+
+    fn new(kind: ProbeFailureKind, detail: impl Into<String>) -> Self {
         Self {
-            kind: ProbeFailureKind::ObservationFailed,
-            detail: ProbeFailureDetail(detail.into()),
+            kind,
+            detail: detail.into(),
         }
     }
 
-    fn reason(&self) -> &'static str {
-        let _ = self.detail.was_supplied();
+    pub(crate) fn canonical_reason(&self) -> &'static str {
+        let _ = self.detail.is_empty();
         match self.kind {
             ProbeFailureKind::PermissionDenied => "permission denied",
             ProbeFailureKind::Unreadable => "state unreadable",
@@ -319,142 +228,6 @@ impl ProbeFailure {
             ProbeFailureKind::MissingPrerequisite => "required prerequisite was unavailable",
             ProbeFailureKind::ObservationFailed => "probe observation failed",
         }
-    }
-}
-
-impl ProbeStatus {
-    fn sanitized(self) -> Self {
-        match self {
-            Self::Absent => Self::Absent,
-            Self::Present { version, healthy } => Self::Present {
-                version: version.and_then(sanitize_version),
-                healthy,
-            },
-            Self::Broken { reason } => Self::Broken {
-                reason: sanitize_reason(&reason),
-            },
-            Self::Unknowable { reason } => Self::Unknowable {
-                reason: sanitize_reason(&reason),
-            },
-        }
-    }
-}
-
-fn sanitize_version(version: String) -> Option<String> {
-    let valid = !version.is_empty()
-        && version.len() <= 128
-        && !looks_secret_shaped(&version)
-        && version
-            .bytes()
-            .all(|byte| matches!(byte, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'.' | b'-' | b'_' | b'+'));
-    valid.then_some(version)
-}
-
-fn sanitize_reason(reason: &str) -> String {
-    let normalized = reason.to_ascii_lowercase();
-    if normalized.contains("permission") || normalized.contains("eacces") {
-        "permission denied".to_owned()
-    } else if normalized.contains("unreadable") {
-        "state unreadable".to_owned()
-    } else if normalized.contains("malformed") || normalized.contains("unsupported") {
-        "output was malformed or unsupported".to_owned()
-    } else if normalized.contains("prerequisite") {
-        "required prerequisite was unavailable".to_owned()
-    } else if normalized.contains("inconsistent") || normalized.contains("corrupt") {
-        "internally inconsistent state".to_owned()
-    } else {
-        "probe observation failed".to_owned()
-    }
-}
-
-#[derive(Clone, PartialEq, Eq)]
-pub(crate) struct ProbeObservation {
-    descriptor: ProbeDescriptor,
-    status: ProbeStatus,
-}
-
-#[derive(Serialize)]
-#[serde(tag = "status", rename_all = "snake_case")]
-enum SerializedProbeStatus<'a> {
-    Absent,
-    Present {
-        version: Option<&'a str>,
-        healthy: bool,
-    },
-    Broken {
-        reason: &'a str,
-    },
-    Unknowable {
-        reason: &'a str,
-    },
-}
-
-impl<'a> From<&'a ProbeStatus> for SerializedProbeStatus<'a> {
-    fn from(status: &'a ProbeStatus) -> Self {
-        match status {
-            ProbeStatus::Absent => Self::Absent,
-            ProbeStatus::Present { version, healthy } => Self::Present {
-                version: version.as_deref(),
-                healthy: *healthy,
-            },
-            ProbeStatus::Broken { reason } => Self::Broken { reason },
-            ProbeStatus::Unknowable { reason } => Self::Unknowable { reason },
-        }
-    }
-}
-
-impl Serialize for ProbeObservation {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        let mut output = serializer.serialize_struct("ProbeObservation", 2)?;
-        output.serialize_field("descriptor", &self.descriptor)?;
-        output.serialize_field("status", &SerializedProbeStatus::from(&self.status))?;
-        output.end()
-    }
-}
-
-impl ProbeObservation {
-    fn new(descriptor: ProbeDescriptor, status: ProbeStatus) -> Self {
-        Self {
-            descriptor,
-            status: status.sanitized(),
-        }
-    }
-
-    pub(crate) fn descriptor(&self) -> &ProbeDescriptor {
-        &self.descriptor
-    }
-
-    pub(crate) fn status(&self) -> &ProbeStatus {
-        &self.status
-    }
-}
-
-#[derive(Clone, PartialEq, Eq)]
-pub(crate) struct ObservedState {
-    observations: Vec<ProbeObservation>,
-}
-
-impl ObservedState {
-    pub(crate) fn iter(&self) -> impl ExactSizeIterator<Item = &ProbeObservation> {
-        self.observations.iter()
-    }
-
-    pub(crate) fn get(&self, id: &ProbeId) -> Option<&ProbeObservation> {
-        self.observations
-            .iter()
-            .find(|observation| observation.descriptor.id == *id)
-    }
-
-    /// A setup view of the same data that doctor projects below; no second list.
-    pub(crate) fn setup_observations(&self) -> impl ExactSizeIterator<Item = &ProbeObservation> {
-        self.iter()
-    }
-
-    pub(crate) fn doctor_findings(&self) -> Vec<DoctorFinding> {
-        self.iter().map(DoctorFinding::from_observation).collect()
     }
 }
 
@@ -471,26 +244,11 @@ impl ProbeCatalog {
                 return Err(ProbeCatalogError::DuplicateId(id));
             }
         }
-
         Ok(Self { probes })
     }
 
     pub(crate) fn observe(&self) -> ObservedState {
-        ObservedState {
-            observations: self
-                .probes
-                .iter()
-                .map(|probe| {
-                    let status = match probe.observe() {
-                        Ok(status) => status,
-                        Err(failure) => ProbeStatus::Unknowable {
-                            reason: failure.reason().to_owned(),
-                        },
-                    };
-                    ProbeObservation::new(probe.descriptor().clone(), status)
-                })
-                .collect(),
-        }
+        super::observe_worker_probes(&self.probes)
     }
 }
 
@@ -500,70 +258,23 @@ pub(crate) enum ProbeCatalogError {
     DuplicateId(ProbeId),
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum DoctorFindingState {
-    Pass,
-    Fail,
-    Unknown,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub(crate) struct DoctorFinding {
-    id: ProbeId,
-    state: DoctorFindingState,
-    severity: FindingSeverity,
-    message: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    remediation: Option<Remediation>,
-}
-
-impl DoctorFinding {
-    fn from_observation(observation: &ProbeObservation) -> Self {
-        let (state, message) = match observation.status() {
-            ProbeStatus::Absent => (DoctorFindingState::Fail, "subject is absent".to_owned()),
-            ProbeStatus::Present { healthy: true, .. } => {
-                (DoctorFindingState::Pass, "healthy".to_owned())
-            }
-            ProbeStatus::Present { healthy: false, .. } => {
-                (DoctorFindingState::Fail, "present but unhealthy".to_owned())
-            }
-            ProbeStatus::Broken { reason } => (DoctorFindingState::Fail, reason.clone()),
-            ProbeStatus::Unknowable { reason } => (DoctorFindingState::Unknown, reason.clone()),
-        };
-        let descriptor = observation.descriptor();
-
-        Self {
-            id: descriptor.id.clone(),
-            state,
-            severity: descriptor.failure_severity,
-            message: format!("{}: {message}", descriptor.label),
-            remediation: descriptor.remediation.clone(),
-        }
-    }
-
-    pub(crate) fn id(&self) -> &ProbeId {
-        &self.id
-    }
-
-    pub(crate) fn state(&self) -> DoctorFindingState {
-        self.state
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
-    use std::path::PathBuf;
-    use std::process::Command;
+    use crate::setup::DoctorFindingState;
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
     };
+    use std::{
+        collections::BTreeMap,
+        path::{Path, PathBuf},
+        process::Command,
+        sync::OnceLock,
+    };
 
     struct FakeProbe {
-        descriptor: ProbeDescriptor,
+        descriptor: ProbeDescriptorSpec,
         result: Result<ProbeStatus, ProbeFailure>,
         calls: Arc<AtomicUsize>,
     }
@@ -571,13 +282,7 @@ mod tests {
     impl FakeProbe {
         fn new(id: &str, status: ProbeStatus, calls: Arc<AtomicUsize>) -> Self {
             Self {
-                descriptor: ProbeDescriptor::new(
-                    ProbeId::parse(id).expect("test probe ID must be valid"),
-                    "test worker probe",
-                    FindingSeverity::Error,
-                    None,
-                )
-                .expect("test descriptor must be valid"),
+                descriptor: descriptor(id),
                 result: Ok(status),
                 calls,
             }
@@ -585,13 +290,7 @@ mod tests {
 
         fn failure(id: &str, failure: ProbeFailure, calls: Arc<AtomicUsize>) -> Self {
             Self {
-                descriptor: ProbeDescriptor::new(
-                    ProbeId::parse(id).expect("test probe ID must be valid"),
-                    "test worker probe",
-                    FindingSeverity::Error,
-                    None,
-                )
-                .expect("test descriptor must be valid"),
+                descriptor: descriptor(id),
                 result: Err(failure),
                 calls,
             }
@@ -601,7 +300,7 @@ mod tests {
     impl worker_probe_only::Sealed for FakeProbe {}
 
     impl WorkerProbe for FakeProbe {
-        fn descriptor(&self) -> &ProbeDescriptor {
+        fn descriptor(&self) -> &ProbeDescriptorSpec {
             &self.descriptor
         }
 
@@ -609,6 +308,47 @@ mod tests {
             self.calls.fetch_add(1, Ordering::SeqCst);
             self.result.clone()
         }
+    }
+
+    mod legitimate_descendant {
+        use super::*;
+
+        pub(super) struct ChildProbe {
+            descriptor: ProbeDescriptorSpec,
+        }
+
+        impl ChildProbe {
+            pub(super) fn new() -> Self {
+                Self {
+                    descriptor: descriptor("tool.descendant"),
+                }
+            }
+        }
+
+        impl worker_probe_only::Sealed for ChildProbe {}
+
+        impl WorkerProbe for ChildProbe {
+            fn descriptor(&self) -> &ProbeDescriptorSpec {
+                &self.descriptor
+            }
+
+            fn observe(&self) -> Result<ProbeStatus, ProbeFailure> {
+                Ok(ProbeStatus::Present {
+                    version: Some("1.0.0".to_owned()),
+                    healthy: true,
+                })
+            }
+        }
+    }
+
+    fn descriptor(id: &str) -> ProbeDescriptorSpec {
+        ProbeDescriptorSpec::new(
+            ProbeId::parse(id).expect("test probe ID must be valid"),
+            "test worker probe",
+            FindingSeverity::Error,
+            None,
+        )
+        .expect("test descriptor must be valid")
     }
 
     #[test]
@@ -644,76 +384,80 @@ mod tests {
             )),
         ])
         .expect("unique worker-local probes must form a catalog");
-
         let observed = catalog.observe();
-
         assert_eq!(calls.load(Ordering::SeqCst), 4);
         assert_eq!(
             observed
                 .iter()
-                .map(|observation| observation.descriptor().id().as_str())
+                .map(|item| item.descriptor().id().as_str())
                 .collect::<Vec<_>>(),
             vec!["tool.present", "tool.absent", "tool.broken", "tool.unknown"]
         );
+        assert!(
+            matches!(observed.get(&ProbeId::parse("tool.present").unwrap()).unwrap().status(), ProbeStatus::Present { version: Some(version), healthy: true } if version == "1.2.3")
+        );
         assert!(matches!(
             observed
-                .get(&ProbeId::parse("tool.present").expect("valid ID"))
-                .expect("present probe must be observable")
-                .status(),
-            ProbeStatus::Present {
-                version: Some(version),
-                healthy: true,
-            } if version == "1.2.3"
-        ));
-        assert!(matches!(
-            observed
-                .get(&ProbeId::parse("tool.absent").expect("valid ID"))
-                .expect("absent probe must be observable")
+                .get(&ProbeId::parse("tool.absent").unwrap())
+                .unwrap()
                 .status(),
             ProbeStatus::Absent
         ));
         assert!(matches!(
             observed
-                .get(&ProbeId::parse("tool.broken").expect("valid ID"))
-                .expect("broken probe must be observable")
+                .get(&ProbeId::parse("tool.broken").unwrap())
+                .unwrap()
                 .status(),
             ProbeStatus::Broken { .. }
         ));
         assert!(matches!(
             observed
-                .get(&ProbeId::parse("tool.unknown").expect("valid ID"))
-                .expect("unknown probe must be observable")
+                .get(&ProbeId::parse("tool.unknown").unwrap())
+                .unwrap()
                 .status(),
             ProbeStatus::Unknowable { .. }
         ));
     }
 
     #[test]
+    fn descendant_probe_uses_validated_specs_and_catalog_guarded_output() {
+        let observed = ProbeCatalog::new(vec![Box::new(legitimate_descendant::ChildProbe::new())])
+            .unwrap()
+            .observe();
+        assert_eq!(observed.iter().count(), 1);
+        assert_eq!(
+            observed.doctor_findings()[0].state(),
+            DoctorFindingState::Pass
+        );
+    }
+
+    #[test]
     fn one_catalog_sentinel_automatically_surfaces_to_setup_and_worker_doctor() {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let catalog = ProbeCatalog::new(vec![Box::new(FakeProbe::new(
+        let observed = ProbeCatalog::new(vec![Box::new(FakeProbe::new(
             "sentinel.shared",
             ProbeStatus::Present {
                 version: None,
                 healthy: true,
             },
-            calls,
+            Arc::new(AtomicUsize::new(0)),
         ))])
-        .expect("sentinel probe must register");
-
-        let observed = catalog.observe();
-        let setup_ids = observed
-            .setup_observations()
-            .map(|observation| observation.descriptor().id().as_str())
-            .collect::<Vec<_>>();
-        let doctor_findings = observed.doctor_findings();
-        let doctor_ids = doctor_findings
-            .iter()
-            .map(|finding| finding.id().as_str())
-            .collect::<Vec<_>>();
-
-        assert_eq!(setup_ids, vec!["sentinel.shared"]);
-        assert_eq!(doctor_ids, vec!["sentinel.shared"]);
+        .unwrap()
+        .observe();
+        assert_eq!(
+            observed
+                .setup_observations()
+                .map(|item| item.descriptor().id().as_str())
+                .collect::<Vec<_>>(),
+            vec!["sentinel.shared"]
+        );
+        assert_eq!(
+            observed
+                .doctor_findings()
+                .iter()
+                .map(|item| item.id().as_str())
+                .collect::<Vec<_>>(),
+            vec!["sentinel.shared"]
+        );
     }
 
     #[test]
@@ -727,258 +471,348 @@ mod tests {
             )),
             Box::new(FakeProbe::new(
                 "tool.git",
-                ProbeStatus::Present {
-                    version: None,
-                    healthy: true,
-                },
+                ProbeStatus::Absent,
                 Arc::clone(&calls),
             )),
         ]);
-
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         assert_eq!(
             result.err(),
             Some(ProbeCatalogError::DuplicateId(
-                ProbeId::parse("tool.git").expect("valid ID")
+                ProbeId::parse("tool.git").unwrap()
             ))
         );
     }
 
     #[test]
-    fn operational_observation_failures_project_to_unknown_without_becoming_absent_or_false() {
-        let cases = [
+    fn operational_failures_project_to_unknown_without_becoming_absent() {
+        for (id, failure) in [
             (
-                "permission",
+                "state.permission",
                 ProbeFailure::permission_denied("EACCES token=do-not-leak"),
             ),
             (
-                "unreadable",
-                ProbeFailure::unreadable("state contains ghp_do-not-leak"),
+                "state.unreadable",
+                ProbeFailure::unreadable("ghp_do-not-leak"),
             ),
             (
-                "malformed",
+                "state.malformed",
                 ProbeFailure::malformed_output("-----BEGIN PRIVATE KEY-----"),
             ),
             (
-                "prerequisite",
+                "state.prerequisite",
                 ProbeFailure::missing_prerequisite("tskey-do-not-leak"),
             ),
-        ];
-
-        for (suffix, failure) in cases {
-            let calls = Arc::new(AtomicUsize::new(0));
-            let catalog = ProbeCatalog::new(vec![Box::new(FakeProbe::failure(
-                &format!("state.{suffix}"),
+        ] {
+            let observed = ProbeCatalog::new(vec![Box::new(FakeProbe::failure(
+                id,
                 failure,
-                calls,
+                Arc::new(AtomicUsize::new(0)),
             ))])
-            .expect("unknown observation probe must register");
-
-            let observed = catalog.observe();
-            let finding = observed.doctor_findings().pop().expect("one finding");
-
+            .unwrap()
+            .observe();
             assert!(matches!(
-                observed.iter().next().expect("one observation").status(),
+                observed.iter().next().unwrap().status(),
                 ProbeStatus::Unknowable { .. }
             ));
-            assert_eq!(finding.state(), DoctorFindingState::Unknown);
+            assert_eq!(
+                observed.doctor_findings()[0].state(),
+                DoctorFindingState::Unknown
+            );
         }
     }
 
     #[test]
-    fn authoritative_lookup_of_its_own_missing_subject_is_absent() {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let catalog = ProbeCatalog::new(vec![Box::new(FakeProbe::new(
+    fn authoritative_own_subject_absence_is_not_an_operational_failure() {
+        let observed = ProbeCatalog::new(vec![Box::new(FakeProbe::new(
             "tool.git",
             ProbeStatus::Absent,
-            calls,
+            Arc::new(AtomicUsize::new(0)),
         ))])
-        .expect("authoritative lookup probe must register");
-
-        let observed = catalog.observe();
-        let finding = observed.doctor_findings().pop().expect("one finding");
-
+        .unwrap()
+        .observe();
         assert!(matches!(
-            observed.iter().next().expect("one observation").status(),
+            observed.iter().next().unwrap().status(),
             ProbeStatus::Absent
         ));
-        assert_eq!(finding.state(), DoctorFindingState::Fail);
+        assert_eq!(
+            observed.doctor_findings()[0].state(),
+            DoctorFindingState::Fail
+        );
     }
 
     #[test]
-    fn serialization_is_tagged_deterministic_and_redacts_unknown_reason() {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let catalog = ProbeCatalog::new(vec![Box::new(FakeProbe::new(
+    fn guarded_serialization_is_tagged_and_redacts_raw_reason() {
+        let observed = ProbeCatalog::new(vec![Box::new(FakeProbe::new(
             "state.protected",
             ProbeStatus::Unknowable {
                 reason: "permission denied; token=super-secret-value".to_owned(),
             },
-            calls,
+            Arc::new(AtomicUsize::new(0)),
         ))])
-        .expect("probe must register");
-
-        let observed = catalog.observe();
-        let observation = observed.iter().next().expect("one observation");
-        let finding = observed.doctor_findings().pop().expect("one finding");
-        let observation_json = serde_json::to_string(observation).expect("observation serializes");
-        let finding_json = serde_json::to_string(&finding).expect("finding serializes");
-
-        assert_eq!(
-            observation_json,
-            "{\"descriptor\":{\"id\":\"state.protected\",\"label\":\"test worker probe\",\"failure_severity\":\"error\"},\"status\":{\"status\":\"unknowable\",\"reason\":\"permission denied\"}}"
-        );
-        assert_eq!(
-            finding_json,
-            "{\"id\":\"state.protected\",\"state\":\"unknown\",\"severity\":\"error\",\"message\":\"test worker probe: permission denied\"}"
-        );
-        assert!(!observation_json.contains("super-secret-value"));
-        assert!(!finding_json.contains("super-secret-value"));
+        .unwrap()
+        .observe();
+        let observation = serde_json::to_string(observed.iter().next().unwrap()).unwrap();
+        let finding = serde_json::to_string(&observed.doctor_findings()[0]).unwrap();
+        assert_eq!(observation, "{\"descriptor\":{\"id\":\"state.protected\",\"label\":\"test worker probe\",\"failure_severity\":\"error\"},\"status\":{\"status\":\"unknowable\",\"reason\":\"permission denied\"}}");
+        assert!(!observation.contains("super-secret-value"));
+        assert!(!finding.contains("super-secret-value"));
     }
 
     #[test]
-    fn probe_ids_reject_invalid_segments_without_reserving_controller_strings() {
+    fn wire_serialization_redacts_every_secret_shaped_runtime_observation() {
+        for secret in secret_examples() {
+            for status in [
+                ProbeStatus::Present {
+                    version: Some((*secret).to_owned()),
+                    healthy: true,
+                },
+                ProbeStatus::Broken {
+                    reason: (*secret).to_owned(),
+                },
+                ProbeStatus::Unknowable {
+                    reason: (*secret).to_owned(),
+                },
+            ] {
+                let observed = ProbeCatalog::new(vec![Box::new(FakeProbe::new(
+                    "state.protected",
+                    status,
+                    Arc::new(AtomicUsize::new(0)),
+                ))])
+                .unwrap()
+                .observe();
+                let observation = serde_json::to_string(observed.iter().next().unwrap()).unwrap();
+                let finding = serde_json::to_string(&observed.doctor_findings()[0]).unwrap();
+                assert!(
+                    !observation.contains(secret),
+                    "observation leaked {secret:?}"
+                );
+                assert!(!finding.contains(secret), "finding leaked {secret:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn remediation_serialization_is_a_closed_styrn_command() {
+        let remediation = RemediationSpec::new(
+            "Initialize the local machine.",
+            Some(StyrnCommand::MachineInit),
+        )
+        .unwrap();
+        let descriptor = ProbeDescriptorSpec::new(
+            ProbeId::parse("machine.initialized").unwrap(),
+            "Machine initialization",
+            FindingSeverity::Error,
+            Some(remediation),
+        )
+        .unwrap();
+        let observed = ProbeCatalog::new(vec![Box::new(FakeProbe {
+            descriptor,
+            result: Ok(ProbeStatus::Absent),
+            calls: Arc::new(AtomicUsize::new(0)),
+        })])
+        .unwrap()
+        .observe();
+        let json = serde_json::to_string(observed.iter().next().unwrap()).unwrap();
+        assert!(json.contains("\"styrn_args\":[\"machine\",\"init\"]"));
+        for forbidden in ["\"program\"", "sh", "powershell", "-c", "-Command", "curl"] {
+            assert!(
+                !json.contains(forbidden),
+                "remediation exposed {forbidden:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn probe_ids_accept_one_character_segments_and_reject_malformed_segments() {
         for invalid in [
             "",
             "tool",
-            "tool. git",
-            "tool.git status",
-            "tool.git;rm",
-            "tool.\u{0000}git",
-            "Tool.git",
-            "-tool.git",
-            "tool-.git",
+            "tool.",
+            "tool.-git",
             "tool.git-",
+            "tool. git",
+            "Tool.git",
         ] {
             assert!(
                 ProbeId::parse(invalid).is_err(),
                 "{invalid:?} must be rejected"
             );
         }
-        assert_eq!(
-            ProbeId::parse("machine.manifest-worker-readable")
-                .expect("worker-local dotted ID must be accepted")
-                .as_str(),
-            "machine.manifest-worker-readable"
-        );
+        assert_eq!(ProbeId::parse("a.b").unwrap().as_str(), "a.b");
         assert!(ProbeId::parse("controller.tailscale-reachability").is_ok());
     }
 
     #[test]
-    fn remediation_is_a_fixed_styrn_command_and_rejects_secret_shaped_summaries() {
-        let remediation = Remediation::new(
-            "Initialize this machine before setup.",
-            Some(StyrnCommand::MachineInit),
-        )
-        .expect("fixed styrn command remediation must be accepted");
-
-        assert_eq!(
-            serde_json::to_string(&remediation).expect("remediation serializes"),
-            "{\"summary\":\"Initialize this machine before setup.\",\"styrn_args\":[\"machine\",\"init\"]}"
-        );
-        assert!(Remediation::new("use token=not-safe", None).is_err());
+    fn secret_classifier_rejects_auth_assignments_and_embedded_credentials_but_allows_plain_text() {
+        for secret in secret_examples() {
+            let remediation = RemediationSpec::new(*secret, Some(StyrnCommand::MachineInit))
+                .expect_err("secret remediation must fail");
+            let descriptor = ProbeDescriptorSpec::new(
+                ProbeId::parse("tool.git").unwrap(),
+                *secret,
+                FindingSeverity::Error,
+                None,
+            )
+            .expect_err("secret label must fail");
+            assert!(!remediation.to_string().contains(secret));
+            assert!(!descriptor.to_string().contains(secret));
+        }
+        assert!(RemediationSpec::new("Inspect local service state.", None).is_ok());
     }
 
-    #[test]
-    fn catalog_redacts_secret_shaped_dynamic_observation_data_and_rejects_static_data() {
-        let secrets = [
+    fn secret_examples() -> &'static [&'static str] {
+        &[
             "--api-key=do-not-leak",
+            "--auth=abc123",
             "auth token do-not-leak",
+            "authorization=Bearer abc123",
+            "Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.signature",
             "secret=do-not-leak",
             "sk_live_do-not-leak",
             "ghp_do-not-leak",
             "github_pat_do-not-leak",
             "tskey-do-not-leak",
             "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.signature",
+            "diagnostic: eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.signature",
             "-----BEGIN PRIVATE KEY-----",
-        ];
-
-        for (index, secret) in secrets.iter().enumerate() {
-            let calls = Arc::new(AtomicUsize::new(0));
-            let catalog = ProbeCatalog::new(vec![Box::new(FakeProbe::new(
-                &format!("state.secret-{index}"),
-                ProbeStatus::Present {
-                    version: Some((*secret).to_owned()),
-                    healthy: false,
-                },
-                calls,
-            ))])
-            .expect("probe must register");
-
-            let observed = catalog.observe();
-            let serialized =
-                serde_json::to_string(&observed.iter().next().expect("one observation"))
-                    .expect("guarded observation serializes");
-            let finding_serialized =
-                serde_json::to_string(&observed.doctor_findings().pop().expect("one finding"))
-                    .expect("guarded finding serializes");
-
-            assert!(!serialized.contains(secret), "version leaked {secret:?}");
-            assert!(
-                !finding_serialized.contains(secret),
-                "finding leaked {secret:?}"
-            );
-            let descriptor_error = ProbeDescriptor::new(
-                ProbeId::parse("tool.git").expect("valid ID"),
-                *secret,
-                FindingSeverity::Error,
-                None,
-            )
-            .expect_err("secret-shaped static label must be rejected");
-            let remediation_error = Remediation::new(*secret, Some(StyrnCommand::MachineInit))
-                .expect_err("secret-shaped remediation summary must be rejected");
-            assert!(!descriptor_error.to_string().contains(secret));
-            assert!(!remediation_error.to_string().contains(secret));
-        }
+        ]
     }
 
     #[test]
-    fn controller_and_raw_serialization_escape_hatches_are_compile_time_rejected() {
-        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let fixture = manifest_dir.join("src/setup/probe/fixtures/controller_escape_hatch.rs");
-        let dependencies = manifest_dir.join("target/debug/deps");
-        let output = Command::new("rustc")
-            .arg("--edition=2021")
-            .arg(&fixture)
-            .arg("-L")
-            .arg(format!("dependency={}", dependencies.display()))
-            .arg("--extern")
-            .arg(extern_artifact(&dependencies, "serde"))
-            .arg("--extern")
-            .arg(extern_artifact(&dependencies, "serde_json"))
-            .arg("--extern")
-            .arg(extern_artifact(&dependencies, "thiserror"))
-            .arg("-o")
-            .arg(manifest_dir.join("target/controller-escape-hatch-test"))
-            .output()
-            .expect("rustc must be available for the compile-fail boundary test");
+    fn only_the_worker_probe_module_can_implement_worker_probe() {
+        assert_fixture_fails("sealed_worker_probe.rs", &["Sealed"]);
+    }
 
-        assert!(
-            !output.status.success(),
-            "controller/raw serialization escape hatch unexpectedly compiled"
-        );
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        assert!(
-            stderr.contains("Sealed"),
-            "expected sealed worker-probe diagnostic, got:\n{stderr}"
-        );
-        assert!(
-            stderr.contains("Serialize"),
-            "expected raw ProbeStatus serialization diagnostic, got:\n{stderr}"
+    #[test]
+    fn raw_probe_status_cannot_be_serialized_directly() {
+        assert_fixture_fails("raw_status_serialization.rs", &["ProbeStatus", "Serialize"]);
+    }
+
+    #[test]
+    fn raw_probe_status_cannot_be_hidden_in_a_serialization_proxy() {
+        assert_fixture_fails(
+            "proxy_status_serialization.rs",
+            &["ProbeStatus", "Serialize"],
         );
     }
 
-    fn extern_artifact(dependencies: &std::path::Path, crate_name: &str) -> String {
-        let prefix = format!("lib{crate_name}-");
-        let artifact = fs::read_dir(dependencies)
-            .expect("test dependencies directory must exist")
-            .filter_map(Result::ok)
-            .map(|entry| entry.path())
-            .find(|path| {
-                path.file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.starts_with(&prefix) && name.ends_with(".rlib"))
-            })
-            .expect("crate artifact must exist");
-        format!("{crate_name}={}", artifact.display())
+    #[test]
+    fn remediation_cannot_accept_arbitrary_argv() {
+        assert_fixture_fails("closed_remediation.rs", &["StyrnCommand", "Vec"]);
+    }
+
+    #[test]
+    fn guarded_wire_dtos_cannot_be_constructed_by_a_probe_implementation() {
+        assert_fixture_fails("wire_dto_construction.rs", &["private"]);
+    }
+
+    fn assert_fixture_fails(fixture_name: &str, required_diagnostics: &[&str]) {
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let fixture = manifest_dir
+            .join("src/setup/probe/fixtures")
+            .join(fixture_name);
+        let artifacts = cargo_managed_artifacts(&manifest_dir);
+        let output_path = artifacts
+            .target_dir
+            .join(format!("{fixture_name}.compile-fail-output"));
+        let mut command = Command::new("rustc");
+        command
+            .arg("--edition=2021")
+            .arg(&fixture)
+            .arg("-L")
+            .arg(format!("dependency={}", artifacts.deps_dir.display()));
+        for dependency in ["base64", "serde", "serde_json", "thiserror"] {
+            command.arg("--extern").arg(format!(
+                "{dependency}={}",
+                artifacts.paths[dependency].display()
+            ));
+        }
+        let output = command
+            .arg("-o")
+            .arg(output_path)
+            .output()
+            .expect("rustc must be available for compile-fail boundary tests");
+        assert!(
+            !output.status.success(),
+            "{fixture_name} unexpectedly compiled"
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        for diagnostic in required_diagnostics {
+            assert!(
+                stderr.contains(diagnostic),
+                "{fixture_name} did not fail for {diagnostic:?}:\n{stderr}"
+            );
+        }
+    }
+
+    struct CargoArtifacts {
+        target_dir: PathBuf,
+        deps_dir: PathBuf,
+        paths: BTreeMap<String, PathBuf>,
+    }
+
+    fn cargo_managed_artifacts(manifest_dir: &Path) -> &'static CargoArtifacts {
+        static ARTIFACTS: OnceLock<CargoArtifacts> = OnceLock::new();
+        ARTIFACTS.get_or_init(|| {
+            let target_dir = std::env::temp_dir().join(format!(
+                "styrn-probe-compile-fixtures-{}",
+                std::process::id()
+            ));
+            let output = Command::new("cargo")
+                .current_dir(manifest_dir)
+                .args([
+                    "build",
+                    "--locked",
+                    "--message-format=json-render-diagnostics",
+                    "--target-dir",
+                ])
+                .arg(&target_dir)
+                .output()
+                .expect("cargo must be available for compile-fail boundary tests");
+            assert!(
+                output.status.success(),
+                "Cargo dependency build failed:\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let mut paths = BTreeMap::new();
+            for line in String::from_utf8_lossy(&output.stdout).lines() {
+                let Ok(message) = serde_json::from_str::<serde_json::Value>(line) else {
+                    continue;
+                };
+                if message["reason"] != "compiler-artifact" {
+                    continue;
+                }
+                let Some(name) = message["target"]["name"].as_str() else {
+                    continue;
+                };
+                if !["base64", "serde", "serde_json", "thiserror"].contains(&name) {
+                    continue;
+                }
+                let artifact = message["filenames"]
+                    .as_array()
+                    .and_then(|filenames| {
+                        filenames
+                            .iter()
+                            .filter_map(|filename| filename.as_str())
+                            .find(|filename| filename.ends_with(".rlib"))
+                    })
+                    .map(PathBuf::from)
+                    .expect("Cargo must report a library artifact for each direct dependency");
+                paths.insert(name.to_owned(), artifact);
+            }
+            for dependency in ["base64", "serde", "serde_json", "thiserror"] {
+                assert!(
+                    paths.contains_key(dependency),
+                    "Cargo did not report the {dependency} artifact"
+                );
+            }
+            let deps_dir = target_dir.join("debug/deps");
+            CargoArtifacts {
+                target_dir,
+                deps_dir,
+                paths,
+            }
+        })
     }
 }
