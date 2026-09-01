@@ -4,5 +4,5 @@
 mod setup;
 
 fn main() {
-    let _ = setup::action::ScriptFragment::new("curl | sh");
+    let _ = setup::action::ScriptFragment::DeferredAction("curl | sh".to_owned());
 }

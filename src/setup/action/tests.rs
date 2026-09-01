@@ -160,13 +160,18 @@ fn script_fragments_reject_raw_shell_text_at_the_type_boundary() {
     assert_fixture_fails(
         "raw_script_fragment.rs",
         FixtureExpectation::new(
-            "E0599",
-            "no variant, associated function, or constant named `new` found for enum `action::ScriptFragment` in the current scope",
+            "E0308",
+            "mismatched types",
             7,
-            Some("variant, associated function, or constant not found in `action::ScriptFragment`"),
+            Some("expected `ActionName`, found `String`"),
             "raw_script_fragment.rs",
         ),
     );
+}
+
+#[test]
+fn script_fragment_variants_remain_closed_to_typed_data() {
+    assert_fixture_compiles("script_fragment_variants.rs");
 }
 
 #[test]
@@ -241,6 +246,20 @@ impl FixtureExpectation {
 
 fn assert_fixture_fails(name: &str, expected: FixtureExpectation) {
     assert_fixture_fails_with_cfg(name, &[], expected);
+}
+
+fn assert_fixture_compiles(name: &str) {
+    let output = compile_fixture(name, &[]);
+    assert!(
+        output.status.success(),
+        "{name} must compile while ScriptFragment has only typed variants: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        output.stderr.is_empty(),
+        "{name} must compile without warnings: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 fn assert_fixture_fails_with_cfg(
