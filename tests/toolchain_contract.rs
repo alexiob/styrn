@@ -53,4 +53,8 @@ fn rust_toolchain_contract_is_pinned_consistently_across_local_and_ci_builds() {
         !ci.contains("dtolnay/rust-toolchain@stable"),
         "CI must not retain a floating Rust toolchain selector"
     );
+    assert!(
+        ci.contains("cargo clippy --workspace --all-targets --all-features -- -D warnings"),
+        "CI must exercise the pinned clippy component with warnings denied"
+    );
 }

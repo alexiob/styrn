@@ -373,15 +373,17 @@ pub(crate) fn catch_unmapped_panic<T>(
     command: impl Into<String>,
     timestamp: DateTime<Utc>,
     operation: impl FnOnce() -> T,
-) -> Result<T, CommandFailure> {
+) -> Result<T, Box<CommandFailure>> {
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(operation)).map_err(|_| {
-        CommandFailure::new(
-            command,
-            timestamp,
-            ErrorCode::InternalError,
-            "unexpected internal error",
+        Box::new(
+            CommandFailure::new(
+                command,
+                timestamp,
+                ErrorCode::InternalError,
+                "unexpected internal error",
+            )
+            .expect("the built-in internal error diagnostic must be valid"),
         )
-        .expect("the built-in internal error diagnostic must be valid")
     })
 }
 

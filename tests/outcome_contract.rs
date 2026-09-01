@@ -99,7 +99,7 @@ fn typed_exit_table_produces_every_documented_process_status() {
 
     for exit in output::StyrnExit::ALL {
         let code = exit.as_i32();
-        let output = run_fixture(&fixture, &["exit", &code.to_string()]);
+        let output = run_fixture(fixture, &["exit", &code.to_string()]);
         assert_eq!(output.status.code(), Some(code), "exit {code}");
         assert!(output.stdout.is_empty(), "exit {code} wrote stdout");
         assert!(output.stderr.is_empty(), "exit {code} wrote stderr");
@@ -111,7 +111,7 @@ fn every_registry_entry_resolves_to_its_documented_process_status() {
     let fixture = fixture();
 
     for (name, exit_code) in EXPECTED_REGISTRY {
-        let output = run_fixture(&fixture, &["registry", name]);
+        let output = run_fixture(fixture, &["registry", name]);
         assert_eq!(output.status.code(), Some(exit_code), "{name}");
         assert_eq!(
             String::from_utf8(output.stdout).unwrap(),
@@ -125,7 +125,7 @@ fn every_registry_entry_resolves_to_its_documented_process_status() {
 #[test]
 fn workflow_inner_exit_is_preserved_in_json_but_never_becomes_the_process_exit() {
     let fixture = fixture();
-    let output = run_fixture(&fixture, &["workflow-101"]);
+    let output = run_fixture(fixture, &["workflow-101"]);
 
     assert_eq!(output.status.code(), Some(12));
     assert!(output.stderr.is_empty());
@@ -140,7 +140,7 @@ fn workflow_inner_exit_is_preserved_in_json_but_never_becomes_the_process_exit()
 #[test]
 fn exec_remote_exit_is_mirrored_and_remains_explicit_in_json() {
     let fixture = fixture();
-    let output = run_fixture(&fixture, &["exec-101"]);
+    let output = run_fixture(fixture, &["exec-101"]);
 
     assert_eq!(output.status.code(), Some(101));
     assert!(output.stderr.is_empty());
@@ -154,7 +154,7 @@ fn exec_remote_exit_is_mirrored_and_remains_explicit_in_json() {
 #[test]
 fn unmapped_panic_becomes_internal_error_with_exit_one() {
     let fixture = fixture();
-    let output = run_fixture(&fixture, &["panic"]);
+    let output = run_fixture(fixture, &["panic"]);
 
     assert_eq!(output.status.code(), Some(1));
     assert!(output.stderr.is_empty());
