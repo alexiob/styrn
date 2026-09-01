@@ -1,7 +1,7 @@
 # Styrn: Cross-Platform Agent and Development Machine Control Plane — Consolidated Design
 
 **Status:** Specification. Nothing described here is implemented. There is no source code, no `Cargo.toml`, and no release. Every statement about behavior is a design decision to be implemented, not a description of an existing system.
-**Revision:** E (consolidated; independent-review correctness fixes; packaging/upgrade, phase plan, and watch TUI specified)
+**Revision:** F (consolidated; independent-review correctness fixes; packaging/upgrade, phase plan, and watch TUI specified; the session substrate made optional)
 **Date:** 2026-09-01
 **Primary use case:** centrally control heterogeneous macOS, Linux, and native Windows development machines and persistent coding-agent harnesses from any enrolled controller machine.
 **Initial project profile:** FriCOS / Rust development.
@@ -57,6 +57,8 @@ To stop terminology drift, the following forms are canonical everywhere in this 
 | `styrn machine …` = local-machine commands; `styrn host …` = inventory/remote commands | undocumented split (orig. §19 vs §25) | S-20 |
 | Herdr headless invocation: `HERDR_SESSION=fleet herdr server` (env-var form) | "depending on the invocation style you standardize on" (orig. §11) | S-23 |
 | Exit code `1` = unexpected internal error | undefined (orig. §24) | S-11 |
+| **"session substrate"** (Herdr; per host; optional — Part 11.0). *"Package substrate"* (15.2.1, 15.7.6) is a different thing; bare "substrate" is never used alone | "persistent execution substrate" as an unconditional description (11.1 title, rev. A–E) | S-40 |
+| Substrate state `none \| registered \| active` (11.0.1) | the undefined mix of manifest `[herdr]`, `[components] herdr`, and plugin-install as implicit signals | S-40 |
 
 ### 0.5 Summary of the major revisions (new in rev. B)
 
@@ -116,6 +118,22 @@ Applied in this revision at: 4.3.1 (lazy key generation), 6.1 (transport default
 6. **`sleep-policy` worker component** (S-38): laptops that sleep were an unstated availability assumption.
 7. **Register grows to 39 issues** (6 blocker / 16 major / 17 minor).
 
+### 0.10 Revision F changelog (pass 4 — the session substrate is optional) (new in rev. F)
+
+Raised by a new operator requirement, verbatim and binding:
+
+> "styrn should not depend on herdr: it should be able to run independently, while leveraging herdr when present and in-use and registered."
+
+1. **The session substrate model** (11.0): Herdr is an optional, per-host **session substrate** with one machine-local state — `none | registered | active` — and a defined precedence among the three signals that previously all touched Herdr independently (manifest `[herdr]` is the registration authority; `[components] herdr` is desired-state input only; `integrate herdr install` points the other way and implies nothing). Vocabulary frozen in §0.4.
+2. **The substrate degradation contract** (11.0.3, binding): substrate-requiring operations on a `none` host fail with exit 7 / `capability.substrate_unregistered`; query-shaped operations answer empty-and-healthy with **no warnings**; registered-but-broken remains exit 11 / `agent.harness_error`. One new error code, no new exit code — 7 already means "required capability unavailable".
+3. **Provider matrix and the no-second-provider decision** (11.2): `HerdrProvider` stays the only v1 implementation and provider resolution is substrate-gated. A reduced provider over the detached supervisor (7.8) is explicitly rejected — it could not honestly implement `prompt`/`read`/`wait`/`attach`, and the need it would serve is already served by batch agent runs as ordinary workflows (§66; `harness.jsonl` already reserved in 7.7/12.5).
+4. **`styrn harness run` gains an explicit standalone context** (12.9): its governance — project identification, job context, computed limits, resource environment, admission accounting — was always substrate-independent and is now specified as such.
+5. **The S-33 Herdr-parity invariant is rescoped, not weakened** (12.9.1): it binds at full force in pane context on a registered substrate, and is *vacuous* — not relaxed — in standalone context, where there is no observer to be indistinguishable to. The scope condition may never be used to skip the parity probe where a substrate is registered.
+6. **Six surfaces conditionalized:** events (5.7), doctor (6.5), the fleet and agent boards (11.10, 14.5.1), `fleet selftest` (16.6 item 6), the MCP agent tools (13.3), and `integrate all` (12.18). A Herdr-less fleet enrolls healthy, passes doctor, and passes selftest.
+7. **`styrn herdr status|attach` added to the canonical surface** (10.5) — they had appeared in 10.7 and the Phase-4 listings but were never in 10.5, a latent violation of the design's own rule that every command is in 10.5. They stay vendor-named (D-9).
+8. **Dependency framing corrected** throughout Parts 1, 11, and 16.9; `[herdr].enabled` added to the manifest (2.4, 2.4.2) and to `schemas/machine-v1.schema.json`; ephemeral `substrate` added to `machine.status` (2.5).
+9. **Register grows to 40 issues** (6 blocker / 17 major / 17 minor); decision log grows to D-9.
+
 ---
 
 # Part 1 — Purpose, scope, and rationale
@@ -160,12 +178,12 @@ fricos/
 - job launcher;
 - project workflow runner;
 - cleanup engine;
-- adapter for Herdr;
+- adapter for Herdr (the optional session substrate; Part 11.0);
 - adapter for Codex, Claude Code, and future agent harnesses.
 
 It does not need a custom network daemon in the first version. Use SSH as the authenticated transport and execute the same `styrn` binary remotely.
 
-Long-running interactive jobs and coding agents should live inside **Herdr**, which (per the upstream claims recorded in Part 17 — verify against current upstream docs before implementation) supplies persistent terminal sessions, panes, worktrees, agent discovery, lifecycle state, JSON-oriented automation, and detach/reattach semantics.
+Long-running interactive jobs and coding agents should live inside **Herdr**, which (per the upstream claims recorded in Part 17 — verify against current upstream docs before implementation) supplies persistent terminal sessions, panes, worktrees, agent discovery, lifecycle state, JSON-oriented automation, and detach/reattach semantics — **on hosts where the session substrate is registered (Part 11.0)**. Herdr is optional per host: Styrn runs, governs jobs, and passes doctor without it. The substrate adds the interactive-agent surface and nothing else depends on it.
 
 ### Recommended high-level stack (orig. §1)
 
@@ -175,7 +193,7 @@ Long-running interactive jobs and coding agents should live inside **Herdr**, wh
 | Stable naming | Tailscale MagicDNS |
 | Remote transport | OpenSSH over Tailscale |
 | Fleet control | `styrn` Rust binary |
-| Persistent terminals/agents | Herdr |
+| Persistent terminals/agents | Herdr — optional session substrate, per host (Part 11.0) |
 | Agent CLIs | Codex CLI, Claude Code, future adapters |
 | Source distribution | Git + worktrees (controller-push; see Part 8.2) |
 | Build resource policy | `styrn` resource governor |
@@ -272,7 +290,7 @@ It is easy to over-generalize. Avoid implementing an extensible enterprise sched
 
 - machine inventory;
 - SSH transport;
-- Herdr;
+- Herdr (optional session substrate — Part 11.0);
 - Codex;
 - Claude;
 - Git worktrees;
@@ -358,7 +376,7 @@ A literal zero-dependency fleet is impossible because the entire point is to man
 
 - Tailscale;
 - Git;
-- Herdr;
+- Herdr (optional — Part 11.0);
 - Codex;
 - Claude Code;
 - Rust;
@@ -531,7 +549,7 @@ transport
 
 as separate concepts.
 
-Use Tailscale and OpenSSH for connectivity. Use Herdr for persistent agent terminals. Use Styrn for orchestration, manifests, resource admission, structured output, and project workflow execution. Keep FriCOS-specific Rust policy in `.styrn.toml`.
+Use Tailscale and OpenSSH for connectivity. Use Herdr for persistent agent terminals where its substrate is registered (Part 11.0). Use Styrn for orchestration, manifests, resource admission, structured output, and project workflow execution. Keep FriCOS-specific Rust policy in `.styrn.toml`.
 
 The result is not a FriCOS tool that happens to manage machines. It is a general heterogeneous development/agent fleet controller that FriCOS happens to use first. That is the more durable architecture.
 
@@ -565,7 +583,7 @@ A controller can:
 - establish SSH/Tailscale connections;
 - query host, job, workflow, and agent state;
 - dispatch project workflows;
-- control remote Herdr sessions and coding agents;
+- control remote Herdr sessions and coding agents on substrate-registered hosts (Part 11.0);
 - expose/use Styrn's MCP integration;
 - enroll and remove machines subject to local authorization.
 
@@ -576,7 +594,7 @@ A controller is **not** automatically eligible to receive work.
 A worker can:
 
 - accept jobs and workflows;
-- host Herdr sessions and coding agents;
+- host Herdr sessions and coding agents (only where the session substrate is registered — Part 11.0);
 - provide native OS/toolchain capabilities;
 - create isolated Git worktrees;
 - enforce RAM, disk, CPU, timeout, and cleanup policy;
@@ -933,8 +951,9 @@ installed = true
 server = true
 public_key_auth = true
 
-[herdr]
+[herdr]                          # optional; absent table = substrate state "none" (Part 11.0)
 installed = true
+enabled = true                   # operator-owned (rev. F); false = installed but not registered
 session = "fleet"
 autostart = "on-demand-ssh"
 
@@ -978,6 +997,7 @@ Revision A's canonical manifest requires `machine_id`, but none of the reference
 - Exactly one of `reserved_disk_bytes` or `reserved_disk_percent` may be present in `[resources.policy]`. Both present is a validation error (`project.profile_invalid` analog for manifests: `machine.manifest_invalid`). `reserved_disk_percent` is evaluated against the *total size* of the filesystem containing `[paths].root`, computed at admission time.
 - All `*_bytes` fields are non-negative integers (bytes). All `max_*` counts are positive integers.
 - `[pending_actions]` (Part 15.2.4) is a list of tables and may be present in the manifest after bootstrap; `styrn host doctor` reports unresolved entries.
+- `[herdr].enabled` (optional boolean, default `true`, new in rev. F) is **operator-owned** in the sense of 15.3.2: setup re-runs preserve it, exactly as they preserve `[resources.policy]`. Registration semantics — and why an absent `[herdr]` table means substrate state `none` rather than "unknown" — are in Part 11.0.2.
 
 ## 2.5 Dynamic status is not the manifest (orig. §20)
 
@@ -1002,9 +1022,16 @@ Do not rewrite the static manifest every few seconds. A status request returns e
   "jobs": {
     "running": 1,
     "heavy_running": 0
+  },
+  "substrate": {
+    "kind": "herdr",
+    "state": "active",
+    "session": "fleet"
   }
 }
 ```
+
+`substrate` (new in rev. F; Part 11.0.3) is ephemeral like everything else here and is **never** written to the manifest — the manifest records *registration*, status reports *liveness*. On a host with no session substrate it is `{"kind": null, "state": "none", "session": null}`. The field is an additive envelope change (2.8.5); an older controller must ignore it.
 
 Controller scheduling uses:
 
@@ -1721,7 +1748,7 @@ controller
   +--- ssh host3 styrn rpc serve --stdio   (events.subscribe)
 ```
 
-The remote Styrn process subscribes to its local Herdr socket (Unix domain socket on Linux/macOS, named pipe on Windows) and to its own job registry, and converts both into `styrn.event.v1` frames. Only the remote Styrn binary needs to know the platform difference (orig. §79). Dropped event sessions are reconnected by the controller with backoff; events during the gap are lost (v1 accepts at-most-once event delivery for *notifications*; authoritative state is always re-queryable).
+The remote Styrn process subscribes to its own job registry unconditionally, and **additionally** to its local Herdr socket (Unix domain socket on Linux/macOS, named pipe on Windows) **when the host's session substrate is registered** (Part 11.0): an `active` substrate is subscribed immediately, and a `registered` substrate whose session is down is retried on the same backoff as a dropped subscription, so agent events begin flowing when the session comes up. On a substrate-`none` host the stream simply carries job and host events only — normal operation, not a warning, and `styrn monitor --notify` (14.1) consequently emits agent-transition notifications only from hosts that have a substrate, with no configuration needed. It converts everything into `styrn.event.v1` frames. Only the remote Styrn binary needs to know the platform difference (orig. §79). Dropped event sessions are reconnected by the controller with backoff; events during the gap are lost (v1 accepts at-most-once event delivery for *notifications*; authoritative state is always re-queryable).
 
 ---
 
@@ -1878,8 +1905,11 @@ SSH reachable
 protocol compatible
 manifest valid
 free disk above hard floor
-Herdr executable found
-Herdr session accessible
+session substrate consistent (11.0) — if registered: Herdr executable
+  found AND session accessible, both hard findings on failure;
+  if none: one informational line, and the host is healthy
+Herdr present but unregistered -> informational drift note (11.0.1)
+[capabilities] agent = true with substrate none -> manifest drift warning
 Git found
 Codex found
 Claude found
@@ -2880,6 +2910,8 @@ resource.heavy_exclusivity_denied  (exit 6)
 resource.job_disk_limit_exceeded   (job outcome → exit 12)
 resource.host_disk_floor           (job outcome → exit 12)
 capability.unsatisfied          no eligible host (exit 7)
+capability.substrate_unregistered  agent-surface operation on a host with no
+                                session substrate (rev. F; exit 7; Part 11.0.3)
 job.not_found                   unknown job id (exit 2)
 job.timeout                     (exit 10)
 job.cancelled                   (job outcome → exit 12)
@@ -3005,6 +3037,17 @@ styrn agent attach <agent>
 
 (Rev. B: `--harness` replaces the original `--kind`; S-20.)
 
+### Session substrate (added to this listing in rev. F; Parts 11.0, 11.6, 11.13)
+
+```text
+styrn herdr status [<host>] [--json]                  (substrate state per host; Part 11.0.1)
+styrn herdr attach <host>                             (full native remote Herdr UI; Part 11.13)
+styrn herdr action <id> [...]                         (plugin plumbing, invoked by Herdr; Part 11.6)
+styrn herdr event <id> [...]                          (plugin plumbing, invoked by Herdr; Part 11.6)
+```
+
+These are **vendor-named on purpose** (D-9), and they were absent from this surface until rev. F even though 10.7 and the Part 16.3 phase listings already used them — a latent breach of the rule that every command appears here. `herdr status` reports each inventory host's substrate state (`none | registered | active`), session name, and Herdr version where active; reporting `none` is its job, so it exits 0 whatever the state. `herdr attach` against a substrate-`none` host refuses per 11.0.3. The `action`/`event` subcommands are executed *by* Herdr's plugin system and so cannot run without it; they need no gating.
+
 ### Jobs
 
 ```text
@@ -3117,9 +3160,57 @@ Do not mix progress text with JSON stdout.
 
 ---
 
-# Part 11 — Herdr integration
+# Part 11 — The session substrate (Herdr)
 
-## 11.1 Herdr is the persistent execution substrate (orig. §11)
+## 11.0 The substrate is optional (new in rev. F; resolves S-40)
+
+The operator's requirement, verbatim and binding:
+
+> "styrn should not depend on herdr: it should be able to run independently, while leveraging herdr when present and in-use and registered."
+
+Styrn has **two execution layers**, and only one of them is Styrn's own. Batch work — jobs, workflows, matrices — runs on the worker-owned detached supervisor (Part 7.8) and depends on nothing in this Part. Persistent *interactive* work — coding-agent sessions with lifecycle, prompt/read/wait, and attach — runs on the host's **session substrate**, which in v1 is Herdr, and which is **optional per host**.
+
+A fleet on which no host has a substrate is a fully healthy Styrn fleet: every command in Parts 5–10 works, enrollment succeeds, doctor is green, and `fleet selftest` passes. What such a fleet lacks is exactly and only the `agent`-lifecycle surface, and it refuses that surface cleanly (11.0.3) without degrading anything else. This is §0.6 applied in both directions: a Herdr-less developer is never nagged about Herdr, and a Herdr user loses nothing specified elsewhere in this Part.
+
+Terminology (§0.4): **"session substrate"** is always written qualified. It is unrelated to the *package substrates* of 15.2.1/15.7.6 (`SubstrateProbe{winget, brew, apt}`), and the unqualified word "substrate" is not used on its own.
+
+### 11.0.1 Substrate state (normative)
+
+Each host has exactly one machine-local **substrate state**, computed by the worker — which is, as everywhere else, the authority on its own condition:
+
+```text
+none         no session substrate is registered on this host
+registered   registered in the manifest, but the named session is not currently live
+active       registered, and the named session answers a liveness query
+```
+
+The operator's three words map onto the model as follows. **Present** = the worker-local probe finds the `herdr` executable (`ToolProbe{herdr}` → `Present`, 15.2.1). **Registered** = the manifest records it: `[herdr] installed = true` and `enabled != false` (2.4). **In use** = the session named by `[herdr] session` answers on its local socket — a worker-local liveness probe, new in rev. F, shared between doctor and setup per 15.2.2. State `active` requires all three.
+
+Presence *without* registration is state `none`: Styrn leverages only what the operator's setup has recorded, and doctor reports the discrepancy as informational drift (6.5), never as ill health. A developer who installed Herdr by hand for their own use has not thereby volunteered it to Styrn.
+
+### 11.0.2 Registration: one authority, three signals ranked
+
+Three pre-existing signals touch Herdr. Their precedence is now defined:
+
+1. **The manifest `[herdr]` table is the registration authority.** It is setup-probed output (15.3.2) plus one operator-owned key — `enabled` (optional, default `true`), the analogue of the operator-owned `[resources.policy]` region and preserved across setup re-runs. Registered ⇔ `installed = true` AND `enabled != false`. Setting `enabled = false` is how an operator keeps Herdr installed for personal use while telling Styrn not to leverage it.
+2. **`[components] herdr` in `setup-config.toml` (15.3.1) is desired-state input only.** It causes installation, whose probe then registers the result in the manifest. It is never consulted at runtime.
+3. **`styrn integrate herdr install` (11.16) points the other way** — it installs Styrn's plugin *into* Herdr. It requires an `active` substrate, and it neither grants nor implies registration: an unlinked plugin does not remove agent control.
+
+**Capability tie.** Manifest generation sets `[capabilities] agent = true` only when the substrate is registered **and** at least one agent harness (`[agents.*] installed = true`) is present. Agent placement — `styrn agent start`, and host selection in MCP `styrn_agent_start` — requires that capability exactly as workflow requirements do (2.1, 9.2). Doctor flags `agent = true` alongside substrate `none` as manifest drift.
+
+### 11.0.3 How a controller learns the state, and the degradation contract
+
+A controller learns *registered vs. none* from the cached manifest (fetched at enrollment, refreshed by `host refresh`), and the *live* state from `machine.status`, which gains an ephemeral `substrate` field (2.5, additive within envelope v1):
+
+```json
+"substrate": { "kind": "herdr", "state": "active", "session": "fleet" }
+```
+
+The hello (5.2) is unchanged — it stays minimal by design.
+
+> **Substrate degradation (binding contract).** Every operation whose semantics *require* a session substrate — `agent start/read/prompt/wait/stop/attach`, `styrn herdr attach`, `styrn integrate herdr install|doctor`, the MCP `styrn_agent_*` tools other than `styrn_agent_list`, and the parity machinery of 12.9.1 — when directed at a host whose substrate state is `none`, fails with **exit 7** and error code **`capability.substrate_unregistered`**, carrying `details = {host, substrate: "none"}` and a remediation naming the enabling command for that host (`styrn setup --install herdr`, run on the host). Query-shaped operations — `agent list`, `styrn_agent_list`, `styrn herdr status`, `doctor`, the 11.10 and 14.5 boards, and `fleet selftest`'s agent leg — treat `none` as a valid, healthy answer: empty data, exit 0, **no warnings**. A Herdr-less fleet is silent, never nagged (§0.6); the single permitted hint is one stderr line on an *interactive* `agent list` that is empty precisely because no host has a substrate. A substrate that is `registered` but cannot be brought up is a different failure — the integration is broken, not absent — and reports **exit 11 / `agent.harness_error`**, which doctor will already be flagging.
+
+## 11.1 What Herdr provides as the session substrate (orig. §11)
 
 Herdr already provides the difficult pieces *(upstream claims recorded 2026-09-01 — verify against current upstream docs; Part 17)*:
 
@@ -3193,7 +3284,16 @@ trait HarnessProvider {
 }
 ```
 
-The first implementation is `HerdrProvider`. Relevant Herdr operations include:
+`HerdrProvider` is the **only** v1 implementation, and provider resolution is substrate-gated (11.0.3): asking for a provider on a host whose substrate state is `none` yields the refusal, never a provider object with failing methods. The per-operation contract:
+
+| Operation | substrate `active` | substrate `registered` (session down) | substrate `none` |
+|---|---|---|---|
+| `list_agents` | full answer | empty list, state reported | empty list, state reported (exit 0) |
+| `start` / `prompt` / `read` / `wait` / `stop` / `attach` | full behavior | start the session first where `[herdr] autostart` permits an on-demand start (`on-demand`, `on-demand-ssh`; canonical invocation per 11.1 *(verify)*); if it cannot be brought up, or `autostart = "systemd-user"` reports the service down, exit 11 / `agent.harness_error` | exit 7 / `capability.substrate_unregistered` |
+
+**There is deliberately no second, reduced provider in v1.** The considered alternative — a provider built on the detached job supervisor (7.8) — cannot honestly implement `prompt`, `read`, `wait`, or `attach`: the supervisor has no PTY, no incremental prompt channel, and no lifecycle detection, and faking them would recreate exactly the split-brain lifecycle model 11.12 forbids. The need such a provider would serve is already served: a *batch* agent run (`codex exec`, `claude -p`) is a workflow command in `.styrn.toml` like any other (§66 — harness knowledge belongs in the project profile), runs under full governance as an ordinary job, and the job layout already reserves `harness.jsonl` for precisely this (7.7, 12.5). Refusal plus the existing job path is the whole answer; a `NullProvider` would be a larger mechanism delivering less honesty (§0.7).
+
+Relevant Herdr operations include:
 
 ```text
 herdr agent list
@@ -3473,6 +3573,8 @@ Do not expose machine enrollment, power cycling or arbitrary root commands as no
  0199...a2             win-hp           test-windows-heavy    running
  0199...17             linux-macpro     test-linux-heavy      running
 ```
+
+On a fleet where no host's substrate is registered, the AGENT section renders a single empty-state line (`no session substrate on any host — 11.0`); the HOST and JOB sections are unaffected, because neither depends on the substrate.
 
 The TUI is optional convenience. Equivalent data remains available through:
 
@@ -3893,7 +3995,12 @@ styrn harness run codex ...
 styrn harness run claude ...
 ```
 
-The command is intended to be run **inside a Herdr pane**. It:
+The command is a **resource-governed launcher**, and its governance — project identification, job context, computed limits, exported resource environment, metadata, and admission accounting — is substrate-independent. It runs in one of two contexts, which it detects for itself:
+
+- **Pane context** — launched inside a pane of a registered session substrate (detected by the presence of Herdr's pane-identity environment, `HERDR_*` *(verify the exact variable set against current Herdr)*). This is the recommended context, and the one the parity invariant (12.9.1) governs.
+- **Standalone context** — launched in any other terminal, including on a host whose substrate state is `none` (11.0). Everything below except step 7 applies identically; the registry entry records `context = "standalone"`. On Windows, standalone mode records the real exit status via the inert waiter (12.10); the Unix exec forfeit described in step 8 applies in both contexts.
+
+It:
 
 1. identifies the project;
 2. creates/loads job context;
@@ -3901,7 +4008,7 @@ The command is intended to be run **inside a Herdr pane**. It:
 4. exports resource environment variables — *augmenting* the inherited environment, never scrubbing it (normative rules below);
 5. records metadata;
 6. starts the real agent;
-7. preserves Herdr process detection — an invariant with per-OS mechanisms (below and 12.10), not a hope;
+7. preserves Herdr process detection **in pane context** — an invariant with per-OS mechanisms (below and 12.10), not a hope; in standalone context there is no observer and the step is vacuous;
 8. records exit status — on Windows, via the inert waiter (12.10); on Unix/macOS, the normative exec model makes the child's exit status unrecoverable by Styrn, so the registry entry is instead closed by pid-death reconciliation with `exit_status: "unknown"` (rev. E; review D §4.1). This is acceptable because agent lifecycle truth lives in Herdr (11.2), not in the interactive session's registry entry.
 
 For Rust projects it can export:
@@ -3920,7 +4027,7 @@ The important point is that these variables exist even if the agent directly inv
 
 Revision B (and orig. §94) listed "preserves Herdr process detection" as a launcher step with no mechanism behind it. If wrapping broke Herdr's detection, the damage would cascade: Herdr's lifecycle states are the source of truth Styrn deliberately does not reimplement (orig. §12), so losing detection breaks `HarnessProvider` — `agent list/read/prompt/wait/stop/attach` — which breaks the `orchestrator` MCP profile and cross-agent delegation (13.9), and turns `styrn agent wait` into a command that never fires. The developer would experience "Styrn-launched agents are invisible and uncontrollable; manually launched ones work" — precisely the tool-fighting failure §0.6 forbids. Therefore:
 
-> **Herdr parity (invariant).** An agent started via `styrn harness run <harness>` MUST be indistinguishable to Herdr from the same agent started manually in a Herdr pane: same detection, same lifecycle-state transitions, same attach/prompt/read behavior. Styrn adds resource context and display metadata; it never degrades harness observability or control. If parity cannot be achieved on a platform or in a given environment, the launcher MUST refuse to wrap and instead launch the agent directly with the resource context applied via environment variables only — an unwrapped-but-governed session — rather than silently producing an undetectable one. The fallback is reported (stderr notice plus pane metadata `styrn_wrap = "env-only"`), never silent.
+> **Herdr parity (invariant — scoped in rev. F to a registered substrate).** When `styrn harness run <harness>` is launched **in pane context** (12.9) on a host whose session substrate is registered (11.0), the agent it starts MUST be indistinguishable to Herdr from the same agent started manually in a Herdr pane: same detection, same lifecycle-state transitions, same attach/prompt/read behavior. Styrn adds resource context and display metadata; it never degrades harness observability or control. If parity cannot be achieved on a platform or in a given environment, the launcher MUST refuse to wrap and instead launch the agent directly with the resource context applied via environment variables only — an unwrapped-but-governed session — rather than silently producing an undetectable one. The fallback is reported (stderr notice plus pane metadata `styrn_wrap = "env-only"`), never silent. **In standalone context the invariant is vacuous, not weakened:** the launcher uses mechanics identical to the wrapped path (exec on Unix, direct child plus inert waiter on Windows) with full resource governance, and makes no parity claim because there is no observer to be indistinguishable to. The scope condition may never be used to skip the parity probe (12.10 item 3) on a host whose substrate *is* registered.
 
 **Environment handling (normative).** The launcher builds the child environment as *inherited environment + Styrn additions*, never from scratch. It may set only: the project resource variables (the Cargo set above and their `[workflows.*.environment]`-style equivalents), `STYRN_JOB_ID`/`STYRN_JOB_ROOT` for its own bookkeeping, and sccache wiring (7.12). Everything Herdr injected into the pane — all `HERDR_*` variables and anything Herdr's Codex/Claude integrations rely on for session/pane identity — passes through untouched. The launcher never unsets or overwrites a pre-existing `HERDR_*` variable.
 
@@ -3936,7 +4043,7 @@ Revision B (and orig. §94) listed "preserves Herdr process detection" as a laun
 
 1. `styrn harness run` creates a Job Object, spawns the harness as its **direct child** with the pane's inherited environment plus additions — no intermediate `cmd`/`conhost` layer of Styrn's making, no command-line rewriting: the child's image name and arguments are exactly the harness's own — assigns the child to the Job Object, and then stays **resident but inert**: one thread waiting on the process handle to record exit status. It allocates no console and touches no stdio; the agent inherits the pane's console directly, so screen-manifest-based detection (11.5) sees exactly what a manual launch produces.
 2. The interactive-session Job Object is configured **without** `KILL_ON_JOB_CLOSE` — an agent must survive a launcher crash (contrast batch jobs, 7.8, where kill-on-close is the point). It exists for tree-scoped accounting and for `styrn agent stop`'s tree-kill only.
-3. **Parity is verified, never assumed:** `styrn integrate herdr doctor` performs a live probe — launch a trivial wrapped process and an unwrapped control in Herdr panes, confirm Herdr's `agent list`/pane detection reports both identically. If the probe fails on a machine, the launcher on that machine downgrades to the env-only fallback of the 12.9.1 invariant and doctor reports why. The conformance test (16.6 item 7) keeps this honest in CI and in `styrn fleet selftest`.
+3. **Parity is verified, never assumed:** `styrn integrate herdr doctor` performs a live probe — launch a trivial wrapped process and an unwrapped control in Herdr panes, confirm Herdr's `agent list`/pane detection reports both identically. If the probe fails on a machine, the launcher on that machine downgrades to the env-only fallback of the 12.9.1 invariant and doctor reports why. The conformance test (16.6 item 7) keeps this honest in CI and in `styrn fleet selftest`. On a host whose substrate state is `none`, the probe is inapplicable: `styrn integrate herdr doctor` refuses per 11.0.3, and the launcher's standalone context (12.9) needs no probe.
 
 The wrapper remains minimal on all platforms — now a requirement with a mechanism, not a hope.
 
@@ -4154,6 +4261,8 @@ styrn integrate all [--json]
 6. validate configuration;
 7. report pending authentication/trust actions.
 
+On a host whose substrate state is `none` (11.0), steps 1–4 are reported as `skipped (substrate: none)` — informational, not failed — and the harness MCP registrations (step 5) proceed: they do not depend on Herdr.
+
 ## 12.19 Research conclusions on harness configuration (orig. §124)
 
 *(Recorded from rev. A's research pass of 2026-09-01. These are external-behavior claims that cannot be re-verified from this repository — verify against current upstream docs at implementation time. The design's posture if any claim is wrong: every harness-specific behavior sits behind the `HarnessProvider` trait and the `integrate` doctor commands, so a drifted upstream surface degrades to a reported integration failure, never a silent policy hole.)*
@@ -4328,6 +4437,8 @@ styrn_agent_stop
 ```
 
 Still restricted to enrolled hosts and declared projects.
+
+**Substrate gating (rev. F; S-40):** each profile's tool surface is stable regardless of fleet substrate state — tools are **not** hidden when no host has a substrate, because fleet state changes and a vanishing tool list is worse than a clear refusal. `styrn_agent_list` answers empty-and-healthy over substrate-`none` hosts; every other `styrn_agent_*` tool directed at such a host returns a structured tool error carrying `capability.substrate_unregistered` per 11.0.3. Host selection in `styrn_agent_start` (13.9) treats the `agent` capability — which implies a registered substrate (11.0.2) — as a hard requirement, so a substrate-less fleet yields the same `capability.unsatisfied`-family refusal an unsatisfiable workflow requirement does.
 
 **`admin`** — potentially adds machine maintenance. Do **not** expose `admin` to normal coding-agent sessions.
 
@@ -4711,7 +4822,7 @@ Together they answer "who did what, from where, when" for a multi-controller fle
 1. **Matrix view** (live projection of 8.6). A workflows × hosts grid; each cell advances `queued → admitted → running → PASS/FAIL` (failure cells show the inner exit code), with job id and elapsed time; Enter on a cell opens the job view. 8.6's human table exists only at completion today — this is the most TUI-shaped surface in the design, and previously unserved.
 2. **Job view with resource trace.** Running (and recent) jobs; per job: state, elapsed vs. `timeout_seconds`, and memory/CPU/disk traces drawn from the supervisor's `resource.jsonl` samples plotted **against the committed budget** (7.2) and `max_job_disk_bytes` (7.5) — the resource governor made legible in real time rather than a post-mortem file read (14.2).
 3. **Fleet board.** Exactly 11.10's layout (hosts / agents / jobs), kept as drawn there.
-4. **Agent board.** All agents on all hosts — **a superset that includes local agents, every row marked by host** — sorted blocked-first (attention), then by most recent transition (11.18's ordering); Enter attaches via the platform-appropriate transport (11.13). This makes 11.12's two-surface split a deliberate **hierarchy** rather than a split brain: Herdr's native Agents view stays authoritative for the local machine; the watch agent board is the single cross-machine place to look. It displays Herdr's lifecycle states and never invents its own (11.11: Styrn owns operational metadata; Herdr owns lifecycle semantics).
+4. **Agent board.** All agents on all hosts — **a superset that includes local agents, every row marked by host** — sorted blocked-first (attention), then by most recent transition (11.18's ordering); Enter attaches via the platform-appropriate transport (11.13). This makes 11.12's two-surface split a deliberate **hierarchy** rather than a split brain: Herdr's native Agents view stays authoritative for the local machine; the watch agent board is the single cross-machine place to look. It displays Herdr's lifecycle states and never invents its own (11.11: Styrn owns operational metadata; Herdr owns lifecycle semantics). Hosts with substrate `none` (11.0) contribute no rows and no warnings; when that leaves the board empty it shows the 11.10 empty-state line. The board is a projection of `agent list --all` (14.5.2 rule 1), which already answers empty-and-healthy on such a fleet (11.0.3).
 5. **Doctor view.** `doctor` / `fleet doctor` as pass/fail rows with expandable finding detail (`id`, `severity`, `message`, `remediation` — 6.5), and a remediation trigger where the remediation is itself a safe styrn command (e.g. `host refresh`) — routed per 14.5.2 rule 2.
 
 **Tier 2:** a **workflow-plan review pane** (13.6's plan rendered read-before-approve, feeding the same confirmation the CLI would show); a **clean-plan confirm** (`clean plan` → review → `clean run`); and a **scheduling explainer** — for a chosen workflow, each host's elimination reason (capability unmet / unreachable / predictive admission fail / final score), i.e. 6.4's algorithm made visible: "why won't this schedule?".
@@ -5388,6 +5499,8 @@ worker baseline components: account, sshd, tailscale, dirs,
   git, sleep-policy; Windows hardened user phase + fallback   (15.7, 15.8)
 all three setup modes, incl. --interactive; zero-arg path     (15.4)
 enrollment card; stage-zero shims; GitHub Releases substrate  (15.10, 15.11.4, 15.14.1)
+session-substrate registration: [herdr].enabled, capability tie,
+  session-liveness probe                                      (11.0.1-11.0.2, 15.2.1-15.2.2)
 ```
 
 **Phase 1 — Fleet visibility.** *See and touch every machine from one seat.*
@@ -5397,6 +5510,8 @@ RPC: framing, hello, streams, chunks                          (Part 5)
 enroll + host-key pinning; lazy controller keys               (6.1, 4.4, 4.3.1)
 host list/show/status/refresh; doctor (both layers); exec     (6.5, 7.10.2)
 fleet status/versions; audit logs                             (6.6, 14.3)
+substrate state in machine.status + doctor rendering,
+  including the two drift lines                               (11.0.3, 6.5)
 ```
 
 **Phase 2 — Jobs and governance.** *One governed remote job survives a closed laptop.*
@@ -5415,18 +5530,22 @@ revision resolution; dirty refusal + --snapshot               (8.4, 8.7)
 ```text
 .styrn.toml, variables, aliases, starter on-ramp              (9.1–9.4)
 workflow plan/run (TTY-aware wait, --host semantics), cancel  (6.4, 7.6, 13.3)
-matrix run; fleet selftest                                    (8.6, 16.6 item 6)
+matrix run; fleet selftest (substrate-conditional agent leg)   (8.6, 16.6 item 6)
 styrnd: maintenance executor + Windows spawn broker           (15.9)
 ```
 
-**Phase 4 — Agents and Herdr** *(absorbs integration phase A).* *Govern agents without losing Herdr parity.*
+**Phase 4 — Agents on the session substrate (Herdr)** *(absorbs integration phase A).* *Govern agents wherever a substrate is registered, without losing Herdr parity; refuse cleanly where none is.*
 
 ```text
-HarnessProvider over RPC; agent list/read/prompt/wait/
-  start/stop/attach; herdr status/attach                      (11.1–11.2, 11.13)
-harness run: parity invariant, doctor probe, env-only fallback (12.9–12.10)
+substrate gating + degradation contract; HarnessProvider
+  over RPC; agent list/read/prompt/wait/start/stop/attach;
+  herdr status/attach (canonical in 10.5)                     (11.0–11.2, 11.13)
+harness run: pane + standalone contexts, parity invariant,
+  doctor probe, env-only fallback                             (12.9–12.10)
 integrate herdr install/doctor; harness-hook                  (11.16, 12.14)
 ```
+
+Phase 5 carries the MCP per-call substrate refusals (13.3) on its existing lines, and Phase 8 carries the board empty-states (11.10, 14.5.1) on its existing lines; neither is a new component, so the placement rule is satisfied without a new entry.
 
 **Phase 5 — MCP** *(absorbs integration phases C–D).* *Agents validate cross-platform without SSH.*
 
@@ -5564,7 +5683,7 @@ A product whose entire value is cross-platform correctness cannot rely on "works
 3. **Fake-worker harness** — `styrn rpc serve --stdio` run as a *local child process* with a temp `paths.root`, exercising the full controller↔worker path (submit → detached supervisor → status/log tailing → reattach after killing the controller-side session → cancel) on whatever OS CI is running. This single harness covers S-01's fix on all three platforms.
 4. **Concurrency tests** — two controller processes hammering one fake worker with simultaneous submissions; assert committed budgets never exceed policy and `max_heavy_jobs` never over-admits (S-03's regression test).
 5. **Platform CI matrix** — GitHub Actions (or equivalent) on `ubuntu-latest`, `macos-latest`, `windows-latest` running layers 1–4, plus Windows-specific tests: Job-Object tree-kill actually reaps grandchildren, long-path job root, argv round-trip through `CreateProcess` for adversarial arguments (spaces, quotes, `%VAR%`, trailing backslashes).
-6. **End-to-end smoke on the real fleet** — a `styrn fleet selftest` command (new): trivially small project profile (`echo`-level workflows) run as a real matrix across all enrolled machines; used after every upgrade, doubling as the acceptance test for enrollment, push, admission, supervision, and artifact retrieval. This is also the dogfooding loop: Styrn's own repository gets a `.styrn.toml` so the fleet validates Styrn.
+6. **End-to-end smoke on the real fleet** — a `styrn fleet selftest` command (new): trivially small project profile (`echo`-level workflows) run as a real matrix across all enrolled machines; used after every upgrade, doubling as the acceptance test for enrollment, push, admission, supervision, and artifact retrieval. This is also the dogfooding loop: Styrn's own repository gets a `.styrn.toml` so the fleet validates Styrn. Selftest passes unchanged on a Herdr-less fleet: the enrollment, push, admission, supervision and artifact legs run on every host, and the agent/parity leg reports `skipped (substrate: none)` per host rather than failing — item 7's conformance runs only where the substrate is `active`, as it already says.
 7. **Herdr parity conformance (rev. C; S-33)** — on every OS where Herdr is present in the test environment: start the same harness (or a stand-in binary with the harness's process signature) twice in Herdr panes — once manually, once via `styrn harness run` — and assert Herdr reports identical detection and an identical lifecycle-transition sequence for both, and that the wrapped child's environment is a superset of the manual one's (no `HERDR_*` variable lost or altered). Runs in CI where Herdr can be installed, and always as part of `styrn fleet selftest` (item 6). This is the check that keeps the 12.9.1 invariant from rotting.
 8. **Setup and rendered-script conformance (rev. D; Part 15)** — on the three-OS VM matrix: fresh-machine `styrn setup --yes` converges (second run prints "nothing to do"); `--uninstall` leaves no styrn-owned residue while sparing pre-existing tools (receipt-ownership test); the Windows transient-logon user phase produces a working `styrn` profile with SSH key login; and for each OS, the emitted `--emit-script` output run on an identical fresh VM converges to the **same probe results** as direct `apply` — the drift check that makes the third renderer trustworthy (15.11).
 
@@ -5681,7 +5800,7 @@ The key decisions are:
 1. **Generalize the controller.** Styrn is not FriCOS-specific.
 2. **Use one Rust binary on every platform.** No Python/Node runtime is required by Styrn itself.
 3. **Run the control command from any enrolled platform.** macOS is not privileged architecturally.
-4. **Use Herdr as the persistent agent/terminal runtime.** Do not reinvent its terminal/process model.
+4. **Use Herdr as the persistent agent/terminal runtime where its substrate is registered (11.0).** Do not reinvent its terminal/process model — and do not require it for anything outside the agent surface.
 5. **Add a thin Styrn Herdr plugin.** This gives contextual actions and a fleet board.
 6. **Add Styrn as an MCP server.** This gives Codex/Claude safe, structured access to remote validation.
 7. **Do not give ordinary agents raw fleet SSH.** Expose project workflows rather than arbitrary remote commands — understood per Part 4.5 as least-privilege ergonomics over worker-side enforcement, not as containment.
@@ -6024,7 +6143,14 @@ Every issue cites the original section(s) it derives from; resolutions name the 
 
 ---
 
-**Register totals: 6 blockers, 16 major, 17 minor — 39 issues** (S-29–S-33 added in rev. C; S-34–S-36 in rev. D; S-37–S-39 in rev. E).
+**S-40 · major · rev. E Parts 1, 5.7, 6.5, 10.5, 11–13, 14.5, 16.3/16.6 (raised by a new operator requirement)**
+**Problem:** the design treated Herdr as unconditionally required while almost nothing in it actually depended on Herdr. Part 11.1's title asserted it *is* the persistent execution substrate; the Part 1 dependency tables listed it flat; 6.5's doctor checklist made a Herdr-less host read as unhealthy; 5.7 subscribed to the Herdr socket unconditionally; 16.6 item 6's selftest would have failed a Herdr-less fleet; `HarnessProvider` (11.2) had no defined behavior when Herdr is absent, leaving every `styrn agent` command and `styrn_agent_*` tool undefined; `styrn harness run` (12.9) — whose actual value (resource environment, budget registration, admission accounting) is entirely Herdr-independent — was specified only "inside a Herdr pane", and the S-33 parity invariant assumed Herdr always exists; `styrn herdr status/attach` appeared in 10.7 and the Phase-4 listings but were never added to the 10.5 canonical surface; and the operator's condition "present and in-use and registered" had no counterpart — three unrelated signals (manifest `[herdr]`, setup `[components] herdr`, `integrate herdr install`) with no precedence and no single authoritative state. The strings "without Herdr" and "Herdr absent" appeared nowhere in the document.
+**Impact:** a Herdr-less machine — a perfectly good validation worker — would enroll unhealthy, fail selftest, and produce undefined behavior across the whole agent surface; the tool would appear to require a component most of its machinery never touches, contradicting the operator requirement and §0.6.
+**Resolution:** the **session substrate** model (11.0): per-host state `none | registered | active`, with the manifest `[herdr]` table (plus operator-owned `enabled`) as the registration authority and the other two signals ranked beneath it; the binding **substrate degradation contract** (11.0.3) — exit 7 / `capability.substrate_unregistered` for substrate-requiring operations, empty-and-healthy for queries, exit 11 for registered-but-broken; `HerdrProvider` as the only provider with substrate-gated resolution, an explicit per-operation matrix, and a reasoned rejection of a reduced supervisor-backed provider (11.2 — batch agent runs are already ordinary workflows, 7.7/12.5); `harness run` pane and standalone contexts with S-33 rescoped to pane context at full force (12.9–12.10); conditionalized doctor (6.5), events (5.7), boards (11.10, 14.5.1), selftest (16.6 item 6), `integrate all` (12.18) and MCP agent tools (13.3); `styrn herdr status/attach` kept vendor-named and added to 10.5; dependency framing corrected in Parts 1, 11 and 16.9. Decision recorded in D-9; phases per 16.3 — registration and probe in 0, state reporting in 1, selftest conditionality in 3, gating and the standalone launcher in 4, MCP refusals in 5, board empty-states in 8.
+
+---
+
+**Register totals: 6 blockers, 17 major, 17 minor — 40 issues** (S-29–S-33 added in rev. C; S-34–S-36 in rev. D; S-37–S-39 in rev. E; S-40 in rev. F).
 
 ---
 
@@ -6084,6 +6210,11 @@ password = "..."                # optional; the 0600 file is the store
 *Decision:* the MacBook enrolls `controller+worker`, `accept_jobs = true`, `priority = 20`, `prefer_remote_workers = true` (2.7).
 *Rationale:* §0.6 — when a macOS-requiring workflow appears it must just run, not demand reconfiguration. Daily-driver impact is bounded by scoring (priority 20 + self-dispatch penalty + idle bonus, 6.4) and by interactive-session budget registration (12.9).
 *Reversal:* `styrn machine role remove worker`, or set `accept_jobs = false` in the manifest.
+
+**D-9 — The session substrate is optional; its absence refuses the agent surface and nothing else.**
+*Decision:* Herdr is an optional, per-host **session substrate** with a single machine-local state (`none | registered | active`), whose registration authority is the manifest `[herdr]` table plus the operator-owned `enabled` key (11.0). Substrate-requiring operations against a `none` host refuse with exit 7 / `capability.substrate_unregistered`; query-shaped operations answer empty-and-healthy with no warnings; registered-but-broken stays exit 11. There is **no** second `HarnessProvider`: batch agent runs are ordinary workflows (`codex exec` declared in `.styrn.toml`, §66; the job layout already reserves `harness.jsonl`, 7.7/12.5), and a supervisor-backed provider could not honestly implement `prompt`/`read`/`wait`/`attach`. `styrn harness run` works standalone with full governance, and the S-33 parity invariant applies at full force in pane context while being vacuous — not weakened — outside it. `styrn herdr status|attach` stay vendor-named.
+*Rationale:* the operator requirement is verbatim and binding, and §0.6 cuts both ways here — a Herdr-less user must never be nagged, and a Herdr user must lose nothing. §0.7 forbids both descoping the agent surface and inventing a `NullProvider` where one state, one error code, and a set of conditionals suffice. Exit 7 already means "required capability unavailable", and substrate absence *is* exactly that, so no new exit code was created. Keeping the command group vendor-named follows §0.4's preference for one precise form over a generic one: the only person who ever types `styrn herdr attach` is a Herdr user, and the name states honestly whose UI appears.
+*Reversal:* if a second substrate ever ships, 11.0's state model and the provider gating are already substrate-shaped — add a provider and a manifest table, and the vendor-named group gains a sibling exactly as `integrate codex|claude` sit beside `integrate herdr`. If the operator instead decides Herdr should be mandatory on workers, flip the default: add `herdr` to the worker baseline set (15.3.3) and demote 6.5's `none` line to a warning. The degradation contract keeps working unchanged underneath either move.
 
 ---
 

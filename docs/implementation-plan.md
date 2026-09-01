@@ -1,6 +1,6 @@
 # Styrn implementation plan
 
-Derived from `docs/design.md` revision E (Part 16.3 phases, Part 16.6 testing strategy, Part 16.1 layout).
+Derived from `docs/design.md` revision F (Part 16.3 phases, Part 16.6 testing strategy, Part 16.1 layout).
 Every task cites the design Part that specifies it. If a task and the design disagree, **the design wins** — fix the plan.
 
 ## How to use this document
@@ -39,7 +39,7 @@ passing negative test.
 | 1 | See and touch every machine from one seat | ☐ |
 | 2 | One governed remote job survives a closed laptop | ☐ |
 | 3 | The 16.7 flagship scenario, end to end | ☐ |
-| 4 | Govern agents without losing Herdr parity | ☐ |
+| 4 | Govern agents wherever a substrate is registered, without losing Herdr parity | ☐ |
 | 5 | Agents validate cross-platform without SSH | ☐ |
 | 6 | v0.N+1 reaches four machines without ceremony | ☐ |
 | 7 | Setup completions: renderers and reversals | ☐ |
@@ -65,13 +65,14 @@ passing negative test.
 
 - [ ] **T0.3** — Exit-code table and error-code registry (10.4, 10.6)
       Codes 0–13 exactly as tabulated. `workflow run` never propagates an inner code (always 12 + `data.exit_code`); `exec` mirrors the remote code per D-6.
-  - [ ] + positive: each code is produced by at least one integration test; every `errors[].code` maps to a documented registry entry.
+  - [ ] + positive: each code is produced by at least one integration test; every `errors[].code` maps to a documented registry entry. The registry includes `capability.substrate_unregistered` (11.0.3), first *produced* by Phase-4 tests like other late-phase codes.
   - [ ] − negative: a workflow command exiting 101 yields Styrn exit 12 with `data.exit_code == 101` — **not** exit 101. An unmapped internal panic yields exit 1, not a masquerading domain code.
 
 - [ ] **T0.4** — CLI skeleton, global flags, TTY detection (10.5)
       clap-based; global `--json`, `--jsonl` where streaming; `--json` disables ANSI colour.
   - [ ] + positive: `--help` lists only commands specified in 10.5; `--json` output contains no ANSI escapes.
   - [ ] − negative: an unknown flag or malformed argument exits 2 with a usage error, and emits no partial JSON envelope.
+  - [ ] − **rev. F amendment:** 10.5 gained the `styrn herdr status|attach|action|event` group (Part 11.0, D-9). Per C9 the parser must cover it, so re-verify the "`--help` lists exactly 10.5" assertion against the amended surface; behavior for `status`/`attach` lands in T4.0.
 
 ## 0.B Manifest
 
@@ -246,13 +247,14 @@ passing negative test.
 
 - [ ] **T1.13** — `host list / show / status / refresh` (10.5, 2.5)
       Status is ephemeral and must not rewrite the static manifest (2.5).
-  - [ ] + positive: status returns live CPU/memory/disk/job counts; refresh updates the manifest cache.
+  - [ ] + positive: status returns live CPU/memory/disk/job counts, including the ephemeral `substrate` field (11.0.3); refresh updates the manifest cache.
   - [ ] − negative: repeated `status` calls leave the manifest file's mtime unchanged.
 
 - [ ] **T1.14** — `doctor`, both layers (6.5)
       Controller-side checks and worker-local probes, kept distinct.
   - [ ] + positive: doctor verifies the full 6.5 checklist and emits remediations in JSON.
   - [ ] − negative: each check has a test that makes it *fail* and asserts the remediation text names the concrete fix — a doctor that only ever passes has never been tested.
+  - [ ] − negative: a substrate-`none` worker reads **healthy** — the substrate line is informational (6.5). Then deliberately register the substrate, stop the session, and assert doctor fails the two hard checks. Also assert the two drift lines: Herdr present but unregistered, and `[capabilities] agent = true` with substrate `none`.
 
 - [ ] **T1.15** — `exec` (10.5, D-6)
       Mirrors the remote command's exit code, ssh-convention.
@@ -416,6 +418,7 @@ passing negative test.
       Trivial `echo`-level project run as a real matrix across all machines; the acceptance test for enrollment, push, admission, supervision, artifact retrieval, and (from Phase 4) Herdr parity.
   - [ ] + positive: green across the real fleet; Styrn's own repo carries a `.styrn.toml` so the fleet validates Styrn (dogfooding loop).
   - [ ] − negative: selftest **fails loudly** when a machine is misconfigured — deliberately break one worker (stop sshd, fill disk, downgrade the binary) and assert each is caught and named.
+  - [ ] − negative: on a Herdr-less fleet selftest **passes**, with the agent leg reported `skipped (substrate: none)` per host. Absence is never a selftest failure (16.6 item 6).
 
 - [ ] **T3.12** — `styrnd`: service install and maintenance executor (15.9)
       Per-worker, unprivileged, no listening network socket. Runs the Part 6.8 daily/weekly ticks under the registry lock.
@@ -433,14 +436,22 @@ passing negative test.
 
 ---
 
-# Phase 4 — Agents and Herdr
+# Phase 4 — Agents on the session substrate (Herdr)
 
-**Exit criterion:** agents on every machine are listed and controlled, and a Styrn-launched agent is indistinguishable to Herdr from a manual one.
+**Exit criterion:** agents on every substrate-registered machine are listed and controlled; a Styrn-launched agent is indistinguishable to Herdr from a manual one; and a host with no substrate refuses the agent surface cleanly (exit 7) while everything else stays green.
+
+- [ ] **T4.0** — Substrate state, gated provider resolution, degradation contract (11.0)
+      State `none | registered | active` computed worker-side; registration = manifest `[herdr]`
+      `installed && enabled` (11.0.2); `machine.status.substrate`; provider resolution refuses on `none`.
+      **Sequenced deliberately before T4.1: `HerdrProvider` is an implementation of a gated abstraction, not the definition of it.**
+  - [ ] + positive: `styrn herdr status` reports the correct state through all three values on one host (uninstalled / installed-not-running / running), and `machine.status` carries the field.
+  - [ ] − negative: `agent start/read/prompt/wait/stop/attach` and `herdr attach` against a substrate-`none` host exit 7 with `capability.substrate_unregistered`, naming the host and the remediation; `agent list --all` over a fully substrate-less fleet exits 0 with empty data and **no warnings**; a `registered` host whose session cannot be started exits 11 `agent.harness_error`, never 7.
 
 - [ ] **T4.1** — `HarnessProvider` trait over RPC (11.1, 12.2)
-      Herdr's lifecycle states (`working|blocked|idle|done|unknown`) are preserved, never re-invented (12.2).
+      Herdr's lifecycle states (`working|blocked|idle|done|unknown`) are preserved, never re-invented (12.2). Provider resolution is substrate-gated per T4.0.
   - [ ] + positive: the same trait drives Linux, macOS, and Windows targets through `styrn rpc serve --stdio` → local Herdr CLI.
   - [ ] − negative: an unknown Herdr state maps to `unknown` rather than being coerced into a Styrn-invented state.
+  - [ ] − negative: resolving a provider for a substrate-`none` host yields the 11.0.3 refusal, not a provider object whose methods fail one by one.
 
 - [ ] **T4.2** — `agent list / read / prompt / wait / stop` (11.2, 10.5)
   - [ ] + positive: cross-host agent control works uniformly, including Windows targets.
@@ -459,6 +470,8 @@ passing negative test.
       Normative, not "where possible". After exec the process *is* the agent.
   - [ ] + positive: pid, process name, and command line match a manual launch exactly.
   - [ ] − negative: exec failure (missing/non-executable binary) surfaces as exit 11 `agent.harness_error` **before** the agent starts — never as a degraded wrapped session. Exit-status recording correctly reports `unknown` via reconciliation (the documented forfeit).
+  - [ ] + positive (standalone, 12.9): launched outside any Herdr pane — including on a substrate-`none` host — the launcher still exports the resource environment, registers the interactive-session budget (7.2 defaults), and execs the harness; the registry records `context = "standalone"`.
+  - [ ] − negative (standalone): no parity probe is consulted and no refusal occurs. Standalone launch must not be conflated with the env-only *fallback*, which exists only in pane context (12.9.1).
 
 - [ ] **T4.6** — `harness run`: Windows direct child (12.10, S-33)
       Job Object without `KILL_ON_JOB_CLOSE`; launcher resident but inert; no `cmd`/`conhost` layer; no command-line rewriting; no console allocation.
@@ -473,6 +486,7 @@ passing negative test.
       `integrate herdr doctor` launches a wrapped and an unwrapped control in Herdr panes and compares what Herdr reports.
   - [ ] + positive: the probe passes on each OS where Herdr is present.
   - [ ] − negative: **when the probe fails, the launcher refuses to wrap** and falls back to env-only direct launch, with doctor reporting why. Simulate a probe failure and assert no undetectable session is ever produced.
+  - [ ] − negative: on a substrate-`none` host, `integrate herdr doctor` refuses per 11.0.3 (exit 7) rather than reporting a failed probe (12.10 item 3).
 
 - [ ] **T4.9** — Parity conformance test in CI and selftest (16.6 item 7)
   - [ ] + positive: identical detection and identical lifecycle-transition sequence for both launch paths.
@@ -500,6 +514,7 @@ passing negative test.
 - [ ] **T5.2** — `readonly` profile (13.3)
   - [ ] + positive: the specified read tools work.
   - [ ] − negative: every mutating tool is absent, not merely rejected at call time.
+  - [ ] − negative: the tool list is **identical** on a substrate-less fleet — tools are never hidden by fleet state (13.3) — and `styrn_agent_list` answers empty-and-healthy rather than erroring.
 
 - [ ] **T5.3** — `developer` profile (13.3)
   - [ ] + positive: `workflow_run`/`workflow_cancel` limited to workflows declared by the current project.
@@ -529,6 +544,7 @@ passing negative test.
 - [ ] **T5.9** — `orchestrator` profile and fan-out bound (13.9) — *gated on approval-behaviour maturity*
   - [ ] + positive: agent_start/prompt/wait/stop restricted to enrolled hosts and declared projects.
   - [ ] − negative: the fan-out bound is enforced — an orchestrating agent cannot spawn unbounded remote agents. Not enabled in the `developer` profile by default.
+  - [ ] − negative: `styrn_agent_prompt/wait/stop` against a substrate-`none` host return a structured tool error carrying `capability.substrate_unregistered`, and `styrn_agent_start` host selection on a substrate-less fleet yields the capability refusal — the `agent` capability implies a registered substrate (11.0.2, 13.3).
 
 - [ ] **T5.10** — `admin` profile — *last, and never default for coding-agent sessions* (13.3)
   - [ ] + positive: exists and is reachable only by explicit operator configuration.
@@ -673,7 +689,7 @@ passing negative test.
 
 - [ ] **T8.7** — `watch`: agent board as a superset (14.5.1)
       All agents, all hosts, local included and marked by host; `blocked` surfaced for attention.
-  - [ ] + positive: one place to see every agent; attach from the row.
+  - [ ] + positive: one place to see every agent; attach from the row. With no host registered, the board renders the 11.10 empty-state line rather than an error or a blank pane.
   - [ ] − negative: local rows are labelled as local and Herdr's native list remains authoritative for them — the board must not become a competing source of truth (11.12).
 
 - [ ] **T8.8** — `watch`: doctor view with triggerable remediations (14.5.1)
@@ -710,7 +726,7 @@ These are not phase tasks; they must hold at every commit from Phase 0 onward (1
 - [ ] **C4** — Concurrency tests: two controllers, one worker, budgets never exceeded (layer 4; the S-03 regression).
 - [ ] **C5** — Platform CI matrix on ubuntu/macos/windows latest, including Windows argv round-trip, Job-Object tree-kill, long paths (layer 5).
 - [ ] **C6** — `fleet selftest` green on the real fleet after every upgrade (layer 6).
-- [ ] **C7** — Herdr parity conformance wherever Herdr is installable (layer 7).
+- [ ] **C7** — Herdr parity conformance wherever Herdr is installable, i.e. wherever the substrate is `active` (layer 7; 11.0.1).
 - [ ] **C8** — Setup and rendered-script conformance on the three-OS VM matrix (layer 8; Phase 7 gate).
 - [ ] **C9** — Every new command added to the Part 10.5 canonical surface in the same change.
 - [ ] **C10** — Every new component placed in exactly one Part 16.3 phase in the same change (the 16.3 placement rule).

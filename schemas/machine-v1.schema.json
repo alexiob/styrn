@@ -167,6 +167,7 @@
       "additionalProperties": false,
       "properties": {
         "installed": { "type": "boolean" },
+        "enabled": { "type": "boolean" },
         "session": { "type": "string" },
         "autostart": { "type": "string" }
       }

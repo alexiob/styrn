@@ -2,10 +2,10 @@
 
 **One control plane for development machines, remote jobs, and coding agents.**
 
-Styrn is a planned cross-platform command-line tool for operating a fleet of macOS, Linux, and native Windows development machines from any enrolled controller. It will set up and inspect hosts, run project-defined workflows under resource limits, keep remote jobs alive after the controller disconnects, and manage persistent Codex and Claude Code sessions through Herdr.
+Styrn is a planned cross-platform command-line tool for operating a fleet of macOS, Linux, and native Windows development machines from any enrolled controller. It will set up and inspect hosts, run project-defined workflows under resource limits, keep remote jobs alive after the controller disconnects, and—on hosts where Herdr is installed and registered—manage persistent Codex and Claude Code sessions through it. Herdr is optional per host: everything except the agent-session surface runs without it.
 
 > [!IMPORTANT]
-> **Styrn is currently a specification, not usable software.** This repository contains the revision-E design and implementation plan, but no Rust source, `Cargo.toml`, installable binary, release, or tests. Commands in this README describe the intended interface.
+> **Styrn is not yet usable software.** Implementation has begun — the repository contains a Rust crate that builds and tests on Linux, macOS, and Windows — but it is early in Phase 0 of nine, there is no release or installable binary, and no command yet performs real fleet work. Commands in this README describe the intended interface, not current behavior.
 
 ## Why Styrn?
 
@@ -16,10 +16,10 @@ The intended result is a single `styrn` binary that can:
 - control the fleet from Windows, Linux, or macOS;
 - discover machine resources and admit work without oversubscribing a worker;
 - run repository-defined checks, tests, and validation matrices;
-- preserve jobs and coding-agent sessions when a laptop closes or a connection drops;
+- preserve jobs—and, where Herdr is registered, coding-agent sessions—when a laptop closes or a connection drops;
 - expose stable human-readable, JSON, and JSON Lines interfaces;
 - give Codex and Claude Code structured, project-scoped operations through MCP; and
-- use familiar infrastructure—Tailscale, OpenSSH, Git, and Herdr—instead of a central cluster service.
+- use familiar infrastructure—Tailscale, OpenSSH, Git, and optionally Herdr—instead of a central cluster service.
 
 Styrn is not intended to be a container orchestrator, CI server, or replacement for each project's build system. Project-specific behavior belongs in `.styrn.toml`; Styrn supplies the cross-platform execution, scheduling, policy, and observability primitives.
 
@@ -63,7 +63,7 @@ Codex / Claude Code                         Human operator
                worker: styrn rpc serve --stdio
                     /                      \
       resource-governed jobs          Herdr sessions
-       in clean worktrees          for persistent agents
+       in clean worktrees          (optional; persistent agents)
 ```
 
 There is no permanent master. A machine may have either or both independent roles:
@@ -103,7 +103,7 @@ The worker—not the controller or coding agent—makes the final admission deci
 
 - **Frictionless by default:** autodetect what can be discovered, provide useful defaults, and prefer one convergent command over setup rituals.
 - **Native and cross-platform:** support macOS, Linux, and native Windows without requiring WSL or a language runtime.
-- **Persistent by design:** worker-owned job supervisors and Herdr-owned agent sessions outlive controller connections.
+- **Persistent by design:** worker-owned job supervisors outlive controller connections; where Herdr is registered, agent sessions do too.
 - **Generic, not abstract:** provide durable fleet primitives while leaving Cargo or other build-system knowledge in the project profile.
 - **Automation is a contract:** finite commands have a versioned JSON envelope, documented error codes, and stable exit semantics.
 - **Security boundaries are explicit:** untrusted work runs without fleet credentials as the dedicated `styrn` user; MCP profiles improve least-privilege ergonomics but are not treated as containment from a process that already has controller shell access.
@@ -116,7 +116,7 @@ The worker—not the controller or coding agent—makes the final admission deci
 | Tailscale and MagicDNS | Private connectivity and stable host names |
 | OpenSSH | Authentication and cross-platform transport |
 | Git and worktrees | Commit-addressed source distribution and isolated validation |
-| Herdr | Persistent terminals, worktrees, and coding-agent lifecycle |
+| Herdr (optional) | Persistent terminals, worktrees, and coding-agent lifecycle on hosts that register it |
 | Codex and Claude Code | Agent harnesses controlled through adapters and MCP |
 | sccache | Optional shared compilation acceleration |
 
@@ -124,7 +124,7 @@ Styrn is not literally dependency-free: v1 relies on system OpenSSH for transpor
 
 ## Repository status
 
-All implementation phases are currently unstarted.
+Implementation is in **Phase 0 of 0–8**: the crate, command-line surface, output envelope, exit-code registry, machine manifest, and setup probe layer are taking shape, with a three-OS CI matrix enforcing formatting, build, tests, and lints. Everything from Phase 1 onward is unstarted.
 
 | Phase | Intended outcome |
 |---:|---|
@@ -132,7 +132,7 @@ All implementation phases are currently unstarted.
 | 1 | Every machine is visible and reachable from one controller |
 | 2 | A governed remote job survives controller disconnection |
 | 3 | Project workflows and cross-platform matrices run end to end |
-| 4 | Agents are governed without losing Herdr lifecycle parity |
+| 4 | Agents are governed wherever Herdr is registered, without losing lifecycle parity |
 | 5 | Agents can request structured remote validation through MCP |
 | 6 | Releases can be upgraded across the fleet |
 | 7 | Setup gains reversible and script-rendered operations |
@@ -144,7 +144,7 @@ The detailed, testable task list is in the [implementation plan](docs/implementa
 
 | Document | Use it for |
 |---|---|
-| [Canonical design, revision E](docs/design.md) | Current architecture, behavior, security model, protocols, and binding decisions |
+| [Canonical design, revision F](docs/design.md) | Current architecture, behavior, security model, protocols, and binding decisions |
 | [Implementation plan](docs/implementation-plan.md) | Ordered work items, positive tests, negative tests, and phase exit criteria |
 | [Revision-D review](docs/design-review-D.md) | Historical adversarial review and proportionality analysis; not the current specification |
 

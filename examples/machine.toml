@@ -73,6 +73,7 @@ public_key_auth = true
 
 [herdr]
 installed = true
+enabled = true
 session = "fleet"
 autostart = "on-demand-ssh"
 

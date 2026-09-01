@@ -162,7 +162,7 @@ manifest_types! {
     Scheduling { priority: Option<i64>, prefer_remote_workers: Option<bool> }
     Tailscale { installed: Option<bool>, mode: Option<TailscaleMode>, unattended: Option<bool> }
     Ssh { installed: Option<bool>, server: Option<bool>, public_key_auth: Option<bool> }
-    Herdr { installed: Option<bool>, session: Option<String>, autostart: Option<String> }
+    Herdr { installed: Option<bool>, enabled: Option<bool>, session: Option<String>, autostart: Option<String> }
     Agent { installed: Option<bool>, command: Option<String>, sandbox: Option<String>, shell: Option<String> }
     Toolchain { installed: Option<bool>, host: Option<String>, version: Option<String> }
     Cache { installed: Option<bool>, max_bytes: Option<u64> }
