@@ -104,14 +104,18 @@ pub(super) fn verify_manifest_ancestors(
     worker: &str,
     trusted_root: &Path,
 ) -> io::Result<()> {
-    if !directory.starts_with(trusted_root) {
+    let system_owner = matches!(owner, ManifestOwner::System);
+    if (system_owner && directory != trusted_root)
+        || (!system_owner && !directory.starts_with(trusted_root))
+    {
         return Err(permission_denied(
             "manifest directory is outside its trusted root",
         ));
     }
-    if directory == trusted_root {
+    if !system_owner && directory == trusted_root {
         return require_real_directory(directory);
     }
+    require_real_directory(directory)?;
     let worker_uid = match owner {
         ManifestOwner::System => Some(lookup_worker_uid(worker)?),
         #[cfg(test)]
@@ -123,16 +127,7 @@ pub(super) fn verify_manifest_ancestors(
         require_real_directory(ancestor)?;
         let metadata = fs::metadata(ancestor)?;
         let mode = metadata.mode();
-        if matches!(owner, ManifestOwner::System) && mode & 0o001 == 0 {
-            return Err(permission_denied(
-                "manifest ancestor is not traversable by the styrn worker",
-            ));
-        }
-        if worker_uid.is_some_and(|uid| uid == metadata.uid()) && mode & 0o200 != 0 {
-            return Err(permission_denied(
-                "styrn worker owns a writable manifest ancestor",
-            ));
-        }
+        validate_ancestor_access(metadata.uid(), mode, worker_uid, system_owner)?;
         if mode & 0o022 != 0 {
             let safe_sticky_root = matches!(owner, ManifestOwner::System)
                 && mode & 0o1000 != 0
@@ -145,14 +140,35 @@ pub(super) fn verify_manifest_ancestors(
             }
         }
         child_uid = metadata.uid();
-        if ancestor == trusted_root {
+        if !system_owner && ancestor == trusted_root {
             return Ok(());
         }
         current = ancestor.parent();
     }
-    Err(permission_denied(
-        "manifest trusted root is not an ancestor",
-    ))
+    if system_owner {
+        Ok(())
+    } else {
+        Err(permission_denied(
+            "manifest trusted root is not an ancestor",
+        ))
+    }
+}
+
+fn validate_ancestor_access(
+    uid: u32,
+    mode: u32,
+    worker_uid: Option<u32>,
+    require_worker_traversal: bool,
+) -> io::Result<()> {
+    if require_worker_traversal && mode & 0o001 == 0 {
+        return Err(permission_denied(
+            "manifest ancestor is not traversable by the styrn worker",
+        ));
+    }
+    if worker_uid == Some(uid) {
+        return Err(permission_denied("styrn worker owns a manifest ancestor"));
+    }
+    Ok(())
 }
 
 fn lookup_worker_uid(worker: &str) -> io::Result<u32> {
@@ -315,5 +331,10 @@ mod tests {
         })
         .is_err());
         assert!(validate_manifest_inspection(&valid).is_ok());
+    }
+
+    #[test]
+    fn worker_owned_read_only_ancestor_is_still_rejected() {
+        assert!(validate_ancestor_access(41, 0o555, Some(41), true).is_err());
     }
 }

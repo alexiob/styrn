@@ -317,10 +317,94 @@ fn generated_write_mints_once_and_preserves_identity_across_updates() {
 
 #[cfg(unix)]
 #[test]
+fn generated_write_rejects_a_preexisting_symlink_without_reading_or_replacing_its_target() {
+    let temp = TestDir::new();
+    let target = temp.path().join("valid-target.toml");
+    let path = temp.path().join("machine.toml");
+    let original = fs::read("examples/machine.toml").unwrap();
+    fs::write(&target, &original).unwrap();
+    std::os::unix::fs::symlink(&target, &path).unwrap();
+    let draft = MachineManifest::parse_toml(&String::from_utf8(original.clone()).unwrap())
+        .unwrap()
+        .without_machine_id();
+
+    assert!(MachineManifestStore::new_for_test(&path)
+        .write_generated(&draft)
+        .is_err());
+    assert!(fs::symlink_metadata(&path)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+    assert_eq!(fs::read(&target).unwrap(), original);
+}
+
+#[cfg(unix)]
+#[test]
+fn generated_write_rejects_preexisting_fifo_and_directory_targets_without_blocking() {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::FileTypeExt;
+
+    let draft = MachineManifest::parse_toml(&fs::read_to_string("examples/machine.toml").unwrap())
+        .unwrap()
+        .without_machine_id();
+
+    let fifo_root = TestDir::new();
+    let fifo = fifo_root.path().join("machine.toml");
+    let fifo_path = CString::new(fifo.as_os_str().as_bytes()).unwrap();
+    assert_eq!(unsafe { libc::mkfifo(fifo_path.as_ptr(), 0o600) }, 0);
+    assert!(MachineManifestStore::new_for_test(&fifo)
+        .write_generated(&draft)
+        .is_err());
+    assert!(fs::symlink_metadata(&fifo).unwrap().file_type().is_fifo());
+
+    let directory_root = TestDir::new();
+    let directory = directory_root.path().join("machine.toml");
+    fs::create_dir(&directory).unwrap();
+    assert!(MachineManifestStore::new_for_test(&directory)
+        .write_generated(&draft)
+        .is_err());
+    assert!(fs::symlink_metadata(directory).unwrap().is_dir());
+}
+
+#[test]
+fn invalid_system_destination_is_rejected_before_creating_or_hardening_it() {
+    let temp = TestDir::new();
+    let invalid_directory = temp.path().join("not-styrn");
+    let path = invalid_directory.join("machine.toml");
+    let draft = MachineManifest::parse_toml(&fs::read_to_string("examples/machine.toml").unwrap())
+        .unwrap()
+        .without_machine_id();
+
+    assert!(MachineManifestStore::new(&path)
+        .write_generated(&draft)
+        .is_err());
+    assert!(!invalid_directory.exists());
+}
+
+#[test]
+fn system_destination_never_creates_missing_broad_ancestors() {
+    let temp = TestDir::new();
+    let missing_ancestor = temp.path().join("missing-broad-parent");
+    let path = missing_ancestor.join("styrn").join("machine.toml");
+    let draft = MachineManifest::parse_toml(&fs::read_to_string("examples/machine.toml").unwrap())
+        .unwrap()
+        .without_machine_id();
+
+    assert!(MachineManifestStore::new(&path)
+        .write_generated(&draft)
+        .is_err());
+    assert!(!missing_ancestor.exists());
+}
+
+#[cfg(unix)]
+#[test]
 #[ignore = "environmental: run as root to verify real system ownership"]
 fn generated_system_manifest_is_root_owned_and_not_worker_writable() {
     let temp = TestDir::new();
-    let path = temp.path().join("machine.toml");
+    let config = temp.path().join("styrn");
+    fs::create_dir(&config).unwrap();
+    let path = config.join("machine.toml");
     let draft = MachineManifest::parse_toml(&fs::read_to_string("examples/machine.toml").unwrap())
         .unwrap()
         .without_machine_id();
@@ -509,7 +593,9 @@ fn real_styrn_account_can_read_but_cannot_write_or_replace_manifest() {
     assert_ne!(uid, 0, "styrn must be an unprivileged account");
 
     let temp = TestDir::new();
-    let path = temp.path().join("machine.toml");
+    let config = temp.path().join("styrn");
+    fs::create_dir(&config).unwrap();
+    let path = config.join("machine.toml");
     let draft = MachineManifest::parse_toml(&fs::read_to_string("examples/machine.toml").unwrap())
         .unwrap()
         .without_machine_id();
@@ -536,7 +622,7 @@ fn real_styrn_account_can_read_but_cannot_write_or_replace_manifest() {
             .write(true)
             .open(&path)
             .is_err_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied);
-        let replace_denied = fs::rename(&path, temp.path().join("stolen.toml"))
+        let replace_denied = fs::rename(&path, config.join("stolen.toml"))
             .is_err_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied);
         unsafe {
             libc::_exit(i32::from(

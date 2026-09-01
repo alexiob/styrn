@@ -178,22 +178,26 @@ fn remove_line(input: &str, starts_with: &str) -> String {
         .join("\n")
 }
 
-struct TestDir(PathBuf);
+struct TestDir {
+    root: PathBuf,
+    config: PathBuf,
+}
 
 impl TestDir {
     fn new() -> Self {
-        let path = std::env::temp_dir().join(format!("styrn-machine-cli-{}", Uuid::now_v7()));
-        fs::create_dir_all(&path).unwrap();
-        Self(path)
+        let root = std::env::temp_dir().join(format!("styrn-machine-cli-{}", Uuid::now_v7()));
+        let config = root.join("styrn");
+        fs::create_dir_all(&config).unwrap();
+        Self { root, config }
     }
 
     fn path(&self) -> &Path {
-        &self.0
+        &self.config
     }
 }
 
 impl Drop for TestDir {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.0);
+        let _ = fs::remove_dir_all(&self.root);
     }
 }

@@ -28,7 +28,7 @@ const INHERIT_ONLY_ACE: u8 = 0x08;
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
 const INVALID_FILE_ATTRIBUTES: u32 = 0xffff_ffff;
 const PARENT_TAKEOVER_ACCESS: u32 =
-    0x0000_0040 | 0x0004_0000 | 0x0008_0000 | 0x4000_0000 | 0x1000_0000;
+    0x0000_0040 | 0x0001_0000 | 0x0004_0000 | 0x0008_0000 | 0x4000_0000 | 0x1000_0000;
 
 #[repr(C)]
 struct Acl {
@@ -275,26 +275,34 @@ pub(super) fn verify_manifest_ancestors(
     worker: &str,
     trusted_root: &Path,
 ) -> io::Result<()> {
-    if !directory.starts_with(trusted_root) {
+    let system_owner = !is_test_owner(owner);
+    if (system_owner && directory != trusted_root)
+        || (!system_owner && !directory.starts_with(trusted_root))
+    {
         return Err(permission_denied(
             "manifest directory is outside its trusted root",
         ));
     }
-    if directory == trusted_root || is_test_owner(owner) {
+    if !system_owner && (directory == trusted_root || is_test_owner(owner)) {
         return require_kind(directory, true);
     }
+    require_kind(directory, true)?;
     let mut current = directory.parent();
     while let Some(ancestor) = current {
         require_kind(ancestor, true)?;
         inspect_ancestor_acl(ancestor, worker)?;
-        if ancestor == trusted_root {
+        if !system_owner && ancestor == trusted_root {
             return Ok(());
         }
         current = ancestor.parent();
     }
-    Err(permission_denied(
-        "manifest trusted root is not an ancestor",
-    ))
+    if system_owner {
+        Ok(())
+    } else {
+        Err(permission_denied(
+            "manifest trusted root is not an ancestor",
+        ))
+    }
 }
 
 fn is_test_owner(owner: ManifestOwner) -> bool {
@@ -747,17 +755,19 @@ mod tests {
 
     #[test]
     fn ancestor_rejects_worker_or_group_delete_child_and_acl_takeover() {
-        for mask in [0x40, 0x0004_0000, 0x0008_0000, 0x1000_0000] {
-            assert!(validate_ancestor_entries(
-                false,
-                &[AceInspection {
-                    principal: Principal::Unexpected,
-                    mask,
-                    flags: 0,
-                    allowed: true,
-                }]
-            )
-            .is_err());
+        for mask in [0x40, 0x0001_0000, 0x0004_0000, 0x0008_0000, 0x1000_0000] {
+            for principal in [Principal::Worker, Principal::Unexpected] {
+                assert!(validate_ancestor_entries(
+                    false,
+                    &[AceInspection {
+                        principal,
+                        mask,
+                        flags: 0,
+                        allowed: true,
+                    }]
+                )
+                .is_err());
+            }
         }
         assert!(validate_ancestor_entries(true, &[]).is_err());
         assert!(validate_ancestor_entries(

@@ -489,8 +489,7 @@ impl MachineManifestStore {
     pub(crate) fn new(path: impl Into<PathBuf>) -> Self {
         let path = path.into();
         let trusted_root = path
-            .ancestors()
-            .last()
+            .parent()
             .map(std::path::Path::to_path_buf)
             .unwrap_or_default();
         Self {
@@ -559,6 +558,7 @@ impl MachineManifestStore {
     }
 
     pub(crate) fn read(&self) -> Result<ReadOutcome, ManifestError> {
+        self.validate_destination_policy()?;
         platform::verify_manifest_file_target(&self.path).map_err(ManifestError::Security)?;
         self.verify_security()?;
         let raw = parse_raw(&fs::read_to_string(&self.path).map_err(ManifestError::Read)?)?;
@@ -628,8 +628,12 @@ impl MachineManifestStore {
     }
 
     fn existing_machine_id_for_generated(&self) -> Result<Option<Uuid>, ManifestError> {
-        if !self.path.exists() {
-            return Ok(None);
+        match fs::symlink_metadata(&self.path) {
+            Ok(_) => {
+                platform::verify_manifest_file_target(&self.path).map_err(ManifestError::Write)?
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(ManifestError::Read(error)),
         }
         let raw = parse_raw(&fs::read_to_string(&self.path).map_err(ManifestError::Read)?)?;
         let machine_id = raw
@@ -646,10 +650,12 @@ impl MachineManifestStore {
         &self,
         operation: impl FnOnce() -> Result<T, ManifestError>,
     ) -> Result<T, ManifestError> {
-        let destination_dir = self.path.parent().ok_or_else(|| {
-            ManifestError::Validation("manifest path has no parent directory".to_owned())
-        })?;
-        fs::create_dir_all(destination_dir).map_err(ManifestError::Write)?;
+        let destination_dir = self.validate_destination_policy()?;
+        match fs::create_dir(destination_dir) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(ManifestError::Write(error)),
+        }
         platform::verify_manifest_ancestors(
             destination_dir,
             self.platform_owner(),
@@ -671,11 +677,37 @@ impl MachineManifestStore {
         operation()
     }
 
+    fn validate_destination_policy(&self) -> Result<&std::path::Path, ManifestError> {
+        let destination_dir = self.path.parent().ok_or_else(|| {
+            ManifestError::Validation("manifest path has no parent directory".to_owned())
+        })?;
+        if matches!(self.security, ManifestSecurity::System) {
+            use std::path::Component;
+
+            if !self.path.is_absolute()
+                || self
+                    .path
+                    .components()
+                    .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+                || destination_dir != self.trusted_root
+                || !destination_dir
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| name.eq_ignore_ascii_case("styrn"))
+            {
+                return Err(ManifestError::Validation(
+                    "system manifest destination must be an absolute dedicated styrn directory"
+                        .to_owned(),
+                ));
+            }
+        }
+        Ok(destination_dir)
+    }
+
     fn write_manifest(&self, manifest: &MachineManifest) -> Result<(), ManifestError> {
         let destination_dir = self.path.parent().ok_or_else(|| {
             ManifestError::Validation("manifest path has no parent directory".to_owned())
         })?;
-        fs::create_dir_all(destination_dir).map_err(ManifestError::Write)?;
         let temporary = destination_dir.join(format!(
             ".{}.{}.tmp",
             self.path
@@ -940,4 +972,41 @@ pub(crate) enum ManifestError {
     Secret { path: String, reason: &'static str },
     #[error("invalid machine manifest: {0}")]
     Validation(String),
+}
+
+#[cfg(test)]
+mod destination_policy_tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn system_policy_accepts_only_a_dedicated_styrn_leaf() {
+        for safe in [
+            Path::new("/srv/example/styrn/machine.toml"),
+            Path::new("/srv/example/Styrn/machine.toml"),
+        ] {
+            assert!(
+                MachineManifestStore::new(safe)
+                    .validate_destination_policy()
+                    .is_ok(),
+                "{} must be accepted as a dedicated system manifest destination",
+                safe.display()
+            );
+        }
+
+        for broad_or_invalid in [
+            Path::new("/"),
+            Path::new("/etc/machine.toml"),
+            Path::new("/Library/Application Support/machine.toml"),
+            Path::new("/srv/example/not-styrn/machine.toml"),
+        ] {
+            assert!(
+                MachineManifestStore::new(broad_or_invalid)
+                    .validate_destination_policy()
+                    .is_err(),
+                "{} must not be accepted as a system manifest destination",
+                broad_or_invalid.display()
+            );
+        }
+    }
 }
