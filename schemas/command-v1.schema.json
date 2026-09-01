@@ -21,7 +21,7 @@
       "description": "RFC 3339 (10.1)."
     },
     "data": {
-      "description": "Command-specific payload; null on failure. Sizes are integer bytes, durations integer milliseconds (10.1).",
+      "description": "Command-specific payload; null on ordinary failure. Workflow and matrix outcome failures carry data.exit_code (10.4). Sizes are integer bytes, durations integer milliseconds (10.1).",
       "type": ["object", "array", "null"]
     },
     "warnings": { "type": "array", "items": { "$ref": "#/$defs/diagnostic" } },
@@ -35,13 +35,40 @@
       "then": { "properties": { "errors": { "maxItems": 0 } } }
     },
     {
-      "$comment": "Failure carries at least one error and a null payload (10.2's error example).",
+      "$comment": "Failures carry at least one error and normally a null payload. Workflow and matrix outcomes are the narrow Part 10.4 exception: they carry the wrapped exit code.",
       "if": { "properties": { "ok": { "const": false } }, "required": ["ok"] },
       "then": {
         "properties": {
-          "errors": { "minItems": 1 },
-          "data": { "type": "null" }
-        }
+          "errors": { "minItems": 1 }
+        },
+        "anyOf": [
+          {
+            "properties": {
+              "data": { "type": "null" }
+            }
+          },
+          {
+            "properties": {
+              "command": { "enum": ["workflow run", "matrix run"] },
+              "data": {
+                "type": "object",
+                "required": ["exit_code"],
+                "properties": {
+                  "exit_code": { "type": "integer" }
+                }
+              },
+              "errors": {
+                "contains": {
+                  "type": "object",
+                  "required": ["code"],
+                  "properties": {
+                    "code": { "const": "job.workflow_failed" }
+                  }
+                }
+              }
+            }
+          }
+        ]
       }
     }
   ],

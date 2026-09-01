@@ -70,8 +70,8 @@ fn failure_envelope_is_schema_valid_with_null_data_and_a_structured_error() {
     let envelope = output::Envelope::failure(
         "project status",
         timestamp(),
-        vec![output::Diagnostic::new(
-            "project.unavailable",
+        vec![output::ErrorDiagnostic::new(
+            output::ErrorCode::ProjectProfileInvalid,
             "project is unavailable",
             Some(json!({"project_id": "p-1"})),
         )
@@ -87,7 +87,7 @@ fn failure_envelope_is_schema_valid_with_null_data_and_a_structured_error() {
     assert_eq!(
         value["errors"],
         json!([{
-            "code": "project.unavailable",
+            "code": "project.profile_invalid",
             "message": "project is unavailable",
             "details": {"project_id": "p-1"}
         }])
