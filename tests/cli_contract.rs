@@ -47,24 +47,24 @@ fn version_is_a_normal_success_response_on_stdout() {
 }
 
 #[test]
-fn interactive_help_does_not_advertise_a_json_contract() {
+fn root_and_finite_help_advertise_the_global_machine_output_option() {
     for args in [
-        &["shell", "--help"][..],
-        &["desktop", "open", "--help"][..],
-        &["admin", "open", "--help"][..],
-        &["agent", "attach", "--help"][..],
-        &["job", "logs", "--help"][..],
-        &["harness", "run", "--help"][..],
-        &["env", "--help"][..],
-        &["watch", "--help"][..],
+        &["--help"][..],
+        &["host", "list", "--help"][..],
+        &["workflow", "plan", "--help"][..],
     ] {
         let output = run(args);
         assert!(output.status.success(), "{}", display(args));
+        let help = String::from_utf8_lossy(&output.stdout);
         assert!(
-            !String::from_utf8_lossy(&output.stdout)
-                .lines()
+            help.lines()
                 .any(|line| line.split_whitespace().any(|word| word == "--json")),
-            "{} must not advertise JSON behavior",
+            "{} must advertise --json",
+            display(args)
+        );
+        assert!(
+            help.contains("machine-readable output"),
+            "{} must describe --json as machine output",
             display(args)
         );
     }
