@@ -8,6 +8,7 @@ mod macos;
 mod windows;
 
 use std::path::Path;
+use std::path::PathBuf;
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum ManifestOwner {
@@ -16,6 +17,31 @@ pub(crate) enum ManifestOwner {
     CurrentProcess,
     #[cfg(test)]
     CurrentProcessWorker,
+}
+
+/// A staging pathname created with the platform's private-at-creation policy.
+///
+/// The containing parent is verified against worker takeover before this value
+/// is minted, so keeping its field private prevents generic code from
+/// publishing a separately created or worker-authorized directory.
+pub(crate) struct PrivateManifestStagingDirectory {
+    path: PathBuf,
+}
+
+impl PrivateManifestStagingDirectory {
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
+pub(crate) fn create_private_manifest_staging_directory(
+    path: &Path,
+    owner: ManifestOwner,
+) -> std::io::Result<PrivateManifestStagingDirectory> {
+    platform_impl::create_private_manifest_staging_directory(path, owner)?;
+    Ok(PrivateManifestStagingDirectory {
+        path: path.to_path_buf(),
+    })
 }
 
 pub(crate) fn harden_manifest_directory(
@@ -80,10 +106,10 @@ pub(crate) fn verify_manifest_directory_security(
 }
 
 pub(crate) fn publish_manifest_directory(
-    staging: &Path,
+    staging: &PrivateManifestStagingDirectory,
     destination: &Path,
 ) -> std::io::Result<()> {
-    platform_impl::publish_manifest_directory(staging, destination)
+    platform_impl::publish_manifest_directory(staging.path(), destination)
 }
 
 pub(crate) fn verify_manifest_file_target(path: &Path) -> std::io::Result<()> {

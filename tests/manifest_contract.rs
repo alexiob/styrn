@@ -584,10 +584,14 @@ fn staging_cleanup_failure_reports_both_errors_without_poisoning_the_final_leaf(
 #[test]
 fn native_directory_publish_never_replaces_an_existing_destination() {
     let temp = TestDir::new();
-    let staging = temp.path().join("staging");
+    let staging_path = temp.path().join("staging");
     let destination = temp.path().join("destination");
-    fs::create_dir(&staging).unwrap();
-    fs::write(staging.join("creator"), b"staging").unwrap();
+    let staging = platform::create_private_manifest_staging_directory(
+        &staging_path,
+        platform::ManifestOwner::CurrentProcess,
+    )
+    .unwrap();
+    fs::write(staging.path().join("creator"), b"staging").unwrap();
     fs::create_dir(&destination).unwrap();
     fs::write(destination.join("creator"), b"winner").unwrap();
 
@@ -595,30 +599,38 @@ fn native_directory_publish_never_replaces_an_existing_destination() {
 
     assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
     assert_eq!(fs::read(destination.join("creator")).unwrap(), b"winner");
-    assert_eq!(fs::read(staging.join("creator")).unwrap(), b"staging");
+    assert_eq!(
+        fs::read(staging.path().join("creator")).unwrap(),
+        b"staging"
+    );
 }
 
 #[test]
 fn concurrent_native_directory_publishers_produce_exactly_one_winner() {
     let temp = TestDir::new();
     let destination = temp.path().join("destination");
-    let staging = [temp.path().join("staging-a"), temp.path().join("staging-b")];
-    for (index, path) in staging.iter().enumerate() {
-        fs::create_dir(path).unwrap();
-        fs::write(path.join("creator"), index.to_string()).unwrap();
+    let staging = [temp.path().join("staging-a"), temp.path().join("staging-b")].map(|path| {
+        platform::create_private_manifest_staging_directory(
+            &path,
+            platform::ManifestOwner::CurrentProcess,
+        )
+        .unwrap()
+    });
+    for (index, staging) in staging.iter().enumerate() {
+        fs::write(staging.path().join("creator"), index.to_string()).unwrap();
     }
     let barrier = Arc::new(Barrier::new(staging.len()));
     let (sender, receiver) = mpsc::channel();
 
     std::thread::scope(|scope| {
-        for path in &staging {
+        for staging in &staging {
             let barrier = Arc::clone(&barrier);
             let sender = sender.clone();
             let destination = destination.clone();
             scope.spawn(move || {
                 barrier.wait();
                 sender
-                    .send(platform::publish_manifest_directory(path, &destination))
+                    .send(platform::publish_manifest_directory(staging, &destination))
                     .unwrap();
             });
         }
@@ -637,8 +649,47 @@ fn concurrent_native_directory_publishers_produce_exactly_one_winner() {
     );
     let winner = fs::read_to_string(destination.join("creator")).unwrap();
     assert!(winner == "0" || winner == "1");
-    assert!(!staging[winner.parse::<usize>().unwrap()].exists());
-    assert!(staging[1 - winner.parse::<usize>().unwrap()].is_dir());
+    assert!(!staging[winner.parse::<usize>().unwrap()].path().exists());
+    assert!(staging[1 - winner.parse::<usize>().unwrap()]
+        .path()
+        .is_dir());
+}
+
+#[cfg(unix)]
+#[test]
+fn private_staging_leaf_is_0700_at_creation_under_a_permissive_umask() {
+    const CHILD_ENV: &str = "STYRN_PRIVATE_STAGING_UMASK_CHILD";
+    if std::env::var_os(CHILD_ENV).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "private_staging_leaf_is_0700_at_creation_under_a_permissive_umask",
+                "--nocapture",
+            ])
+            .env(CHILD_ENV, "1")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "isolated umask child failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+
+    unsafe {
+        libc::umask(0);
+    }
+    let temp = TestDir::new();
+    let staging_path = temp.path().join("staging");
+    let staging = platform::create_private_manifest_staging_directory(
+        &staging_path,
+        platform::ManifestOwner::CurrentProcess,
+    )
+    .unwrap();
+
+    assert_eq!(fs::metadata(staging.path()).unwrap().mode() & 0o777, 0o700);
 }
 
 #[test]

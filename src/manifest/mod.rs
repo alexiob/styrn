@@ -856,18 +856,22 @@ impl MachineManifestStore {
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap_or("styrn");
-        let staging = parent.join(format!(".{leaf}.{}.tmp", Uuid::now_v7()));
-        fs::create_dir(&staging).map_err(ManifestError::Write)?;
+        let staging_path = parent.join(format!(".{leaf}.{}.tmp", Uuid::now_v7()));
+        let staging = platform::create_private_manifest_staging_directory(
+            &staging_path,
+            self.platform_owner(),
+        )
+        .map_err(ManifestError::Write)?;
 
         let operation = (|| {
-            self.harden_directory(&staging)?;
-            self.inject_directory_publication_race(&staging, destination)?;
+            self.harden_directory(staging.path())?;
+            self.inject_directory_publication_race(staging.path(), destination)?;
             platform::publish_manifest_directory(&staging, destination)
                 .map_err(ManifestError::Write)
         })();
         match operation {
             Ok(()) => Ok(()),
-            Err(operation) => match fs::remove_dir(&staging) {
+            Err(operation) => match fs::remove_dir(staging.path()) {
                 Ok(()) => Err(operation),
                 Err(cleanup) => Err(ManifestError::StagingDirectoryCleanup {
                     operation: Box::new(operation),

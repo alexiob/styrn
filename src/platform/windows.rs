@@ -58,6 +58,7 @@ enum AclKind {
     Manifest,
     Directory,
     Lock,
+    Staging,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -80,6 +81,13 @@ struct AclInspection {
     owner_is_administrators: bool,
     dacl_is_protected: bool,
     entries: Vec<AceInspection>,
+}
+
+#[repr(C)]
+struct SecurityAttributes {
+    length: u32,
+    security_descriptor: *mut c_void,
+    inherit_handle: i32,
 }
 
 #[link(name = "advapi32")]
@@ -147,9 +155,48 @@ unsafe extern "system" {
 unsafe extern "system" {
     fn LocalFree(memory: *mut c_void) -> *mut c_void;
     fn GetFileAttributesW(file_name: *const u16) -> u32;
+    fn CreateDirectoryW(
+        path_name: *const u16,
+        security_attributes: *const SecurityAttributes,
+    ) -> i32;
     fn MoveFileExW(existing: *const u16, replacement: *const u16, flags: u32) -> i32;
     #[cfg(test)]
     fn CloseHandle(handle: *mut c_void) -> i32;
+}
+
+pub(super) fn create_private_manifest_staging_directory(
+    path: &Path,
+    owner: ManifestOwner,
+) -> io::Result<()> {
+    if is_test_owner(owner) {
+        return std::fs::create_dir(path);
+    }
+
+    let wide_sddl = wide(&acl_sddl("unused", AclKind::Staging));
+    let mut descriptor = std::ptr::null_mut();
+    if unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            wide_sddl.as_ptr(),
+            1,
+            &mut descriptor,
+            std::ptr::null_mut(),
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    let descriptor = LocalAllocation(descriptor);
+    let attributes = SecurityAttributes {
+        length: std::mem::size_of::<SecurityAttributes>() as u32,
+        security_descriptor: descriptor.0,
+        inherit_handle: 0,
+    };
+    let path = wide_os(path);
+    if unsafe { CreateDirectoryW(path.as_ptr(), &attributes) } == 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
 }
 
 pub(crate) fn replace_file(temporary: &Path, destination: &Path) -> io::Result<()> {
@@ -411,7 +458,7 @@ fn acl_sddl(worker_sid: &str, kind: AclKind) -> String {
         AclKind::Directory => {
             format!("O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;{worker_sid})")
         }
-        AclKind::Lock => "O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)".to_owned(),
+        AclKind::Lock | AclKind::Staging => "O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)".to_owned(),
     }
 }
 
@@ -559,7 +606,7 @@ fn validate_acl_contract(inspection: &AclInspection, kind: AclKind) -> io::Resul
             flags: inherited_flags,
             allowed: true,
         }),
-        AclKind::Lock => {}
+        AclKind::Lock | AclKind::Staging => {}
     }
     if inspection.entries.len() != expected.len()
         || expected
@@ -762,6 +809,51 @@ mod tests {
             acl_sddl("S-1-5-21-1-2-3-1001", AclKind::Directory),
             "O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;0x1200a9;;;S-1-5-21-1-2-3-1001)"
         );
+        assert_eq!(
+            acl_sddl("S-1-5-21-1-2-3-1001", AclKind::Staging),
+            "O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)"
+        );
+    }
+
+    #[test]
+    fn private_staging_acl_rejects_worker_inheritance_and_unexpected_principals() {
+        let base = AclInspection {
+            owner_is_administrators: true,
+            dacl_is_protected: true,
+            entries: vec![
+                AceInspection {
+                    principal: Principal::System,
+                    mask: FILE_ALL_ACCESS,
+                    flags: 0,
+                    allowed: true,
+                },
+                AceInspection {
+                    principal: Principal::Administrators,
+                    mask: FILE_ALL_ACCESS,
+                    flags: 0,
+                    allowed: true,
+                },
+            ],
+        };
+        assert!(validate_acl_contract(&base, AclKind::Staging).is_ok());
+        for principal in [Principal::Worker, Principal::Unexpected] {
+            let mut entries = base.entries.clone();
+            entries.push(AceInspection {
+                principal,
+                mask: FILE_ALL_ACCESS,
+                flags: OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE,
+                allowed: true,
+            });
+            assert!(validate_acl_contract(
+                &AclInspection {
+                    owner_is_administrators: true,
+                    dacl_is_protected: true,
+                    entries,
+                },
+                AclKind::Staging,
+            )
+            .is_err());
+        }
     }
 
     #[test]

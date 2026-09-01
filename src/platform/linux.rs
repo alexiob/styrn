@@ -2,13 +2,21 @@ use super::ManifestOwner;
 use std::fs;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::OpenOptionsExt;
+use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
 
 #[allow(dead_code)]
 pub(crate) fn platform_name() -> &'static str {
     "linux"
+}
+
+pub(super) fn create_private_manifest_staging_directory(
+    path: &Path,
+    _owner: ManifestOwner,
+) -> io::Result<()> {
+    let mut builder = fs::DirBuilder::new();
+    builder.mode(0o700).create(path)
 }
 
 pub(super) fn harden_manifest_directory(
