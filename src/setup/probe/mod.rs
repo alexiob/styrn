@@ -1104,9 +1104,9 @@ mod tests {
     fn only_the_worker_probe_module_can_implement_worker_probe() {
         assert_fixture_fails(
             "sealed_worker_probe.rs",
-            &[FixtureExpectation::new(
+            &[FixtureExpectation::sealed_trait_bound(
                 "E0277",
-                "the trait bound `ControllerCheck: Sealed` is not satisfied",
+                "ControllerCheck",
                 13,
                 "unsatisfied trait bound",
             )],
@@ -1191,6 +1191,20 @@ mod tests {
     }
 
     #[test]
+    fn sealed_fixture_message_tolerates_only_trait_qualification() {
+        let expectation = FixtureMessage::UnsatisfiedSealedBound {
+            subject: "ControllerCheck",
+        };
+        assert!(expectation.matches(
+            "the trait bound `ControllerCheck: worker_probe_only::Sealed` is not satisfied"
+        ));
+        assert!(expectation.matches("the trait bound `ControllerCheck: Sealed` is not satisfied"));
+        assert!(!expectation
+            .matches("the trait bound `OtherCheck: worker_probe_only::Sealed` is not satisfied"));
+        assert!(!expectation.matches("the trait bound `ControllerCheck: Other` is not satisfied"));
+    }
+
+    #[test]
     fn fixture_artifact_cache_is_process_independent() {
         let cache = fixture_artifact_cache_dir();
         assert_eq!(cache, fixture_artifact_cache_dir());
@@ -1218,9 +1232,15 @@ mod tests {
     #[derive(Clone, Copy)]
     struct FixtureExpectation {
         code: &'static str,
-        message: &'static str,
+        message: FixtureMessage,
         line: u64,
         primary_label: &'static str,
+    }
+
+    #[derive(Clone, Copy)]
+    enum FixtureMessage {
+        Exact(&'static str),
+        UnsatisfiedSealedBound { subject: &'static str },
     }
 
     impl FixtureExpectation {
@@ -1232,9 +1252,44 @@ mod tests {
         ) -> Self {
             Self {
                 code,
-                message,
+                message: FixtureMessage::Exact(message),
                 line,
                 primary_label,
+            }
+        }
+
+        const fn sealed_trait_bound(
+            code: &'static str,
+            subject: &'static str,
+            line: u64,
+            primary_label: &'static str,
+        ) -> Self {
+            Self {
+                code,
+                message: FixtureMessage::UnsatisfiedSealedBound { subject },
+                line,
+                primary_label,
+            }
+        }
+    }
+
+    impl FixtureMessage {
+        fn matches(self, message: &str) -> bool {
+            match self {
+                Self::Exact(expected) => message == expected,
+                Self::UnsatisfiedSealedBound { subject } => {
+                    let Some(bound) = message
+                        .strip_prefix("the trait bound `")
+                        .and_then(|message| message.strip_suffix("` is not satisfied"))
+                    else {
+                        return false;
+                    };
+                    let Some((actual_subject, trait_path)) = bound.split_once(": ") else {
+                        return false;
+                    };
+                    actual_subject == subject
+                        && (trait_path == "Sealed" || trait_path.ends_with("::Sealed"))
+                }
             }
         }
     }
@@ -1311,7 +1366,9 @@ mod tests {
         for expectation in expectations {
             if !errors.iter().any(|diagnostic| {
                 diagnostic["code"]["code"] == expectation.code
-                    && diagnostic["message"] == expectation.message
+                    && diagnostic["message"]
+                        .as_str()
+                        .is_some_and(|message| expectation.message.matches(message))
                     && diagnostic["spans"].as_array().is_some_and(|spans| {
                         spans.iter().any(|span| {
                             span["is_primary"] == true
