@@ -1090,6 +1090,20 @@ mod tests {
         )
         .unwrap();
 
+        let swap_control = public.join(format!("styrn-staging-swap-control-{nonce}"));
+        std::fs::create_dir(&swap_control).unwrap();
+        apply_sddl(
+            &swap_control,
+            &format!("O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;{worker_sid})"),
+        )
+        .unwrap();
+        let control_destination = swap_control.join("destination");
+        let control_replacement = swap_control.join("replacement");
+        std::fs::create_dir(&control_destination).unwrap();
+        std::fs::create_dir(&control_replacement).unwrap();
+        let control_marker = control_replacement.join("replacement-marker");
+        std::fs::write(&control_marker, b"replacement reached").unwrap();
+
         let username = wide("styrn");
         let domain = wide(".");
         let mut password = wide(&password);
@@ -1119,6 +1133,15 @@ mod tests {
         let worker_control = replacement.join("worker-control");
         std::fs::write(&worker_control, b"worker-controlled")
             .expect("worker cannot exercise the directory-create control");
+        let control_swap =
+            attempt_delete_then_rename_directory_swap(&control_replacement, &control_destination);
+        assert!(
+            matches!(
+                &control_swap,
+                DirectorySwapOutcome::SourceRenamedIntoDestination
+            ),
+            "worker-writable delete-then-rename control did not complete: {control_swap:?}"
+        );
 
         assert_access_denied_for("open staging directory", open_directory_for_read(&staging));
         assert_access_denied_for("list staging directory", std::fs::read_dir(&staging));
@@ -1131,19 +1154,36 @@ mod tests {
             std::fs::rename(&staging, parent.join("renamed")),
         );
         assert_access_denied_for("delete staging directory", std::fs::remove_dir(&staging));
-        assert_access_denied_for(
-            "replace staging directory",
-            replace_directory(&replacement, &staging),
-        );
+        match attempt_delete_then_rename_directory_swap(&replacement, &staging) {
+            DirectorySwapOutcome::Blocked { step, error } => {
+                assert_eq!(step, DirectorySwapStep::DeleteDestination);
+                assert_eq!(
+                    error.kind(),
+                    io::ErrorKind::PermissionDenied,
+                    "delete-then-rename staging swap failed unexpectedly: {error}"
+                );
+            }
+            DirectorySwapOutcome::SourceRenamedIntoDestination => {
+                panic!("worker completed a delete-then-rename staging swap")
+            }
+        }
 
         drop(impersonation);
         assert!(
             staging.is_dir(),
-            "replacement removed the protected staging directory"
+            "delete-then-rename attempt removed the protected staging directory"
         );
         assert!(
             replacement.is_dir(),
-            "replacement source moved despite the denied replacement"
+            "replacement source moved despite the denied destination-delete step"
+        );
+        assert!(
+            !control_replacement.exists(),
+            "worker-writable control did not move its replacement source"
+        );
+        assert!(
+            control_destination.join("replacement-marker").is_file(),
+            "worker-writable control did not complete its replacement rename"
         );
         assert!(!staging.join("worker-created").exists());
         assert!(!parent.join("renamed").exists());
@@ -1152,6 +1192,9 @@ mod tests {
         std::fs::remove_dir(parent).unwrap();
         std::fs::remove_file(worker_control).unwrap();
         std::fs::remove_dir(replacement).unwrap();
+        std::fs::remove_file(control_destination.join("replacement-marker")).unwrap();
+        std::fs::remove_dir(control_destination).unwrap();
+        std::fs::remove_dir(swap_control).unwrap();
     }
 
     fn assert_access_denied<T: std::fmt::Debug>(result: io::Result<T>) {
@@ -1170,9 +1213,38 @@ mod tests {
         );
     }
 
-    fn replace_directory(replacement: &Path, destination: &Path) -> io::Result<()> {
-        std::fs::remove_dir(destination)?;
-        std::fs::rename(replacement, destination)
+    #[derive(Debug)]
+    enum DirectorySwapOutcome {
+        SourceRenamedIntoDestination,
+        Blocked {
+            step: DirectorySwapStep,
+            error: io::Error,
+        },
+    }
+
+    #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+    enum DirectorySwapStep {
+        DeleteDestination,
+        RenameSourceIntoDestination,
+    }
+
+    fn attempt_delete_then_rename_directory_swap(
+        source: &Path,
+        destination: &Path,
+    ) -> DirectorySwapOutcome {
+        if let Err(error) = std::fs::remove_dir(destination) {
+            return DirectorySwapOutcome::Blocked {
+                step: DirectorySwapStep::DeleteDestination,
+                error,
+            };
+        }
+        if let Err(error) = std::fs::rename(source, destination) {
+            return DirectorySwapOutcome::Blocked {
+                step: DirectorySwapStep::RenameSourceIntoDestination,
+                error,
+            };
+        }
+        DirectorySwapOutcome::SourceRenamedIntoDestination
     }
 
     fn open_directory_for_read(path: &Path) -> io::Result<()> {
