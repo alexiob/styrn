@@ -442,9 +442,13 @@ fn next_marker_word(tokens: &[LexToken<'_>], start: usize) -> Option<usize> {
 fn marker_value_after(tokens: &[LexToken<'_>], start: usize) -> Option<usize> {
     for (index, token) in tokens.iter().enumerate().skip(start + 1) {
         match token {
-            LexToken::Gap | LexToken::Wrapper | LexToken::Joiner | LexToken::Separator => continue,
+            LexToken::Gap
+            | LexToken::Wrapper
+            | LexToken::Joiner
+            | LexToken::FamilyJoiner
+            | LexToken::Separator => continue,
             LexToken::Word(_) => return Some(index),
-            LexToken::Boundary | LexToken::FamilyJoiner => return None,
+            LexToken::Boundary => return None,
         }
     }
     None
@@ -465,6 +469,8 @@ const SAFE_MARKER_NOUNS: &[&str] = &[
     "refresh",
     "rotation",
     "permissions",
+    "file",
+    "policy",
 ];
 
 const COPULAS: &[&str] = &["is", "are", "was", "were", "be", "been", "being"];
@@ -499,7 +505,8 @@ fn is_safe_marker_prose(tokens: &[LexToken<'_>], value_index: usize) -> bool {
             return false;
         }
         let Some(next) = next_context_word(tokens, current + 1) else {
-            return clause_ends_after(tokens, current + 1);
+            return separator_status_clause(tokens, current + 1)
+                .unwrap_or_else(|| clause_ends_after(tokens, current + 1));
         };
         let LexToken::Word(next_word) = tokens[next] else {
             return false;
@@ -526,12 +533,70 @@ fn next_context_word(tokens: &[LexToken<'_>], start: usize) -> Option<usize> {
 }
 
 fn clause_ends_after(tokens: &[LexToken<'_>], start: usize) -> bool {
-    tokens.iter().skip(start).all(|token| {
-        matches!(
-            token,
-            LexToken::Gap | LexToken::Boundary | LexToken::FamilyJoiner
-        )
-    })
+    let mut index = start;
+    while let Some(token) = tokens.get(index) {
+        match token {
+            LexToken::Gap | LexToken::Boundary | LexToken::FamilyJoiner | LexToken::Joiner => {
+                index += 1;
+            }
+            LexToken::Wrapper => {
+                index += 1;
+                let mut has_qualifier = false;
+                while let Some(qualifier) = tokens.get(index) {
+                    match qualifier {
+                        LexToken::Gap => index += 1,
+                        LexToken::Word(word)
+                            if matches!(
+                                normalized_word(word).as_str(),
+                                "managed"
+                                    | "system"
+                                    | "default"
+                                    | "local"
+                                    | "remote"
+                                    | "configured"
+                                    | "required"
+                                    | "optional"
+                            ) =>
+                        {
+                            has_qualifier = true;
+                            index += 1;
+                        }
+                        LexToken::Wrapper if has_qualifier => {
+                            index += 1;
+                            break;
+                        }
+                        _ => return false,
+                    }
+                }
+                if !has_qualifier {
+                    return false;
+                }
+            }
+            LexToken::Separator | LexToken::Word(_) => return false,
+        }
+    }
+    true
+}
+
+fn separator_status_clause(tokens: &[LexToken<'_>], start: usize) -> Option<bool> {
+    let mut index = start;
+    while matches!(tokens.get(index), Some(LexToken::Gap)) {
+        index += 1;
+    }
+    if !matches!(tokens.get(index), Some(LexToken::Separator)) {
+        return None;
+    }
+    index += 1;
+    while matches!(tokens.get(index), Some(LexToken::Gap)) {
+        index += 1;
+    }
+    let LexToken::Word(predicate) = tokens.get(index)? else {
+        return Some(false);
+    };
+    Some(
+        STATUS_PREDICATES.contains(&normalized_word(predicate).as_str())
+            && clause_ends_after(tokens, index + 1),
+    )
 }
 
 fn contains_credential_prefix(value: &str) -> bool {
@@ -550,14 +615,19 @@ fn contains_credential_prefix(value: &str) -> bool {
     .iter()
     .any(|prefix| {
         lowercase.match_indices(prefix).any(|(start, _)| {
-            lowercase[start + prefix.len()..]
+            let left_boundary = lowercase[..start]
                 .chars()
-                .take_while(|character| {
-                    character.is_ascii_alphanumeric() || matches!(character, '-' | '_')
-                })
-                .take(4)
-                .count()
-                == 4
+                .next_back()
+                .is_none_or(|character| !character.is_ascii_alphanumeric());
+            left_boundary
+                && lowercase[start + prefix.len()..]
+                    .chars()
+                    .take_while(|character| {
+                        character.is_ascii_alphanumeric() || matches!(character, '-' | '_')
+                    })
+                    .take(4)
+                    .count()
+                    == 4
         })
     })
 }
@@ -702,6 +772,10 @@ mod tests {
             "https://host/path?token=abc123",
             "token-abc123",
             "private_key_abc123",
+            "token.value",
+            "password.hunter2",
+            "api.key.abc123",
+            "private.key.hunter2",
         ] {
             assert!(contains_sensitive_marker_value(value), "{value:?}");
         }
@@ -723,6 +797,11 @@ mod tests {
             "Token refresh service is healthy.",
             "API key rotation is enabled.",
             "Private key permissions status is healthy.",
+            "Token status: absent.",
+            "Private key file is absent.",
+            "Password policy is enabled.",
+            "Token status is absent!",
+            "Token status is absent (managed).",
         ] {
             assert!(!contains_sensitive_marker_value(value), "{value:?}");
         }
@@ -751,6 +830,14 @@ mod tests {
             "prefix/ghp_do-not-leak",
         ] {
             assert!(contains_credential_prefix(value), "{value:?}");
+        }
+        for value in [
+            "task_worker",
+            "task_status",
+            "flask_service",
+            "mask_enabled",
+        ] {
+            assert!(!contains_credential_prefix(value), "{value:?}");
         }
     }
 

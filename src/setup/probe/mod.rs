@@ -846,6 +846,22 @@ mod tests {
                 is_secret: true,
             },
             CredentialCase {
+                value: "token.value",
+                is_secret: true,
+            },
+            CredentialCase {
+                value: "password.hunter2",
+                is_secret: true,
+            },
+            CredentialCase {
+                value: "api.key.abc123",
+                is_secret: true,
+            },
+            CredentialCase {
+                value: "private.key.hunter2",
+                is_secret: true,
+            },
+            CredentialCase {
                 value: "sk_live_do-not-leak",
                 is_secret: true,
             },
@@ -1019,6 +1035,42 @@ mod tests {
             },
             CredentialCase {
                 value: "Private key permissions status is healthy.",
+                is_secret: false,
+            },
+            CredentialCase {
+                value: "Token status: absent.",
+                is_secret: false,
+            },
+            CredentialCase {
+                value: "Private key file is absent.",
+                is_secret: false,
+            },
+            CredentialCase {
+                value: "Password policy is enabled.",
+                is_secret: false,
+            },
+            CredentialCase {
+                value: "Token status is absent!",
+                is_secret: false,
+            },
+            CredentialCase {
+                value: "Token status is absent (managed).",
+                is_secret: false,
+            },
+            CredentialCase {
+                value: "task_worker",
+                is_secret: false,
+            },
+            CredentialCase {
+                value: "task_status",
+                is_secret: false,
+            },
+            CredentialCase {
+                value: "flask_service",
+                is_secret: false,
+            },
+            CredentialCase {
+                value: "mask_enabled",
                 is_secret: false,
             },
             CredentialCase {
