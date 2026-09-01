@@ -54,6 +54,136 @@ fn checked_in_examples_parse_validate_and_round_trip_without_losing_fields() {
 }
 
 #[test]
+fn guarded_serialization_rejects_secret_named_dynamic_entries() {
+    let valid = fs::read_to_string("examples/machine.controller-worker.toml").unwrap();
+    let cases = [
+        ("capabilities", "private_key"),
+        ("agents", "PRIVATE.KEY"),
+        ("toolchains", "api-key"),
+        ("caches", "AUTH_KEY"),
+        ("agents", "tailscale-auth-key"),
+        ("toolchains", "token"),
+        ("caches", "ACCESS.TOKEN"),
+        ("agents", "password"),
+        ("toolchains", "passphrase"),
+        ("caches", "secret"),
+        ("agents", "identity"),
+    ];
+
+    for (section, key) in cases {
+        let mut manifest = MachineManifest::parse_toml(&valid).unwrap();
+        match section {
+            "capabilities" => {
+                manifest
+                    .capabilities
+                    .as_mut()
+                    .unwrap()
+                    .insert(key.to_owned(), true);
+            }
+            "agents" => {
+                manifest.agents.as_mut().unwrap().insert(
+                    key.to_owned(),
+                    manifest::Agent {
+                        installed: Some(true),
+                        command: None,
+                        sandbox: None,
+                        shell: None,
+                    },
+                );
+            }
+            "toolchains" => {
+                manifest.toolchains.as_mut().unwrap().insert(
+                    key.to_owned(),
+                    manifest::Toolchain {
+                        installed: Some(true),
+                        host: None,
+                        version: None,
+                    },
+                );
+            }
+            "caches" => {
+                manifest.caches.as_mut().unwrap().insert(
+                    key.to_owned(),
+                    manifest::Cache {
+                        installed: Some(true),
+                        max_bytes: None,
+                    },
+                );
+            }
+            _ => unreachable!(),
+        }
+        for result in [
+            manifest.to_toml().map(|_| ()),
+            manifest.to_json_value().map(|_| ()),
+        ] {
+            let error = result.expect_err("{section}.{key} must not serialize");
+            let rendered = error.to_string();
+            assert!(rendered.contains(section), "{rendered}");
+            assert!(rendered.contains(key), "{rendered}");
+        }
+    }
+}
+
+#[test]
+fn guarded_serialization_rejects_private_key_and_jwt_values_without_echoing_them() {
+    let valid = fs::read_to_string("examples/machine.toml").unwrap();
+    let cases = [
+        "-----BEGIN PRIVATE KEY-----",
+        "  -----begin private key-----",
+        "-----BEGIN RSA PRIVATE KEY-----",
+        "-----BEGIN EC PRIVATE KEY-----",
+        "-----BEGIN DSA PRIVATE KEY-----",
+        "-----BEGIN OPENSSH PRIVATE KEY-----",
+        "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJzdHlybiIsInJvbGUiOiJ3b3JrZXIifQ.signaturesegmentwithenoughbase64urlchars123",
+    ];
+
+    for value in cases {
+        let mut manifest = MachineManifest::parse_toml(&valid).unwrap();
+        manifest
+            .agents
+            .as_mut()
+            .unwrap()
+            .get_mut("codex")
+            .unwrap()
+            .sandbox = Some(value.to_owned());
+        for result in [
+            manifest.to_toml().map(|_| ()),
+            manifest.to_json_value().map(|_| ()),
+        ] {
+            let error = result.expect_err("secret-shaped value must not serialize");
+            let rendered = error.to_string();
+            assert!(rendered.contains("agents.codex.sandbox"), "{rendered}");
+            assert!(!rendered.contains(value), "{rendered}");
+        }
+    }
+}
+
+#[test]
+fn guarded_serialization_allows_public_and_non_secret_near_misses() {
+    let valid = fs::read_to_string("examples/machine.toml").unwrap();
+    let cases = [
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGenuinePublicKeyMaterial user@host",
+        "-----BEGIN PUBLIC KEY-----",
+        "api.styrn.dev",
+        "1.2.3",
+        "tokenizer",
+        "public_key_auth",
+        "VGhpcy1pcy1sb25nLWJ1dC1iZW5pZ24tYmFzZTY0LWxpa2UtdGV4dC13aXRob3V0LWRvdHM",
+    ];
+
+    for value in cases {
+        let manifest = MachineManifest::parse_toml(&valid.replacen(
+            "sandbox = \"elevated\"",
+            &format!("sandbox = \"{value}\""),
+            1,
+        ))
+        .unwrap();
+        assert!(manifest.to_toml().is_ok(), "{value}");
+        assert!(manifest.to_json_value().is_ok(), "{value}");
+    }
+}
+
+#[test]
 fn manifest_rejects_hand_authored_invalid_contract_cases() {
     let valid = fs::read_to_string("examples/machine.toml").unwrap();
     let cases = [
@@ -158,6 +288,98 @@ fn generated_write_mints_once_and_preserves_identity_across_updates() {
     assert!(!stored.machine_id_minted);
     assert_eq!(stored.manifest.machine_id, first);
     assert_eq!(stored.manifest.name, "renamed-worker");
+}
+
+#[test]
+fn complete_legitimate_manifest_round_trips_and_persists_without_false_positives() {
+    let mut manifest = MachineManifest::parse_toml(
+        &fs::read_to_string("examples/machine.controller-worker.toml").unwrap(),
+    )
+    .unwrap();
+    let codex = manifest.agents.as_mut().unwrap().get_mut("codex").unwrap();
+    codex.command = Some("codex --ask-for-approval never".to_owned());
+    codex.sandbox = Some("workspace-write".to_owned());
+    codex.shell = Some("zsh".to_owned());
+    manifest.pending_actions = Some(vec![manifest::PendingAction {
+        id: "first-login".to_owned(),
+        severity: manifest::PendingSeverity::Info,
+        message: "Complete the first interactive login.".to_owned(),
+    }]);
+
+    manifest.validate().unwrap();
+    let canonical_toml = manifest.to_toml().unwrap();
+    assert_eq!(
+        MachineManifest::parse_toml(&canonical_toml)
+            .unwrap()
+            .to_json_value()
+            .unwrap(),
+        manifest.to_json_value().unwrap()
+    );
+
+    let temp = TestDir::new();
+    let store = MachineManifestStore::new(temp.path().join("machine.toml"));
+    let machine_id = store
+        .write_generated(&manifest.clone().without_machine_id())
+        .unwrap();
+    manifest.machine_id = machine_id;
+    assert_eq!(
+        store
+            .read_or_repair()
+            .unwrap()
+            .manifest
+            .to_json_value()
+            .unwrap(),
+        manifest.to_json_value().unwrap()
+    );
+}
+
+#[test]
+fn secret_bearing_generated_writes_preserve_destinations_and_leave_no_temporary_files() {
+    let temp = TestDir::new();
+    let path = temp.path().join("machine.toml");
+    let store = MachineManifestStore::new(&path);
+    let mut secret_draft =
+        MachineManifest::parse_toml(&fs::read_to_string("examples/machine.toml").unwrap())
+            .unwrap()
+            .without_machine_id();
+    secret_draft
+        .agents
+        .as_mut()
+        .unwrap()
+        .get_mut("codex")
+        .unwrap()
+        .command = Some("-----BEGIN PRIVATE KEY-----".to_owned());
+
+    assert!(store.write_generated(&secret_draft).is_err());
+    assert!(!path.exists());
+    assert_no_manifest_temporaries(temp.path());
+
+    let original = fs::read("examples/machine.toml").unwrap();
+    fs::write(&path, &original).unwrap();
+    assert!(store.write_generated(&secret_draft).is_err());
+    assert_eq!(fs::read(&path).unwrap(), original);
+    assert_no_manifest_temporaries(temp.path());
+}
+
+#[test]
+fn secret_bearing_legacy_manifest_does_not_self_heal_or_rewrite() {
+    let temp = TestDir::new();
+    let path = temp.path().join("machine.toml");
+    let secret_legacy = remove_line(
+        &fs::read_to_string("examples/machine.toml")
+            .unwrap()
+            .replacen(
+                "sandbox = \"elevated\"",
+                "sandbox = \"-----BEGIN OPENSSH PRIVATE KEY-----\"",
+                1,
+            ),
+        "machine_id =",
+    );
+    fs::write(&path, &secret_legacy).unwrap();
+
+    assert!(MachineManifestStore::new(&path).read_or_repair().is_err());
+    assert_eq!(fs::read_to_string(&path).unwrap(), secret_legacy);
+    assert_no_manifest_temporaries(temp.path());
 }
 
 #[test]
@@ -297,4 +519,14 @@ fn replace_line(input: &str, starts_with: &str, replacement: &str) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+fn assert_no_manifest_temporaries(directory: &Path) {
+    assert!(
+        fs::read_dir(directory)
+            .unwrap()
+            .map(Result::unwrap)
+            .all(|entry| !entry.file_name().to_string_lossy().contains(".tmp")),
+        "secret rejection must not leave a temporary manifest"
+    );
 }

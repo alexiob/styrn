@@ -93,6 +93,33 @@ fn init_repairs_an_existing_stage_zero_manifest_but_never_invents_one() {
     assert!(!absent_dir.path().join("machine.toml").exists());
 }
 
+#[test]
+fn secret_bearing_manifest_fails_as_a_typed_json_error_without_leaking_or_rewriting() {
+    let temp = TestDir::new();
+    let secret = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJzdHlybiIsInJvbGUiOiJ3b3JrZXIifQ.signaturesegmentwithenoughbase64urlchars123";
+    let original = fs::read_to_string("examples/machine.toml")
+        .unwrap()
+        .replacen(
+            "sandbox = \"elevated\"",
+            &format!("sandbox = \"{secret}\""),
+            1,
+        );
+    let path = temp.path().join("machine.toml");
+    fs::write(&path, &original).unwrap();
+
+    let output = run(temp.path(), &["machine", "manifest", "--json"]);
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    let json = exactly_one_json(&output.stdout);
+    assert_schema_valid(&json);
+    assert_eq!(json["ok"], false);
+    assert_eq!(json["data"], Value::Null);
+    assert_eq!(json["errors"].as_array().unwrap().len(), 1);
+    assert_eq!(json["errors"][0]["code"], "machine.manifest_invalid");
+    assert!(!String::from_utf8_lossy(&output.stdout).contains(secret));
+    assert!(!String::from_utf8_lossy(&output.stderr).contains(secret));
+    assert_eq!(fs::read_to_string(path).unwrap(), original);
+}
+
 fn run(config_dir: &Path, arguments: &[&str]) -> Output {
     Command::new(env!("CARGO_BIN_EXE_styrn"))
         .args(arguments)

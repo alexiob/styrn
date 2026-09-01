@@ -9,7 +9,7 @@ use std::path::PathBuf;
 use thiserror::Error;
 use uuid::Uuid;
 
-#[derive(Clone, Debug, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct MachineManifest {
     pub(crate) schema_version: u64,
@@ -48,6 +48,46 @@ pub(crate) struct MachineManifest {
     pub(crate) desktop: Option<Desktop>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) pending_actions: Option<Vec<PendingAction>>,
+}
+
+#[derive(Serialize)]
+struct MachineManifestWire<'a> {
+    schema_version: u64,
+    machine_id: Uuid,
+    name: &'a str,
+    roles: &'a [MachineRole],
+    platform: &'a Platform,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    transport: &'a Option<Transport>,
+    paths: &'a Paths,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    controller: &'a Option<Controller>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    worker: &'a Option<Worker>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    resources: &'a Option<Resources>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    capabilities: &'a Option<BTreeMap<String, bool>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    scheduling: &'a Option<Scheduling>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tailscale: &'a Option<Tailscale>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ssh: &'a Option<Ssh>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    herdr: &'a Option<Herdr>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agents: &'a Option<BTreeMap<String, Agent>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    toolchains: &'a Option<BTreeMap<String, Toolchain>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    caches: &'a Option<BTreeMap<String, Cache>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    install: &'a Option<Install>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    desktop: &'a Option<Desktop>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pending_actions: &'a Option<Vec<PendingAction>>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -257,22 +297,61 @@ impl MachineManifest {
                 non_empty("pending_actions.message", &action.message)?;
             }
         }
+        self.ensure_secret_free()?;
         Ok(())
     }
 
     pub(crate) fn to_json_value(&self) -> Result<Value, ManifestError> {
-        let mut value = serde_json::to_value(self).map_err(ManifestError::Json)?;
+        let mut value = self.wire_value()?;
+        scan_secret_free(&value, "$")?;
         prune_nulls(&mut value);
         Ok(value)
     }
 
     pub(crate) fn to_toml(&self) -> Result<String, ManifestError> {
-        toml::to_string_pretty(self).map_err(ManifestError::TomlSerialize)
+        let wire = self.wire();
+        let value = serde_json::to_value(&wire).map_err(ManifestError::Json)?;
+        scan_secret_free(&value, "$")?;
+        toml::to_string_pretty(&wire).map_err(ManifestError::TomlSerialize)
     }
 
     #[allow(dead_code)] // Generated writes intentionally accept identity-free data only.
     pub(crate) fn without_machine_id(self) -> MachineManifestDraft {
         MachineManifestDraft::from(self)
+    }
+
+    fn wire(&self) -> MachineManifestWire<'_> {
+        MachineManifestWire {
+            schema_version: self.schema_version,
+            machine_id: self.machine_id,
+            name: &self.name,
+            roles: &self.roles,
+            platform: &self.platform,
+            transport: &self.transport,
+            paths: &self.paths,
+            controller: &self.controller,
+            worker: &self.worker,
+            resources: &self.resources,
+            capabilities: &self.capabilities,
+            scheduling: &self.scheduling,
+            tailscale: &self.tailscale,
+            ssh: &self.ssh,
+            herdr: &self.herdr,
+            agents: &self.agents,
+            toolchains: &self.toolchains,
+            caches: &self.caches,
+            install: &self.install,
+            desktop: &self.desktop,
+            pending_actions: &self.pending_actions,
+        }
+    }
+
+    fn wire_value(&self) -> Result<Value, ManifestError> {
+        serde_json::to_value(self.wire()).map_err(ManifestError::Json)
+    }
+
+    fn ensure_secret_free(&self) -> Result<(), ManifestError> {
+        scan_secret_free(&self.wire_value()?, "$")
     }
 }
 
@@ -567,6 +646,102 @@ fn prune_nulls(value: &mut Value) {
     }
 }
 
+fn scan_secret_free(value: &Value, path: &str) -> Result<(), ManifestError> {
+    match value {
+        Value::Array(values) => {
+            for (index, value) in values.iter().enumerate() {
+                scan_secret_free(value, &format!("{path}[{index}]"))?;
+            }
+        }
+        Value::Object(values) => {
+            for (key, value) in values {
+                let field_path = json_field_path(path, key);
+                if is_forbidden_secret_name(key) {
+                    return Err(ManifestError::Secret {
+                        path: field_path,
+                        reason: "forbidden secret-bearing field name",
+                    });
+                }
+                scan_secret_free(value, &field_path)?;
+            }
+        }
+        Value::String(value) => {
+            if is_private_key(value) {
+                return Err(ManifestError::Secret {
+                    path: path.to_owned(),
+                    reason: "private key material",
+                });
+            }
+            if is_compact_jwt(value) {
+                return Err(ManifestError::Secret {
+                    path: path.to_owned(),
+                    reason: "JWT-shaped credential",
+                });
+            }
+        }
+        _ => {}
+    }
+    Ok(())
+}
+
+fn json_field_path(parent: &str, key: &str) -> String {
+    if key
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+    {
+        format!("{parent}.{key}")
+    } else {
+        format!(
+            "{parent}[{}]",
+            serde_json::to_string(key).expect("string serializes")
+        )
+    }
+}
+
+fn is_forbidden_secret_name(key: &str) -> bool {
+    matches!(
+        key.bytes()
+            .filter(|byte| !matches!(byte, b'_' | b'-' | b'.'))
+            .map(char::from)
+            .flat_map(char::to_lowercase)
+            .collect::<String>()
+            .as_str(),
+        "privatekey"
+            | "apikey"
+            | "authkey"
+            | "tailscaleauthkey"
+            | "token"
+            | "accesstoken"
+            | "password"
+            | "passphrase"
+            | "secret"
+            | "identity"
+    )
+}
+
+fn is_private_key(value: &str) -> bool {
+    matches!(
+        value.trim_start().to_ascii_uppercase().as_str(),
+        marker if marker.starts_with("-----BEGIN PRIVATE KEY-----")
+            || marker.starts_with("-----BEGIN RSA PRIVATE KEY-----")
+            || marker.starts_with("-----BEGIN EC PRIVATE KEY-----")
+            || marker.starts_with("-----BEGIN DSA PRIVATE KEY-----")
+            || marker.starts_with("-----BEGIN OPENSSH PRIVATE KEY-----")
+    )
+}
+
+fn is_compact_jwt(value: &str) -> bool {
+    let segments: Vec<_> = value.split('.').collect();
+    segments.len() == 3
+        && segments[0].starts_with("eyJ")
+        && segments.iter().all(|segment| {
+            segment.len() >= 12
+                && segment
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        })
+}
+
 #[derive(Debug, Error)]
 pub(crate) enum ManifestError {
     #[error("could not parse machine manifest: {0}")]
@@ -579,6 +754,8 @@ pub(crate) enum ManifestError {
     Read(std::io::Error),
     #[error("could not write machine manifest: {0}")]
     Write(std::io::Error),
+    #[error("manifest secret rejected at {path}: {reason}")]
+    Secret { path: String, reason: &'static str },
     #[error("invalid machine manifest: {0}")]
     Validation(String),
 }
