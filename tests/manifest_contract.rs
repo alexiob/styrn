@@ -368,9 +368,9 @@ fn generated_write_rejects_preexisting_fifo_and_directory_targets_without_blocki
 }
 
 #[test]
-fn invalid_system_destination_is_rejected_before_creating_or_hardening_it() {
+fn lexically_non_normalized_system_destination_is_rejected_without_mutation() {
     let temp = TestDir::new();
-    let invalid_directory = temp.path().join("not-styrn");
+    let invalid_directory = temp.path().join("unused").join("..").join("custom-config");
     let path = invalid_directory.join("machine.toml");
     let draft = MachineManifest::parse_toml(&fs::read_to_string("examples/machine.toml").unwrap())
         .unwrap()
@@ -379,7 +379,111 @@ fn invalid_system_destination_is_rejected_before_creating_or_hardening_it() {
     assert!(MachineManifestStore::new(&path)
         .write_generated(&draft)
         .is_err());
-    assert!(!invalid_directory.exists());
+    assert!(!temp.path().join("unused").exists());
+    assert!(!temp.path().join("custom-config").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn broad_existing_system_directories_are_rejected_without_metadata_mutation() {
+    let draft = MachineManifest::parse_toml(&fs::read_to_string("examples/machine.toml").unwrap())
+        .unwrap()
+        .without_machine_id();
+    let broad_directories = [
+        Path::new("/etc"),
+        #[cfg(target_os = "macos")]
+        Path::new("/Library/Application Support"),
+    ];
+
+    for directory in broad_directories {
+        let before = fs::symlink_metadata(directory).unwrap();
+        let before_signature = (
+            before.file_type().is_symlink(),
+            before.uid(),
+            before.gid(),
+            before.mode(),
+        );
+
+        assert!(MachineManifestStore::new(directory.join("machine.toml"))
+            .write_generated(&draft)
+            .is_err());
+
+        let after = fs::symlink_metadata(directory).unwrap();
+        assert_eq!(
+            (
+                after.file_type().is_symlink(),
+                after.uid(),
+                after.gid(),
+                after.mode(),
+            ),
+            before_signature,
+            "{} metadata changed",
+            directory.display()
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn system_destination_rejects_a_symlinked_existing_parent_before_creating_the_leaf() {
+    let temp = TestDir::new();
+    let real_parent = temp.path().join("real-parent");
+    let linked_parent = temp.path().join("linked-parent");
+    fs::create_dir(&real_parent).unwrap();
+    std::os::unix::fs::symlink(&real_parent, &linked_parent).unwrap();
+    let path = linked_parent.join("styrn").join("machine.toml");
+    let draft = MachineManifest::parse_toml(&fs::read_to_string("examples/machine.toml").unwrap())
+        .unwrap()
+        .without_machine_id();
+
+    assert!(MachineManifestStore::new(&path)
+        .write_generated(&draft)
+        .is_err());
+    assert!(!real_parent.join("styrn").exists());
+    assert!(fs::symlink_metadata(linked_parent)
+        .unwrap()
+        .file_type()
+        .is_symlink());
+}
+
+#[cfg(unix)]
+#[test]
+fn system_destination_rejects_a_worker_owned_read_only_parent_without_creating_the_leaf() {
+    let temp = TestDir::new();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o555)).unwrap();
+    let path = temp.path().join("custom-config").join("machine.toml");
+    let draft = MachineManifest::parse_toml(&fs::read_to_string("examples/machine.toml").unwrap())
+        .unwrap()
+        .without_machine_id();
+
+    assert!(
+        MachineManifestStore::new_for_test_with_worker_owned_parent(&path)
+            .write_generated(&draft)
+            .is_err()
+    );
+    assert!(!temp.path().join("custom-config").exists());
+    assert_eq!(fs::metadata(temp.path()).unwrap().mode() & 0o777, 0o555);
+
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn existing_override_directory_must_already_be_secure_and_is_never_hardened() {
+    let temp = TestDir::new();
+    let directory = temp.path().join("custom-config");
+    fs::create_dir(&directory).unwrap();
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o777)).unwrap();
+    let path = directory.join("machine.toml");
+    let draft = MachineManifest::parse_toml(&fs::read_to_string("examples/machine.toml").unwrap())
+        .unwrap()
+        .without_machine_id();
+
+    assert!(MachineManifestStore::new_override_for_test(&path)
+        .write_generated(&draft)
+        .is_err());
+    assert_eq!(fs::metadata(&directory).unwrap().mode() & 0o777, 0o777);
+    assert!(!path.exists());
 }
 
 #[test]
@@ -491,17 +595,39 @@ fn complete_manifest_read_rejects_insecure_file_directory_and_symlink() {
 
 #[cfg(unix)]
 #[test]
-fn valid_id_reconciliation_repairs_security_before_reporting_success() {
+fn valid_id_reconciliation_rejects_insecure_input_without_rewriting_it() {
     let temp = TestDir::new();
     let path = temp.path().join("machine.toml");
-    fs::write(&path, fs::read("examples/machine.toml").unwrap()).unwrap();
+    let original = fs::read("examples/machine.toml").unwrap();
+    fs::write(&path, &original).unwrap();
     fs::set_permissions(&path, fs::Permissions::from_mode(0o666)).unwrap();
 
-    MachineManifestStore::new_for_test(&path)
+    assert!(MachineManifestStore::new_for_test(&path)
         .reconcile()
-        .unwrap();
+        .is_err());
 
-    assert_eq!(fs::metadata(path).unwrap().mode() & 0o777, 0o644);
+    assert_eq!(fs::read(&path).unwrap(), original);
+    assert_eq!(fs::metadata(path).unwrap().mode() & 0o777, 0o666);
+}
+
+#[cfg(unix)]
+#[test]
+fn generated_write_rejects_an_insecure_existing_manifest_without_preserving_its_identity() {
+    let temp = TestDir::new();
+    let path = temp.path().join("machine.toml");
+    let original = fs::read("examples/machine.toml").unwrap();
+    fs::write(&path, &original).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o666)).unwrap();
+    let mut draft = MachineManifest::parse_toml(&String::from_utf8(original.clone()).unwrap())
+        .unwrap()
+        .without_machine_id();
+    draft.name = "must-not-be-written".to_owned();
+
+    assert!(MachineManifestStore::new_for_test(&path)
+        .write_generated(&draft)
+        .is_err());
+    assert_eq!(fs::read(&path).unwrap(), original);
+    assert_eq!(fs::metadata(path).unwrap().mode() & 0o777, 0o666);
 }
 
 #[cfg(unix)]

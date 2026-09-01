@@ -48,7 +48,7 @@ fn run(parsed: cli::ParsedCli) {
         cli::MachineAction::Manifest => "machine manifest",
         cli::MachineAction::Init => "machine init",
     };
-    let store = manifest::MachineManifestStore::new(manifest::configured_manifest_path());
+    let store = manifest::configured_manifest_store();
     let result = match action {
         cli::MachineAction::Manifest => store.read(),
         cli::MachineAction::Init => store.reconcile(),

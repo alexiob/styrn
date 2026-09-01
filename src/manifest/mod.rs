@@ -451,6 +451,14 @@ pub(crate) struct MachineManifestStore {
     path: PathBuf,
     trusted_root: PathBuf,
     security: ManifestSecurity,
+    destination_origin: DestinationOrigin,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum DestinationOrigin {
+    Canonical,
+    Override,
+    Test,
 }
 
 #[allow(dead_code)] // Test-only policies are unused by the binary test harness itself.
@@ -463,13 +471,11 @@ enum ManifestSecurity {
     FailBeforeReplace,
     #[cfg(test)]
     FailAfterReplace,
+    #[cfg(test)]
+    CurrentProcessWorker,
 }
 
-#[allow(dead_code)] // Referenced by the executable; integration tests compile this module separately.
-pub(crate) fn configured_manifest_path() -> PathBuf {
-    if let Some(directory) = std::env::var_os("STYRN_CONFIG_DIR") {
-        return PathBuf::from(directory).join("machine.toml");
-    }
+fn canonical_manifest_path() -> PathBuf {
     #[cfg(target_os = "linux")]
     {
         PathBuf::from("/etc/styrn/machine.toml")
@@ -484,6 +490,14 @@ pub(crate) fn configured_manifest_path() -> PathBuf {
     }
 }
 
+#[allow(dead_code)] // Referenced by the executable; integration tests compile this module separately.
+pub(crate) fn configured_manifest_store() -> MachineManifestStore {
+    if let Some(directory) = std::env::var_os("STYRN_CONFIG_DIR") {
+        return MachineManifestStore::new(PathBuf::from(directory).join("machine.toml"));
+    }
+    MachineManifestStore::new_canonical(canonical_manifest_path())
+}
+
 impl MachineManifestStore {
     #[allow(dead_code)] // Integration test crates include this module without the executable.
     pub(crate) fn new(path: impl Into<PathBuf>) -> Self {
@@ -496,6 +510,21 @@ impl MachineManifestStore {
             path,
             trusted_root,
             security: ManifestSecurity::System,
+            destination_origin: DestinationOrigin::Override,
+        }
+    }
+
+    fn new_canonical(path: impl Into<PathBuf>) -> Self {
+        let path = path.into();
+        let trusted_root = path
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_default();
+        Self {
+            path,
+            trusted_root,
+            security: ManifestSecurity::System,
+            destination_origin: DestinationOrigin::Canonical,
         }
     }
 
@@ -511,6 +540,7 @@ impl MachineManifestStore {
             path,
             trusted_root,
             security: ManifestSecurity::CurrentProcess,
+            destination_origin: DestinationOrigin::Test,
         }
     }
 
@@ -524,6 +554,39 @@ impl MachineManifestStore {
             path: path.into(),
             trusted_root: trusted_root.into(),
             security: ManifestSecurity::CurrentProcess,
+            destination_origin: DestinationOrigin::Test,
+        }
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn new_for_test_with_worker_owned_parent(path: impl Into<PathBuf>) -> Self {
+        let path = path.into();
+        let trusted_root = path
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_default();
+        Self {
+            path,
+            trusted_root,
+            security: ManifestSecurity::CurrentProcessWorker,
+            destination_origin: DestinationOrigin::Override,
+        }
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn new_override_for_test(path: impl Into<PathBuf>) -> Self {
+        let path = path.into();
+        let trusted_root = path
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_default();
+        Self {
+            path,
+            trusted_root,
+            security: ManifestSecurity::CurrentProcess,
+            destination_origin: DestinationOrigin::Override,
         }
     }
 
@@ -539,6 +602,7 @@ impl MachineManifestStore {
             path,
             trusted_root,
             security: ManifestSecurity::FailBeforeReplace,
+            destination_origin: DestinationOrigin::Test,
         }
     }
 
@@ -554,6 +618,7 @@ impl MachineManifestStore {
             path,
             trusted_root,
             security: ManifestSecurity::FailAfterReplace,
+            destination_origin: DestinationOrigin::Test,
         }
     }
 
@@ -583,6 +648,7 @@ impl MachineManifestStore {
 
     fn reconcile_locked(&self) -> Result<ReadOutcome, ManifestError> {
         platform::verify_manifest_file_target(&self.path).map_err(ManifestError::Write)?;
+        self.verify_security()?;
         let raw = parse_raw(&fs::read_to_string(&self.path).map_err(ManifestError::Read)?)?;
         let machine_id = raw
             .machine_id
@@ -630,7 +696,8 @@ impl MachineManifestStore {
     fn existing_machine_id_for_generated(&self) -> Result<Option<Uuid>, ManifestError> {
         match fs::symlink_metadata(&self.path) {
             Ok(_) => {
-                platform::verify_manifest_file_target(&self.path).map_err(ManifestError::Write)?
+                platform::verify_manifest_file_target(&self.path).map_err(ManifestError::Write)?;
+                self.verify_security()?;
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => return Err(ManifestError::Read(error)),
@@ -651,19 +718,7 @@ impl MachineManifestStore {
         operation: impl FnOnce() -> Result<T, ManifestError>,
     ) -> Result<T, ManifestError> {
         let destination_dir = self.validate_destination_policy()?;
-        match fs::create_dir(destination_dir) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(ManifestError::Write(error)),
-        }
-        platform::verify_manifest_ancestors(
-            destination_dir,
-            self.platform_owner(),
-            "styrn",
-            &self.trusted_root,
-        )
-        .map_err(ManifestError::Write)?;
-        self.harden_directory(destination_dir)?;
+        self.prepare_destination(destination_dir)?;
         let lock_path = destination_dir.join(format!(
             ".{}.lock",
             self.path
@@ -677,29 +732,85 @@ impl MachineManifestStore {
         operation()
     }
 
+    fn prepare_destination(&self, destination_dir: &std::path::Path) -> Result<(), ManifestError> {
+        let metadata = match fs::symlink_metadata(destination_dir) {
+            Ok(metadata) => Some(metadata),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(error) => return Err(ManifestError::Write(error)),
+        };
+
+        if self.requires_system_parent_chain() {
+            let parent = destination_dir.parent().ok_or_else(|| {
+                ManifestError::Validation(
+                    "manifest directory must be below an existing parent".to_owned(),
+                )
+            })?;
+            platform::verify_manifest_parent_chain(parent, self.platform_owner(), "styrn")
+                .map_err(ManifestError::Write)?;
+
+            if metadata.is_none() {
+                fs::create_dir(destination_dir).map_err(ManifestError::Write)?;
+                return self.harden_directory(destination_dir);
+            }
+
+            if self.destination_origin == DestinationOrigin::Override {
+                return platform::verify_manifest_directory_security(
+                    destination_dir,
+                    self.platform_owner(),
+                    "styrn",
+                )
+                .map_err(ManifestError::Write);
+            }
+            return self.harden_directory(destination_dir);
+        }
+
+        if metadata.is_none() {
+            fs::create_dir(destination_dir).map_err(ManifestError::Write)?;
+        }
+        platform::verify_manifest_ancestors(
+            destination_dir,
+            self.platform_owner(),
+            "styrn",
+            &self.trusted_root,
+        )
+        .map_err(ManifestError::Write)?;
+        if self.destination_origin == DestinationOrigin::Override && metadata.is_some() {
+            platform::verify_manifest_directory_security(
+                destination_dir,
+                self.platform_owner(),
+                "styrn",
+            )
+            .map_err(ManifestError::Write)
+        } else {
+            self.harden_directory(destination_dir)
+        }
+    }
+
     fn validate_destination_policy(&self) -> Result<&std::path::Path, ManifestError> {
         let destination_dir = self.path.parent().ok_or_else(|| {
             ManifestError::Validation("manifest path has no parent directory".to_owned())
         })?;
-        if matches!(self.security, ManifestSecurity::System) {
-            use std::path::Component;
-
-            if !self.path.is_absolute()
-                || self
-                    .path
-                    .components()
-                    .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
+        if self.destination_origin != DestinationOrigin::Test
+            && (!self.path.is_absolute()
+                || self.path.components().any(|component| {
+                    matches!(
+                        component,
+                        std::path::Component::CurDir | std::path::Component::ParentDir
+                    )
+                })
+                || self.path.components().collect::<PathBuf>().as_os_str() != self.path.as_os_str()
                 || destination_dir != self.trusted_root
-                || !destination_dir
-                    .file_name()
-                    .and_then(|name| name.to_str())
-                    .is_some_and(|name| name.eq_ignore_ascii_case("styrn"))
-            {
-                return Err(ManifestError::Validation(
-                    "system manifest destination must be an absolute dedicated styrn directory"
-                        .to_owned(),
-                ));
-            }
+                || destination_dir
+                    .components()
+                    .filter(|component| matches!(component, std::path::Component::Normal(_)))
+                    .count()
+                    < 2
+                || is_broad_system_root(destination_dir))
+        {
+            return Err(ManifestError::Validation(
+                "system manifest destination must be a normalized dedicated directory below a system root"
+                    .to_owned(),
+            ));
         }
         Ok(destination_dir)
     }
@@ -779,6 +890,22 @@ impl MachineManifestStore {
             }
             #[cfg(test)]
             ManifestSecurity::FailAfterReplace => platform::ManifestOwner::CurrentProcess,
+            #[cfg(test)]
+            ManifestSecurity::CurrentProcessWorker => platform::ManifestOwner::CurrentProcessWorker,
+        }
+    }
+
+    fn requires_system_parent_chain(&self) -> bool {
+        if matches!(self.security, ManifestSecurity::System) {
+            return true;
+        }
+        #[cfg(test)]
+        {
+            matches!(self.security, ManifestSecurity::CurrentProcessWorker)
+        }
+        #[cfg(not(test))]
+        {
+            false
         }
     }
 
@@ -791,6 +918,19 @@ impl MachineManifestStore {
             )));
         }
         Ok(())
+    }
+}
+
+fn is_broad_system_root(path: &std::path::Path) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        path.to_str()
+            .is_some_and(|path| path.eq_ignore_ascii_case("/Library/Application Support"))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = path;
+        false
     }
 }
 
@@ -979,12 +1119,43 @@ mod destination_policy_tests {
     use super::*;
     use std::path::Path;
 
+    #[cfg(target_os = "linux")]
     #[test]
-    fn system_policy_accepts_only_a_dedicated_styrn_leaf() {
-        for safe in [
-            Path::new("/srv/example/styrn/machine.toml"),
-            Path::new("/srv/example/Styrn/machine.toml"),
-        ] {
+    fn linux_override_policy_uses_normalized_absolute_dedicated_locations() {
+        assert_destination_policy(
+            &[
+                Path::new("/opt/custom-config/machine.toml"),
+                Path::new("/srv/example/settings/machine.toml"),
+            ],
+            &[
+                Path::new("/"),
+                Path::new("/etc/machine.toml"),
+                Path::new("/opt/custom-config/../custom-config/machine.toml"),
+                Path::new("/opt//custom-config/machine.toml"),
+            ],
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn macos_override_policy_uses_normalized_absolute_dedicated_locations() {
+        assert_destination_policy(
+            &[
+                Path::new("/opt/custom-config/machine.toml"),
+                Path::new("/srv/example/settings/machine.toml"),
+            ],
+            &[
+                Path::new("/"),
+                Path::new("/etc/machine.toml"),
+                Path::new("/Library/Application Support/machine.toml"),
+                Path::new("/opt/custom-config/../custom-config/machine.toml"),
+                Path::new("/opt//custom-config/machine.toml"),
+            ],
+        );
+    }
+
+    fn assert_destination_policy(safe: &[&Path], broad_or_invalid: &[&Path]) {
+        for safe in safe {
             assert!(
                 MachineManifestStore::new(safe)
                     .validate_destination_policy()
@@ -993,13 +1164,7 @@ mod destination_policy_tests {
                 safe.display()
             );
         }
-
-        for broad_or_invalid in [
-            Path::new("/"),
-            Path::new("/etc/machine.toml"),
-            Path::new("/Library/Application Support/machine.toml"),
-            Path::new("/srv/example/not-styrn/machine.toml"),
-        ] {
+        for broad_or_invalid in broad_or_invalid {
             assert!(
                 MachineManifestStore::new(broad_or_invalid)
                     .validate_destination_policy()
@@ -1008,5 +1173,22 @@ mod destination_policy_tests {
                 broad_or_invalid.display()
             );
         }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_override_policy_uses_drive_qualified_normalized_local_paths() {
+        assert_destination_policy(
+            &[
+                Path::new(r"C:\ProgramData\custom-config\machine.toml"),
+                Path::new(r"D:\service\settings\machine.toml"),
+            ],
+            &[
+                Path::new(r"C:\machine.toml"),
+                Path::new(r"C:\ProgramData\machine.toml"),
+                Path::new(r"C:\ProgramData\custom-config\..\custom-config\machine.toml"),
+                Path::new("C:\\ProgramData\\\\custom-config\\machine.toml"),
+            ],
+        );
     }
 }

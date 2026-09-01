@@ -14,6 +14,8 @@ pub(crate) enum ManifestOwner {
     System,
     #[cfg(test)]
     CurrentProcess,
+    #[cfg(test)]
+    CurrentProcessWorker,
 }
 
 pub(crate) fn harden_manifest_directory(
@@ -59,6 +61,22 @@ pub(crate) fn verify_manifest_ancestors(
     trusted_root: &Path,
 ) -> std::io::Result<()> {
     platform_impl::verify_manifest_ancestors(directory, owner, worker, trusted_root)
+}
+
+pub(crate) fn verify_manifest_parent_chain(
+    parent: &Path,
+    owner: ManifestOwner,
+    worker: &str,
+) -> std::io::Result<()> {
+    platform_impl::verify_manifest_parent_chain(parent, owner, worker)
+}
+
+pub(crate) fn verify_manifest_directory_security(
+    directory: &Path,
+    owner: ManifestOwner,
+    worker: &str,
+) -> std::io::Result<()> {
+    platform_impl::verify_manifest_directory_security(directory, owner, worker)
 }
 
 pub(crate) fn verify_manifest_file_target(path: &Path) -> std::io::Result<()> {

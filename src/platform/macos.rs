@@ -124,7 +124,7 @@ pub(super) fn verify_manifest_security(
     let expected_uid = match owner {
         ManifestOwner::System => 0,
         #[cfg(test)]
-        ManifestOwner::CurrentProcess => file.uid(),
+        ManifestOwner::CurrentProcess | ManifestOwner::CurrentProcessWorker => file.uid(),
     };
     validate_manifest_inspection(&UnixManifestInspection {
         expected_uid,
@@ -138,6 +138,31 @@ pub(super) fn verify_manifest_security(
 
 pub(super) fn verify_manifest_file_target(path: &Path) -> io::Result<()> {
     require_regular_file(path)
+}
+
+pub(super) fn verify_manifest_directory_security(
+    directory: &Path,
+    owner: ManifestOwner,
+    _worker: &str,
+) -> io::Result<()> {
+    verify_directory(directory, owner)
+}
+
+pub(super) fn verify_manifest_parent_chain(
+    parent: &Path,
+    owner: ManifestOwner,
+    worker: &str,
+) -> io::Result<()> {
+    require_real_directory(parent)?;
+    let worker_uid = worker_uid(owner, worker)?;
+    let child_uid = match owner {
+        ManifestOwner::System => 0,
+        #[cfg(test)]
+        ManifestOwner::CurrentProcess | ManifestOwner::CurrentProcessWorker => unsafe {
+            libc::geteuid()
+        },
+    };
+    verify_ancestor_chain(parent, child_uid, owner, worker_uid)
 }
 
 pub(super) fn verify_manifest_ancestors(
@@ -158,11 +183,7 @@ pub(super) fn verify_manifest_ancestors(
         return require_real_directory(directory);
     }
     require_real_directory(directory)?;
-    let worker_uid = match owner {
-        ManifestOwner::System => Some(lookup_worker_uid(worker)?),
-        #[cfg(test)]
-        ManifestOwner::CurrentProcess => None,
-    };
+    let worker_uid = worker_uid(owner, worker)?;
     let mut child_uid = fs::symlink_metadata(directory)?.uid();
     let mut current = directory.parent();
     while let Some(ancestor) = current {
@@ -194,6 +215,45 @@ pub(super) fn verify_manifest_ancestors(
         Err(permission_denied(
             "manifest trusted root is not an ancestor",
         ))
+    }
+}
+
+fn verify_ancestor_chain(
+    start: &Path,
+    mut child_uid: u32,
+    owner: ManifestOwner,
+    worker_uid: Option<u32>,
+) -> io::Result<()> {
+    let system_owner = matches!(owner, ManifestOwner::System);
+    let mut current = Some(start);
+    while let Some(ancestor) = current {
+        require_real_directory(ancestor)?;
+        verify_no_extended_acl(ancestor)?;
+        let metadata = fs::metadata(ancestor)?;
+        let mode = metadata.mode();
+        validate_ancestor_access(metadata.uid(), mode, worker_uid, system_owner)?;
+        if mode & 0o022 != 0 {
+            let safe_sticky_root =
+                system_owner && mode & 0o1000 != 0 && metadata.uid() == 0 && child_uid == 0;
+            if !safe_sticky_root {
+                return Err(permission_denied(
+                    "manifest ancestor grants replacement access",
+                ));
+            }
+        }
+        child_uid = metadata.uid();
+        current = ancestor.parent();
+    }
+    Ok(())
+}
+
+fn worker_uid(owner: ManifestOwner, worker: &str) -> io::Result<Option<u32>> {
+    match owner {
+        ManifestOwner::System => Ok(Some(lookup_worker_uid(worker)?)),
+        #[cfg(test)]
+        ManifestOwner::CurrentProcess => Ok(None),
+        #[cfg(test)]
+        ManifestOwner::CurrentProcessWorker => Ok(Some(unsafe { libc::geteuid() })),
     }
 }
 
@@ -273,7 +333,7 @@ fn apply_owner(path: &Path, owner: ManifestOwner) -> io::Result<()> {
     match owner {
         ManifestOwner::System => std::os::unix::fs::chown(path, Some(0), Some(0)),
         #[cfg(test)]
-        ManifestOwner::CurrentProcess => Ok(()),
+        ManifestOwner::CurrentProcess | ManifestOwner::CurrentProcessWorker => Ok(()),
     }
 }
 
@@ -360,7 +420,7 @@ fn verify_owner(metadata: &fs::Metadata, owner: ManifestOwner, label: &str) -> i
     let expected = match owner {
         ManifestOwner::System => 0,
         #[cfg(test)]
-        ManifestOwner::CurrentProcess => metadata.uid(),
+        ManifestOwner::CurrentProcess | ManifestOwner::CurrentProcessWorker => metadata.uid(),
     };
     if metadata.uid() != expected {
         return Err(permission_denied(&format!(

@@ -269,6 +269,34 @@ pub(super) fn verify_manifest_file_target(path: &Path) -> io::Result<()> {
     require_kind(path, false)
 }
 
+pub(super) fn verify_manifest_directory_security(
+    directory: &Path,
+    owner: ManifestOwner,
+    worker: &str,
+) -> io::Result<()> {
+    require_kind(directory, true)?;
+    if is_test_owner(owner) {
+        return Ok(());
+    }
+    inspect_acl(directory, worker, AclKind::Directory)
+}
+
+pub(super) fn verify_manifest_parent_chain(
+    parent: &Path,
+    owner: ManifestOwner,
+    worker: &str,
+) -> io::Result<()> {
+    let mut current = Some(parent);
+    while let Some(ancestor) = current {
+        require_kind(ancestor, true)?;
+        if !is_test_owner(owner) {
+            inspect_ancestor_acl(ancestor, worker)?;
+        }
+        current = ancestor.parent();
+    }
+    Ok(())
+}
+
 pub(super) fn verify_manifest_ancestors(
     directory: &Path,
     owner: ManifestOwner,
@@ -309,7 +337,7 @@ fn is_test_owner(owner: ManifestOwner) -> bool {
     match owner {
         ManifestOwner::System => false,
         #[cfg(test)]
-        ManifestOwner::CurrentProcess => true,
+        ManifestOwner::CurrentProcess | ManifestOwner::CurrentProcessWorker => true,
     }
 }
 
