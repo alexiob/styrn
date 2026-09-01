@@ -1,4 +1,5 @@
 use crate::platform;
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chrono::{DateTime, FixedOffset};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -655,6 +656,12 @@ fn scan_secret_free(value: &Value, path: &str) -> Result<(), ManifestError> {
         }
         Value::Object(values) => {
             for (key, value) in values {
+                if let Some(reason) = secret_shaped_key_reason(key) {
+                    return Err(ManifestError::Secret {
+                        path: redacted_key_path(path),
+                        reason,
+                    });
+                }
                 let field_path = json_field_path(path, key);
                 if is_forbidden_secret_name(key) {
                     return Err(ManifestError::Secret {
@@ -682,6 +689,20 @@ fn scan_secret_free(value: &Value, path: &str) -> Result<(), ManifestError> {
         _ => {}
     }
     Ok(())
+}
+
+fn secret_shaped_key_reason(key: &str) -> Option<&'static str> {
+    if is_private_key(key) {
+        Some("private key material in object key")
+    } else if is_compact_jwt(key) {
+        Some("JWT-shaped credential in object key")
+    } else {
+        None
+    }
+}
+
+fn redacted_key_path(parent: &str) -> String {
+    format!("{parent}[redacted-secret-key]")
 }
 
 fn json_field_path(parent: &str, key: &str) -> String {
@@ -740,6 +761,11 @@ fn is_compact_jwt(value: &str) -> bool {
                     .bytes()
                     .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
         })
+        && URL_SAFE_NO_PAD
+            .decode(segments[0])
+            .ok()
+            .and_then(|header| serde_json::from_slice::<Value>(&header).ok())
+            .is_some_and(|header| header.is_object())
 }
 
 #[derive(Debug, Error)]

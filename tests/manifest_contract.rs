@@ -57,61 +57,52 @@ fn checked_in_examples_parse_validate_and_round_trip_without_losing_fields() {
 fn guarded_serialization_rejects_secret_named_dynamic_entries() {
     let valid = fs::read_to_string("examples/machine.controller-worker.toml").unwrap();
     let cases = [
-        ("capabilities", "private_key"),
-        ("agents", "PRIVATE.KEY"),
-        ("toolchains", "api-key"),
-        ("caches", "AUTH_KEY"),
-        ("agents", "tailscale-auth-key"),
-        ("toolchains", "token"),
-        ("caches", "ACCESS.TOKEN"),
-        ("agents", "password"),
-        ("toolchains", "passphrase"),
-        ("caches", "secret"),
-        ("agents", "identity"),
+        "PrIvAtE_kEy",
+        "private-key",
+        "private.key",
+        "privateKey",
+        "API_kEy",
+        "api-key",
+        "api.key",
+        "apiKey",
+        "AuTh_kEy",
+        "auth-key",
+        "auth.key",
+        "authKey",
+        "TAILSCALE_auth_key",
+        "tailscale-auth-key",
+        "tailscale.auth.key",
+        "tailscaleAuthKey",
+        "ToKeN",
+        "to-ken",
+        "to.ken",
+        "toKen",
+        "ACCESS_tOkEn",
+        "access-token",
+        "access.token",
+        "accessToken",
+        "PASS_word",
+        "pass-word",
+        "pass.word",
+        "passWord",
+        "PASS_phrase",
+        "pass-phrase",
+        "pass.phrase",
+        "passPhrase",
+        "SE_cret",
+        "se-cret",
+        "se.cret",
+        "seCret",
+        "ID_entity",
+        "id-entity",
+        "id.entity",
+        "idEntity",
     ];
 
-    for (section, key) in cases {
+    for (index, key) in cases.into_iter().enumerate() {
+        let section = ["capabilities", "agents", "toolchains", "caches"][index % 4];
         let mut manifest = MachineManifest::parse_toml(&valid).unwrap();
-        match section {
-            "capabilities" => {
-                manifest
-                    .capabilities
-                    .as_mut()
-                    .unwrap()
-                    .insert(key.to_owned(), true);
-            }
-            "agents" => {
-                manifest.agents.as_mut().unwrap().insert(
-                    key.to_owned(),
-                    manifest::Agent {
-                        installed: Some(true),
-                        command: None,
-                        sandbox: None,
-                        shell: None,
-                    },
-                );
-            }
-            "toolchains" => {
-                manifest.toolchains.as_mut().unwrap().insert(
-                    key.to_owned(),
-                    manifest::Toolchain {
-                        installed: Some(true),
-                        host: None,
-                        version: None,
-                    },
-                );
-            }
-            "caches" => {
-                manifest.caches.as_mut().unwrap().insert(
-                    key.to_owned(),
-                    manifest::Cache {
-                        installed: Some(true),
-                        max_bytes: None,
-                    },
-                );
-            }
-            _ => unreachable!(),
-        }
+        insert_dynamic_key(&mut manifest, section, key);
         for result in [
             manifest.to_toml().map(|_| ()),
             manifest.to_json_value().map(|_| ()),
@@ -120,6 +111,34 @@ fn guarded_serialization_rejects_secret_named_dynamic_entries() {
             let rendered = error.to_string();
             assert!(rendered.contains(section), "{rendered}");
             assert!(rendered.contains(key), "{rendered}");
+        }
+    }
+}
+
+#[test]
+fn guarded_serialization_redacts_secret_shaped_dynamic_keys() {
+    let valid = fs::read_to_string("examples/machine.controller-worker.toml").unwrap();
+    let cases = [
+        ("capabilities", "-----BEGIN PRIVATE KEY-----", "private key material"),
+        ("agents", "-----BEGIN OPENSSH PRIVATE KEY-----", "private key material"),
+        ("toolchains", "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJzdHlybiIsInJvbGUiOiJ3b3JrZXIifQ.signaturesegmentwithenoughbase64urlchars123", "JWT-shaped credential"),
+        ("caches", "-----BEGIN RSA PRIVATE KEY-----", "private key material"),
+    ];
+
+    for (section, secret_key, reason) in cases {
+        let mut manifest = MachineManifest::parse_toml(&valid).unwrap();
+        insert_dynamic_key(&mut manifest, section, secret_key);
+        for result in [
+            manifest.to_toml().map(|_| ()),
+            manifest.to_json_value().map(|_| ()),
+        ] {
+            let rendered = result
+                .expect_err("secret-shaped dynamic key must not serialize")
+                .to_string();
+            assert!(rendered.contains(section), "{rendered}");
+            assert!(rendered.contains("redacted"), "{rendered}");
+            assert!(rendered.contains(reason), "{rendered}");
+            assert!(!rendered.contains(secret_key), "{rendered}");
         }
     }
 }
@@ -169,6 +188,7 @@ fn guarded_serialization_allows_public_and_non_secret_near_misses() {
         "tokenizer",
         "public_key_auth",
         "VGhpcy1pcy1sb25nLWJ1dC1iZW5pZ24tYmFzZTY0LWxpa2UtdGV4dC13aXRob3V0LWRvdHM",
+        "eyJaaaaaaaaa.abcdefghijkl.abcdefghijkl",
     ];
 
     for value in cases {
@@ -362,6 +382,51 @@ fn secret_bearing_generated_writes_preserve_destinations_and_leave_no_temporary_
 }
 
 #[test]
+fn secret_shaped_dynamic_key_generated_writes_preserve_destinations_without_leaking() {
+    let secret_keys = [
+        "-----BEGIN PRIVATE KEY-----",
+        "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJzdHlybiIsInJvbGUiOiJ3b3JrZXIifQ.signaturesegmentwithenoughbase64urlchars123",
+    ];
+
+    for secret_key in secret_keys {
+        let temp = TestDir::new();
+        let path = temp.path().join("machine.toml");
+        let store = MachineManifestStore::new(&path);
+        let mut secret_draft =
+            MachineManifest::parse_toml(&fs::read_to_string("examples/machine.toml").unwrap())
+                .unwrap()
+                .without_machine_id();
+        secret_draft.agents.as_mut().unwrap().insert(
+            secret_key.to_owned(),
+            manifest::Agent {
+                installed: Some(true),
+                command: None,
+                sandbox: None,
+                shell: None,
+            },
+        );
+
+        let error = store
+            .write_generated(&secret_draft)
+            .unwrap_err()
+            .to_string();
+        assert!(!error.contains(secret_key), "{error}");
+        assert!(!path.exists());
+        assert_no_manifest_temporaries(temp.path());
+
+        let original = fs::read("examples/machine.toml").unwrap();
+        fs::write(&path, &original).unwrap();
+        let error = store
+            .write_generated(&secret_draft)
+            .unwrap_err()
+            .to_string();
+        assert!(!error.contains(secret_key), "{error}");
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert_no_manifest_temporaries(temp.path());
+    }
+}
+
+#[test]
 fn secret_bearing_legacy_manifest_does_not_self_heal_or_rewrite() {
     let temp = TestDir::new();
     let path = temp.path().join("machine.toml");
@@ -529,4 +594,47 @@ fn assert_no_manifest_temporaries(directory: &Path) {
             .all(|entry| !entry.file_name().to_string_lossy().contains(".tmp")),
         "secret rejection must not leave a temporary manifest"
     );
+}
+
+fn insert_dynamic_key(manifest: &mut MachineManifest, section: &str, key: &str) {
+    match section {
+        "capabilities" => {
+            manifest
+                .capabilities
+                .as_mut()
+                .unwrap()
+                .insert(key.to_owned(), true);
+        }
+        "agents" => {
+            manifest.agents.as_mut().unwrap().insert(
+                key.to_owned(),
+                manifest::Agent {
+                    installed: Some(true),
+                    command: None,
+                    sandbox: None,
+                    shell: None,
+                },
+            );
+        }
+        "toolchains" => {
+            manifest.toolchains.as_mut().unwrap().insert(
+                key.to_owned(),
+                manifest::Toolchain {
+                    installed: Some(true),
+                    host: None,
+                    version: None,
+                },
+            );
+        }
+        "caches" => {
+            manifest.caches.as_mut().unwrap().insert(
+                key.to_owned(),
+                manifest::Cache {
+                    installed: Some(true),
+                    max_bytes: None,
+                },
+            );
+        }
+        _ => unreachable!(),
+    }
 }
