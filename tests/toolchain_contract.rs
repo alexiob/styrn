@@ -14,7 +14,9 @@ fn ci_toolchain_contract_holds(ci: &str) -> bool {
         .lines()
         .filter_map(|line| {
             line.trim_start()
-                .strip_prefix("- uses: dtolnay/rust-toolchain@")
+                .strip_prefix("- ")
+                .unwrap_or(line.trim_start())
+                .strip_prefix("uses: dtolnay/rust-toolchain@")
                 .and_then(|selector| selector.split_whitespace().next())
         })
         .collect();
@@ -22,6 +24,8 @@ fn ci_toolchain_contract_holds(ci: &str) -> bool {
         line.starts_with("toolchain:")
             || line.contains("rustup toolchain install")
             || line.contains("rustup default")
+            || line.contains("rustup override set")
+            || line.contains("rustup run")
     });
 
     selectors == [EXPECTED_CI_TOOLCHAIN]
@@ -37,12 +41,19 @@ fn ci_toolchain_contract_rejects_duplicate_different_and_floating_selectors() {
     let floating = format!("{good}\n- uses: dtolnay/rust-toolchain@beta");
     let alternate_input = format!("{good}\n  toolchain: stable");
     let rustup_install = format!("{good}\n- run: rustup toolchain install stable");
+    let multiline_selector =
+        format!("{good}\n- name: install a different Rust\n  uses: dtolnay/rust-toolchain@stable");
+    let rustup_override = format!("{good}\n- run: rustup override set stable");
+    let rustup_run = format!("{good}\n- run: rustup run stable cargo test");
 
+    assert!(!ci_toolchain_contract_holds(&multiline_selector));
     assert!(!ci_toolchain_contract_holds(&duplicate));
     assert!(!ci_toolchain_contract_holds(&different));
     assert!(!ci_toolchain_contract_holds(&floating));
     assert!(!ci_toolchain_contract_holds(&alternate_input));
     assert!(!ci_toolchain_contract_holds(&rustup_install));
+    assert!(!ci_toolchain_contract_holds(&rustup_override));
+    assert!(!ci_toolchain_contract_holds(&rustup_run));
 }
 
 #[test]
