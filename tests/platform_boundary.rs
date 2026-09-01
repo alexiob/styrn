@@ -2,7 +2,7 @@ use std::path::PathBuf;
 use std::process::Command;
 
 #[test]
-fn generic_consumer_cannot_access_platform_module() {
+fn generic_sibling_cannot_access_host_platform_module() {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let consumer = manifest_dir.join("tests/fixtures/platform_consumer.rs");
     let output = Command::new("rustc")
@@ -19,7 +19,7 @@ fn generic_consumer_cannot_access_platform_module() {
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("module `platform` is private"),
-        "expected a platform privacy error, got:\n{stderr}"
+        stderr.contains("is private"),
+        "expected a host platform privacy error, got:\n{stderr}"
     );
 }

@@ -71,3 +71,26 @@ test result: ok. 1 passed; 0 failed
 ## Concerns
 
 Local verification ran on the current host only; the three-host positive claim is gated by the added CI matrix and was not emulated locally.
+
+## Fix Round 1
+
+Changed files:
+
+- `tests/platform_boundary.rs`
+- `tests/fixtures/platform_consumer.rs`
+
+The fixture now compiles the real `src/platform/mod.rs` as a crate-root module and defines a sibling `generic` module. A target-selected `generic::misuse` function attempts to reach the host-specific child module. This is rejected by Rust privacy on Linux, macOS, and Windows; making the host module public would make the fixture compile and fail the test.
+
+Covering command:
+
+```text
+cargo test --test platform_boundary
+```
+
+Relevant output:
+
+```text
+running 1 test
+test generic_sibling_cannot_access_host_platform_module ... ok
+test result: ok. 1 passed; 0 failed
+```
