@@ -742,6 +742,58 @@ mod tests {
                 is_secret: true,
             },
             CredentialCase {
+                value: "password hunter2",
+                is_secret: true,
+            },
+            CredentialCase {
+                value: "api key abc123",
+                is_secret: true,
+            },
+            CredentialCase {
+                value: "API_KEY abc123",
+                is_secret: true,
+            },
+            CredentialCase {
+                value: "auth_token abc123",
+                is_secret: true,
+            },
+            CredentialCase {
+                value: "bearer-token abc123",
+                is_secret: true,
+            },
+            CredentialCase {
+                value: "authorization_bearer_token abc123",
+                is_secret: true,
+            },
+            CredentialCase {
+                value: "private [key]=abc123",
+                is_secret: true,
+            },
+            CredentialCase {
+                value: "https://host/path?token=abc123",
+                is_secret: true,
+            },
+            CredentialCase {
+                value: "token-abc123",
+                is_secret: true,
+            },
+            CredentialCase {
+                value: "token_abc123",
+                is_secret: true,
+            },
+            CredentialCase {
+                value: "password-hunter2",
+                is_secret: true,
+            },
+            CredentialCase {
+                value: "api-key-abc123",
+                is_secret: true,
+            },
+            CredentialCase {
+                value: "private_key_abc123",
+                is_secret: true,
+            },
+            CredentialCase {
                 value: "sk_live_do-not-leak",
                 is_secret: true,
             },
@@ -763,6 +815,18 @@ mod tests {
             },
             CredentialCase {
                 value: "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.signature.",
+                is_secret: true,
+            },
+            CredentialCase {
+                value: "eyJ0eXAiOiJKV1QifQ.eyJzdWIiOiIxIn0.signature",
+                is_secret: true,
+            },
+            CredentialCase {
+                value: "eyJhbGciOiJSU0EtT0FFUCIsImVuYyI6IkEyNTZHQ00ifQ.a.b.c.d",
+                is_secret: true,
+            },
+            CredentialCase {
+                value: "prefix/eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.signature",
                 is_secret: true,
             },
             CredentialCase {
@@ -839,6 +903,22 @@ mod tests {
             },
             CredentialCase {
                 value: "Bearer token support is enabled.",
+                is_secret: false,
+            },
+            CredentialCase {
+                value: "Bearer token",
+                is_secret: false,
+            },
+            CredentialCase {
+                value: "Bearer token is absent.",
+                is_secret: false,
+            },
+            CredentialCase {
+                value: "Auth token cache is healthy.",
+                is_secret: false,
+            },
+            CredentialCase {
+                value: "Authorization bearer token support is enabled.",
                 is_secret: false,
             },
             CredentialCase {
