@@ -447,16 +447,29 @@ impl MachineManifestStore {
         draft: &MachineManifestDraft,
     ) -> Result<Uuid, ManifestError> {
         self.with_mutation_lock(|| {
-            let machine_id = if self.path.exists() {
-                self.read_or_repair_locked()?.manifest.machine_id
-            } else {
-                Uuid::now_v7()
-            };
+            let machine_id = self
+                .existing_machine_id_for_generated()?
+                .unwrap_or_else(Uuid::now_v7);
             let manifest = draft.with_machine_id(machine_id);
             manifest.validate()?;
             self.write_manifest(&manifest)?;
             Ok(machine_id)
         })
+    }
+
+    fn existing_machine_id_for_generated(&self) -> Result<Option<Uuid>, ManifestError> {
+        if !self.path.exists() {
+            return Ok(None);
+        }
+        let raw = parse_raw(&fs::read_to_string(&self.path).map_err(ManifestError::Read)?)?;
+        let machine_id = raw
+            .machine_id
+            .as_deref()
+            .map(parse_canonical_uuid)
+            .transpose()?
+            .unwrap_or_else(Uuid::now_v7);
+        raw.into_manifest(machine_id).validate()?;
+        Ok(Some(machine_id))
     }
 
     fn with_mutation_lock<T>(

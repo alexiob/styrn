@@ -607,7 +607,7 @@ struct WatchArgs {
 
 #[cfg(test)]
 mod tests {
-    use super::{render_parse_failure, AnsiPolicy, Cli};
+    use super::{render_parse_failure, AnsiPolicy, Cli, MachineAction};
     use std::ffi::OsString;
 
     #[test]
@@ -701,6 +701,17 @@ mod tests {
                 stderr: true
             }
         );
+    }
+
+    #[test]
+    fn machine_manifest_and_init_parse_without_invoking_the_domain_handler() {
+        for (arguments, expected) in [
+            (["styrn", "machine", "manifest"], MachineAction::Manifest),
+            (["styrn", "machine", "init"], MachineAction::Init),
+        ] {
+            let parsed = Cli::try_parse_with_terminals(args(arguments), false, false).unwrap();
+            assert_eq!(parsed.machine_action(), Some(expected));
+        }
     }
 
     fn args<const N: usize>(values: [&str; N]) -> Vec<OsString> {

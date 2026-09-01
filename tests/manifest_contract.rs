@@ -161,6 +161,27 @@ fn generated_write_mints_once_and_preserves_identity_across_updates() {
 }
 
 #[test]
+fn invalid_generated_write_does_not_repair_an_existing_stage_zero_manifest() {
+    let temp = TestDir::new();
+    let path = temp.path().join("machine.toml");
+    let stage_zero = remove_line(
+        &fs::read_to_string("examples/machine.toml").unwrap(),
+        "machine_id =",
+    );
+    fs::write(&path, &stage_zero).unwrap();
+    let mut invalid_draft =
+        MachineManifest::parse_toml(&fs::read_to_string("examples/machine.toml").unwrap())
+            .unwrap()
+            .without_machine_id();
+    invalid_draft.schema_version = 2;
+
+    assert!(MachineManifestStore::new(&path)
+        .write_generated(&invalid_draft)
+        .is_err());
+    assert_eq!(fs::read_to_string(path).unwrap(), stage_zero);
+}
+
+#[test]
 fn missing_machine_id_repairs_once_and_invalid_input_never_rewrites() {
     let temp = TestDir::new();
     let path = temp.path().join("machine.toml");
