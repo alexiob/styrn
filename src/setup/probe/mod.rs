@@ -439,17 +439,21 @@ mod tests {
 
     #[test]
     fn wire_serialization_redacts_every_secret_shaped_runtime_observation() {
-        for secret in secret_examples() {
+        for case in credential_case_matrix()
+            .iter()
+            .filter(|case| case.is_secret)
+        {
+            let secret = case.value;
             for status in [
                 ProbeStatus::Present {
-                    version: Some((*secret).to_owned()),
+                    version: Some(secret.to_owned()),
                     healthy: true,
                 },
                 ProbeStatus::Broken {
-                    reason: (*secret).to_owned(),
+                    reason: secret.to_owned(),
                 },
                 ProbeStatus::Unknowable {
-                    reason: (*secret).to_owned(),
+                    reason: secret.to_owned(),
                 },
             ] {
                 let observed = ProbeCatalog::new(vec![Box::new(FakeProbe::new(
@@ -523,12 +527,16 @@ mod tests {
 
     #[test]
     fn secret_classifier_rejects_auth_assignments_and_embedded_credentials_but_allows_plain_text() {
-        for secret in secret_examples() {
-            let remediation = RemediationSpec::new(*secret, Some(StyrnCommand::MachineInit))
+        for case in credential_case_matrix()
+            .iter()
+            .filter(|case| case.is_secret)
+        {
+            let secret = case.value;
+            let remediation = RemediationSpec::new(secret, Some(StyrnCommand::MachineInit))
                 .expect_err("secret remediation must fail");
             let descriptor = ProbeDescriptorSpec::new(
                 ProbeId::parse("tool.git").unwrap(),
-                *secret,
+                secret,
                 FindingSeverity::Error,
                 None,
             )
@@ -536,25 +544,11 @@ mod tests {
             assert!(!remediation.to_string().contains(secret));
             assert!(!descriptor.to_string().contains(secret));
         }
-        for ordinary_text in [
-            "Inspect local service state.",
-            "Diagnostic: local version 1.2.3 is healthy.",
-            "Authoritative machine identity is healthy.",
-            "authentication service is healthy.",
-            "the bearer process is healthy.",
-            "Bearer process is healthy.",
-            "Bearer process was healthy.",
-            "Bearer support is enabled.",
-            "Bearer authentication is healthy.",
-            "Bearer process status is healthy.",
-            "Auth token support is enabled.",
-            "Token:, cache is healthy.",
-            "Bearer; process is healthy.",
-            "Auth service is healthy.",
-            "Token cache is healthy.",
-            "The auth process is healthy.",
-            "Token is absent.",
-        ] {
+        for case in credential_case_matrix()
+            .iter()
+            .filter(|case| !case.is_secret)
+        {
+            let ordinary_text = case.value;
             assert!(RemediationSpec::new(ordinary_text, None).is_ok());
             let descriptor = ProbeDescriptorSpec::new(
                 ProbeId::parse("tool.safe").unwrap(),
@@ -579,45 +573,298 @@ mod tests {
         }
     }
 
-    fn secret_examples() -> &'static [&'static str] {
+    #[derive(Clone, Copy)]
+    struct CredentialCase {
+        value: &'static str,
+        is_secret: bool,
+    }
+
+    fn credential_case_matrix() -> &'static [CredentialCase] {
         &[
-            "--api-key=do-not-leak",
-            "api_key=abc123",
-            "--auth=abc123",
-            "auth token do-not-leak",
-            "authorization=Bearer abc123",
-            "Bearer=abc123",
-            "Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.signature",
-            "secret=do-not-leak",
-            "token=abc123",
-            "token: abc123",
-            "auth = abc123",
-            "AUTH : abc123",
-            "password: hunter2",
-            "api_key: abc123",
-            "Bearer abcdefgh",
-            "received Bearer abcdefgh",
-            "using Bearer abcdefgh",
-            "received bearer=abcdefgh",
-            "authorization bearer abcdefgh",
-            "authorization bearer: abcdefgh",
-            "token: (abc123)",
-            "AUTH = [abc123]",
-            "auth token (abc123)",
-            "authorization bearer [abcdefgh]",
-            "received Bearer (abcdefgh)",
-            "secret = {abc123}",
-            "sk_live_do-not-leak",
-            "ghp_do-not-leak",
-            "github_pat_do-not-leak",
-            "tskey-do-not-leak",
-            "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.signature",
-            "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.signature.",
-            "diagnostic: eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.signature",
-            "diagnostic=eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.signature",
-            "diagnostic=eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.signature.",
-            "diagnostic:eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.signature,",
-            "-----BEGIN PRIVATE KEY-----",
+            CredentialCase {
+                value: "--api-key=do-not-leak",
+                is_secret: true,
+            },
+            CredentialCase {
+                value: "api_key=abc123",
+                is_secret: true,
+            },
+            CredentialCase {
+                value: "--auth=abc123",
+                is_secret: true,
+            },
+            CredentialCase {
+                value: "auth token do-not-leak",
+                is_secret: true,
+            },
+            CredentialCase {
+                value: "authorization=Bearer abc123",
+                is_secret: true,
+            },
+            CredentialCase {
+                value: "Bearer=abc123",
+                is_secret: true,
+            },
+            CredentialCase {
+                value: "Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.signature",
+                is_secret: true,
+            },
+            CredentialCase {
+                value: "secret=do-not-leak",
+                is_secret: true,
+            },
+            CredentialCase {
+                value: "token=abc123",
+                is_secret: true,
+            },
+            CredentialCase {
+                value: "token: abc123",
+                is_secret: true,
+            },
+            CredentialCase {
+                value: "auth = abc123",
+                is_secret: true,
+            },
+            CredentialCase {
+                value: "AUTH : abc123",
+                is_secret: true,
+            },
+            CredentialCase {
+                value: "password: hunter2",
+                is_secret: true,
+            },
+            CredentialCase {
+                value: "api_key: abc123",
+                is_secret: true,
+            },
+            CredentialCase {
+                value: "Bearer abcdefgh",
+                is_secret: true,
+            },
+            CredentialCase {
+                value: "received Bearer abcdefgh",
+                is_secret: true,
+            },
+            CredentialCase {
+                value: "using Bearer abcdefgh",
+                is_secret: true,
+            },
+            CredentialCase {
+                value: "received bearer=abcdefgh",
+                is_secret: true,
+            },
+            CredentialCase {
+                value: "authorization bearer abcdefgh",
+                is_secret: true,
+            },
+            CredentialCase {
+                value: "authorization bearer: abcdefgh",
+                is_secret: true,
+            },
+            CredentialCase {
+                value: "token: (abc123)",
+                is_secret: true,
+            },
+            CredentialCase {
+                value: "AUTH = [abc123]",
+                is_secret: true,
+            },
+            CredentialCase {
+                value: "auth token (abc123)",
+                is_secret: true,
+            },
+            CredentialCase {
+                value: "authorization bearer [abcdefgh]",
+                is_secret: true,
+            },
+            CredentialCase {
+                value: "received Bearer (abcdefgh)",
+                is_secret: true,
+            },
+            CredentialCase {
+                value: "secret = {abc123}",
+                is_secret: true,
+            },
+            CredentialCase {
+                value: "auth_token=abc123",
+                is_secret: true,
+            },
+            CredentialCase {
+                value: "--auth-token: (abc123)",
+                is_secret: true,
+            },
+            CredentialCase {
+                value: "access_token=[abc123]",
+                is_secret: true,
+            },
+            CredentialCase {
+                value: "bearer-token=abcdefgh",
+                is_secret: true,
+            },
+            CredentialCase {
+                value: "api key: abc123",
+                is_secret: true,
+            },
+            CredentialCase {
+                value: "access key=abc123",
+                is_secret: true,
+            },
+            CredentialCase {
+                value: "authorization token=abc123",
+                is_secret: true,
+            },
+            CredentialCase {
+                value: "refresh-token=abc123",
+                is_secret: true,
+            },
+            CredentialCase {
+                value: "id_token=abc123",
+                is_secret: true,
+            },
+            CredentialCase {
+                value: "session token=abc123",
+                is_secret: true,
+            },
+            CredentialCase {
+                value: "private_key=abc123",
+                is_secret: true,
+            },
+            CredentialCase {
+                value: "secret key=abc123",
+                is_secret: true,
+            },
+            CredentialCase {
+                value: "client-secret=abc123",
+                is_secret: true,
+            },
+            CredentialCase {
+                value: "credentials: abc123",
+                is_secret: true,
+            },
+            CredentialCase {
+                value: "sk_live_do-not-leak",
+                is_secret: true,
+            },
+            CredentialCase {
+                value: "ghp_do-not-leak",
+                is_secret: true,
+            },
+            CredentialCase {
+                value: "github_pat_do-not-leak",
+                is_secret: true,
+            },
+            CredentialCase {
+                value: "tskey-do-not-leak",
+                is_secret: true,
+            },
+            CredentialCase {
+                value: "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.signature",
+                is_secret: true,
+            },
+            CredentialCase {
+                value: "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.signature.",
+                is_secret: true,
+            },
+            CredentialCase {
+                value: "diagnostic: eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.signature",
+                is_secret: true,
+            },
+            CredentialCase {
+                value: "diagnostic=eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.signature",
+                is_secret: true,
+            },
+            CredentialCase {
+                value: "diagnostic=eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.signature.",
+                is_secret: true,
+            },
+            CredentialCase {
+                value: "diagnostic:eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.signature,",
+                is_secret: true,
+            },
+            CredentialCase {
+                value: "-----BEGIN PRIVATE KEY-----",
+                is_secret: true,
+            },
+            CredentialCase {
+                value: "Inspect local service state.",
+                is_secret: false,
+            },
+            CredentialCase {
+                value: "Diagnostic: local version 1.2.3 is healthy.",
+                is_secret: false,
+            },
+            CredentialCase {
+                value: "Authoritative machine identity is healthy.",
+                is_secret: false,
+            },
+            CredentialCase {
+                value: "authentication service is healthy.",
+                is_secret: false,
+            },
+            CredentialCase {
+                value: "the bearer process is healthy.",
+                is_secret: false,
+            },
+            CredentialCase {
+                value: "Bearer process is healthy.",
+                is_secret: false,
+            },
+            CredentialCase {
+                value: "Bearer process was healthy.",
+                is_secret: false,
+            },
+            CredentialCase {
+                value: "Bearer support is enabled.",
+                is_secret: false,
+            },
+            CredentialCase {
+                value: "Bearer authentication is healthy.",
+                is_secret: false,
+            },
+            CredentialCase {
+                value: "Bearer process status is healthy.",
+                is_secret: false,
+            },
+            CredentialCase {
+                value: "Auth token support is enabled.",
+                is_secret: false,
+            },
+            CredentialCase {
+                value: "API key support is enabled.",
+                is_secret: false,
+            },
+            CredentialCase {
+                value: "Access token cache is healthy.",
+                is_secret: false,
+            },
+            CredentialCase {
+                value: "Bearer token support is enabled.",
+                is_secret: false,
+            },
+            CredentialCase {
+                value: "Token:, cache is healthy.",
+                is_secret: false,
+            },
+            CredentialCase {
+                value: "Bearer; process is healthy.",
+                is_secret: false,
+            },
+            CredentialCase {
+                value: "Auth service is healthy.",
+                is_secret: false,
+            },
+            CredentialCase {
+                value: "Token cache is healthy.",
+                is_secret: false,
+            },
+            CredentialCase {
+                value: "The auth process is healthy.",
+                is_secret: false,
+            },
+            CredentialCase {
+                value: "Token is absent.",
+                is_secret: false,
+            },
         ]
     }
 

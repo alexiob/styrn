@@ -344,7 +344,8 @@ fn contains_sensitive_marker_value(value: &str) -> bool {
             return false;
         };
         let marker = normalized_marker(marker);
-        (is_sensitive_marker(&marker) && assignment_value_after(&tokens, index).is_some())
+        credential_marker_end(&tokens, index)
+            .is_some_and(|marker_end| assignment_value_after(&tokens, marker_end).is_some())
             || (marker == "auth"
                 && phrase_value_after(&tokens, index, "token")
                     .is_some_and(|value| !is_safe_subject_noun_prose(&tokens, value)))
@@ -353,8 +354,79 @@ fn contains_sensitive_marker_value(value: &str) -> bool {
                     .is_some_and(|value| !is_safe_subject_noun_prose(&tokens, value)))
             || (marker == "bearer"
                 && contextual_value_after(&tokens, index)
-                    .is_some_and(|value| !is_safe_subject_noun_prose(&tokens, value)))
+                    .is_some_and(|value| !is_safe_bearer_context(&tokens, value)))
     })
+}
+
+const CREDENTIAL_MARKER_FAMILIES: &[&[&str]] = &[
+    &["authorization", "bearer", "token"],
+    &["authorization", "token"],
+    &["bearer", "token"],
+    &["access", "token"],
+    &["refresh", "token"],
+    &["session", "token"],
+    &["access", "key"],
+    &["private", "key"],
+    &["secret", "key"],
+    &["client", "secret"],
+    &["api", "key"],
+    &["auth", "token"],
+    &["id", "token"],
+];
+
+const SINGLE_CREDENTIAL_MARKERS: &[&str] = &[
+    "apikey",
+    "auth",
+    "authorization",
+    "password",
+    "privatekey",
+    "secret",
+    "accesskey",
+    "credential",
+    "credentials",
+    "token",
+];
+
+fn credential_marker_end(tokens: &[MarkerToken<'_>], index: usize) -> Option<usize> {
+    let MarkerToken::Word(word) = tokens[index] else {
+        return None;
+    };
+    let word = normalized_marker(word);
+    let mut longest = SINGLE_CREDENTIAL_MARKERS
+        .contains(&word.as_str())
+        .then_some(index);
+
+    for family in CREDENTIAL_MARKER_FAMILIES {
+        let joined: String = family.concat();
+        if word == joined {
+            longest = Some(index);
+            continue;
+        }
+        if word != family[0] {
+            continue;
+        }
+        let mut end = index;
+        let mut matches = true;
+        for expected in &family[1..] {
+            let Some(next) = next_marker_word(tokens, end + 1) else {
+                matches = false;
+                break;
+            };
+            let MarkerToken::Word(next_word) = tokens[next] else {
+                matches = false;
+                break;
+            };
+            if normalized_marker(next_word) != *expected {
+                matches = false;
+                break;
+            }
+            end = next;
+        }
+        if matches {
+            longest = Some(longest.map_or(end, |previous| previous.max(end)));
+        }
+    }
+    longest
 }
 
 fn assignment_value_after(tokens: &[MarkerToken<'_>], index: usize) -> Option<usize> {
@@ -382,6 +454,17 @@ fn contextual_value_after(tokens: &[MarkerToken<'_>], index: usize) -> Option<us
 fn next_word(tokens: &[MarkerToken<'_>], start: usize) -> Option<usize> {
     let (index, token) = next_value_token(tokens, start)?;
     matches!(token, MarkerToken::Word(_)).then_some(index)
+}
+
+fn next_marker_word(tokens: &[MarkerToken<'_>], start: usize) -> Option<usize> {
+    for (index, token) in tokens.iter().enumerate().skip(start) {
+        match token {
+            MarkerToken::Gap => continue,
+            MarkerToken::Word(_) => return Some(index),
+            MarkerToken::Separator | MarkerToken::Boundary | MarkerToken::Wrapper => return None,
+        }
+    }
+    None
 }
 
 fn next_value_token<'tokens, 'text>(
@@ -445,6 +528,17 @@ fn is_safe_subject_noun_prose(tokens: &[MarkerToken<'_>], subject_index: usize) 
                     | "unavailable"
             )
     )
+}
+
+fn is_safe_bearer_context(tokens: &[MarkerToken<'_>], value_index: usize) -> bool {
+    if is_safe_subject_noun_prose(tokens, value_index) {
+        return true;
+    }
+    matches!(
+        tokens[value_index],
+        MarkerToken::Word(word) if normalized_marker(word) == "token"
+    ) && contextual_value_after(tokens, value_index)
+        .is_some_and(|subject| is_safe_subject_noun_prose(tokens, subject))
 }
 
 fn contains_credential_prefix(value: &str) -> bool {
@@ -515,21 +609,6 @@ fn normalized_marker(value: &str) -> String {
         .filter(char::is_ascii_alphanumeric)
         .map(|character| character.to_ascii_lowercase())
         .collect()
-}
-
-fn is_sensitive_marker(value: &str) -> bool {
-    matches!(
-        normalized_marker(value).as_str(),
-        "apikey"
-            | "auth"
-            | "authorization"
-            | "password"
-            | "privatekey"
-            | "secret"
-            | "accesskey"
-            | "credential"
-            | "token"
-    )
 }
 
 fn credential_candidates(value: &str) -> Vec<&str> {
