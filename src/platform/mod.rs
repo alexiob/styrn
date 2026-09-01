@@ -18,6 +18,8 @@ pub(crate) enum ManifestOwner {
     CurrentProcessWorker,
 }
 
+pub(crate) struct ManifestDirectoryIdentity(platform_impl::ManifestDirectoryIdentity);
+
 pub(crate) fn harden_manifest_directory(
     path: &Path,
     owner: ManifestOwner,
@@ -77,6 +79,19 @@ pub(crate) fn verify_manifest_directory_security(
     worker: &str,
 ) -> std::io::Result<()> {
     platform_impl::verify_manifest_directory_security(directory, owner, worker)
+}
+
+pub(crate) fn manifest_directory_identity(
+    directory: &Path,
+) -> std::io::Result<ManifestDirectoryIdentity> {
+    platform_impl::manifest_directory_identity(directory).map(ManifestDirectoryIdentity)
+}
+
+pub(crate) fn remove_manifest_directory_if_same_and_empty(
+    directory: &Path,
+    identity: &ManifestDirectoryIdentity,
+) -> std::io::Result<()> {
+    platform_impl::remove_manifest_directory_if_same_and_empty(directory, &identity.0)
 }
 
 pub(crate) fn verify_manifest_file_target(path: &Path) -> std::io::Result<()> {

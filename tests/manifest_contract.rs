@@ -486,6 +486,52 @@ fn existing_override_directory_must_already_be_secure_and_is_never_hardened() {
     assert!(!path.exists());
 }
 
+#[cfg(unix)]
+#[test]
+fn existing_override_directory_must_be_worker_traversable_and_readable() {
+    for insecure_mode in [0o700, 0o750] {
+        let temp = TestDir::new();
+        let directory = temp.path().join("custom-config");
+        fs::create_dir(&directory).unwrap();
+        fs::set_permissions(&directory, fs::Permissions::from_mode(insecure_mode)).unwrap();
+        let path = directory.join("machine.toml");
+        let draft =
+            MachineManifest::parse_toml(&fs::read_to_string("examples/machine.toml").unwrap())
+                .unwrap()
+                .without_machine_id();
+
+        assert!(MachineManifestStore::new_override_for_test(&path)
+            .write_generated(&draft)
+            .is_err());
+        assert_eq!(
+            fs::metadata(&directory).unwrap().mode() & 0o777,
+            insecure_mode
+        );
+        assert!(!path.exists());
+    }
+}
+
+#[test]
+fn failed_hardening_of_a_new_leaf_removes_it_and_allows_a_clean_retry() {
+    let temp = TestDir::new();
+    let directory = temp.path().join("new-config");
+    let path = directory.join("machine.toml");
+    let draft = MachineManifest::parse_toml(&fs::read_to_string("examples/machine.toml").unwrap())
+        .unwrap()
+        .without_machine_id();
+
+    let error = MachineManifestStore::new_override_with_failing_hardening(&path)
+        .write_generated(&draft)
+        .unwrap_err();
+    assert!(matches!(error, manifest::ManifestError::Write(_)));
+    assert!(!directory.exists());
+
+    MachineManifestStore::new_for_test(&path)
+        .write_generated(&draft)
+        .unwrap();
+    assert!(path.is_file());
+}
+
 #[test]
 fn system_destination_never_creates_missing_broad_ancestors() {
     let temp = TestDir::new();

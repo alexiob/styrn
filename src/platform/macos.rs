@@ -6,6 +6,11 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
 
+pub(super) struct ManifestDirectoryIdentity {
+    device: u64,
+    inode: u64,
+}
+
 type Acl = *mut std::ffi::c_void;
 type AclEntry = *mut std::ffi::c_void;
 #[cfg(test)]
@@ -146,6 +151,31 @@ pub(super) fn verify_manifest_directory_security(
     _worker: &str,
 ) -> io::Result<()> {
     verify_directory(directory, owner)
+}
+
+pub(super) fn manifest_directory_identity(
+    directory: &Path,
+) -> io::Result<ManifestDirectoryIdentity> {
+    require_real_directory(directory)?;
+    let metadata = fs::metadata(directory)?;
+    Ok(ManifestDirectoryIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+pub(super) fn remove_manifest_directory_if_same_and_empty(
+    directory: &Path,
+    identity: &ManifestDirectoryIdentity,
+) -> io::Result<()> {
+    require_real_directory(directory)?;
+    let metadata = fs::metadata(directory)?;
+    if metadata.dev() != identity.device || metadata.ino() != identity.inode {
+        return Err(permission_denied(
+            "new manifest directory changed before cleanup",
+        ));
+    }
+    fs::remove_dir(directory)
 }
 
 pub(super) fn verify_manifest_parent_chain(
@@ -321,10 +351,8 @@ fn validate_manifest_inspection(inspection: &UnixManifestInspection) -> io::Resu
     if inspection.file_mode != 0o644 {
         return Err(permission_denied("manifest mode must be 0644"));
     }
-    if inspection.directory_mode & 0o022 != 0 {
-        return Err(permission_denied(
-            "manifest directory grants group/other replacement access",
-        ));
+    if inspection.directory_mode != 0o755 {
+        return Err(permission_denied("manifest directory mode must be 0755"));
     }
     Ok(())
 }
@@ -342,10 +370,8 @@ fn verify_directory(path: &Path, owner: ManifestOwner) -> io::Result<()> {
     verify_no_extended_acl(path)?;
     let metadata = fs::metadata(path)?;
     verify_owner(&metadata, owner, "manifest directory")?;
-    if metadata.mode() & 0o022 != 0 {
-        return Err(permission_denied(
-            "manifest directory grants group/other replacement access",
-        ));
+    if metadata.mode() & 0o777 != 0o755 {
+        return Err(permission_denied("manifest directory mode must be 0755"));
     }
     Ok(())
 }
@@ -487,6 +513,13 @@ mod tests {
             ..valid
         })
         .is_err());
+        for directory_mode in [0o700, 0o750] {
+            assert!(validate_manifest_inspection(&UnixManifestInspection {
+                directory_mode,
+                ..valid
+            })
+            .is_err());
+        }
         assert!(validate_manifest_inspection(&valid).is_ok());
     }
 

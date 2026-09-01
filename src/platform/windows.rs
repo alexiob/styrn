@@ -9,6 +9,11 @@ use std::io;
 use std::os::windows::ffi::OsStrExt;
 use std::path::Path;
 
+pub(super) struct ManifestDirectoryIdentity {
+    volume_serial_number: u32,
+    file_index: u64,
+}
+
 const OWNER_SECURITY_INFORMATION: u32 = 0x0000_0001;
 const DACL_SECURITY_INFORMATION: u32 = 0x0000_0004;
 const PROTECTED_DACL_SECURITY_INFORMATION: u32 = 0x8000_0000;
@@ -25,6 +30,13 @@ const ACCESS_DENIED_ACE_TYPE: u8 = 1;
 const OBJECT_INHERIT_ACE: u8 = 0x01;
 const CONTAINER_INHERIT_ACE: u8 = 0x02;
 const INHERIT_ONLY_ACE: u8 = 0x08;
+const FILE_READ_ATTRIBUTES: u32 = 0x0000_0080;
+const FILE_SHARE_READ: u32 = 0x0000_0001;
+const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+const FILE_SHARE_DELETE: u32 = 0x0000_0004;
+const OPEN_EXISTING: u32 = 3;
+const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
 const INVALID_FILE_ATTRIBUTES: u32 = 0xffff_ffff;
 const PARENT_TAKEOVER_ACCESS: u32 =
@@ -51,6 +63,26 @@ struct AccessAllowedAce {
     header: AceHeader,
     mask: u32,
     sid_start: u32,
+}
+
+#[repr(C)]
+struct FileTime {
+    low_date_time: u32,
+    high_date_time: u32,
+}
+
+#[repr(C)]
+struct ByHandleFileInformation {
+    file_attributes: u32,
+    creation_time: FileTime,
+    last_access_time: FileTime,
+    last_write_time: FileTime,
+    volume_serial_number: u32,
+    file_size_high: u32,
+    file_size_low: u32,
+    number_of_links: u32,
+    file_index_high: u32,
+    file_index_low: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -147,7 +179,19 @@ unsafe extern "system" {
 unsafe extern "system" {
     fn LocalFree(memory: *mut c_void) -> *mut c_void;
     fn GetFileAttributesW(file_name: *const u16) -> u32;
-    #[cfg(test)]
+    fn CreateFileW(
+        file_name: *const u16,
+        desired_access: u32,
+        share_mode: u32,
+        security_attributes: *const c_void,
+        creation_disposition: u32,
+        flags_and_attributes: u32,
+        template_file: *mut c_void,
+    ) -> *mut c_void;
+    fn GetFileInformationByHandle(
+        file: *mut c_void,
+        information: *mut ByHandleFileInformation,
+    ) -> i32;
     fn CloseHandle(handle: *mut c_void) -> i32;
 }
 
@@ -279,6 +323,27 @@ pub(super) fn verify_manifest_directory_security(
         return Ok(());
     }
     inspect_acl(directory, worker, AclKind::Directory)
+}
+
+pub(super) fn manifest_directory_identity(
+    directory: &Path,
+) -> io::Result<ManifestDirectoryIdentity> {
+    directory_identity(directory)
+}
+
+pub(super) fn remove_manifest_directory_if_same_and_empty(
+    directory: &Path,
+    identity: &ManifestDirectoryIdentity,
+) -> io::Result<()> {
+    let current = directory_identity(directory)?;
+    if current.volume_serial_number != identity.volume_serial_number
+        || current.file_index != identity.file_index
+    {
+        return Err(permission_denied(
+            "new manifest directory changed before cleanup",
+        ));
+    }
+    std::fs::remove_dir(directory)
 }
 
 pub(super) fn verify_manifest_parent_chain(
@@ -681,6 +746,41 @@ fn require_kind(path: &Path, directory: bool) -> io::Result<()> {
     Ok(())
 }
 
+fn directory_identity(directory: &Path) -> io::Result<ManifestDirectoryIdentity> {
+    require_kind(directory, true)?;
+    let wide_path = wide_os(directory);
+    let handle = unsafe {
+        CreateFileW(
+            wide_path.as_ptr(),
+            FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle == (-1_isize as *mut c_void) {
+        return Err(io::Error::last_os_error());
+    }
+    let handle = OwnedHandle(handle);
+    let mut information = std::mem::MaybeUninit::<ByHandleFileInformation>::uninit();
+    if unsafe { GetFileInformationByHandle(handle.0, information.as_mut_ptr()) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let information = unsafe { information.assume_init() };
+    if information.file_attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(permission_denied(
+            "manifest security path crosses a reparse point",
+        ));
+    }
+    Ok(ManifestDirectoryIdentity {
+        volume_serial_number: information.volume_serial_number,
+        file_index: (u64::from(information.file_index_high) << 32)
+            | u64::from(information.file_index_low),
+    })
+}
+
 fn wide(value: &str) -> Vec<u16> {
     value.encode_utf16().chain(std::iter::once(0)).collect()
 }
@@ -701,6 +801,16 @@ fn invalid_data(message: &str) -> io::Error {
 }
 
 struct LocalAllocation(*mut c_void);
+
+struct OwnedHandle(*mut c_void);
+
+impl Drop for OwnedHandle {
+    fn drop(&mut self) {
+        unsafe {
+            CloseHandle(self.0);
+        }
+    }
+}
 
 impl Drop for LocalAllocation {
     fn drop(&mut self) {

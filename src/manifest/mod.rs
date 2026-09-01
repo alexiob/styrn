@@ -608,6 +608,22 @@ impl MachineManifestStore {
 
     #[cfg(test)]
     #[allow(dead_code)]
+    pub(crate) fn new_override_with_failing_hardening(path: impl Into<PathBuf>) -> Self {
+        let path = path.into();
+        let trusted_root = path
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_default();
+        Self {
+            path,
+            trusted_root,
+            security: ManifestSecurity::FailBeforeReplace,
+            destination_origin: DestinationOrigin::Override,
+        }
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) fn new_with_failing_post_replace_verification(path: impl Into<PathBuf>) -> Self {
         let path = path.into();
         let trusted_root = path
@@ -750,7 +766,7 @@ impl MachineManifestStore {
 
             if metadata.is_none() {
                 fs::create_dir(destination_dir).map_err(ManifestError::Write)?;
-                return self.harden_directory(destination_dir);
+                return self.harden_created_directory(destination_dir);
             }
 
             if self.destination_origin == DestinationOrigin::Override {
@@ -782,7 +798,27 @@ impl MachineManifestStore {
             )
             .map_err(ManifestError::Write)
         } else {
-            self.harden_directory(destination_dir)
+            if metadata.is_some() {
+                self.harden_directory(destination_dir)
+            } else {
+                self.harden_created_directory(destination_dir)
+            }
+        }
+    }
+
+    fn harden_created_directory(&self, path: &std::path::Path) -> Result<(), ManifestError> {
+        let identity = platform::manifest_directory_identity(path).map_err(ManifestError::Write)?;
+        match self.harden_directory(path) {
+            Ok(()) => Ok(()),
+            Err(hardening) => {
+                match platform::remove_manifest_directory_if_same_and_empty(path, &identity) {
+                    Ok(()) => Err(hardening),
+                    Err(cleanup) => Err(ManifestError::NewDirectoryCleanup {
+                        hardening: Box::new(hardening),
+                        cleanup,
+                    }),
+                }
+            }
         }
     }
 
@@ -799,6 +835,7 @@ impl MachineManifestStore {
                     )
                 })
                 || self.path.components().collect::<PathBuf>().as_os_str() != self.path.as_os_str()
+                || !has_supported_system_path_root(&self.path)
                 || destination_dir != self.trusted_root
                 || destination_dir
                     .components()
@@ -931,6 +968,23 @@ fn is_broad_system_root(path: &std::path::Path) -> bool {
     {
         let _ = path;
         false
+    }
+}
+
+fn has_supported_system_path_root(path: &std::path::Path) -> bool {
+    #[cfg(windows)]
+    {
+        let mut components = path.components();
+        matches!(
+            components.next(),
+            Some(std::path::Component::Prefix(prefix))
+                if matches!(prefix.kind(), std::path::Prefix::Disk(_))
+        ) && matches!(components.next(), Some(std::path::Component::RootDir))
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = path;
+        true
     }
 }
 
@@ -1108,6 +1162,13 @@ pub(crate) enum ManifestError {
     Security(std::io::Error),
     #[error("machine manifest was replaced but security verification failed: {0}")]
     PostReplaceSecurity(std::io::Error),
+    #[error(
+        "new manifest directory hardening failed ({hardening}); cleanup also failed: {cleanup}"
+    )]
+    NewDirectoryCleanup {
+        hardening: Box<ManifestError>,
+        cleanup: std::io::Error,
+    },
     #[error("manifest secret rejected at {path}: {reason}")]
     Secret { path: String, reason: &'static str },
     #[error("invalid machine manifest: {0}")]
@@ -1188,6 +1249,12 @@ mod destination_policy_tests {
                 Path::new(r"C:\ProgramData\machine.toml"),
                 Path::new(r"C:\ProgramData\custom-config\..\custom-config\machine.toml"),
                 Path::new("C:\\ProgramData\\\\custom-config\\machine.toml"),
+                Path::new(r"\\server\share\custom-config\machine.toml"),
+                Path::new(r"\\?\C:\ProgramData\custom-config\machine.toml"),
+                Path::new(r"\\?\UNC\server\share\custom-config\machine.toml"),
+                Path::new(r"\\.\PIPE\custom-config\machine.toml"),
+                Path::new(r"C:ProgramData\custom-config\machine.toml"),
+                Path::new(r"\ProgramData\custom-config\machine.toml"),
             ],
         );
     }
