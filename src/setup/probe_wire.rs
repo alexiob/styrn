@@ -345,21 +345,25 @@ fn contains_sensitive_marker_value(value: &str) -> bool {
         };
         let marker = normalized_marker(marker);
         (is_sensitive_marker(&marker) && assignment_value_after(&tokens, index).is_some())
-            || (marker == "auth" && phrase_value_after(&tokens, index, "token").is_some())
-            || (marker == "authorization" && phrase_value_after(&tokens, index, "bearer").is_some())
+            || (marker == "auth"
+                && phrase_value_after(&tokens, index, "token")
+                    .is_some_and(|value| !is_safe_subject_noun_prose(&tokens, value)))
+            || (marker == "authorization"
+                && phrase_value_after(&tokens, index, "bearer")
+                    .is_some_and(|value| !is_safe_subject_noun_prose(&tokens, value)))
             || (marker == "bearer"
                 && contextual_value_after(&tokens, index)
-                    .is_some_and(|continuation| !is_bearer_noun_prose(&tokens, continuation)))
+                    .is_some_and(|value| !is_safe_subject_noun_prose(&tokens, value)))
     })
 }
 
 fn assignment_value_after(tokens: &[MarkerToken<'_>], index: usize) -> Option<usize> {
-    let (separator_index, separator) = next_non_gap(tokens, index + 1)?;
+    let (separator_index, separator) = next_value_token(tokens, index + 1)?;
     matches!(separator, MarkerToken::Separator).then(|| next_word(tokens, separator_index + 1))?
 }
 
 fn phrase_value_after(tokens: &[MarkerToken<'_>], index: usize, phrase: &str) -> Option<usize> {
-    let (phrase_index, phrase_token) = next_non_gap(tokens, index + 1)?;
+    let (phrase_index, phrase_token) = next_value_token(tokens, index + 1)?;
     let MarkerToken::Word(word) = phrase_token else {
         return None;
     };
@@ -367,7 +371,7 @@ fn phrase_value_after(tokens: &[MarkerToken<'_>], index: usize, phrase: &str) ->
 }
 
 fn contextual_value_after(tokens: &[MarkerToken<'_>], index: usize) -> Option<usize> {
-    let (next_index, next) = next_non_gap(tokens, index + 1)?;
+    let (next_index, next) = next_value_token(tokens, index + 1)?;
     match next {
         MarkerToken::Word(_) => Some(next_index),
         MarkerToken::Separator => next_word(tokens, next_index + 1),
@@ -376,11 +380,11 @@ fn contextual_value_after(tokens: &[MarkerToken<'_>], index: usize) -> Option<us
 }
 
 fn next_word(tokens: &[MarkerToken<'_>], start: usize) -> Option<usize> {
-    let (index, token) = next_non_gap(tokens, start)?;
+    let (index, token) = next_value_token(tokens, start)?;
     matches!(token, MarkerToken::Word(_)).then_some(index)
 }
 
-fn next_non_gap<'tokens, 'text>(
+fn next_value_token<'tokens, 'text>(
     tokens: &'tokens [MarkerToken<'text>],
     start: usize,
 ) -> Option<(usize, &'tokens MarkerToken<'text>)> {
@@ -388,25 +392,58 @@ fn next_non_gap<'tokens, 'text>(
         .iter()
         .enumerate()
         .skip(start)
-        .find(|(_, token)| !matches!(token, MarkerToken::Gap))
+        .find(|(_, token)| !matches!(token, MarkerToken::Gap | MarkerToken::Wrapper))
 }
 
-fn is_bearer_noun_prose(tokens: &[MarkerToken<'_>], continuation: usize) -> bool {
-    let MarkerToken::Word(noun) = tokens[continuation] else {
+fn is_safe_subject_noun_prose(tokens: &[MarkerToken<'_>], subject_index: usize) -> bool {
+    let MarkerToken::Word(subject) = tokens[subject_index] else {
         return false;
     };
-    if !matches!(normalized_marker(noun).as_str(), "process") {
+    let subject = normalized_marker(subject);
+    if !matches!(subject.as_str(), "support" | "authentication" | "process") {
         return false;
     }
-    let Some(copula) = next_word(tokens, continuation + 1) else {
+
+    let Some(mut copula_index) = next_word(tokens, subject_index + 1) else {
         return false;
     };
-    let MarkerToken::Word(copula) = tokens[copula] else {
+    if subject == "process"
+        && matches!(
+            tokens[copula_index],
+            MarkerToken::Word(word) if normalized_marker(word) == "status"
+        )
+    {
+        let Some(status_copula_index) = next_word(tokens, copula_index + 1) else {
+            return false;
+        };
+        copula_index = status_copula_index;
+    }
+
+    let MarkerToken::Word(copula) = tokens[copula_index] else {
+        return false;
+    };
+    if !matches!(
+        normalized_marker(copula).as_str(),
+        "is" | "are" | "was" | "were" | "be" | "been" | "being"
+    ) {
+        return false;
+    }
+    let Some(predicate_index) = next_word(tokens, copula_index + 1) else {
         return false;
     };
     matches!(
-        normalized_marker(copula).as_str(),
-        "is" | "are" | "was" | "were" | "be" | "been" | "being"
+        tokens[predicate_index],
+        MarkerToken::Word(predicate)
+            if matches!(
+                normalized_marker(predicate).as_str(),
+                "enabled"
+                    | "healthy"
+                    | "disabled"
+                    | "unhealthy"
+                    | "absent"
+                    | "available"
+                    | "unavailable"
+            )
     )
 }
 
@@ -437,6 +474,7 @@ enum MarkerToken<'a> {
     Separator,
     Boundary,
     Gap,
+    Wrapper,
 }
 
 fn marker_tokens(value: &str) -> Vec<MarkerToken<'_>> {
@@ -445,8 +483,9 @@ fn marker_tokens(value: &str) -> Vec<MarkerToken<'_>> {
     for (index, character) in value.char_indices() {
         let is_separator = matches!(character, ':' | '=');
         let is_gap = character.is_whitespace();
-        let is_boundary = matches!(character, ',' | ';' | '(' | ')' | '[' | ']' | '{' | '}');
-        if !is_separator && !is_gap && !is_boundary {
+        let is_wrapper = matches!(character, '(' | ')' | '[' | ']' | '{' | '}');
+        let is_boundary = matches!(character, ',' | ';' | '.');
+        if !is_separator && !is_gap && !is_wrapper && !is_boundary {
             word_start.get_or_insert(index);
             continue;
         }
@@ -457,6 +496,8 @@ fn marker_tokens(value: &str) -> Vec<MarkerToken<'_>> {
             MarkerToken::Separator
         } else if is_gap {
             MarkerToken::Gap
+        } else if is_wrapper {
+            MarkerToken::Wrapper
         } else {
             MarkerToken::Boundary
         });
