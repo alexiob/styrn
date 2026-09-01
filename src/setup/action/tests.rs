@@ -1,6 +1,6 @@
 use super::{
-    action_sealed, Action, ActionCheck, ActionDescription, ActionEffect, ActionError, ActionImpl,
-    ActionName, ApplyOutcome, HumanInstructions, NeedsHuman, Privilege, ScriptFragment,
+    Action, ActionDescription, ActionEffect, ActionError, ActionName, ApplyOutcome,
+    HumanInstructions, NeedsHuman, Privilege, TestMetrics,
 };
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
@@ -13,117 +13,30 @@ use std::{
     process::{Command, Output},
 };
 
-struct FakeAction {
-    name: ActionName,
-    description: ActionDescription,
-    privilege: Privilege,
-    state: Arc<Mutex<Vec<u8>>>,
-    check_calls: Arc<AtomicUsize>,
-    mutation_calls: Arc<AtomicUsize>,
-    behavior: Behavior,
-}
-
-#[derive(Clone)]
-enum Behavior {
-    StateDriven,
-    NeedsHuman(NeedsHuman),
-    CheckFailure,
-    ApplyFailure,
-}
-
-impl FakeAction {
-    fn state_driven(state: Arc<Mutex<Vec<u8>>>) -> Self {
-        Self::new(Privilege::None, state, Behavior::StateDriven)
-    }
-
-    fn with_behavior(privilege: Privilege, state: Arc<Mutex<Vec<u8>>>, behavior: Behavior) -> Self {
-        Self::new(privilege, state, behavior)
-    }
-
-    fn new(privilege: Privilege, state: Arc<Mutex<Vec<u8>>>, behavior: Behavior) -> Self {
-        Self {
-            name: ActionName::parse("test.state").expect("test action name must be valid"),
-            description: ActionDescription::new("Converge test state")
-                .expect("test description must be valid"),
-            privilege,
-            state,
-            check_calls: Arc::new(AtomicUsize::new(0)),
-            mutation_calls: Arc::new(AtomicUsize::new(0)),
-            behavior,
-        }
-    }
-}
-
-impl action_sealed::Sealed for FakeAction {}
-
-impl ActionImpl for FakeAction {
-    fn check(&self) -> Result<ActionCheck, ActionError> {
-        self.check_calls.fetch_add(1, Ordering::SeqCst);
-        match &self.behavior {
-            Behavior::StateDriven | Behavior::ApplyFailure => {
-                if self.state.lock().unwrap().as_slice() == [1] {
-                    Ok(ActionCheck::Done)
-                } else {
-                    Ok(ActionCheck::Todo)
-                }
-            }
-            Behavior::NeedsHuman(needs_human) => Ok(ActionCheck::NeedsHuman(needs_human.clone())),
-            Behavior::CheckFailure => Err(ActionError::check_failed(self.name.clone())),
-        }
-    }
-
-    fn privilege(&self) -> Privilege {
-        self.privilege
-    }
-
-    fn describe(&self) -> &ActionDescription {
-        &self.description
-    }
-
-    fn name(&self) -> &ActionName {
-        &self.name
-    }
-
-    fn apply_mutation(&mut self) -> Result<ActionEffect, ActionError> {
-        self.mutation_calls.fetch_add(1, Ordering::SeqCst);
-        if matches!(self.behavior, Behavior::ApplyFailure) {
-            return Err(ActionError::apply_failed(self.name.clone()));
-        }
-        *self.state.lock().unwrap() = vec![1];
-        Ok(ActionEffect::Changed)
-    }
-}
-
-fn wrap(action: FakeAction) -> Action {
-    Action::from_impl(action)
+fn state_driven(state: Arc<Mutex<Vec<u8>>>) -> (Action, TestMetrics) {
+    Action::test_state_driven(Privilege::None, state)
 }
 
 #[test]
 fn done_check_returns_noop_without_running_mutation_or_changing_bytes() {
     let state = Arc::new(Mutex::new(vec![1]));
     let before = state.lock().unwrap().clone();
-    let fake = FakeAction::state_driven(Arc::clone(&state));
-    let check_calls = Arc::clone(&fake.check_calls);
-    let mutation_calls = Arc::clone(&fake.mutation_calls);
-    let mut action = wrap(fake);
+    let (mut action, metrics) = state_driven(Arc::clone(&state));
 
     let outcome = action
         .apply()
         .expect("done check must be a successful no-op");
 
     assert_eq!(outcome, ApplyOutcome::Noop);
-    assert_eq!(check_calls.load(Ordering::SeqCst), 1);
-    assert_eq!(mutation_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(metrics.check_calls(), 1);
+    assert_eq!(metrics.mutation_calls(), 0);
     assert_eq!(*state.lock().unwrap(), before);
 }
 
 #[test]
 fn todo_check_runs_mutation_once_then_a_second_public_apply_is_a_noop() {
     let state = Arc::new(Mutex::new(vec![0]));
-    let fake = FakeAction::state_driven(Arc::clone(&state));
-    let check_calls = Arc::clone(&fake.check_calls);
-    let mutation_calls = Arc::clone(&fake.mutation_calls);
-    let mut action = wrap(fake);
+    let (mut action, metrics) = state_driven(Arc::clone(&state));
 
     assert_eq!(
         action.apply().unwrap(),
@@ -132,8 +45,8 @@ fn todo_check_runs_mutation_once_then_a_second_public_apply_is_a_noop() {
     assert_eq!(action.apply().unwrap(), ApplyOutcome::Noop);
 
     assert_eq!(*state.lock().unwrap(), vec![1]);
-    assert_eq!(check_calls.load(Ordering::SeqCst), 2);
-    assert_eq!(mutation_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(metrics.check_calls(), 2);
+    assert_eq!(metrics.mutation_calls(), 1);
 }
 
 #[test]
@@ -143,20 +56,15 @@ fn needs_human_is_not_mutated_or_reported_as_success() {
         HumanInstructions::new("Sign in to the local account before continuing.").unwrap(),
         None,
     );
-    let fake = FakeAction::with_behavior(
-        Privilege::Admin,
-        Arc::clone(&state),
-        Behavior::NeedsHuman(needs_human.clone()),
-    );
-    let mutation_calls = Arc::clone(&fake.mutation_calls);
-    let mut action = wrap(fake);
+    let (mut action, metrics) =
+        Action::test_needs_human(Privilege::Admin, Arc::clone(&state), needs_human.clone());
 
     assert_eq!(
         action.apply().unwrap(),
         ApplyOutcome::NeedsHuman(needs_human)
     );
     assert_eq!(*state.lock().unwrap(), vec![0]);
-    assert_eq!(mutation_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(metrics.mutation_calls(), 0);
 }
 
 #[test]
@@ -165,26 +73,15 @@ fn unsafe_human_text_is_rejected_without_echoing_the_rejected_value() {
     let name_error = ActionName::parse(secret).unwrap_err();
     let description_error = ActionDescription::new(secret).unwrap_err();
     let instruction_error = HumanInstructions::new(secret).unwrap_err();
-    let fragment_error = ScriptFragment::new(secret).unwrap_err();
 
     assert_eq!(name_error, ActionError::InvalidActionName);
     assert_eq!(description_error, ActionError::InvalidDescription);
     assert_eq!(instruction_error, ActionError::InvalidInstructions);
-    assert_eq!(fragment_error, ActionError::InvalidScriptFragment);
     assert_eq!(
         HumanInstructions::new("").unwrap_err(),
         ActionError::InvalidInstructions
     );
-    assert_eq!(
-        ScriptFragment::new("").unwrap_err(),
-        ActionError::InvalidScriptFragment
-    );
-    for error in [
-        name_error,
-        description_error,
-        instruction_error,
-        fragment_error,
-    ] {
+    for error in [name_error, description_error, instruction_error] {
         assert!(!error.to_string().contains(secret));
     }
     assert_eq!(
@@ -197,21 +94,11 @@ fn unsafe_human_text_is_rejected_without_echoing_the_rejected_value() {
 fn check_and_apply_failures_are_typed_safe_and_have_no_success_outcome() {
     let secret = "ghp_do-not-echo";
     let check_state = Arc::new(Mutex::new(vec![0]));
-    let check_fake = FakeAction::with_behavior(
-        Privilege::None,
-        Arc::clone(&check_state),
-        Behavior::CheckFailure,
-    );
-    let check_mutation_calls = Arc::clone(&check_fake.mutation_calls);
-    let mut check_failure = wrap(check_fake);
+    let (mut check_failure, check_metrics) =
+        Action::test_check_failure(Privilege::None, Arc::clone(&check_state));
     let apply_state = Arc::new(Mutex::new(vec![0]));
-    let apply_fake = FakeAction::with_behavior(
-        Privilege::Root,
-        Arc::clone(&apply_state),
-        Behavior::ApplyFailure,
-    );
-    let apply_mutation_calls = Arc::clone(&apply_fake.mutation_calls);
-    let mut apply_failure = wrap(apply_fake);
+    let (mut apply_failure, apply_metrics) =
+        Action::test_apply_failure(Privilege::Root, Arc::clone(&apply_state));
 
     let check_error = check_failure.apply().unwrap_err();
     let apply_error = apply_failure.apply().unwrap_err();
@@ -222,8 +109,8 @@ fn check_and_apply_failures_are_typed_safe_and_have_no_success_outcome() {
         assert!(error.to_string().contains("test.state"));
         assert!(!error.to_string().contains(secret));
     }
-    assert_eq!(check_mutation_calls.load(Ordering::SeqCst), 0);
-    assert_eq!(apply_mutation_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(check_metrics.mutation_calls(), 0);
+    assert_eq!(apply_metrics.mutation_calls(), 1);
     assert_eq!(*check_state.lock().unwrap(), vec![0]);
     assert_eq!(*apply_state.lock().unwrap(), vec![0]);
 }
@@ -232,21 +119,9 @@ fn check_and_apply_failures_are_typed_safe_and_have_no_success_outcome() {
 fn deterministic_privilege_and_description_cover_all_platform_needs() {
     let state = Arc::new(Mutex::new(vec![1]));
     let actions = [
-        wrap(FakeAction::with_behavior(
-            Privilege::None,
-            Arc::clone(&state),
-            Behavior::StateDriven,
-        )),
-        wrap(FakeAction::with_behavior(
-            Privilege::Root,
-            Arc::clone(&state),
-            Behavior::StateDriven,
-        )),
-        wrap(FakeAction::with_behavior(
-            Privilege::Admin,
-            state,
-            Behavior::StateDriven,
-        )),
+        Action::test_state_driven(Privilege::None, Arc::clone(&state)).0,
+        Action::test_state_driven(Privilege::Root, Arc::clone(&state)).0,
+        Action::test_state_driven(Privilege::Admin, state).0,
     ];
 
     assert_eq!(
@@ -264,18 +139,34 @@ fn deterministic_privilege_and_description_cover_all_platform_needs() {
 #[test]
 fn foundation_action_phase_seven_slots_return_typed_unsupported_errors() {
     let state = Arc::new(Mutex::new(vec![1]));
-    let mut action = wrap(FakeAction::state_driven(state));
+    let mut action = state_driven(state).0;
 
     assert!(matches!(
         action.revert(&ActionEffect::Changed),
-        Err(ActionError::UnsupportedUntilPhase7 { action, .. }) if action.as_str() == "test.state"
+        Err(ActionError::UnsupportedUntilPhase7 { action, operation: super::UnsupportedOperation::Revert }) if action.as_str() == "test.state"
     ));
-    for result in [action.render_posix(), action.render_powershell()] {
-        assert!(matches!(
-            result,
-            Err(ActionError::UnsupportedUntilPhase7 { action, .. }) if action.as_str() == "test.state"
-        ));
-    }
+    assert!(matches!(
+        action.render_posix(),
+        Err(ActionError::UnsupportedUntilPhase7 { action, operation: super::UnsupportedOperation::RenderPosix }) if action.as_str() == "test.state"
+    ));
+    assert!(matches!(
+        action.render_powershell(),
+        Err(ActionError::UnsupportedUntilPhase7 { action, operation: super::UnsupportedOperation::RenderPowerShell }) if action.as_str() == "test.state"
+    ));
+}
+
+#[test]
+fn script_fragments_reject_raw_shell_text_at_the_type_boundary() {
+    assert_fixture_fails(
+        "raw_script_fragment.rs",
+        FixtureExpectation::new(
+            "E0599",
+            "no variant, associated function, or constant named `new` found for enum `action::ScriptFragment` in the current scope",
+            7,
+            Some("variant, associated function, or constant not found in `action::ScriptFragment`"),
+            "raw_script_fragment.rs",
+        ),
+    );
 }
 
 #[test]
@@ -284,9 +175,10 @@ fn ordinary_callers_cannot_invoke_the_ungated_mutation_hook() {
         "ungated_mutation.rs",
         FixtureExpectation::new(
             "E0599",
-            "no method named `apply_mutation` found for mutable reference `&mut Action` in the current scope",
+            "no method named `apply_mutation` found for mutable reference `&mut action::Action` in the current scope",
             7,
-            Some("method not found in `&mut Action`"),
+            Some("method not found in `&mut action::Action`"),
+            "ungated_mutation.rs",
         ),
     );
 }
@@ -296,10 +188,26 @@ fn an_outside_module_cannot_unseal_an_action_implementation() {
     assert_fixture_fails(
         "unsealed_action.rs",
         FixtureExpectation::new(
-            "E0277",
-            "the trait bound `ForeignAction: action_sealed::Sealed` is not satisfied",
-            12,
-            Some("unsatisfied trait bound"),
+            "E0404",
+            "expected trait, found enum `Action`",
+            10,
+            Some("not a trait"),
+            "unsealed_action.rs",
+        ),
+    );
+}
+
+#[test]
+fn a_setup_owned_descendant_cannot_invoke_the_gate_executor_directly() {
+    assert_fixture_fails_with_cfg(
+        "owned_descendant.rs",
+        &["action_owned_descendant_fixture"],
+        FixtureExpectation::new(
+            "E0603",
+            "function `execute` is private",
+            2,
+            Some("private function"),
+            "owned_descendant_impl.rs",
         ),
     );
 }
@@ -310,6 +218,7 @@ struct FixtureExpectation {
     message: &'static str,
     line: u64,
     primary_label: Option<&'static str>,
+    source_name: &'static str,
 }
 
 impl FixtureExpectation {
@@ -318,18 +227,28 @@ impl FixtureExpectation {
         message: &'static str,
         line: u64,
         primary_label: Option<&'static str>,
+        source_name: &'static str,
     ) -> Self {
         Self {
             code,
             message,
             line,
             primary_label,
+            source_name,
         }
     }
 }
 
 fn assert_fixture_fails(name: &str, expected: FixtureExpectation) {
-    let output = compile_fixture(name);
+    assert_fixture_fails_with_cfg(name, &[], expected);
+}
+
+fn assert_fixture_fails_with_cfg(
+    name: &str,
+    configurations: &[&str],
+    expected: FixtureExpectation,
+) {
+    let output = compile_fixture(name, configurations);
     assert!(
         !output.status.success(),
         "{name} unexpectedly compiled as an action-boundary bypass"
@@ -362,7 +281,7 @@ fn assert_fixture_fails(name: &str, expected: FixtureExpectation) {
             span["is_primary"] == true
                 && span["file_name"]
                     .as_str()
-                    .is_some_and(|file| file.ends_with(name))
+                    .is_some_and(|file| file.ends_with(expected.source_name))
                 && span["line_start"] == expected.line
                 && span["label"].as_str() == expected.primary_label
         }),
@@ -370,7 +289,7 @@ fn assert_fixture_fails(name: &str, expected: FixtureExpectation) {
     );
 }
 
-fn compile_fixture(name: &str) -> Output {
+fn compile_fixture(name: &str, configurations: &[&str]) -> Output {
     let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let artifacts = CargoArtifacts::build(&manifest_dir);
     let fixture = manifest_dir.join("src/setup/action/fixtures").join(name);
@@ -382,6 +301,12 @@ fn compile_fixture(name: &str) -> Output {
         .arg(fixture)
         .arg("-L")
         .arg(format!("dependency={}", artifacts.deps_dir.display()));
+    if configurations.contains(&"test") {
+        command.arg("--test");
+    }
+    for configuration in configurations {
+        command.arg("--cfg").arg(configuration);
+    }
     for dependency in ["base64", "serde", "serde_json", "thiserror"] {
         command.arg("--extern").arg(format!(
             "{dependency}={}",

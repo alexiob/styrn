@@ -7,10 +7,6 @@
 use std::fmt;
 use thiserror::Error;
 
-mod action_sealed {
-    pub(crate) trait Sealed {}
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ActionCheck {
     Done,
@@ -29,6 +25,30 @@ pub(crate) enum ApplyOutcome {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ActionEffect {
     Changed,
+}
+
+#[cfg(test)]
+use std::sync::{
+    atomic::{AtomicUsize, Ordering},
+    Arc, Mutex,
+};
+
+#[cfg(test)]
+#[derive(Clone)]
+pub(super) struct TestMetrics {
+    check_calls: Arc<AtomicUsize>,
+    mutation_calls: Arc<AtomicUsize>,
+}
+
+#[cfg(test)]
+impl TestMetrics {
+    pub(super) fn check_calls(&self) -> usize {
+        self.check_calls.load(Ordering::SeqCst)
+    }
+
+    pub(super) fn mutation_calls(&self) -> usize {
+        self.mutation_calls.load(Ordering::SeqCst)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -113,18 +133,10 @@ impl HumanInstructions {
     }
 }
 
-/// Validated text reserved for Phase 7 rendering; it is never executed here.
+/// A closed, non-executable placeholder for Phase 7 script rendering.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct ScriptFragment(String);
-
-impl ScriptFragment {
-    pub(in crate::setup::action) fn new(value: &str) -> Result<Self, ActionError> {
-        checked_text(value, ActionError::InvalidScriptFragment).map(Self)
-    }
-
-    pub(crate) fn as_str(&self) -> &str {
-        &self.0
-    }
+pub(crate) enum ScriptFragment {
+    DeferredAction(ActionName),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -175,92 +187,193 @@ impl ActionError {
     }
 }
 
-/// The canonical setup action contract.
-///
-/// Its mutation path is non-overridable: every ordinary caller reaches this
-/// inherent [`Action::apply`] gate, which checks before dispatching to the
-/// setup-owned implementation.
-pub(crate) struct Action {
-    implementation: Box<dyn ActionImpl>,
+/// The closed setup action plan type. Future component actions extend this
+/// enum; there is no open implementation trait or raw mutation entry point.
+pub(crate) enum Action {
+    Foundation(FoundationAction),
+    #[cfg(test)]
+    Test(TestAction),
 }
 
-impl Action {
-    pub(in crate::setup::action) fn from_impl(implementation: impl ActionImpl + 'static) -> Self {
-        Self {
-            implementation: Box::new(implementation),
+pub(crate) type ActionPlan = Vec<Action>;
+
+pub(crate) struct FoundationAction {
+    name: ActionName,
+    description: ActionDescription,
+    privilege: Privilege,
+    check: ActionCheck,
+}
+
+#[cfg(test)]
+pub(crate) struct TestAction {
+    name: ActionName,
+    description: ActionDescription,
+    privilege: Privilege,
+    state: Arc<Mutex<Vec<u8>>>,
+    metrics: TestMetrics,
+    behavior: TestBehavior,
+}
+
+#[cfg(test)]
+#[derive(Clone)]
+enum TestBehavior {
+    StateDriven,
+    NeedsHuman(NeedsHuman),
+    CheckFailure,
+    ApplyFailure,
+}
+
+mod gate {
+    use super::*;
+
+    impl Action {
+        #[cfg(test)]
+        pub(super) fn test_state_driven(
+            privilege: Privilege,
+            state: Arc<Mutex<Vec<u8>>>,
+        ) -> (Self, TestMetrics) {
+            Self::test_action(privilege, state, TestBehavior::StateDriven)
+        }
+
+        #[cfg(test)]
+        pub(super) fn test_needs_human(
+            privilege: Privilege,
+            state: Arc<Mutex<Vec<u8>>>,
+            needs_human: NeedsHuman,
+        ) -> (Self, TestMetrics) {
+            Self::test_action(privilege, state, TestBehavior::NeedsHuman(needs_human))
+        }
+
+        #[cfg(test)]
+        pub(super) fn test_check_failure(
+            privilege: Privilege,
+            state: Arc<Mutex<Vec<u8>>>,
+        ) -> (Self, TestMetrics) {
+            Self::test_action(privilege, state, TestBehavior::CheckFailure)
+        }
+
+        #[cfg(test)]
+        pub(super) fn test_apply_failure(
+            privilege: Privilege,
+            state: Arc<Mutex<Vec<u8>>>,
+        ) -> (Self, TestMetrics) {
+            Self::test_action(privilege, state, TestBehavior::ApplyFailure)
+        }
+
+        #[cfg(test)]
+        fn test_action(
+            privilege: Privilege,
+            state: Arc<Mutex<Vec<u8>>>,
+            behavior: TestBehavior,
+        ) -> (Self, TestMetrics) {
+            let metrics = TestMetrics {
+                check_calls: Arc::new(AtomicUsize::new(0)),
+                mutation_calls: Arc::new(AtomicUsize::new(0)),
+            };
+            let action = TestAction {
+                name: ActionName::parse("test.state").expect("test action name must be valid"),
+                description: ActionDescription::new("Converge test state")
+                    .expect("test description must be valid"),
+                privilege,
+                state,
+                metrics: metrics.clone(),
+                behavior,
+            };
+            (Self::Test(action), metrics)
+        }
+
+        pub(crate) fn name(&self) -> &ActionName {
+            match self {
+                Self::Foundation(action) => &action.name,
+                #[cfg(test)]
+                Self::Test(action) => &action.name,
+            }
+        }
+
+        pub(crate) fn check(&self) -> Result<ActionCheck, ActionError> {
+            match self {
+                Self::Foundation(action) => Ok(action.check.clone()),
+                #[cfg(test)]
+                Self::Test(action) => {
+                    action.metrics.check_calls.fetch_add(1, Ordering::SeqCst);
+                    match &action.behavior {
+                        TestBehavior::StateDriven | TestBehavior::ApplyFailure => {
+                            if action.state.lock().unwrap().as_slice() == [1] {
+                                Ok(ActionCheck::Done)
+                            } else {
+                                Ok(ActionCheck::Todo)
+                            }
+                        }
+                        TestBehavior::NeedsHuman(needs_human) => {
+                            Ok(ActionCheck::NeedsHuman(needs_human.clone()))
+                        }
+                        TestBehavior::CheckFailure => {
+                            Err(ActionError::check_failed(action.name.clone()))
+                        }
+                    }
+                }
+            }
+        }
+
+        pub(crate) fn privilege(&self) -> Privilege {
+            match self {
+                Self::Foundation(action) => action.privilege,
+                #[cfg(test)]
+                Self::Test(action) => action.privilege,
+            }
+        }
+
+        pub(crate) fn describe(&self) -> &ActionDescription {
+            match self {
+                Self::Foundation(action) => &action.description,
+                #[cfg(test)]
+                Self::Test(action) => &action.description,
+            }
+        }
+
+        pub(crate) fn apply(&mut self) -> Result<ApplyOutcome, ActionError> {
+            match self.check()? {
+                ActionCheck::Done => Ok(ApplyOutcome::Noop),
+                ActionCheck::Todo => execute(self).map(ApplyOutcome::Applied),
+                ActionCheck::NeedsHuman(needs_human) => Ok(ApplyOutcome::NeedsHuman(needs_human)),
+            }
+        }
+
+        pub(crate) fn revert(&mut self, _effect: &ActionEffect) -> Result<(), ActionError> {
+            Err(ActionError::UnsupportedUntilPhase7 {
+                action: self.name().clone(),
+                operation: UnsupportedOperation::Revert,
+            })
+        }
+
+        pub(crate) fn render_posix(&self) -> Result<ScriptFragment, ActionError> {
+            Err(ActionError::UnsupportedUntilPhase7 {
+                action: self.name().clone(),
+                operation: UnsupportedOperation::RenderPosix,
+            })
+        }
+
+        pub(crate) fn render_powershell(&self) -> Result<ScriptFragment, ActionError> {
+            Err(ActionError::UnsupportedUntilPhase7 {
+                action: self.name().clone(),
+                operation: UnsupportedOperation::RenderPowerShell,
+            })
         }
     }
 
-    pub(crate) fn name(&self) -> &ActionName {
-        self.implementation.name()
-    }
-
-    pub(crate) fn check(&self) -> Result<ActionCheck, ActionError> {
-        self.implementation.check()
-    }
-
-    pub(crate) fn privilege(&self) -> Privilege {
-        self.implementation.privilege()
-    }
-
-    pub(crate) fn describe(&self) -> &ActionDescription {
-        self.implementation.describe()
-    }
-
-    pub(crate) fn apply(&mut self) -> Result<ApplyOutcome, ActionError> {
-        match self.implementation.check()? {
-            ActionCheck::Done => Ok(ApplyOutcome::Noop),
-            ActionCheck::Todo => self
-                .implementation
-                .apply_mutation()
-                .map(ApplyOutcome::Applied),
-            ActionCheck::NeedsHuman(needs_human) => Ok(ApplyOutcome::NeedsHuman(needs_human)),
+    fn execute(action: &mut Action) -> Result<ActionEffect, ActionError> {
+        match action {
+            Action::Foundation(action) => Err(ActionError::apply_failed(action.name.clone())),
+            #[cfg(test)]
+            Action::Test(action) => {
+                action.metrics.mutation_calls.fetch_add(1, Ordering::SeqCst);
+                if matches!(action.behavior, TestBehavior::ApplyFailure) {
+                    return Err(ActionError::apply_failed(action.name.clone()));
+                }
+                *action.state.lock().unwrap() = vec![1];
+                Ok(ActionEffect::Changed)
+            }
         }
-    }
-
-    pub(crate) fn revert(&mut self, effect: &ActionEffect) -> Result<(), ActionError> {
-        self.implementation.revert(effect)
-    }
-
-    pub(crate) fn render_posix(&self) -> Result<ScriptFragment, ActionError> {
-        self.implementation.render_posix()
-    }
-
-    pub(crate) fn render_powershell(&self) -> Result<ScriptFragment, ActionError> {
-        self.implementation.render_powershell()
-    }
-}
-
-/// Sealed implementation hooks for setup-owned action variants.
-///
-/// This trait intentionally has no public apply method. [`Action`] owns the
-/// idempotency gate and is the sole normal setup mutation entry point.
-pub(crate) trait ActionImpl: action_sealed::Sealed {
-    fn name(&self) -> &ActionName;
-    fn check(&self) -> Result<ActionCheck, ActionError>;
-    fn privilege(&self) -> Privilege;
-    fn describe(&self) -> &ActionDescription;
-    fn apply_mutation(&mut self) -> Result<ActionEffect, ActionError>;
-
-    fn revert(&mut self, _effect: &ActionEffect) -> Result<(), ActionError> {
-        Err(ActionError::UnsupportedUntilPhase7 {
-            action: self.name().clone(),
-            operation: UnsupportedOperation::Revert,
-        })
-    }
-
-    fn render_posix(&self) -> Result<ScriptFragment, ActionError> {
-        Err(ActionError::UnsupportedUntilPhase7 {
-            action: self.name().clone(),
-            operation: UnsupportedOperation::RenderPosix,
-        })
-    }
-
-    fn render_powershell(&self) -> Result<ScriptFragment, ActionError> {
-        Err(ActionError::UnsupportedUntilPhase7 {
-            action: self.name().clone(),
-            operation: UnsupportedOperation::RenderPowerShell,
-        })
     }
 }
 
@@ -290,3 +403,10 @@ fn valid_action_name_segment(segment: &str) -> bool {
 
 #[cfg(test)]
 mod tests;
+
+#[allow(unexpected_cfgs)]
+mod fixture_support {
+    #[cfg(action_owned_descendant_fixture)]
+    #[path = "owned_descendant_impl.rs"]
+    mod owned_descendant;
+}
