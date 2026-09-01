@@ -29,11 +29,11 @@ project workflows; project-specific build knowledge belongs in `.styrn.toml`.
 
 ## Rust, dependencies, and layout
 
-- `rust-toolchain.toml` is authoritative. The current exact toolchain is
-  `1.98.0`, with `rustfmt` and `clippy`; `Cargo.toml` declares Rust `1.98`.
-  Keep the local file, `rust-version`, and the single CI selector aligned.
-  Never downgrade Rust. Updates must use a current stable release, never below
-  Rust 1.94, and update the lockfile and toolchain-contract tests together.
+- `rust-toolchain.toml` is authoritative and pins the current exact toolchain
+  (`1.98.0`, with `rustfmt` and `clippy`); `Cargo.toml` declares Rust `1.98`.
+  Never downgrade Rust. Each update must use the then-current latest stable
+  release, never below Rust 1.94, and update the local pin, `rust-version`, CI
+  selector, lockfile, and toolchain-contract tests together.
 - Build with the pinned toolchain; do not select `stable`, `beta`, nightly, or
   a second toolchain in CI.
 - Before adding or updating a dependency, check the design's Part 16.2 and the
@@ -56,12 +56,16 @@ project workflows; project-specific build knowledge belongs in `.styrn.toml`.
   Manifest writes must remain validated, locked, temporary-file based,
   hardened, atomically replaced, and verified after replacement. Reject unsafe
   paths, links, special files, and insecure ownership/permission chains.
-- Never serialize, log, return, or leave in receipts a private key, auth/API
-  key, token, password, or secret-shaped value. Secret rejection must occur
-  before a write and must not echo the secret in an error.
+- Never serialize, log, return, or include in manifests, receipts, audit logs,
+  generated/rendered setup scripts, command payloads/envelopes, or diagnostics
+  a private key, auth/API key, token, password, or secret-shaped value. Secret
+  rejection must occur before a write and must not echo the secret in an error.
 - Machine manifests are root/Administrator-owned and readable but not writable
-  by the unprivileged `styrn` worker. A worker may write only its designated job
-  tree; it must not gain controller credentials or policy-editing authority.
+  by the unprivileged `styrn` worker. Untrusted job code is confined by
+  convention and filesystem permissions to its job-scoped workspace/output
+  reach. The worker control plane may write registry, locks, audit,
+  maintenance, cache, repos, and artifacts under its designated Styrn-owned
+  tree, but it must not gain controller credentials or policy-editing authority.
 - A controller role is not job eligibility, and a worker role is not admin
   authority. The worker makes atomic resource-admission decisions. Agent jobs
   may modify source; validation runs use a clean worktree at an exact commit and
