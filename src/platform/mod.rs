@@ -9,6 +9,48 @@ mod windows;
 
 use std::path::Path;
 
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum ManifestOwner {
+    System,
+    #[cfg(test)]
+    CurrentProcess,
+}
+
+pub(crate) fn harden_manifest_directory(
+    path: &Path,
+    owner: ManifestOwner,
+    worker: &str,
+) -> std::io::Result<()> {
+    platform_impl::harden_manifest_directory(path, owner, worker)
+}
+
+pub(crate) fn harden_manifest_file(
+    path: &Path,
+    owner: ManifestOwner,
+    worker: &str,
+) -> std::io::Result<()> {
+    platform_impl::harden_manifest_file(path, owner, worker)
+}
+
+pub(crate) fn open_manifest_lock(
+    path: &Path,
+    owner: ManifestOwner,
+) -> std::io::Result<std::fs::File> {
+    platform_impl::open_manifest_lock(path, owner)
+}
+
+pub(crate) fn create_manifest_temporary(path: &Path) -> std::io::Result<std::fs::File> {
+    platform_impl::create_manifest_temporary(path)
+}
+
+pub(crate) fn verify_manifest_security(
+    path: &Path,
+    owner: ManifestOwner,
+    worker: &str,
+) -> std::io::Result<()> {
+    platform_impl::verify_manifest_security(path, owner, worker)
+}
+
 /// Replaces a completed temporary file with its destination. Ownership and
 /// permission hardening belong at this boundary in T0.7.
 pub(crate) fn replace_file(temporary: &Path, destination: &Path) -> std::io::Result<()> {
@@ -21,3 +63,12 @@ pub(crate) fn replace_file(temporary: &Path, destination: &Path) -> std::io::Res
         windows::replace_file(temporary, destination)
     }
 }
+
+#[cfg(target_os = "linux")]
+use linux as platform_impl;
+
+#[cfg(target_os = "macos")]
+use macos as platform_impl;
+
+#[cfg(target_os = "windows")]
+use windows as platform_impl;

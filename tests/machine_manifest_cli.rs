@@ -5,15 +5,15 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use uuid::Uuid;
 
+#[cfg(unix)]
+use std::os::unix::fs::MetadataExt;
+
 #[test]
-fn manifest_json_repairs_once_and_keeps_a_stable_schema_valid_id() {
+fn manifest_json_keeps_a_stable_schema_valid_id_without_rewriting() {
     let temp = TestDir::new();
     fs::write(
         temp.path().join("machine.toml"),
-        remove_line(
-            &fs::read_to_string("examples/machine.toml").unwrap(),
-            "machine_id =",
-        ),
+        fs::read_to_string("examples/machine.toml").unwrap(),
     )
     .unwrap();
 
@@ -23,11 +23,7 @@ fn manifest_json_repairs_once_and_keeps_a_stable_schema_valid_id() {
     assert_schema_valid(&first_json);
     assert_eq!(first_json["ok"], true);
     assert_eq!(first_json["command"], "machine manifest");
-    assert_eq!(first_json["warnings"].as_array().unwrap().len(), 1);
-    assert_eq!(
-        first_json["warnings"][0]["code"],
-        "machine.machine_id_minted"
-    );
+    assert_eq!(first_json["warnings"].as_array().unwrap().len(), 0);
 
     let second = run(temp.path(), &["machine", "manifest", "--json"]);
     assert!(second.status.success(), "{second:?}");
@@ -65,25 +61,37 @@ fn init_and_manifest_report_invalid_documents_as_one_typed_exit_two_envelope() {
 }
 
 #[test]
-fn init_repairs_an_existing_stage_zero_manifest_but_never_invents_one() {
+#[cfg(unix)]
+fn init_never_reports_an_unhardened_repair_as_success_and_never_invents_one() {
     let repaired_dir = TestDir::new();
-    fs::write(
-        repaired_dir.path().join("machine.toml"),
-        remove_line(
-            &fs::read_to_string("examples/machine.toml").unwrap(),
-            "machine_id =",
-        ),
-    )
-    .unwrap();
+    let stage_zero = remove_line(
+        &fs::read_to_string("examples/machine.toml").unwrap(),
+        "machine_id =",
+    );
+    let repaired_path = repaired_dir.path().join("machine.toml");
+    fs::write(&repaired_path, &stage_zero).unwrap();
     let repaired = run(repaired_dir.path(), &["machine", "init", "--json"]);
-    assert!(repaired.status.success(), "{repaired:?}");
     let repaired_json = exactly_one_json(&repaired.stdout);
     assert_eq!(repaired_json["command"], "machine init");
-    assert_eq!(
-        repaired_json["warnings"][0]["code"],
-        "machine.machine_id_minted"
-    );
-    assert!(repaired_dir.path().join("machine.toml").exists());
+    if unsafe { libc::geteuid() } == 0 {
+        assert!(repaired.status.success(), "{repaired:?}");
+        assert_eq!(
+            repaired_json["warnings"][0]["code"],
+            "machine.machine_id_minted"
+        );
+        assert_ne!(fs::read_to_string(&repaired_path).unwrap(), stage_zero);
+        let metadata = fs::metadata(&repaired_path).unwrap();
+        assert_eq!(metadata.uid(), 0);
+        assert_eq!(metadata.mode() & 0o777, 0o644);
+    } else {
+        assert_eq!(repaired.status.code(), Some(2), "{repaired:?}");
+        assert_eq!(repaired_json["ok"], false);
+        assert_eq!(
+            repaired_json["errors"][0]["code"],
+            "machine.manifest_invalid"
+        );
+        assert_eq!(fs::read_to_string(&repaired_path).unwrap(), stage_zero);
+    }
 
     let absent_dir = TestDir::new();
     let absent = run(absent_dir.path(), &["machine", "init", "--json"]);
@@ -157,6 +165,7 @@ fn assert_schema_valid(value: &Value) {
     }
 }
 
+#[cfg(unix)]
 fn remove_line(input: &str, starts_with: &str) -> String {
     input
         .lines()

@@ -824,6 +824,7 @@ dependencies = [
  "chrono",
  "clap",
  "jsonschema",
+ "libc",
  "serde",
  "serde_json",
  "sysinfo",

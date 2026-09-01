@@ -4,7 +4,7 @@ use chrono::{DateTime, FixedOffset};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
-use std::fs::{self, OpenOptions};
+use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use thiserror::Error;
@@ -449,6 +449,17 @@ pub(crate) struct ReadOutcome {
 #[derive(Debug)]
 pub(crate) struct MachineManifestStore {
     path: PathBuf,
+    security: ManifestSecurity,
+}
+
+#[allow(dead_code)] // Test-only policies are unused by the binary test harness itself.
+#[derive(Clone, Copy, Debug)]
+enum ManifestSecurity {
+    System,
+    #[cfg(test)]
+    CurrentProcess,
+    #[cfg(test)]
+    FailBeforeReplace,
 }
 
 #[allow(dead_code)] // Referenced by the executable; integration tests compile this module separately.
@@ -471,8 +482,30 @@ pub(crate) fn configured_manifest_path() -> PathBuf {
 }
 
 impl MachineManifestStore {
+    #[allow(dead_code)] // Integration test crates include this module without the executable.
     pub(crate) fn new(path: impl Into<PathBuf>) -> Self {
-        Self { path: path.into() }
+        Self {
+            path: path.into(),
+            security: ManifestSecurity::System,
+        }
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn new_for_test(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            security: ManifestSecurity::CurrentProcess,
+        }
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn new_with_failing_hardening(path: impl Into<PathBuf>) -> Self {
+        Self {
+            path: path.into(),
+            security: ManifestSecurity::FailBeforeReplace,
+        }
     }
 
     pub(crate) fn read_or_repair(&self) -> Result<ReadOutcome, ManifestError> {
@@ -560,6 +593,7 @@ impl MachineManifestStore {
             ManifestError::Validation("manifest path has no parent directory".to_owned())
         })?;
         fs::create_dir_all(destination_dir).map_err(ManifestError::Write)?;
+        self.harden_directory(destination_dir)?;
         let lock_path = destination_dir.join(format!(
             ".{}.lock",
             self.path
@@ -567,12 +601,7 @@ impl MachineManifestStore {
                 .and_then(|name| name.to_str())
                 .unwrap_or("machine.toml")
         ));
-        let lock = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(lock_path)
+        let lock = platform::open_manifest_lock(&lock_path, self.platform_owner())
             .map_err(ManifestError::Write)?;
         lock.lock().map_err(ManifestError::Write)?;
         operation()
@@ -592,21 +621,58 @@ impl MachineManifestStore {
             Uuid::now_v7()
         ));
         let result = (|| {
-            let mut file = OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&temporary)
-                .map_err(ManifestError::Write)?;
+            let mut file =
+                platform::create_manifest_temporary(&temporary).map_err(ManifestError::Write)?;
             file.write_all(manifest.to_toml()?.as_bytes())
                 .map_err(ManifestError::Write)?;
             file.flush().map_err(ManifestError::Write)?;
             file.sync_all().map_err(ManifestError::Write)?;
-            platform::replace_file(&temporary, &self.path).map_err(ManifestError::Write)
+            self.harden_temporary(&temporary)?;
+            platform::replace_file(&temporary, &self.path).map_err(ManifestError::Write)?;
+            self.verify_security()
         })();
         if result.is_err() {
             let _ = fs::remove_file(&temporary);
         }
         result
+    }
+
+    fn harden_directory(&self, path: &std::path::Path) -> Result<(), ManifestError> {
+        self.ensure_hardening_available()?;
+        platform::harden_manifest_directory(path, self.platform_owner(), "styrn")
+            .map_err(ManifestError::Write)
+    }
+
+    fn harden_temporary(&self, path: &std::path::Path) -> Result<(), ManifestError> {
+        self.ensure_hardening_available()?;
+        platform::harden_manifest_file(path, self.platform_owner(), "styrn")
+            .map_err(ManifestError::Write)
+    }
+
+    fn verify_security(&self) -> Result<(), ManifestError> {
+        platform::verify_manifest_security(&self.path, self.platform_owner(), "styrn")
+            .map_err(ManifestError::Write)
+    }
+
+    fn platform_owner(&self) -> platform::ManifestOwner {
+        match self.security {
+            ManifestSecurity::System => platform::ManifestOwner::System,
+            #[cfg(test)]
+            ManifestSecurity::CurrentProcess | ManifestSecurity::FailBeforeReplace => {
+                platform::ManifestOwner::CurrentProcess
+            }
+        }
+    }
+
+    fn ensure_hardening_available(&self) -> Result<(), ManifestError> {
+        #[cfg(test)]
+        if matches!(self.security, ManifestSecurity::FailBeforeReplace) {
+            return Err(ManifestError::Write(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "injected manifest hardening failure",
+            )));
+        }
+        Ok(())
     }
 }
 

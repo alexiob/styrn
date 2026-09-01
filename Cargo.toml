@@ -31,3 +31,6 @@ tracing = "0.1"
 
 [dev-dependencies]
 jsonschema = { version = "=0.17.1", default-features = false }
+
+[target.'cfg(unix)'.dev-dependencies]
+libc = "=0.2.189"

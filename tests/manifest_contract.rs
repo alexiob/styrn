@@ -12,6 +12,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{mpsc, Arc, Barrier};
 use uuid::Uuid;
 
+#[cfg(unix)]
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
 fn schema_validator() -> JSONSchema {
     let schema: Value = serde_json::from_str(
         &fs::read_to_string(concat!(
@@ -292,7 +295,7 @@ fn schema_valid_optional_desktop_kind_is_accepted() {
 fn generated_write_mints_once_and_preserves_identity_across_updates() {
     let temp = TestDir::new();
     let path = temp.path().join("machine.toml");
-    let store = MachineManifestStore::new(&path);
+    let store = MachineManifestStore::new_for_test(&path);
     let draft = MachineManifest::parse_toml(&fs::read_to_string("examples/machine.toml").unwrap())
         .unwrap()
         .without_machine_id();
@@ -308,6 +311,143 @@ fn generated_write_mints_once_and_preserves_identity_across_updates() {
     assert!(!stored.machine_id_minted);
     assert_eq!(stored.manifest.machine_id, first);
     assert_eq!(stored.manifest.name, "renamed-worker");
+}
+
+#[cfg(unix)]
+#[test]
+#[ignore = "environmental: run as root to verify real system ownership"]
+fn generated_system_manifest_is_root_owned_and_not_worker_writable() {
+    let temp = TestDir::new();
+    let path = temp.path().join("machine.toml");
+    let draft = MachineManifest::parse_toml(&fs::read_to_string("examples/machine.toml").unwrap())
+        .unwrap()
+        .without_machine_id();
+
+    MachineManifestStore::new(&path)
+        .write_generated(&draft)
+        .unwrap();
+
+    let metadata = fs::metadata(path).unwrap();
+    assert_eq!(metadata.uid(), 0, "the manifest owner must be root");
+    assert_eq!(metadata.mode() & 0o777, 0o644);
+}
+
+#[cfg(unix)]
+#[test]
+fn deterministic_unix_hardening_sets_readable_file_and_protects_replacement_path() {
+    let temp = TestDir::new();
+    let path = temp.path().join("machine.toml");
+    let draft = MachineManifest::parse_toml(&fs::read_to_string("examples/machine.toml").unwrap())
+        .unwrap()
+        .without_machine_id();
+    MachineManifestStore::new_for_test(&path)
+        .write_generated(&draft)
+        .unwrap();
+
+    assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o644);
+    assert_eq!(fs::metadata(temp.path()).unwrap().mode() & 0o022, 0);
+    assert_eq!(
+        fs::metadata(temp.path().join(".machine.toml.lock"))
+            .unwrap()
+            .mode()
+            & 0o777,
+        0o600
+    );
+    assert!(fs::read_to_string(&path)
+        .unwrap()
+        .contains("schema_version = 1"));
+
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o664)).unwrap();
+    assert!(platform::verify_manifest_security(
+        &path,
+        platform::ManifestOwner::CurrentProcess,
+        "styrn"
+    )
+    .is_err());
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+    fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o775)).unwrap();
+    assert!(platform::verify_manifest_security(
+        &path,
+        platform::ManifestOwner::CurrentProcess,
+        "styrn"
+    )
+    .is_err());
+}
+
+#[test]
+fn hardening_error_propagates_without_replacing_manifest_or_leaving_a_temporary() {
+    let temp = TestDir::new();
+    let path = temp.path().join("machine.toml");
+    let original = fs::read("examples/machine.toml").unwrap();
+    fs::write(&path, &original).unwrap();
+    let draft = MachineManifest::parse_toml(&String::from_utf8(original.clone()).unwrap())
+        .unwrap()
+        .without_machine_id();
+
+    let error = MachineManifestStore::new_with_failing_hardening(&path)
+        .write_generated(&draft)
+        .unwrap_err();
+
+    assert!(matches!(error, manifest::ManifestError::Write(_)));
+    assert_eq!(fs::read(&path).unwrap(), original);
+    assert_no_manifest_temporaries(temp.path());
+}
+
+#[cfg(unix)]
+#[test]
+#[ignore = "environmental: run as root on a host with an unprivileged styrn account"]
+fn real_styrn_account_can_read_but_cannot_write_or_replace_manifest() {
+    use std::ffi::CString;
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::ExitStatus;
+
+    assert_eq!(unsafe { libc::geteuid() }, 0, "requires root privileges");
+    let account = CString::new("styrn").unwrap();
+    let password = unsafe { libc::getpwnam(account.as_ptr()) };
+    assert!(!password.is_null(), "requires a real styrn account");
+    let uid = unsafe { (*password).pw_uid };
+    let gid = unsafe { (*password).pw_gid };
+    assert_ne!(uid, 0, "styrn must be an unprivileged account");
+
+    let temp = TestDir::new();
+    let path = temp.path().join("machine.toml");
+    let draft = MachineManifest::parse_toml(&fs::read_to_string("examples/machine.toml").unwrap())
+        .unwrap()
+        .without_machine_id();
+    MachineManifestStore::new(&path)
+        .write_generated(&draft)
+        .unwrap();
+
+    let child = unsafe { libc::fork() };
+    assert!(child >= 0, "fork failed");
+    if child == 0 {
+        #[cfg(target_os = "linux")]
+        let group_ok = unsafe { libc::initgroups(account.as_ptr(), gid) } == 0;
+        #[cfg(target_os = "macos")]
+        let group_ok = unsafe {
+            libc::initgroups(
+                account.as_ptr(),
+                libc::c_int::try_from(gid).expect("styrn gid must fit c_int"),
+            )
+        } == 0;
+        let gid_ok = unsafe { libc::setgid(gid) } == 0;
+        let uid_ok = unsafe { libc::setuid(uid) } == 0;
+        let readable = fs::read_to_string(&path).is_ok();
+        let write_denied = fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied);
+        let replace_denied = fs::rename(&path, temp.path().join("stolen.toml"))
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied);
+        unsafe {
+            libc::_exit(i32::from(
+                !(group_ok && gid_ok && uid_ok && readable && write_denied && replace_denied),
+            ));
+        }
+    }
+    let mut status = 0;
+    assert_eq!(unsafe { libc::waitpid(child, &mut status, 0) }, child);
+    assert!(ExitStatus::from_raw(status).success());
 }
 
 #[test]
@@ -337,7 +477,7 @@ fn complete_legitimate_manifest_round_trips_and_persists_without_false_positives
     );
 
     let temp = TestDir::new();
-    let store = MachineManifestStore::new(temp.path().join("machine.toml"));
+    let store = MachineManifestStore::new_for_test(temp.path().join("machine.toml"));
     let machine_id = store
         .write_generated(&manifest.clone().without_machine_id())
         .unwrap();
@@ -357,7 +497,7 @@ fn complete_legitimate_manifest_round_trips_and_persists_without_false_positives
 fn secret_bearing_generated_writes_preserve_destinations_and_leave_no_temporary_files() {
     let temp = TestDir::new();
     let path = temp.path().join("machine.toml");
-    let store = MachineManifestStore::new(&path);
+    let store = MachineManifestStore::new_for_test(&path);
     let mut secret_draft =
         MachineManifest::parse_toml(&fs::read_to_string("examples/machine.toml").unwrap())
             .unwrap()
@@ -391,7 +531,7 @@ fn secret_shaped_dynamic_key_generated_writes_preserve_destinations_without_leak
     for secret_key in secret_keys {
         let temp = TestDir::new();
         let path = temp.path().join("machine.toml");
-        let store = MachineManifestStore::new(&path);
+        let store = MachineManifestStore::new_for_test(&path);
         let mut secret_draft =
             MachineManifest::parse_toml(&fs::read_to_string("examples/machine.toml").unwrap())
                 .unwrap()
@@ -442,7 +582,9 @@ fn secret_bearing_legacy_manifest_does_not_self_heal_or_rewrite() {
     );
     fs::write(&path, &secret_legacy).unwrap();
 
-    assert!(MachineManifestStore::new(&path).read_or_repair().is_err());
+    assert!(MachineManifestStore::new_for_test(&path)
+        .read_or_repair()
+        .is_err());
     assert_eq!(fs::read_to_string(&path).unwrap(), secret_legacy);
     assert_no_manifest_temporaries(temp.path());
 }
@@ -462,7 +604,7 @@ fn invalid_generated_write_does_not_repair_an_existing_stage_zero_manifest() {
             .without_machine_id();
     invalid_draft.schema_version = 2;
 
-    assert!(MachineManifestStore::new(&path)
+    assert!(MachineManifestStore::new_for_test(&path)
         .write_generated(&invalid_draft)
         .is_err());
     assert_eq!(fs::read_to_string(path).unwrap(), stage_zero);
@@ -474,7 +616,7 @@ fn missing_machine_id_repairs_once_and_invalid_input_never_rewrites() {
     let path = temp.path().join("machine.toml");
     let valid = fs::read_to_string("examples/machine.toml").unwrap();
     fs::write(&path, remove_line(&valid, "machine_id =")).unwrap();
-    let store = MachineManifestStore::new(&path);
+    let store = MachineManifestStore::new_for_test(&path);
 
     let repaired = store.read_or_repair().unwrap();
     assert!(repaired.machine_id_minted);
@@ -498,7 +640,9 @@ fn complete_manifest_read_is_byte_preserving() {
     let original = fs::read("examples/machine.toml").unwrap();
     fs::write(&path, &original).unwrap();
 
-    let outcome = MachineManifestStore::new(&path).read_or_repair().unwrap();
+    let outcome = MachineManifestStore::new_for_test(&path)
+        .read_or_repair()
+        .unwrap();
     assert!(!outcome.machine_id_minted);
     assert_eq!(fs::read(path).unwrap(), original);
 }
@@ -528,7 +672,7 @@ fn simultaneous_missing_id_repairs_return_one_persisted_uuid() {
                 barrier.wait();
                 sender
                     .send(
-                        MachineManifestStore::new(path)
+                        MachineManifestStore::new_for_test(path)
                             .read_or_repair()
                             .unwrap()
                             .manifest
