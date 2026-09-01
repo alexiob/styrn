@@ -344,47 +344,70 @@ fn contains_sensitive_marker_value(value: &str) -> bool {
             return false;
         };
         let marker = normalized_marker(marker);
-        let Some((next_index, next)) = tokens
-            .iter()
-            .enumerate()
-            .skip(index + 1)
-            .find(|(_, token)| !matches!(token, MarkerToken::Gap))
-        else {
-            return false;
-        };
-        let (has_separator, continuation_index) = match next {
-            MarkerToken::Separator => {
-                let Some((continuation_index, _)) = tokens
-                    .iter()
-                    .enumerate()
-                    .skip(next_index + 1)
-                    .find(|(_, token)| !matches!(token, MarkerToken::Gap))
-                else {
-                    return false;
-                };
-                (true, continuation_index)
-            }
-            MarkerToken::Word(_) => (false, next_index),
-            _ => return false,
-        };
-        let Some(MarkerToken::Word(continuation)) = tokens.get(continuation_index) else {
-            return false;
-        };
-        if continuation.is_empty() {
-            return false;
-        }
-        if marker == "bearer" {
-            let begins_clause = tokens[..index]
-                .iter()
-                .rev()
-                .find(|token| !matches!(token, MarkerToken::Gap))
-                .is_none_or(|previous| {
-                    matches!(previous, MarkerToken::Boundary | MarkerToken::Separator)
-                });
-            return (begins_clause || has_separator) && !continuation.is_empty();
-        }
-        is_sensitive_marker(&marker)
+        (is_sensitive_marker(&marker) && assignment_value_after(&tokens, index).is_some())
+            || (marker == "auth" && phrase_value_after(&tokens, index, "token").is_some())
+            || (marker == "authorization" && phrase_value_after(&tokens, index, "bearer").is_some())
+            || (marker == "bearer"
+                && contextual_value_after(&tokens, index)
+                    .is_some_and(|continuation| !is_bearer_noun_prose(&tokens, continuation)))
     })
+}
+
+fn assignment_value_after(tokens: &[MarkerToken<'_>], index: usize) -> Option<usize> {
+    let (separator_index, separator) = next_non_gap(tokens, index + 1)?;
+    matches!(separator, MarkerToken::Separator).then(|| next_word(tokens, separator_index + 1))?
+}
+
+fn phrase_value_after(tokens: &[MarkerToken<'_>], index: usize, phrase: &str) -> Option<usize> {
+    let (phrase_index, phrase_token) = next_non_gap(tokens, index + 1)?;
+    let MarkerToken::Word(word) = phrase_token else {
+        return None;
+    };
+    (normalized_marker(word) == phrase).then(|| contextual_value_after(tokens, phrase_index))?
+}
+
+fn contextual_value_after(tokens: &[MarkerToken<'_>], index: usize) -> Option<usize> {
+    let (next_index, next) = next_non_gap(tokens, index + 1)?;
+    match next {
+        MarkerToken::Word(_) => Some(next_index),
+        MarkerToken::Separator => next_word(tokens, next_index + 1),
+        _ => None,
+    }
+}
+
+fn next_word(tokens: &[MarkerToken<'_>], start: usize) -> Option<usize> {
+    let (index, token) = next_non_gap(tokens, start)?;
+    matches!(token, MarkerToken::Word(_)).then_some(index)
+}
+
+fn next_non_gap<'tokens, 'text>(
+    tokens: &'tokens [MarkerToken<'text>],
+    start: usize,
+) -> Option<(usize, &'tokens MarkerToken<'text>)> {
+    tokens
+        .iter()
+        .enumerate()
+        .skip(start)
+        .find(|(_, token)| !matches!(token, MarkerToken::Gap))
+}
+
+fn is_bearer_noun_prose(tokens: &[MarkerToken<'_>], continuation: usize) -> bool {
+    let MarkerToken::Word(noun) = tokens[continuation] else {
+        return false;
+    };
+    if !matches!(normalized_marker(noun).as_str(), "process") {
+        return false;
+    }
+    let Some(copula) = next_word(tokens, continuation + 1) else {
+        return false;
+    };
+    let MarkerToken::Word(copula) = tokens[copula] else {
+        return false;
+    };
+    matches!(
+        normalized_marker(copula).as_str(),
+        "is" | "are" | "was" | "were" | "be" | "been" | "being"
+    )
 }
 
 fn contains_credential_prefix(value: &str) -> bool {

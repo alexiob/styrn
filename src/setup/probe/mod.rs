@@ -542,15 +542,34 @@ mod tests {
             "Authoritative machine identity is healthy.",
             "authentication service is healthy.",
             "the bearer process is healthy.",
+            "Bearer process is healthy.",
+            "Bearer process was healthy.",
+            "Auth service is healthy.",
+            "Token cache is healthy.",
+            "The auth process is healthy.",
+            "Token is absent.",
         ] {
             assert!(RemediationSpec::new(ordinary_text, None).is_ok());
-            assert!(ProbeDescriptorSpec::new(
+            let descriptor = ProbeDescriptorSpec::new(
                 ProbeId::parse("tool.safe").unwrap(),
                 ordinary_text,
                 FindingSeverity::Info,
                 None,
             )
-            .is_ok());
+            .expect("ordinary descriptor must be accepted");
+            let observed = ProbeCatalog::new(vec![Box::new(FakeProbe {
+                descriptor,
+                result: Ok(ProbeStatus::Present {
+                    version: None,
+                    healthy: true,
+                }),
+                calls: Arc::new(AtomicUsize::new(0)),
+            })])
+            .unwrap()
+            .observe();
+            assert!(serde_json::to_string(observed.iter().next().unwrap())
+                .unwrap()
+                .contains(ordinary_text));
         }
     }
 
@@ -567,9 +586,15 @@ mod tests {
             "token=abc123",
             "token: abc123",
             "auth = abc123",
+            "AUTH : abc123",
             "password: hunter2",
             "api_key: abc123",
             "Bearer abcdefgh",
+            "received Bearer abcdefgh",
+            "using Bearer abcdefgh",
+            "received bearer=abcdefgh",
+            "authorization bearer abcdefgh",
+            "authorization bearer: abcdefgh",
             "sk_live_do-not-leak",
             "ghp_do-not-leak",
             "github_pat_do-not-leak",
