@@ -6,7 +6,6 @@ use chrono::{TimeZone, Utc};
 use jsonschema::JSONSchema;
 use serde_json::{json, Value};
 use std::fs;
-use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn timestamp() -> chrono::DateTime<Utc> {
@@ -108,8 +107,9 @@ fn invalid_envelope_inputs_are_rejected_before_serialization() {
 
 #[test]
 fn fixture_writes_one_schema_valid_json_document_to_stdout_and_diagnostics_to_stderr() {
-    let fixture = compile_fixture();
-    let output = Command::new(fixture).output().unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_output-fixture-test"))
+        .output()
+        .unwrap();
 
     assert!(output.status.success());
     assert!(
@@ -120,51 +120,4 @@ fn fixture_writes_one_schema_valid_json_document_to_stdout_and_diagnostics_to_st
     let value: Value = serde_json::from_str(&stdout)
         .expect("stdout must be exactly one JSON document with no trailing decoration");
     assert_schema_valid(&value);
-}
-
-fn compile_fixture() -> PathBuf {
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let deps_dir = manifest_dir.join("target/debug/deps");
-    let executable = manifest_dir.join("target/output-fixture-test");
-    let mut command = Command::new("rustc");
-    command
-        .arg("--edition=2021")
-        .arg(manifest_dir.join("tests/fixtures/output_fixture.rs"))
-        .arg("-L")
-        .arg(format!("dependency={}", deps_dir.display()))
-        .arg("--extern")
-        .arg(extern_rlib(&deps_dir, "chrono"))
-        .arg("--extern")
-        .arg(extern_rlib(&deps_dir, "serde"))
-        .arg("--extern")
-        .arg(extern_rlib(&deps_dir, "serde_json"))
-        .arg("-o")
-        .arg(&executable);
-    let output = command.output().unwrap();
-    assert!(
-        output.status.success(),
-        "fixture must compile:\n{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(
-        output.stderr.is_empty(),
-        "fixture compiler must not emit warnings:\n{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    executable
-}
-
-fn extern_rlib(deps_dir: &Path, crate_name: &str) -> String {
-    let prefix = format!("lib{crate_name}-");
-    let path = fs::read_dir(deps_dir)
-        .unwrap()
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .find(|path| {
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with(&prefix) && name.ends_with(".rlib"))
-        })
-        .unwrap_or_else(|| panic!("missing compiled dependency {crate_name}"));
-    format!("{crate_name}={}", path.display())
 }

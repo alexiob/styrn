@@ -41,14 +41,8 @@ fn workflow_101() -> ! {
 }
 
 fn exec_101() -> ! {
-    let outcome = output::ExecOutcome::new(
-        timestamp(),
-        101,
-        "fixture stdout",
-        "fixture stderr",
-        12,
-    )
-    .unwrap();
+    let outcome =
+        output::ExecOutcome::new(timestamp(), 101, "fixture stdout", "fixture stderr", 12).unwrap();
     output::write_json(std::io::stdout(), outcome.envelope()).unwrap();
     std::process::exit(outcome.process_exit_code())
 }
@@ -56,8 +50,9 @@ fn exec_101() -> ! {
 fn panic_boundary() -> ! {
     let previous_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(|_| {}));
-    let failure = output::catch_unmapped_panic("host status", timestamp(), || panic!("fixture panic"))
-        .expect_err("panic must become a failure envelope");
+    let failure =
+        output::catch_unmapped_panic("host status", timestamp(), || panic!("fixture panic"))
+            .expect_err("panic must become a failure envelope");
     std::panic::set_hook(previous_hook);
     output::write_json(std::io::stdout(), failure.envelope()).unwrap();
     output::exit_process(failure.exit_code())

@@ -5,9 +5,8 @@ mod output;
 use jsonschema::JSONSchema;
 use serde_json::Value;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::{Command, Output};
-use std::sync::OnceLock;
 
 const EXPECTED_REGISTRY: [(&str, i32); 37] = [
     ("usage.invalid_argument", 2),
@@ -167,54 +166,6 @@ fn run_fixture(fixture: &Path, args: &[&str]) -> Output {
     Command::new(fixture).args(args).output().unwrap()
 }
 
-fn fixture() -> &'static PathBuf {
-    static FIXTURE: OnceLock<PathBuf> = OnceLock::new();
-    FIXTURE.get_or_init(compile_fixture)
-}
-
-fn compile_fixture() -> PathBuf {
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let deps_dir = manifest_dir.join("target/debug/deps");
-    let executable = manifest_dir.join("target/outcome-fixture-test");
-    let mut command = Command::new("rustc");
-    command
-        .arg("--edition=2021")
-        .arg(manifest_dir.join("tests/fixtures/outcome_fixture.rs"))
-        .arg("-L")
-        .arg(format!("dependency={}", deps_dir.display()))
-        .arg("--extern")
-        .arg(extern_rlib(&deps_dir, "chrono"))
-        .arg("--extern")
-        .arg(extern_rlib(&deps_dir, "serde"))
-        .arg("--extern")
-        .arg(extern_rlib(&deps_dir, "serde_json"))
-        .arg("-o")
-        .arg(&executable);
-    let output = command.output().unwrap();
-    assert!(
-        output.status.success(),
-        "fixture must compile:\n{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(
-        output.stderr.is_empty(),
-        "fixture compiler must not emit warnings:\n{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    executable
-}
-
-fn extern_rlib(deps_dir: &Path, crate_name: &str) -> String {
-    let prefix = format!("lib{crate_name}-");
-    let path = fs::read_dir(deps_dir)
-        .unwrap()
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .find(|path| {
-            path.file_name()
-                .and_then(|name| name.to_str())
-                .is_some_and(|name| name.starts_with(&prefix) && name.ends_with(".rlib"))
-        })
-        .unwrap_or_else(|| panic!("missing compiled dependency {crate_name}"));
-    format!("{crate_name}={}", path.display())
+fn fixture() -> &'static Path {
+    Path::new(env!("CARGO_BIN_EXE_outcome-fixture-test"))
 }

@@ -7,6 +7,18 @@ edition = "2021"
 name = "styrn"
 path = "src/main.rs"
 
+[[bin]]
+name = "output-fixture-test"
+path = "tests/fixtures/output_fixture.rs"
+test = false
+bench = false
+
+[[bin]]
+name = "outcome-fixture-test"
+path = "tests/fixtures/outcome_fixture.rs"
+test = false
+bench = false
+
 [dependencies]
 clap = { version = "=4.5.41", features = ["derive"] }
 serde = { version = "=1.0.219", features = ["derive"] }
