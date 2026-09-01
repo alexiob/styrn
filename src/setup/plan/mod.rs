@@ -78,7 +78,16 @@ enum DesiredBehavior {
         repair: DesiredAction,
         done: DesiredAction,
     },
-    Line(DesiredAction),
+    Exceptional {
+        action: DesiredAction,
+        required_observation: ExceptionalObservation,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExceptionalObservation {
+    Absent,
+    Healthy,
 }
 
 impl DesiredChange {
@@ -110,21 +119,68 @@ impl DesiredChange {
         })
     }
 
-    /// Represents a deliberate non-convergence line such as `NeedsHuman`, a
-    /// skipped optional component, or an uninstall request. It still names a
-    /// canonical worker-local subject and therefore cannot bypass observation.
-    pub(crate) fn line(
+    /// A missing capability whose next step cannot be automated.
+    pub(crate) fn needs_human(
         subject: ProbeId,
         component: &str,
         action: DesiredAction,
     ) -> Result<Self, PlanError> {
-        if action.subject() != &subject {
+        Self::exceptional(
+            subject,
+            component,
+            action,
+            PlanOperation::NeedsHuman,
+            ExceptionalObservation::Absent,
+        )
+    }
+
+    /// An absent optional capability deliberately excluded from this setup.
+    pub(crate) fn skipped(
+        subject: ProbeId,
+        component: &str,
+        action: DesiredAction,
+    ) -> Result<Self, PlanError> {
+        Self::exceptional(
+            subject,
+            component,
+            action,
+            PlanOperation::Skipped,
+            ExceptionalObservation::Absent,
+        )
+    }
+
+    /// A healthy present capability selected for removal.
+    pub(crate) fn remove(
+        subject: ProbeId,
+        component: &str,
+        action: DesiredAction,
+    ) -> Result<Self, PlanError> {
+        Self::exceptional(
+            subject,
+            component,
+            action,
+            PlanOperation::Remove,
+            ExceptionalObservation::Healthy,
+        )
+    }
+
+    fn exceptional(
+        subject: ProbeId,
+        component: &str,
+        action: DesiredAction,
+        expected_operation: PlanOperation,
+        required_observation: ExceptionalObservation,
+    ) -> Result<Self, PlanError> {
+        if action.subject() != &subject || action.operation != expected_operation {
             return Err(PlanError::InvalidCrossLink);
         }
         Ok(Self {
             subject,
             component: ComponentName::parse(component)?,
-            behavior: DesiredBehavior::Line(action),
+            behavior: DesiredBehavior::Exceptional {
+                action,
+                required_observation,
+            },
         })
     }
 }
@@ -160,6 +216,8 @@ pub(crate) enum PlanError {
     MissingObservation,
     #[error("setup plan is blocked because an observation is unknowable")]
     UnknowableObservation,
+    #[error("exceptional setup plan line does not match the observed state")]
+    ExceptionalObservationMismatch,
 }
 
 #[derive(Debug, Error)]
@@ -201,6 +259,26 @@ impl SetupPlan {
             if matches!(observation.status(), ProbeStatus::Unknowable { .. }) {
                 return Err(PlanError::UnknowableObservation);
             }
+            if let DesiredBehavior::Exceptional {
+                required_observation,
+                ..
+            } = &change.behavior
+            {
+                let matched = match required_observation {
+                    ExceptionalObservation::Absent => {
+                        matches!(observation.status(), ProbeStatus::Absent)
+                    }
+                    ExceptionalObservation::Healthy => {
+                        matches!(
+                            observation.status(),
+                            ProbeStatus::Present { healthy: true, .. }
+                        )
+                    }
+                };
+                if !matched {
+                    return Err(PlanError::ExceptionalObservationMismatch);
+                }
+            }
         }
 
         let entries = desired
@@ -224,7 +302,7 @@ impl SetupPlan {
                             unreachable!("unknowable observations were validated above")
                         }
                     },
-                    DesiredBehavior::Line(action) => action.clone(),
+                    DesiredBehavior::Exceptional { action, .. } => action.clone(),
                 };
                 PlanEntry {
                     subject: change.subject.clone(),
@@ -348,3 +426,10 @@ impl fmt::Display for PlanOperation {
 
 #[cfg(test)]
 mod tests;
+
+#[allow(unexpected_cfgs)]
+mod fixture_support {
+    #[cfg(plan_action_apply_fixture)]
+    #[path = "hostile_apply.rs"]
+    mod hostile_apply;
+}

@@ -53,6 +53,41 @@ fn converge(subject: &str, component: &str) -> DesiredChange {
     .expect("test desired convergence must be valid")
 }
 
+fn converge_with_done(
+    subject: &str,
+    component: &str,
+    name: &str,
+    description: &str,
+    privilege: Privilege,
+) -> DesiredChange {
+    DesiredChange::converge(
+        id(subject),
+        component,
+        action(
+            subject,
+            &format!("{name}.install"),
+            "install the component",
+            privilege,
+            PlanOperation::Create,
+        ),
+        action(
+            subject,
+            &format!("{name}.repair"),
+            "repair the component",
+            privilege,
+            PlanOperation::Reconfigure,
+        ),
+        action(
+            subject,
+            &format!("{name}.done"),
+            description,
+            privilege,
+            PlanOperation::Done,
+        ),
+    )
+    .expect("test desired convergence must be valid")
+}
+
 #[test]
 fn ordered_diff_renders_grouped_create_reconfigure_and_done_lines() {
     let calls = Arc::new(AtomicUsize::new(0));
@@ -324,6 +359,129 @@ fn status_mapping_keeps_absent_unhealthy_and_broken_distinct() {
 }
 
 #[test]
+fn converge_rejects_status_inverting_create_and_done_templates() {
+    let absent_done = DesiredChange::converge(
+        id("tool.absent"),
+        "absent",
+        action(
+            "tool.absent",
+            "absent.done",
+            "claim absent component is done",
+            Privilege::None,
+            PlanOperation::Done,
+        ),
+        action(
+            "tool.absent",
+            "absent.repair",
+            "repair absent component",
+            Privilege::None,
+            PlanOperation::Reconfigure,
+        ),
+        action(
+            "tool.absent",
+            "absent.healthy",
+            "component is healthy",
+            Privilege::None,
+            PlanOperation::Done,
+        ),
+    );
+    let healthy_create = DesiredChange::converge(
+        id("tool.healthy"),
+        "healthy",
+        action(
+            "tool.healthy",
+            "healthy.install",
+            "install healthy component",
+            Privilege::None,
+            PlanOperation::Create,
+        ),
+        action(
+            "tool.healthy",
+            "healthy.repair",
+            "repair healthy component",
+            Privilege::None,
+            PlanOperation::Reconfigure,
+        ),
+        action(
+            "tool.healthy",
+            "healthy.create",
+            "create healthy component",
+            Privilege::None,
+            PlanOperation::Create,
+        ),
+    );
+
+    assert_eq!(absent_done.unwrap_err(), PlanError::InvalidCrossLink);
+    assert_eq!(healthy_create.unwrap_err(), PlanError::InvalidCrossLink);
+}
+
+#[test]
+fn exceptional_lines_require_their_declared_observed_states() {
+    let exceptional = vec![
+        DesiredChange::needs_human(
+            id("tool.human"),
+            "human",
+            action(
+                "tool.human",
+                "human.login",
+                "authenticate in browser",
+                Privilege::None,
+                PlanOperation::NeedsHuman,
+            ),
+        )
+        .unwrap(),
+        DesiredChange::skipped(
+            id("tool.skip"),
+            "skip",
+            action(
+                "tool.skip",
+                "skip.optional",
+                "enable with configuration",
+                Privilege::None,
+                PlanOperation::Skipped,
+            ),
+        )
+        .unwrap(),
+        DesiredChange::remove(
+            id("tool.remove"),
+            "remove",
+            action(
+                "tool.remove",
+                "remove.old",
+                "remove old component",
+                Privilege::Admin,
+                PlanOperation::Remove,
+            ),
+        )
+        .unwrap(),
+    ];
+
+    for status in [
+        ProbeStatus::Present {
+            version: None,
+            healthy: false,
+        },
+        ProbeStatus::Broken {
+            reason: "inconsistent state".to_owned(),
+        },
+    ] {
+        for change in &exceptional {
+            let catalog = test_support::catalog(vec![test_support::TestProbe::fixed(
+                change.subject.as_str(),
+                status.clone(),
+                Arc::new(AtomicUsize::new(0)),
+            )]);
+            let desired = DesiredState::new(vec![change.clone()]);
+
+            assert_eq!(
+                SetupPlan::compute(&catalog.observe(), &desired).unwrap_err(),
+                PlanError::ExceptionalObservationMismatch
+            );
+        }
+    }
+}
+
+#[test]
 fn badges_and_first_seen_component_groups_are_exact_and_special_lines_stay_typed() {
     let catalog = test_support::catalog(vec![
         test_support::TestProbe::fixed(
@@ -352,18 +510,12 @@ fn badges_and_first_seen_component_groups_are_exact_and_special_lines_stay_typed
         ),
         test_support::TestProbe::fixed(
             "tool.human",
-            ProbeStatus::Present {
-                version: None,
-                healthy: true,
-            },
+            ProbeStatus::Absent,
             Arc::new(AtomicUsize::new(0)),
         ),
         test_support::TestProbe::fixed(
             "tool.skip",
-            ProbeStatus::Present {
-                version: None,
-                healthy: true,
-            },
+            ProbeStatus::Absent,
             Arc::new(AtomicUsize::new(0)),
         ),
         test_support::TestProbe::fixed(
@@ -376,43 +528,28 @@ fn badges_and_first_seen_component_groups_are_exact_and_special_lines_stay_typed
         ),
     ]);
     let desired = DesiredState::new(vec![
-        DesiredChange::line(
-            id("tool.root"),
+        converge_with_done(
+            "tool.root",
             "first",
-            action(
-                "tool.root",
-                "first.root",
-                "root line",
-                Privilege::Root,
-                PlanOperation::Done,
-            ),
-        )
-        .unwrap(),
-        DesiredChange::line(
-            id("tool.admin"),
+            "first.root",
+            "root line",
+            Privilege::Root,
+        ),
+        converge_with_done(
+            "tool.admin",
             "second",
-            action(
-                "tool.admin",
-                "second.admin",
-                "admin line",
-                Privilege::Admin,
-                PlanOperation::Done,
-            ),
-        )
-        .unwrap(),
-        DesiredChange::line(
-            id("tool.none"),
+            "second.admin",
+            "admin line",
+            Privilege::Admin,
+        ),
+        converge_with_done(
+            "tool.none",
             "first",
-            action(
-                "tool.none",
-                "first.none",
-                "plain line",
-                Privilege::None,
-                PlanOperation::Done,
-            ),
-        )
-        .unwrap(),
-        DesiredChange::line(
+            "first.none",
+            "plain line",
+            Privilege::None,
+        ),
+        DesiredChange::needs_human(
             id("tool.human"),
             "special",
             action(
@@ -424,7 +561,7 @@ fn badges_and_first_seen_component_groups_are_exact_and_special_lines_stay_typed
             ),
         )
         .unwrap(),
-        DesiredChange::line(
+        DesiredChange::skipped(
             id("tool.skip"),
             "special",
             action(
@@ -436,7 +573,7 @@ fn badges_and_first_seen_component_groups_are_exact_and_special_lines_stay_typed
             ),
         )
         .unwrap(),
-        DesiredChange::line(
+        DesiredChange::remove(
             id("tool.remove"),
             "special",
             action(
