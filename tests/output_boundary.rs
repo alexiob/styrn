@@ -2,11 +2,15 @@
 #[path = "../src/output/mod.rs"]
 mod output;
 
+mod fixture_builder;
+
 use chrono::{TimeZone, Utc};
 use jsonschema::JSONSchema;
 use serde_json::{json, Value};
 use std::fs;
+use std::path::PathBuf;
 use std::process::Command;
+use std::sync::OnceLock;
 
 fn timestamp() -> chrono::DateTime<Utc> {
     Utc.with_ymd_and_hms(2026, 9, 1, 12, 0, 0).single().unwrap()
@@ -107,9 +111,7 @@ fn invalid_envelope_inputs_are_rejected_before_serialization() {
 
 #[test]
 fn fixture_writes_one_schema_valid_json_document_to_stdout_and_diagnostics_to_stderr() {
-    let output = Command::new(env!("CARGO_BIN_EXE_output-fixture-test"))
-        .output()
-        .unwrap();
+    let output = Command::new(fixture()).output().unwrap();
 
     assert!(output.status.success());
     assert!(
@@ -120,4 +122,9 @@ fn fixture_writes_one_schema_valid_json_document_to_stdout_and_diagnostics_to_st
     let value: Value = serde_json::from_str(&stdout)
         .expect("stdout must be exactly one JSON document with no trailing decoration");
     assert_schema_valid(&value);
+}
+
+fn fixture() -> &'static PathBuf {
+    static FIXTURE: OnceLock<PathBuf> = OnceLock::new();
+    FIXTURE.get_or_init(|| fixture_builder::build_example("output-fixture-test"))
 }

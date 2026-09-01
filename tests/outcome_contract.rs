@@ -2,11 +2,14 @@
 #[path = "../src/output/mod.rs"]
 mod output;
 
+mod fixture_builder;
+
 use jsonschema::JSONSchema;
 use serde_json::Value;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::OnceLock;
 
 const EXPECTED_REGISTRY: [(&str, i32); 37] = [
     ("usage.invalid_argument", 2),
@@ -166,6 +169,7 @@ fn run_fixture(fixture: &Path, args: &[&str]) -> Output {
     Command::new(fixture).args(args).output().unwrap()
 }
 
-fn fixture() -> &'static Path {
-    Path::new(env!("CARGO_BIN_EXE_outcome-fixture-test"))
+fn fixture() -> &'static PathBuf {
+    static FIXTURE: OnceLock<PathBuf> = OnceLock::new();
+    FIXTURE.get_or_init(|| fixture_builder::build_example("outcome-fixture-test"))
 }
