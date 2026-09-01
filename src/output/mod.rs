@@ -6,9 +6,32 @@ use std::io::Write;
 
 const SCHEMA: &str = "styrn.command.v1";
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-#[repr(i32)]
-pub(crate) enum StyrnExit {
+macro_rules! define_styrn_exits {
+    ($( $variant:ident = $value:literal ),+ $(,)?) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        #[repr(i32)]
+        pub(crate) enum StyrnExit {
+            $( $variant = $value, )+
+        }
+
+        impl StyrnExit {
+            pub(crate) const ALL: &'static [Self] = &[$(Self::$variant),+];
+
+            pub(crate) const fn as_i32(self) -> i32 {
+                self as i32
+            }
+
+            pub(crate) fn from_i32(value: i32) -> Option<Self> {
+                Self::ALL
+                    .iter()
+                    .copied()
+                    .find(|exit| exit.as_i32() == value)
+            }
+        }
+    };
+}
+
+define_styrn_exits! {
     Success = 0,
     InternalError = 1,
     Usage = 2,
@@ -25,200 +48,80 @@ pub(crate) enum StyrnExit {
     Setup = 13,
 }
 
-impl StyrnExit {
-    pub(crate) const ALL: [Self; 14] = [
-        Self::Success,
-        Self::InternalError,
-        Self::Usage,
-        Self::Unreachable,
-        Self::Authentication,
-        Self::RemoteExecution,
-        Self::ResourceAdmission,
-        Self::CapabilityUnavailable,
-        Self::Protocol,
-        Self::PartialFleet,
-        Self::Timeout,
-        Self::AgentHarness,
-        Self::Workflow,
-        Self::Setup,
-    ];
-
-    pub(crate) const fn as_i32(self) -> i32 {
-        self as i32
-    }
-}
-
 pub(crate) fn exit_process(exit: StyrnExit) -> ! {
     std::process::exit(exit.as_i32())
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum ErrorCode {
-    UsageInvalidArgument,
-    UsageConfigInvalid,
-    TransportUnreachable,
-    TransportAuthFailed,
-    TransportSessionLost,
-    ProtocolIncompatible,
-    ProtocolMalformed,
-    MachineManifestInvalid,
-    ResourceMemoryAdmissionDenied,
-    ResourceCpuAdmissionDenied,
-    ResourceDiskAdmissionDenied,
-    ResourceHeavyExclusivityDenied,
-    ResourceJobDiskLimitExceeded,
-    ResourceHostDiskFloor,
-    CapabilityUnsatisfied,
-    JobNotFound,
-    JobTimeout,
-    JobCancelled,
-    JobWorkflowFailed,
-    JobSupervisorLost,
-    AgentNotFound,
-    AgentHarnessError,
-    ProjectProfileInvalid,
-    ProjectWorkflowNotDeclared,
-    ProjectRevisionUnresolved,
-    ProjectWorktreeDirty,
-    FleetPartial,
-    InternalError,
-    SetupProbeFailed,
-    SetupPlanInvalid,
-    SetupConfirmationRequired,
-    SetupElevationRequired,
-    SetupApplyFailed,
-    SetupNeedsHuman,
-    SetupUnsupportedOs,
-    SetupReceiptConflict,
-    SetupAdoptMismatch,
+macro_rules! define_error_codes {
+    ($( $variant:ident => ($name:literal, $exit:ident) ),+ $(,)?) => {
+        #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+        pub(crate) enum ErrorCode {
+            $( $variant, )+
+        }
+
+        impl ErrorCode {
+            pub(crate) const ALL: &'static [Self] = &[$(Self::$variant),+];
+
+            pub(crate) fn from_str(value: &str) -> Option<Self> {
+                Self::ALL
+                    .iter()
+                    .copied()
+                    .find(|code| code.as_str() == value)
+            }
+
+            pub(crate) const fn as_str(self) -> &'static str {
+                match self {
+                    $( Self::$variant => $name, )+
+                }
+            }
+
+            pub(crate) const fn exit_code(self) -> StyrnExit {
+                match self {
+                    $( Self::$variant => StyrnExit::$exit, )+
+                }
+            }
+        }
+    };
 }
 
-impl ErrorCode {
-    pub(crate) const ALL: [Self; 37] = [
-        Self::UsageInvalidArgument,
-        Self::UsageConfigInvalid,
-        Self::TransportUnreachable,
-        Self::TransportAuthFailed,
-        Self::TransportSessionLost,
-        Self::ProtocolIncompatible,
-        Self::ProtocolMalformed,
-        Self::MachineManifestInvalid,
-        Self::ResourceMemoryAdmissionDenied,
-        Self::ResourceCpuAdmissionDenied,
-        Self::ResourceDiskAdmissionDenied,
-        Self::ResourceHeavyExclusivityDenied,
-        Self::ResourceJobDiskLimitExceeded,
-        Self::ResourceHostDiskFloor,
-        Self::CapabilityUnsatisfied,
-        Self::JobNotFound,
-        Self::JobTimeout,
-        Self::JobCancelled,
-        Self::JobWorkflowFailed,
-        Self::JobSupervisorLost,
-        Self::AgentNotFound,
-        Self::AgentHarnessError,
-        Self::ProjectProfileInvalid,
-        Self::ProjectWorkflowNotDeclared,
-        Self::ProjectRevisionUnresolved,
-        Self::ProjectWorktreeDirty,
-        Self::FleetPartial,
-        Self::InternalError,
-        Self::SetupProbeFailed,
-        Self::SetupPlanInvalid,
-        Self::SetupConfirmationRequired,
-        Self::SetupElevationRequired,
-        Self::SetupApplyFailed,
-        Self::SetupNeedsHuman,
-        Self::SetupUnsupportedOs,
-        Self::SetupReceiptConflict,
-        Self::SetupAdoptMismatch,
-    ];
-
-    pub(crate) fn from_str(value: &str) -> Option<Self> {
-        Self::ALL.into_iter().find(|code| code.as_str() == value)
-    }
-
-    pub(crate) const fn as_str(self) -> &'static str {
-        match self {
-            Self::UsageInvalidArgument => "usage.invalid_argument",
-            Self::UsageConfigInvalid => "usage.config_invalid",
-            Self::TransportUnreachable => "transport.unreachable",
-            Self::TransportAuthFailed => "transport.auth_failed",
-            Self::TransportSessionLost => "transport.session_lost",
-            Self::ProtocolIncompatible => "protocol.incompatible",
-            Self::ProtocolMalformed => "protocol.malformed",
-            Self::MachineManifestInvalid => "machine.manifest_invalid",
-            Self::ResourceMemoryAdmissionDenied => "resource.memory_admission_denied",
-            Self::ResourceCpuAdmissionDenied => "resource.cpu_admission_denied",
-            Self::ResourceDiskAdmissionDenied => "resource.disk_admission_denied",
-            Self::ResourceHeavyExclusivityDenied => "resource.heavy_exclusivity_denied",
-            Self::ResourceJobDiskLimitExceeded => "resource.job_disk_limit_exceeded",
-            Self::ResourceHostDiskFloor => "resource.host_disk_floor",
-            Self::CapabilityUnsatisfied => "capability.unsatisfied",
-            Self::JobNotFound => "job.not_found",
-            Self::JobTimeout => "job.timeout",
-            Self::JobCancelled => "job.cancelled",
-            Self::JobWorkflowFailed => "job.workflow_failed",
-            Self::JobSupervisorLost => "job.supervisor_lost",
-            Self::AgentNotFound => "agent.not_found",
-            Self::AgentHarnessError => "agent.harness_error",
-            Self::ProjectProfileInvalid => "project.profile_invalid",
-            Self::ProjectWorkflowNotDeclared => "project.workflow_not_declared",
-            Self::ProjectRevisionUnresolved => "project.revision_unresolved",
-            Self::ProjectWorktreeDirty => "project.worktree_dirty",
-            Self::FleetPartial => "fleet.partial",
-            Self::InternalError => "internal.error",
-            Self::SetupProbeFailed => "setup.probe_failed",
-            Self::SetupPlanInvalid => "setup.plan_invalid",
-            Self::SetupConfirmationRequired => "setup.confirmation_required",
-            Self::SetupElevationRequired => "setup.elevation_required",
-            Self::SetupApplyFailed => "setup.apply_failed",
-            Self::SetupNeedsHuman => "setup.needs_human",
-            Self::SetupUnsupportedOs => "setup.unsupported_os",
-            Self::SetupReceiptConflict => "setup.receipt_conflict",
-            Self::SetupAdoptMismatch => "setup.adopt_mismatch",
-        }
-    }
-
-    pub(crate) const fn exit_code(self) -> StyrnExit {
-        match self {
-            Self::UsageInvalidArgument
-            | Self::UsageConfigInvalid
-            | Self::MachineManifestInvalid
-            | Self::JobNotFound
-            | Self::AgentNotFound
-            | Self::ProjectProfileInvalid
-            | Self::ProjectWorkflowNotDeclared
-            | Self::ProjectRevisionUnresolved
-            | Self::ProjectWorktreeDirty => StyrnExit::Usage,
-            Self::TransportUnreachable | Self::TransportSessionLost => StyrnExit::Unreachable,
-            Self::TransportAuthFailed => StyrnExit::Authentication,
-            Self::ProtocolIncompatible | Self::ProtocolMalformed => StyrnExit::Protocol,
-            Self::ResourceMemoryAdmissionDenied
-            | Self::ResourceCpuAdmissionDenied
-            | Self::ResourceDiskAdmissionDenied
-            | Self::ResourceHeavyExclusivityDenied => StyrnExit::ResourceAdmission,
-            Self::CapabilityUnsatisfied => StyrnExit::CapabilityUnavailable,
-            Self::JobTimeout => StyrnExit::Timeout,
-            Self::JobCancelled
-            | Self::JobWorkflowFailed
-            | Self::JobSupervisorLost
-            | Self::ResourceJobDiskLimitExceeded
-            | Self::ResourceHostDiskFloor => StyrnExit::Workflow,
-            Self::AgentHarnessError => StyrnExit::AgentHarness,
-            Self::FleetPartial => StyrnExit::PartialFleet,
-            Self::InternalError => StyrnExit::InternalError,
-            Self::SetupProbeFailed
-            | Self::SetupPlanInvalid
-            | Self::SetupConfirmationRequired
-            | Self::SetupElevationRequired
-            | Self::SetupApplyFailed
-            | Self::SetupNeedsHuman
-            | Self::SetupUnsupportedOs
-            | Self::SetupReceiptConflict
-            | Self::SetupAdoptMismatch => StyrnExit::Setup,
-        }
-    }
+define_error_codes! {
+    UsageInvalidArgument => ("usage.invalid_argument", Usage),
+    UsageConfigInvalid => ("usage.config_invalid", Usage),
+    TransportUnreachable => ("transport.unreachable", Unreachable),
+    TransportAuthFailed => ("transport.auth_failed", Authentication),
+    TransportSessionLost => ("transport.session_lost", Unreachable),
+    ProtocolIncompatible => ("protocol.incompatible", Protocol),
+    ProtocolMalformed => ("protocol.malformed", Protocol),
+    MachineManifestInvalid => ("machine.manifest_invalid", Usage),
+    ResourceMemoryAdmissionDenied => ("resource.memory_admission_denied", ResourceAdmission),
+    ResourceCpuAdmissionDenied => ("resource.cpu_admission_denied", ResourceAdmission),
+    ResourceDiskAdmissionDenied => ("resource.disk_admission_denied", ResourceAdmission),
+    ResourceHeavyExclusivityDenied => ("resource.heavy_exclusivity_denied", ResourceAdmission),
+    ResourceJobDiskLimitExceeded => ("resource.job_disk_limit_exceeded", Workflow),
+    ResourceHostDiskFloor => ("resource.host_disk_floor", Workflow),
+    CapabilityUnsatisfied => ("capability.unsatisfied", CapabilityUnavailable),
+    JobNotFound => ("job.not_found", Usage),
+    JobTimeout => ("job.timeout", Timeout),
+    JobCancelled => ("job.cancelled", Workflow),
+    JobWorkflowFailed => ("job.workflow_failed", Workflow),
+    JobSupervisorLost => ("job.supervisor_lost", Workflow),
+    AgentNotFound => ("agent.not_found", Usage),
+    AgentHarnessError => ("agent.harness_error", AgentHarness),
+    ProjectProfileInvalid => ("project.profile_invalid", Usage),
+    ProjectWorkflowNotDeclared => ("project.workflow_not_declared", Usage),
+    ProjectRevisionUnresolved => ("project.revision_unresolved", Usage),
+    ProjectWorktreeDirty => ("project.worktree_dirty", Usage),
+    FleetPartial => ("fleet.partial", PartialFleet),
+    InternalError => ("internal.error", InternalError),
+    SetupProbeFailed => ("setup.probe_failed", Setup),
+    SetupPlanInvalid => ("setup.plan_invalid", Setup),
+    SetupConfirmationRequired => ("setup.confirmation_required", Setup),
+    SetupElevationRequired => ("setup.elevation_required", Setup),
+    SetupApplyFailed => ("setup.apply_failed", Setup),
+    SetupNeedsHuman => ("setup.needs_human", Setup),
+    SetupUnsupportedOs => ("setup.unsupported_os", Setup),
+    SetupReceiptConflict => ("setup.receipt_conflict", Setup),
+    SetupAdoptMismatch => ("setup.adopt_mismatch", Setup),
 }
 
 impl Serialize for ErrorCode {

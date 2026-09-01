@@ -49,6 +49,8 @@ const EXPECTED_REGISTRY: [(&str, i32); 37] = [
     ("setup.adopt_mismatch", 13),
 ];
 
+const EXPECTED_EXITS: [i32; 14] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13];
+
 fn validator() -> JSONSchema {
     let schema: Value = serde_json::from_str(
         &fs::read_to_string(concat!(
@@ -86,12 +88,19 @@ fn registry_is_exactly_the_documented_append_only_set() {
 #[test]
 fn typed_exit_table_produces_every_documented_process_status() {
     let fixture = fixture();
+    let actual: Vec<i32> = output::StyrnExit::ALL
+        .iter()
+        .map(|exit| exit.as_i32())
+        .collect();
 
-    for code in 0..=13 {
-        let output = run_fixture(&fixture, &[&format!("exit-{code}")]);
-        assert_eq!(output.status.code(), Some(code), "exit-{code}");
-        assert!(output.stdout.is_empty(), "exit-{code} wrote stdout");
-        assert!(output.stderr.is_empty(), "exit-{code} wrote stderr");
+    assert_eq!(actual, EXPECTED_EXITS);
+
+    for exit in output::StyrnExit::ALL {
+        let code = exit.as_i32();
+        let output = run_fixture(&fixture, &["exit", &code.to_string()]);
+        assert_eq!(output.status.code(), Some(code), "exit {code}");
+        assert!(output.stdout.is_empty(), "exit {code} wrote stdout");
+        assert!(output.stderr.is_empty(), "exit {code} wrote stderr");
     }
 }
 

@@ -13,26 +13,19 @@ fn main() {
     let scenario = arguments.next().expect("fixture scenario is required");
 
     match scenario.as_str() {
-        "exit-0" => output::exit_process(output::StyrnExit::Success),
-        "exit-1" => output::exit_process(output::StyrnExit::InternalError),
-        "exit-2" => output::exit_process(output::StyrnExit::Usage),
-        "exit-3" => output::exit_process(output::StyrnExit::Unreachable),
-        "exit-4" => output::exit_process(output::StyrnExit::Authentication),
-        "exit-5" => output::exit_process(output::StyrnExit::RemoteExecution),
-        "exit-6" => output::exit_process(output::StyrnExit::ResourceAdmission),
-        "exit-7" => output::exit_process(output::StyrnExit::CapabilityUnavailable),
-        "exit-8" => output::exit_process(output::StyrnExit::Protocol),
-        "exit-9" => output::exit_process(output::StyrnExit::PartialFleet),
-        "exit-10" => output::exit_process(output::StyrnExit::Timeout),
-        "exit-11" => output::exit_process(output::StyrnExit::AgentHarness),
-        "exit-12" => output::exit_process(output::StyrnExit::Workflow),
-        "exit-13" => output::exit_process(output::StyrnExit::Setup),
+        "exit" => exit(arguments.next().expect("exit code is required")),
         "registry" => registry(arguments.next().expect("registry code is required")),
         "workflow-101" => workflow_101(),
         "exec-101" => exec_101(),
         "panic" => panic_boundary(),
         _ => panic!("unknown fixture scenario"),
     }
+}
+
+fn exit(value: String) -> ! {
+    let value: i32 = value.parse().expect("exit code must be an integer");
+    let exit = output::StyrnExit::from_i32(value).expect("documented Styrn exit code");
+    output::exit_process(exit)
 }
 
 fn registry(name: String) -> ! {
