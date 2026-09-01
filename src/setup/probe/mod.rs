@@ -539,6 +539,9 @@ mod tests {
         for ordinary_text in [
             "Inspect local service state.",
             "Diagnostic: local version 1.2.3 is healthy.",
+            "Authoritative machine identity is healthy.",
+            "authentication service is healthy.",
+            "the bearer process is healthy.",
         ] {
             assert!(RemediationSpec::new(ordinary_text, None).is_ok());
             assert!(ProbeDescriptorSpec::new(
@@ -554,19 +557,24 @@ mod tests {
     fn secret_examples() -> &'static [&'static str] {
         &[
             "--api-key=do-not-leak",
+            "api_key=abc123",
             "--auth=abc123",
             "auth token do-not-leak",
             "authorization=Bearer abc123",
             "Bearer=abc123",
             "Bearer eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.signature",
             "secret=do-not-leak",
+            "token=abc123",
             "sk_live_do-not-leak",
             "ghp_do-not-leak",
             "github_pat_do-not-leak",
             "tskey-do-not-leak",
             "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.signature",
+            "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.signature.",
             "diagnostic: eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.signature",
             "diagnostic=eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.signature",
+            "diagnostic=eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.signature.",
+            "diagnostic:eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.signature,",
             "-----BEGIN PRIVATE KEY-----",
         ]
     }
@@ -664,14 +672,14 @@ mod tests {
     #[test]
     fn fixture_artifact_cache_is_process_independent() {
         let cache = fixture_artifact_cache_dir();
-        assert_eq!(
-            cache,
-            std::env::temp_dir().join("styrn-probe-compile-fixture-cache-v1")
-        );
-        assert_eq!(
-            cache.file_name().and_then(|name| name.to_str()),
-            Some("styrn-probe-compile-fixture-cache-v1")
-        );
+        assert_eq!(cache, fixture_artifact_cache_dir());
+        assert!(cache
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| {
+                name.starts_with("styrn-probe-compile-fixture-cache-v2-")
+                    && name.len() == "styrn-probe-compile-fixture-cache-v2-".len() + 16
+            }));
     }
 
     #[test]
@@ -866,7 +874,32 @@ mod tests {
     }
 
     fn fixture_artifact_cache_dir() -> PathBuf {
-        std::env::temp_dir().join("styrn-probe-compile-fixture-cache-v1")
+        let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let lockfile = fs::read(manifest_dir.join("Cargo.lock"))
+            .expect("fixture cache must be keyed by the Cargo lockfile");
+        let rustc = Command::new("rustc")
+            .args(["--version", "--verbose"])
+            .output()
+            .expect("rustc must be available to key the fixture artifact cache");
+        assert!(
+            rustc.status.success(),
+            "rustc must report its version to key the fixture artifact cache"
+        );
+        let fingerprint = deterministic_fingerprint(&[&lockfile, &rustc.stdout]);
+        std::env::temp_dir().join(format!(
+            "styrn-probe-compile-fixture-cache-v2-{fingerprint}"
+        ))
+    }
+
+    fn deterministic_fingerprint(parts: &[&[u8]]) -> String {
+        let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+        for part in parts {
+            for byte in *part {
+                hash ^= u64::from(*byte);
+                hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        }
+        format!("{hash:016x}")
     }
 
     struct ScopedFixtureOutput {

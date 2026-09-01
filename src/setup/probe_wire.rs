@@ -326,29 +326,52 @@ fn is_safe_text(value: &str) -> bool {
 
 fn looks_secret_shaped(value: &str) -> bool {
     let normalized = value.to_ascii_lowercase();
-    let compact = normalized
-        .bytes()
-        .filter(u8::is_ascii_alphanumeric)
-        .map(char::from)
-        .collect::<String>();
     value.chars().any(char::is_control)
         || normalized.contains("-----begin")
         || contains_bearer_credential(&normalized)
         || contains_embedded_compact_jwt(value)
-        || [
-            "apikey",
-            "auth",
-            "authorization",
-            "password",
-            "privatekey",
-            "secret",
-            "accesskey",
-            "credential",
-            "token",
-        ]
-        .iter()
-        .any(|needle| compact.contains(needle))
-        || [
+        || contains_sensitive_assignment(value)
+        || contains_auth_token_phrase(value)
+        || contains_credential_prefix(value)
+}
+
+fn contains_bearer_credential(value: &str) -> bool {
+    let candidates = credential_candidates(value);
+    lexical_tokens(value).iter().any(|token| {
+        assignment_pair(token).is_some_and(|(name, continuation)| {
+            normalized_marker(name) == "bearer" && looks_credential_continuation(continuation)
+        })
+    }) || candidates.windows(2).any(|pair| {
+        normalized_marker(pair[0]) == "bearer" && looks_credential_continuation(pair[1])
+    })
+}
+
+fn contains_embedded_compact_jwt(value: &str) -> bool {
+    credential_candidates(value).into_iter().any(is_compact_jwt)
+}
+
+fn contains_sensitive_assignment(value: &str) -> bool {
+    lexical_tokens(value).iter().any(|token| {
+        assignment_pair(token).is_some_and(|(name, continuation)| {
+            is_sensitive_marker(name) && !continuation.is_empty()
+        })
+    })
+}
+
+fn contains_auth_token_phrase(value: &str) -> bool {
+    credential_candidates(value).windows(3).any(|words| {
+        normalized_marker(words[0]) == "auth"
+            && normalized_marker(words[1]) == "token"
+            && looks_credential_continuation(words[2])
+    })
+}
+
+fn contains_credential_prefix(value: &str) -> bool {
+    credential_candidates(value).into_iter().any(|candidate| {
+        let candidate = candidate.trim_matches(
+            |character: char| !matches!(character, 'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_'),
+        );
+        [
             "sk-",
             "sk_",
             "ghp_",
@@ -360,18 +383,63 @@ fn looks_secret_shaped(value: &str) -> bool {
             "tskey_",
         ]
         .iter()
-        .any(|prefix| normalized.contains(prefix))
+        .any(|prefix| candidate.to_ascii_lowercase().starts_with(prefix))
+    })
 }
 
-fn contains_bearer_credential(value: &str) -> bool {
-    let candidates = credential_candidates(value);
-    candidates
-        .windows(2)
-        .any(|pair| pair[0].eq_ignore_ascii_case("bearer") && !pair[1].is_empty())
+fn looks_credential_continuation(value: &str) -> bool {
+    let value = value.trim_matches(
+        |character: char| !matches!(character, 'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.'),
+    );
+    !value.is_empty()
+        && (is_compact_jwt(value)
+            || contains_credential_prefix(value)
+            || (value.len() >= 6
+                && value.bytes().all(
+                    |byte| matches!(byte, b'a'..=b'z' | b'A'..=b'Z' | b'0'..=b'9' | b'-' | b'_'),
+                )
+                && value
+                    .bytes()
+                    .any(|byte| byte.is_ascii_digit() || matches!(byte, b'-' | b'_'))))
 }
 
-fn contains_embedded_compact_jwt(value: &str) -> bool {
-    credential_candidates(value).into_iter().any(is_compact_jwt)
+fn lexical_tokens(value: &str) -> Vec<&str> {
+    value
+        .split(|character: char| {
+            character.is_whitespace()
+                || matches!(character, ',' | ';' | '(' | ')' | '[' | ']' | '{' | '}')
+        })
+        .filter(|token| !token.is_empty())
+        .collect()
+}
+
+fn assignment_pair(token: &str) -> Option<(&str, &str)> {
+    let separator = token.find(['=', ':'])?;
+    Some((&token[..separator], &token[separator + 1..]))
+}
+
+fn normalized_marker(value: &str) -> String {
+    value
+        .trim_start_matches('-')
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .map(|character| character.to_ascii_lowercase())
+        .collect()
+}
+
+fn is_sensitive_marker(value: &str) -> bool {
+    matches!(
+        normalized_marker(value).as_str(),
+        "apikey"
+            | "auth"
+            | "authorization"
+            | "password"
+            | "privatekey"
+            | "secret"
+            | "accesskey"
+            | "credential"
+            | "token"
+    )
 }
 
 fn credential_candidates(value: &str) -> Vec<&str> {
@@ -391,6 +459,12 @@ fn is_compact_jwt(value: &str) -> bool {
     let candidate = value.trim_matches(
         |character: char| !matches!(character, 'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.'),
     );
+    is_compact_jwt_segments(candidate)
+        || (candidate.trim_end_matches('.').len() < candidate.len()
+            && is_compact_jwt_segments(candidate.trim_end_matches('.')))
+}
+
+fn is_compact_jwt_segments(candidate: &str) -> bool {
     let mut segments = candidate.split('.');
     let (Some(header), Some(payload), Some(signature), None) = (
         segments.next(),
