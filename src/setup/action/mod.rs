@@ -58,6 +58,17 @@ pub(crate) enum Privilege {
     Admin,
 }
 
+/// The closed set of semantic plan marks from design Part 15.4.4.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PlanOperation {
+    Create,
+    Reconfigure,
+    Done,
+    NeedsHuman,
+    Skipped,
+    Remove,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct NeedsHuman {
     instructions: HumanInstructions,
@@ -88,7 +99,7 @@ impl NeedsHuman {
 pub(crate) struct ActionName(String);
 
 impl ActionName {
-    pub(in crate::setup::action) fn parse(value: &str) -> Result<Self, ActionError> {
+    pub(in crate::setup) fn parse(value: &str) -> Result<Self, ActionError> {
         if valid_action_name(value) && super::validate_probe_static_text(value) {
             Ok(Self(value.to_owned()))
         } else {
@@ -111,7 +122,7 @@ impl fmt::Display for ActionName {
 pub(crate) struct ActionDescription(String);
 
 impl ActionDescription {
-    pub(in crate::setup::action) fn new(value: &str) -> Result<Self, ActionError> {
+    pub(in crate::setup) fn new(value: &str) -> Result<Self, ActionError> {
         checked_text(value, ActionError::InvalidDescription).map(Self)
     }
 
@@ -201,6 +212,7 @@ pub(crate) struct FoundationAction {
     name: ActionName,
     description: ActionDescription,
     privilege: Privilege,
+    operation: PlanOperation,
     check: ActionCheck,
 }
 
@@ -227,6 +239,33 @@ mod gate {
     use super::*;
 
     impl Action {
+        /// Builds a plan-only foundation action from already validated data.
+        /// Component actions added by later phases remain enum variants.
+        pub(in crate::setup) fn planned(
+            name: ActionName,
+            description: ActionDescription,
+            privilege: Privilege,
+            operation: PlanOperation,
+        ) -> Self {
+            let check = match operation {
+                PlanOperation::Create | PlanOperation::Reconfigure | PlanOperation::Remove => {
+                    ActionCheck::Todo
+                }
+                PlanOperation::Done | PlanOperation::Skipped => ActionCheck::Done,
+                PlanOperation::NeedsHuman => ActionCheck::NeedsHuman(NeedsHuman {
+                    instructions: HumanInstructions(description.as_str().to_owned()),
+                    fragment: None,
+                }),
+            };
+            Self::Foundation(FoundationAction {
+                name,
+                description,
+                privilege,
+                operation,
+                check,
+            })
+        }
+
         #[cfg(test)]
         pub(super) fn test_state_driven(
             privilege: Privilege,
@@ -323,6 +362,14 @@ mod gate {
             }
         }
 
+        pub(crate) fn plan_operation(&self) -> PlanOperation {
+            match self {
+                Self::Foundation(action) => action.operation,
+                #[cfg(test)]
+                Self::Test(_) => PlanOperation::Reconfigure,
+            }
+        }
+
         pub(crate) fn describe(&self) -> &ActionDescription {
             match self {
                 Self::Foundation(action) => &action.description,
@@ -331,7 +378,7 @@ mod gate {
             }
         }
 
-        pub(crate) fn apply(&mut self) -> Result<ApplyOutcome, ActionError> {
+        pub(in crate::setup::action) fn apply(&mut self) -> Result<ApplyOutcome, ActionError> {
             match self.check()? {
                 ActionCheck::Done => Ok(ApplyOutcome::Noop),
                 ActionCheck::Todo => execute(self).map(ApplyOutcome::Applied),

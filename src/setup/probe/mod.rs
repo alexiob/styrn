@@ -115,6 +115,92 @@ impl ProbeCatalog {
     }
 }
 
+/// Test-only catalog inputs let sibling setup tests exercise the canonical
+/// probe-to-observed-state boundary without constructing wire observations.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::*;
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    };
+
+    pub(crate) struct TestProbe {
+        descriptor: ProbeDescriptorSpec,
+        observe: Box<dyn Fn() -> ProbeStatus + Send + Sync>,
+    }
+
+    impl TestProbe {
+        pub(crate) fn fixed(id: &str, status: ProbeStatus, calls: Arc<AtomicUsize>) -> Self {
+            Self {
+                descriptor: descriptor(id),
+                observe: Box::new(move || {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    status.clone()
+                }),
+            }
+        }
+
+        pub(crate) fn stateful_absence(
+            id: &str,
+            bytes: Arc<Mutex<Vec<u8>>>,
+            calls: Arc<AtomicUsize>,
+        ) -> Self {
+            Self {
+                descriptor: descriptor(id),
+                observe: Box::new(move || {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    if bytes
+                        .lock()
+                        .expect("test state lock must not poison")
+                        .as_slice()
+                        == [0]
+                    {
+                        ProbeStatus::Absent
+                    } else {
+                        ProbeStatus::Present {
+                            version: Some("1.0.0".to_owned()),
+                            healthy: true,
+                        }
+                    }
+                }),
+            }
+        }
+    }
+
+    impl worker_probe_only::Sealed for TestProbe {}
+
+    impl WorkerProbe for TestProbe {
+        fn descriptor(&self) -> &ProbeDescriptorSpec {
+            &self.descriptor
+        }
+
+        fn observe(&self) -> Result<ProbeStatus, ProbeFailure> {
+            Ok((self.observe)())
+        }
+    }
+
+    pub(crate) fn catalog(probes: Vec<TestProbe>) -> ProbeCatalog {
+        ProbeCatalog::new(
+            probes
+                .into_iter()
+                .map(|probe| Box::new(probe) as Box<dyn WorkerProbe>)
+                .collect(),
+        )
+        .expect("test probe catalog must be valid")
+    }
+
+    fn descriptor(id: &str) -> ProbeDescriptorSpec {
+        ProbeDescriptorSpec::new(
+            ProbeId::parse(id).expect("test probe ID must be valid"),
+            "test worker probe",
+            FindingSeverity::Error,
+            None,
+        )
+        .expect("test descriptor must be valid")
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub(crate) enum ProbeCatalogError {
     #[error("worker-local probe descriptor is invalid")]

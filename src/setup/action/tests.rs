@@ -189,6 +189,20 @@ fn ordinary_callers_cannot_invoke_the_ungated_mutation_hook() {
 }
 
 #[test]
+fn plan_code_cannot_invoke_the_action_apply_route() {
+    assert_fixture_fails(
+        "plan_apply.rs",
+        FixtureExpectation::new(
+            "E0624",
+            "method `apply` is private",
+            8,
+            Some("private method"),
+            "plan_apply.rs",
+        ),
+    );
+}
+
+#[test]
 fn an_outside_module_cannot_unseal_an_action_implementation() {
     assert_fixture_fails(
         "unsealed_action.rs",

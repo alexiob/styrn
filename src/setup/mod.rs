@@ -1,6 +1,8 @@
 #[allow(dead_code)]
 pub(crate) mod action;
 #[allow(dead_code)]
+pub(crate) mod plan;
+#[allow(dead_code)]
 pub(crate) mod probe;
 #[allow(dead_code)]
 mod probe_values;
