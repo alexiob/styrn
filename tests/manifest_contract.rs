@@ -525,11 +525,120 @@ fn failed_hardening_of_a_new_leaf_removes_it_and_allows_a_clean_retry() {
         .unwrap_err();
     assert!(matches!(error, manifest::ManifestError::Write(_)));
     assert!(!directory.exists());
+    assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 0);
 
     MachineManifestStore::new_for_test(&path)
         .write_generated(&draft)
         .unwrap();
     assert!(path.is_file());
+}
+
+#[test]
+fn destination_publication_race_preserves_the_winner_and_cleans_the_staging_leaf() {
+    let temp = TestDir::new();
+    let directory = temp.path().join("new-config");
+    let path = directory.join("machine.toml");
+    let draft = MachineManifest::parse_toml(&fs::read_to_string("examples/machine.toml").unwrap())
+        .unwrap()
+        .without_machine_id();
+
+    let error = MachineManifestStore::new_with_directory_publication_race(&path)
+        .write_generated(&draft)
+        .unwrap_err();
+
+    assert!(matches!(error, manifest::ManifestError::Write(_)));
+    assert_eq!(fs::read(directory.join("race-winner")).unwrap(), b"winner");
+    assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 1);
+}
+
+#[test]
+fn staging_cleanup_failure_reports_both_errors_without_poisoning_the_final_leaf() {
+    let temp = TestDir::new();
+    let directory = temp.path().join("new-config");
+    let path = directory.join("machine.toml");
+    let draft = MachineManifest::parse_toml(&fs::read_to_string("examples/machine.toml").unwrap())
+        .unwrap()
+        .without_machine_id();
+
+    let error = MachineManifestStore::new_with_directory_publication_and_cleanup_failure(&path)
+        .write_generated(&draft)
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        manifest::ManifestError::StagingDirectoryCleanup { .. }
+    ));
+    assert_eq!(fs::read(directory.join("race-winner")).unwrap(), b"winner");
+    assert!(!path.exists());
+    let staging = fs::read_dir(temp.path())
+        .unwrap()
+        .map(Result::unwrap)
+        .find(|entry| entry.file_name().to_string_lossy().ends_with(".tmp"))
+        .expect("failed cleanup must leave the unpublished staging leaf");
+    assert_eq!(
+        fs::read(staging.path().join("cleanup-blocker")).unwrap(),
+        b"block"
+    );
+}
+
+#[test]
+fn native_directory_publish_never_replaces_an_existing_destination() {
+    let temp = TestDir::new();
+    let staging = temp.path().join("staging");
+    let destination = temp.path().join("destination");
+    fs::create_dir(&staging).unwrap();
+    fs::write(staging.join("creator"), b"staging").unwrap();
+    fs::create_dir(&destination).unwrap();
+    fs::write(destination.join("creator"), b"winner").unwrap();
+
+    let error = platform::publish_manifest_directory(&staging, &destination).unwrap_err();
+
+    assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+    assert_eq!(fs::read(destination.join("creator")).unwrap(), b"winner");
+    assert_eq!(fs::read(staging.join("creator")).unwrap(), b"staging");
+}
+
+#[test]
+fn concurrent_native_directory_publishers_produce_exactly_one_winner() {
+    let temp = TestDir::new();
+    let destination = temp.path().join("destination");
+    let staging = [temp.path().join("staging-a"), temp.path().join("staging-b")];
+    for (index, path) in staging.iter().enumerate() {
+        fs::create_dir(path).unwrap();
+        fs::write(path.join("creator"), index.to_string()).unwrap();
+    }
+    let barrier = Arc::new(Barrier::new(staging.len()));
+    let (sender, receiver) = mpsc::channel();
+
+    std::thread::scope(|scope| {
+        for path in &staging {
+            let barrier = Arc::clone(&barrier);
+            let sender = sender.clone();
+            let destination = destination.clone();
+            scope.spawn(move || {
+                barrier.wait();
+                sender
+                    .send(platform::publish_manifest_directory(path, &destination))
+                    .unwrap();
+            });
+        }
+    });
+    drop(sender);
+    let results = receiver.into_iter().collect::<Vec<_>>();
+
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    assert_eq!(
+        results
+            .iter()
+            .filter_map(|result| result.as_ref().err())
+            .map(std::io::Error::kind)
+            .collect::<Vec<_>>(),
+        vec![std::io::ErrorKind::AlreadyExists]
+    );
+    let winner = fs::read_to_string(destination.join("creator")).unwrap();
+    assert!(winner == "0" || winner == "1");
+    assert!(!staging[winner.parse::<usize>().unwrap()].exists());
+    assert!(staging[1 - winner.parse::<usize>().unwrap()].is_dir());
 }
 
 #[test]

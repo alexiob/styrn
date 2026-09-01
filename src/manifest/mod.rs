@@ -472,6 +472,10 @@ enum ManifestSecurity {
     #[cfg(test)]
     FailAfterReplace,
     #[cfg(test)]
+    DirectoryPublicationRace,
+    #[cfg(test)]
+    DirectoryPublicationAndCleanupFailure,
+    #[cfg(test)]
     CurrentProcessWorker,
 }
 
@@ -624,6 +628,40 @@ impl MachineManifestStore {
 
     #[cfg(test)]
     #[allow(dead_code)]
+    pub(crate) fn new_with_directory_publication_race(path: impl Into<PathBuf>) -> Self {
+        let path = path.into();
+        let trusted_root = path
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_default();
+        Self {
+            path,
+            trusted_root,
+            security: ManifestSecurity::DirectoryPublicationRace,
+            destination_origin: DestinationOrigin::Test,
+        }
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn new_with_directory_publication_and_cleanup_failure(
+        path: impl Into<PathBuf>,
+    ) -> Self {
+        let path = path.into();
+        let trusted_root = path
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_default();
+        Self {
+            path,
+            trusted_root,
+            security: ManifestSecurity::DirectoryPublicationAndCleanupFailure,
+            destination_origin: DestinationOrigin::Test,
+        }
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) fn new_with_failing_post_replace_verification(path: impl Into<PathBuf>) -> Self {
         let path = path.into();
         let trusted_root = path
@@ -765,8 +803,7 @@ impl MachineManifestStore {
                 .map_err(ManifestError::Write)?;
 
             if metadata.is_none() {
-                fs::create_dir(destination_dir).map_err(ManifestError::Write)?;
-                return self.harden_created_directory(destination_dir);
+                return self.create_and_publish_directory(destination_dir);
             }
 
             if self.destination_origin == DestinationOrigin::Override {
@@ -781,7 +818,7 @@ impl MachineManifestStore {
         }
 
         if metadata.is_none() {
-            fs::create_dir(destination_dir).map_err(ManifestError::Write)?;
+            self.create_and_publish_directory(destination_dir)?;
         }
         platform::verify_manifest_ancestors(
             destination_dir,
@@ -801,25 +838,67 @@ impl MachineManifestStore {
             if metadata.is_some() {
                 self.harden_directory(destination_dir)
             } else {
-                self.harden_created_directory(destination_dir)
+                Ok(())
             }
         }
     }
 
-    fn harden_created_directory(&self, path: &std::path::Path) -> Result<(), ManifestError> {
-        let identity = platform::manifest_directory_identity(path).map_err(ManifestError::Write)?;
-        match self.harden_directory(path) {
+    fn create_and_publish_directory(
+        &self,
+        destination: &std::path::Path,
+    ) -> Result<(), ManifestError> {
+        let parent = destination.parent().ok_or_else(|| {
+            ManifestError::Validation(
+                "manifest directory must be below an existing parent".to_owned(),
+            )
+        })?;
+        let leaf = destination
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("styrn");
+        let staging = parent.join(format!(".{leaf}.{}.tmp", Uuid::now_v7()));
+        fs::create_dir(&staging).map_err(ManifestError::Write)?;
+
+        let operation = (|| {
+            self.harden_directory(&staging)?;
+            self.inject_directory_publication_race(&staging, destination)?;
+            platform::publish_manifest_directory(&staging, destination)
+                .map_err(ManifestError::Write)
+        })();
+        match operation {
             Ok(()) => Ok(()),
-            Err(hardening) => {
-                match platform::remove_manifest_directory_if_same_and_empty(path, &identity) {
-                    Ok(()) => Err(hardening),
-                    Err(cleanup) => Err(ManifestError::NewDirectoryCleanup {
-                        hardening: Box::new(hardening),
-                        cleanup,
-                    }),
-                }
+            Err(operation) => match fs::remove_dir(&staging) {
+                Ok(()) => Err(operation),
+                Err(cleanup) => Err(ManifestError::StagingDirectoryCleanup {
+                    operation: Box::new(operation),
+                    cleanup,
+                }),
+            },
+        }
+    }
+
+    fn inject_directory_publication_race(
+        &self,
+        _staging: &std::path::Path,
+        _destination: &std::path::Path,
+    ) -> Result<(), ManifestError> {
+        #[cfg(test)]
+        if matches!(
+            self.security,
+            ManifestSecurity::DirectoryPublicationRace
+                | ManifestSecurity::DirectoryPublicationAndCleanupFailure
+        ) {
+            fs::create_dir(_destination).map_err(ManifestError::Write)?;
+            fs::write(_destination.join("race-winner"), b"winner").map_err(ManifestError::Write)?;
+            if matches!(
+                self.security,
+                ManifestSecurity::DirectoryPublicationAndCleanupFailure
+            ) {
+                fs::write(_staging.join("cleanup-blocker"), b"block")
+                    .map_err(ManifestError::Write)?;
             }
         }
+        Ok(())
     }
 
     fn validate_destination_policy(&self) -> Result<&std::path::Path, ManifestError> {
@@ -922,7 +1001,10 @@ impl MachineManifestStore {
         match self.security {
             ManifestSecurity::System => platform::ManifestOwner::System,
             #[cfg(test)]
-            ManifestSecurity::CurrentProcess | ManifestSecurity::FailBeforeReplace => {
+            ManifestSecurity::CurrentProcess
+            | ManifestSecurity::FailBeforeReplace
+            | ManifestSecurity::DirectoryPublicationRace
+            | ManifestSecurity::DirectoryPublicationAndCleanupFailure => {
                 platform::ManifestOwner::CurrentProcess
             }
             #[cfg(test)]
@@ -1163,10 +1245,10 @@ pub(crate) enum ManifestError {
     #[error("machine manifest was replaced but security verification failed: {0}")]
     PostReplaceSecurity(std::io::Error),
     #[error(
-        "new manifest directory hardening failed ({hardening}); cleanup also failed: {cleanup}"
+        "manifest staging directory operation failed ({operation}); cleanup also failed: {cleanup}"
     )]
-    NewDirectoryCleanup {
-        hardening: Box<ManifestError>,
+    StagingDirectoryCleanup {
+        operation: Box<ManifestError>,
         cleanup: std::io::Error,
     },
     #[error("manifest secret rejected at {path}: {reason}")]
@@ -1252,6 +1334,9 @@ mod destination_policy_tests {
                 Path::new(r"\\server\share\custom-config\machine.toml"),
                 Path::new(r"\\?\C:\ProgramData\custom-config\machine.toml"),
                 Path::new(r"\\?\UNC\server\share\custom-config\machine.toml"),
+                Path::new(
+                    r"\\?\Volume{12345678-1234-1234-1234-123456789abc}\custom-config\machine.toml",
+                ),
                 Path::new(r"\\.\PIPE\custom-config\machine.toml"),
                 Path::new(r"C:ProgramData\custom-config\machine.toml"),
                 Path::new(r"\ProgramData\custom-config\machine.toml"),

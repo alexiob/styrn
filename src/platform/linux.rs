@@ -1,14 +1,10 @@
 use super::ManifestOwner;
 use std::fs;
 use std::io;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
-
-pub(super) struct ManifestDirectoryIdentity {
-    device: u64,
-    inode: u64,
-}
 
 #[allow(dead_code)]
 pub(crate) fn platform_name() -> &'static str {
@@ -111,29 +107,26 @@ pub(super) fn verify_manifest_directory_security(
     verify_directory(directory, owner)
 }
 
-pub(super) fn manifest_directory_identity(
-    directory: &Path,
-) -> io::Result<ManifestDirectoryIdentity> {
-    require_real_directory(directory)?;
-    let metadata = fs::metadata(directory)?;
-    Ok(ManifestDirectoryIdentity {
-        device: metadata.dev(),
-        inode: metadata.ino(),
-    })
-}
-
-pub(super) fn remove_manifest_directory_if_same_and_empty(
-    directory: &Path,
-    identity: &ManifestDirectoryIdentity,
-) -> io::Result<()> {
-    require_real_directory(directory)?;
-    let metadata = fs::metadata(directory)?;
-    if metadata.dev() != identity.device || metadata.ino() != identity.inode {
-        return Err(permission_denied(
-            "new manifest directory changed before cleanup",
-        ));
+pub(super) fn publish_manifest_directory(staging: &Path, destination: &Path) -> io::Result<()> {
+    require_real_directory(staging)?;
+    let staging = std::ffi::CString::new(staging.as_os_str().as_bytes())
+        .map_err(|_| invalid_data("manifest staging path contains a NUL byte"))?;
+    let destination = std::ffi::CString::new(destination.as_os_str().as_bytes())
+        .map_err(|_| invalid_data("manifest destination path contains a NUL byte"))?;
+    if unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            staging.as_ptr(),
+            libc::AT_FDCWD,
+            destination.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    } == -1
+    {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
     }
-    fs::remove_dir(directory)
 }
 
 pub(super) fn verify_manifest_parent_chain(

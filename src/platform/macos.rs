@@ -6,11 +6,6 @@ use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
 
-pub(super) struct ManifestDirectoryIdentity {
-    device: u64,
-    inode: u64,
-}
-
 type Acl = *mut std::ffi::c_void;
 type AclEntry = *mut std::ffi::c_void;
 #[cfg(test)]
@@ -28,6 +23,7 @@ const ACL_DELETE: i32 = 1 << 4;
 const ACL_DELETE_CHILD: i32 = 1 << 6;
 
 unsafe extern "C" {
+    fn renamex_np(old: *const i8, new: *const i8, flags: u32) -> i32;
     fn acl_init(count: i32) -> Acl;
     fn acl_free(object: *mut std::ffi::c_void) -> i32;
     fn acl_get_file(path: *const i8, kind: i32) -> Acl;
@@ -153,29 +149,18 @@ pub(super) fn verify_manifest_directory_security(
     verify_directory(directory, owner)
 }
 
-pub(super) fn manifest_directory_identity(
-    directory: &Path,
-) -> io::Result<ManifestDirectoryIdentity> {
-    require_real_directory(directory)?;
-    let metadata = fs::metadata(directory)?;
-    Ok(ManifestDirectoryIdentity {
-        device: metadata.dev(),
-        inode: metadata.ino(),
-    })
-}
-
-pub(super) fn remove_manifest_directory_if_same_and_empty(
-    directory: &Path,
-    identity: &ManifestDirectoryIdentity,
-) -> io::Result<()> {
-    require_real_directory(directory)?;
-    let metadata = fs::metadata(directory)?;
-    if metadata.dev() != identity.device || metadata.ino() != identity.inode {
-        return Err(permission_denied(
-            "new manifest directory changed before cleanup",
-        ));
+pub(super) fn publish_manifest_directory(staging: &Path, destination: &Path) -> io::Result<()> {
+    const RENAME_EXCL: u32 = 0x0000_0004;
+    require_real_directory(staging)?;
+    let staging = std::ffi::CString::new(staging.as_os_str().as_bytes())
+        .map_err(|_| invalid_data("manifest staging path contains a NUL byte"))?;
+    let destination = std::ffi::CString::new(destination.as_os_str().as_bytes())
+        .map_err(|_| invalid_data("manifest destination path contains a NUL byte"))?;
+    if unsafe { renamex_np(staging.as_ptr(), destination.as_ptr(), RENAME_EXCL) } == -1 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
     }
-    fs::remove_dir(directory)
 }
 
 pub(super) fn verify_manifest_parent_chain(
