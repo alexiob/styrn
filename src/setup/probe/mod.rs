@@ -794,6 +794,58 @@ mod tests {
                 is_secret: true,
             },
             CredentialCase {
+                value: "token is absent hunter2",
+                is_secret: true,
+            },
+            CredentialCase {
+                value: "password is unavailable hunter2",
+                is_secret: true,
+            },
+            CredentialCase {
+                value: "api key support is enabled abc123",
+                is_secret: true,
+            },
+            CredentialCase {
+                value: "bearer token cache is healthy abc123",
+                is_secret: true,
+            },
+            CredentialCase {
+                value: "authorization bearer token support is enabled abc123",
+                is_secret: true,
+            },
+            CredentialCase {
+                value: "private key state is absent abc123",
+                is_secret: true,
+            },
+            CredentialCase {
+                value: "auth token status is healthy abc123",
+                is_secret: true,
+            },
+            CredentialCase {
+                value: "token cache is healthy: abc123",
+                is_secret: true,
+            },
+            CredentialCase {
+                value: "api.key=abc123",
+                is_secret: true,
+            },
+            CredentialCase {
+                value: "private.key=abc123",
+                is_secret: true,
+            },
+            CredentialCase {
+                value: "access.key=abc123",
+                is_secret: true,
+            },
+            CredentialCase {
+                value: "secret.key=abc123",
+                is_secret: true,
+            },
+            CredentialCase {
+                value: "api?key=abc123",
+                is_secret: true,
+            },
+            CredentialCase {
                 value: "sk_live_do-not-leak",
                 is_secret: true,
             },
@@ -807,6 +859,26 @@ mod tests {
             },
             CredentialCase {
                 value: "tskey-do-not-leak",
+                is_secret: true,
+            },
+            CredentialCase {
+                value: "prefix/sk_live_do-not-leak",
+                is_secret: true,
+            },
+            CredentialCase {
+                value: "https://host/sk_live_do-not-leak",
+                is_secret: true,
+            },
+            CredentialCase {
+                value: "diagnostic-sk_live_do-not-leak",
+                is_secret: true,
+            },
+            CredentialCase {
+                value: "foo?ghp_do-not-leak",
+                is_secret: true,
+            },
+            CredentialCase {
+                value: "prefix/ghp_do-not-leak",
                 is_secret: true,
             },
             CredentialCase {
@@ -827,6 +899,18 @@ mod tests {
             },
             CredentialCase {
                 value: "prefix/eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.signature",
+                is_secret: true,
+            },
+            CredentialCase {
+                value: "diagnostic-eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.signature",
+                is_secret: true,
+            },
+            CredentialCase {
+                value: "diagnostic_eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.signature",
+                is_secret: true,
+            },
+            CredentialCase {
+                value: "diagnosticeyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.signature",
                 is_secret: true,
             },
             CredentialCase {
@@ -919,6 +1003,22 @@ mod tests {
             },
             CredentialCase {
                 value: "Authorization bearer token support is enabled.",
+                is_secret: false,
+            },
+            CredentialCase {
+                value: "Password reset service is enabled.",
+                is_secret: false,
+            },
+            CredentialCase {
+                value: "Token refresh service is healthy.",
+                is_secret: false,
+            },
+            CredentialCase {
+                value: "API key rotation is enabled.",
+                is_secret: false,
+            },
+            CredentialCase {
+                value: "Private key permissions status is healthy.",
                 is_secret: false,
             },
             CredentialCase {

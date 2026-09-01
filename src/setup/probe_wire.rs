@@ -334,12 +334,21 @@ fn looks_secret_shaped(value: &str) -> bool {
 }
 
 fn contains_embedded_compact_jwt(value: &str) -> bool {
-    value
-        .split(|character: char| {
-            !matches!(character, 'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.')
-        })
-        .filter(|candidate| !candidate.is_empty())
-        .any(is_compact_jwt)
+    let mut search_start = 0;
+    while let Some(relative_start) = value[search_start..].find("eyJ") {
+        let start = search_start + relative_start;
+        let end = value[start..]
+            .char_indices()
+            .find(|(_, character)| {
+                !matches!(character, 'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_' | '.')
+            })
+            .map_or(value.len(), |(offset, _)| start + offset);
+        if is_compact_jwt(&value[start..end]) {
+            return true;
+        }
+        search_start = start + "eyJ".len();
+    }
+    false
 }
 
 fn contains_sensitive_marker_value(value: &str) -> bool {
@@ -420,7 +429,9 @@ fn marker_family_end(tokens: &[LexToken<'_>], start: usize, family: &[&str]) -> 
 fn next_marker_word(tokens: &[LexToken<'_>], start: usize) -> Option<usize> {
     for (index, token) in tokens.iter().enumerate().skip(start) {
         match token {
-            LexToken::Gap | LexToken::Wrapper | LexToken::Joiner => continue,
+            LexToken::Gap | LexToken::Wrapper | LexToken::Joiner | LexToken::FamilyJoiner => {
+                continue
+            }
             LexToken::Word(_) => return Some(index),
             LexToken::Separator | LexToken::Boundary => return None,
         }
@@ -433,7 +444,7 @@ fn marker_value_after(tokens: &[LexToken<'_>], start: usize) -> Option<usize> {
         match token {
             LexToken::Gap | LexToken::Wrapper | LexToken::Joiner | LexToken::Separator => continue,
             LexToken::Word(_) => return Some(index),
-            LexToken::Boundary => return None,
+            LexToken::Boundary | LexToken::FamilyJoiner => return None,
         }
     }
     None
@@ -450,6 +461,10 @@ const SAFE_MARKER_NOUNS: &[&str] = &[
     "capability",
     "scheme",
     "header",
+    "reset",
+    "refresh",
+    "rotation",
+    "permissions",
 ];
 
 const COPULAS: &[&str] = &["is", "are", "was", "were", "be", "been", "being"];
@@ -471,6 +486,7 @@ fn is_safe_marker_prose(tokens: &[LexToken<'_>], value_index: usize) -> bool {
     if COPULAS.contains(&first.as_str()) {
         return next_context_word(tokens, value_index + 1).is_some_and(|predicate| {
             matches!(tokens[predicate], LexToken::Word(word) if STATUS_PREDICATES.contains(&normalized_word(word).as_str()))
+                && clause_ends_after(tokens, predicate + 1)
         });
     }
 
@@ -483,7 +499,7 @@ fn is_safe_marker_prose(tokens: &[LexToken<'_>], value_index: usize) -> bool {
             return false;
         }
         let Some(next) = next_context_word(tokens, current + 1) else {
-            return true;
+            return clause_ends_after(tokens, current + 1);
         };
         let LexToken::Word(next_word) = tokens[next] else {
             return false;
@@ -491,6 +507,7 @@ fn is_safe_marker_prose(tokens: &[LexToken<'_>], value_index: usize) -> bool {
         if COPULAS.contains(&normalized_word(next_word).as_str()) {
             return next_context_word(tokens, next + 1).is_some_and(|predicate| {
                 matches!(tokens[predicate], LexToken::Word(word) if STATUS_PREDICATES.contains(&normalized_word(word).as_str()))
+                    && clause_ends_after(tokens, predicate + 1)
             });
         }
         current = next;
@@ -502,30 +519,46 @@ fn next_context_word(tokens: &[LexToken<'_>], start: usize) -> Option<usize> {
         match token {
             LexToken::Gap | LexToken::Wrapper | LexToken::Joiner => continue,
             LexToken::Word(_) => return Some(index),
-            LexToken::Separator | LexToken::Boundary => return None,
+            LexToken::Separator | LexToken::Boundary | LexToken::FamilyJoiner => return None,
         }
     }
     None
 }
 
+fn clause_ends_after(tokens: &[LexToken<'_>], start: usize) -> bool {
+    tokens.iter().skip(start).all(|token| {
+        matches!(
+            token,
+            LexToken::Gap | LexToken::Boundary | LexToken::FamilyJoiner
+        )
+    })
+}
+
 fn contains_credential_prefix(value: &str) -> bool {
-    credential_candidates(value).into_iter().any(|candidate| {
-        let candidate = candidate.trim_matches(
-            |character: char| !matches!(character, 'A'..='Z' | 'a'..='z' | '0'..='9' | '-' | '_'),
-        );
-        [
-            "sk-",
-            "sk_",
-            "ghp_",
-            "gho_",
-            "ghu_",
-            "ghs_",
-            "github_pat_",
-            "tskey-",
-            "tskey_",
-        ]
-        .iter()
-        .any(|prefix| candidate.to_ascii_lowercase().starts_with(prefix))
+    let lowercase = value.to_ascii_lowercase();
+    [
+        "sk-",
+        "sk_",
+        "ghp_",
+        "gho_",
+        "ghu_",
+        "ghs_",
+        "github_pat_",
+        "tskey-",
+        "tskey_",
+    ]
+    .iter()
+    .any(|prefix| {
+        lowercase.match_indices(prefix).any(|(start, _)| {
+            lowercase[start + prefix.len()..]
+                .chars()
+                .take_while(|character| {
+                    character.is_ascii_alphanumeric() || matches!(character, '-' | '_')
+                })
+                .take(4)
+                .count()
+                == 4
+        })
     })
 }
 
@@ -537,6 +570,7 @@ enum LexToken<'a> {
     Gap,
     Wrapper,
     Joiner,
+    FamilyJoiner,
 }
 
 fn lexical_tokens(value: &str) -> Vec<LexToken<'_>> {
@@ -547,7 +581,8 @@ fn lexical_tokens(value: &str) -> Vec<LexToken<'_>> {
         let is_separator = matches!(character, ':' | '=');
         let is_gap = character.is_whitespace();
         let is_wrapper = matches!(character, '(' | ')' | '[' | ']' | '{' | '}');
-        let is_boundary = matches!(character, ',' | ';' | '.' | '?' | '&') || !character.is_ascii();
+        let is_family_joiner = matches!(character, '.' | '?');
+        let is_boundary = matches!(character, ',' | ';' | '&') || !character.is_ascii();
         let is_joiner = !is_word && !is_separator && !is_gap && !is_wrapper && !is_boundary;
         if is_word {
             word_start.get_or_insert(index);
@@ -562,6 +597,8 @@ fn lexical_tokens(value: &str) -> Vec<LexToken<'_>> {
             LexToken::Gap
         } else if is_wrapper {
             LexToken::Wrapper
+        } else if is_family_joiner {
+            LexToken::FamilyJoiner
         } else if is_joiner {
             LexToken::Joiner
         } else {
@@ -576,19 +613,6 @@ fn lexical_tokens(value: &str) -> Vec<LexToken<'_>> {
 
 fn normalized_word(value: &str) -> String {
     value.to_ascii_lowercase()
-}
-
-fn credential_candidates(value: &str) -> Vec<&str> {
-    value
-        .split(|character: char| {
-            character.is_whitespace()
-                || matches!(
-                    character,
-                    ':' | '=' | ',' | ';' | '(' | ')' | '[' | ']' | '{' | '}'
-                )
-        })
-        .filter(|candidate| !candidate.is_empty())
-        .collect()
 }
 
 fn is_compact_jwt(value: &str) -> bool {
@@ -619,8 +643,8 @@ fn is_compact_jwt_segments(candidate: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::{
-        contains_embedded_compact_jwt, contains_sensitive_marker_value, credential_marker_end,
-        lexical_tokens, marker_value_after, LexToken,
+        contains_credential_prefix, contains_embedded_compact_jwt, contains_sensitive_marker_value,
+        credential_marker_end, lexical_tokens, marker_value_after, LexToken,
     };
 
     #[test]
@@ -684,11 +708,61 @@ mod tests {
     }
 
     #[test]
+    fn status_prose_must_consume_its_entire_clause() {
+        for value in [
+            "token is absent hunter2",
+            "password is unavailable hunter2",
+            "api key support is enabled abc123",
+            "bearer token cache is healthy abc123",
+            "token cache is healthy: abc123",
+        ] {
+            assert!(contains_sensitive_marker_value(value), "{value:?}");
+        }
+        for value in [
+            "Password reset service is enabled.",
+            "Token refresh service is healthy.",
+            "API key rotation is enabled.",
+            "Private key permissions status is healthy.",
+        ] {
+            assert!(!contains_sensitive_marker_value(value), "{value:?}");
+        }
+    }
+
+    #[test]
+    fn marker_matcher_connects_dot_and_query_key_forms() {
+        for value in [
+            "api.key=abc123",
+            "private.key=abc123",
+            "access.key=abc123",
+            "secret.key=abc123",
+            "api?key=abc123",
+        ] {
+            assert!(contains_sensitive_marker_value(value), "{value:?}");
+        }
+    }
+
+    #[test]
+    fn credential_prefix_scanner_finds_embedded_prefixes() {
+        for value in [
+            "prefix/sk_live_do-not-leak",
+            "https://host/sk_live_do-not-leak",
+            "diagnostic-sk_live_do-not-leak",
+            "foo?ghp_do-not-leak",
+            "prefix/ghp_do-not-leak",
+        ] {
+            assert!(contains_credential_prefix(value), "{value:?}");
+        }
+    }
+
+    #[test]
     fn jwt_scanner_detects_three_and_five_segment_json_object_headers() {
         for value in [
             "eyJ0eXAiOiJKV1QifQ.eyJzdWIiOiIxIn0.signature",
             "eyJhbGciOiJSU0EtT0FFUCIsImVuYyI6IkEyNTZHQ00ifQ.a.b.c.d",
             "prefix/eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.signature",
+            "diagnostic-eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.signature",
+            "diagnostic_eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.signature",
+            "diagnosticeyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxIn0.signature",
         ] {
             assert!(contains_embedded_compact_jwt(value), "{value:?}");
         }
