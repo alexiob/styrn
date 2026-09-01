@@ -159,6 +159,16 @@ unsafe extern "system" {
         path_name: *const u16,
         security_attributes: *const SecurityAttributes,
     ) -> i32;
+    #[cfg(test)]
+    fn CreateFileW(
+        file_name: *const u16,
+        desired_access: u32,
+        share_mode: u32,
+        security_attributes: *const SecurityAttributes,
+        creation_disposition: u32,
+        flags_and_attributes: u32,
+        template_file: *mut c_void,
+    ) -> *mut c_void;
     fn MoveFileExW(existing: *const u16, replacement: *const u16, flags: u32) -> i32;
     #[cfg(test)]
     fn CloseHandle(handle: *mut c_void) -> i32;
@@ -1045,9 +1055,154 @@ mod tests {
         std::fs::remove_dir(replacement_directory).unwrap();
     }
 
+    #[test]
+    #[ignore = "environmental: elevated Windows, real styrn account, and STYRN_WINDOWS_TEST_PASSWORD"]
+    fn real_windows_worker_cannot_access_private_staging_before_hardening() {
+        let password = std::env::var("STYRN_WINDOWS_TEST_PASSWORD")
+            .expect("STYRN_WINDOWS_TEST_PASSWORD is required for worker impersonation");
+        let public = std::path::PathBuf::from(
+            std::env::var_os("PUBLIC").expect("Windows PUBLIC directory is required"),
+        );
+        let nonce = format!(
+            "{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let parent = public.join(format!("styrn-staging-parent-{nonce}"));
+        std::fs::create_dir(&parent).unwrap();
+        harden_manifest_directory(&parent, ManifestOwner::System, "styrn").unwrap();
+
+        let staging = parent.join("staging");
+        create_private_manifest_staging_directory(&staging, ManifestOwner::System).unwrap();
+        inspect_acl(&staging, "styrn", AclKind::Staging).unwrap();
+        assert_eq!(std::fs::read_dir(&staging).unwrap().count(), 0);
+
+        let replacement = public.join(format!("styrn-staging-replacement-{nonce}"));
+        std::fs::create_dir(&replacement).unwrap();
+        let worker_sid = lookup_account_sid("styrn").unwrap();
+        let worker_sid = sid_to_string(worker_sid.as_ptr().cast()).unwrap();
+        apply_sddl(
+            &replacement,
+            &format!("O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;{worker_sid})"),
+        )
+        .unwrap();
+
+        let username = wide("styrn");
+        let domain = wide(".");
+        let mut password = wide(&password);
+        let mut token = std::ptr::null_mut();
+        assert_ne!(
+            unsafe {
+                LogonUserW(
+                    username.as_ptr(),
+                    domain.as_ptr(),
+                    password.as_ptr(),
+                    2,
+                    0,
+                    &mut token,
+                )
+            },
+            0,
+            "LogonUserW failed: {}",
+            io::Error::last_os_error()
+        );
+        password.fill(0);
+        assert_ne!(unsafe { ImpersonateLoggedOnUser(token) }, 0);
+        let impersonation = ImpersonationGuard(token);
+
+        open_directory_for_read(&replacement)
+            .expect("worker cannot exercise the directory-open control");
+        std::fs::read_dir(&replacement).expect("worker cannot exercise the directory-list control");
+        let worker_control = replacement.join("worker-control");
+        std::fs::write(&worker_control, b"worker-controlled")
+            .expect("worker cannot exercise the directory-create control");
+
+        assert_access_denied_for("open staging directory", open_directory_for_read(&staging));
+        assert_access_denied_for("list staging directory", std::fs::read_dir(&staging));
+        assert_access_denied_for(
+            "create within staging directory",
+            std::fs::write(staging.join("worker-created"), b"worker-controlled"),
+        );
+        assert_access_denied_for(
+            "rename staging directory",
+            std::fs::rename(&staging, parent.join("renamed")),
+        );
+        assert_access_denied_for("delete staging directory", std::fs::remove_dir(&staging));
+        assert_access_denied_for(
+            "replace staging directory",
+            replace_directory(&replacement, &staging),
+        );
+
+        drop(impersonation);
+        assert!(
+            staging.is_dir(),
+            "replacement removed the protected staging directory"
+        );
+        assert!(
+            replacement.is_dir(),
+            "replacement source moved despite the denied replacement"
+        );
+        assert!(!staging.join("worker-created").exists());
+        assert!(!parent.join("renamed").exists());
+
+        std::fs::remove_dir(staging).unwrap();
+        std::fs::remove_dir(parent).unwrap();
+        std::fs::remove_file(worker_control).unwrap();
+        std::fs::remove_dir(replacement).unwrap();
+    }
+
     fn assert_access_denied<T: std::fmt::Debug>(result: io::Result<T>) {
-        let error = result.expect_err("worker mutation unexpectedly succeeded");
-        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{error}");
+        assert_access_denied_for("worker mutation", result);
+    }
+
+    fn assert_access_denied_for<T: std::fmt::Debug>(operation: &str, result: io::Result<T>) {
+        let error = match result {
+            Ok(value) => panic!("{operation} unexpectedly succeeded: {value:?}"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error.kind(),
+            io::ErrorKind::PermissionDenied,
+            "{operation}: {error}"
+        );
+    }
+
+    fn replace_directory(replacement: &Path, destination: &Path) -> io::Result<()> {
+        std::fs::remove_dir(destination)?;
+        std::fs::rename(replacement, destination)
+    }
+
+    fn open_directory_for_read(path: &Path) -> io::Result<()> {
+        const GENERIC_READ: u32 = 0x8000_0000;
+        const FILE_SHARE_READ: u32 = 0x1;
+        const FILE_SHARE_WRITE: u32 = 0x2;
+        const FILE_SHARE_DELETE: u32 = 0x4;
+        const OPEN_EXISTING: u32 = 3;
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+        const INVALID_HANDLE_VALUE: *mut c_void = -1_isize as *mut c_void;
+
+        let path = wide_os(path);
+        let handle = unsafe {
+            CreateFileW(
+                path.as_ptr(),
+                GENERIC_READ,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS,
+                std::ptr::null_mut(),
+            )
+        };
+        if handle == INVALID_HANDLE_VALUE {
+            return Err(io::Error::last_os_error());
+        }
+        unsafe {
+            CloseHandle(handle);
+        }
+        Ok(())
     }
 
     struct ImpersonationGuard(*mut c_void);
