@@ -1,0 +1,68 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://styrn.dev/schemas/command-v1.schema.json",
+  "title": "Styrn command output envelope v1",
+  "description": "Every finite non-interactive command emits exactly one document of this shape on stdout under --json. Normative source: docs/design.md Part 10.1-10.3. Diagnostics go to stderr and never appear here.",
+  "type": "object",
+  "required": ["schema", "ok", "command", "timestamp", "data", "warnings", "errors"],
+  "additionalProperties": false,
+
+  "properties": {
+    "schema": { "const": "styrn.command.v1" },
+    "ok": { "type": "boolean" },
+    "command": {
+      "type": "string",
+      "minLength": 1,
+      "description": "The canonical command path, e.g. \"host status\", \"workflow run\"."
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "description": "RFC 3339 (10.1)."
+    },
+    "data": {
+      "description": "Command-specific payload; null on failure. Sizes are integer bytes, durations integer milliseconds (10.1).",
+      "type": ["object", "array", "null"]
+    },
+    "warnings": { "type": "array", "items": { "$ref": "#/$defs/diagnostic" } },
+    "errors": { "type": "array", "items": { "$ref": "#/$defs/diagnostic" } }
+  },
+
+  "allOf": [
+    {
+      "$comment": "Success carries no errors.",
+      "if": { "properties": { "ok": { "const": true } }, "required": ["ok"] },
+      "then": { "properties": { "errors": { "maxItems": 0 } } }
+    },
+    {
+      "$comment": "Failure carries at least one error and a null payload (10.2's error example).",
+      "if": { "properties": { "ok": { "const": false } }, "required": ["ok"] },
+      "then": {
+        "properties": {
+          "errors": { "minItems": 1 },
+          "data": { "type": "null" }
+        }
+      }
+    }
+  ],
+
+  "$defs": {
+    "diagnostic": {
+      "type": "object",
+      "required": ["code", "message"],
+      "additionalProperties": false,
+      "properties": {
+        "code": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_]*(\\.[a-z][a-z0-9_]*)+$",
+          "description": "Dot-namespaced, stable, append-only within envelope v1 (10.3 registry; 2.8.5). Not enumerated here on purpose: the registry grows without a schema-version bump, while field removal requires one."
+        },
+        "message": { "type": "string", "minLength": 1 },
+        "details": {
+          "type": "object",
+          "description": "Structured context, e.g. {free_bytes, required_free_bytes} for resource.disk_admission_denied."
+        }
+      }
+    }
+  }
+}

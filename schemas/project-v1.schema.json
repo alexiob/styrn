@@ -1,0 +1,166 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://styrn.dev/schemas/project-v1.schema.json",
+  "title": "Styrn project profile v1 (.styrn.toml)",
+  "description": "Per-project policy. Normative source: docs/design.md Part 9.1-9.5. Styrn expands resource variables and executes declared workflows; all build-system knowledge stays here (Part 1.9).",
+  "type": "object",
+  "required": ["schema_version", "project", "workflows"],
+  "additionalProperties": false,
+
+  "properties": {
+    "schema_version": { "const": 1 },
+    "minimum_styrn_version": {
+      "type": "string",
+      "pattern": "^\\d+\\.\\d+\\.\\d+$",
+      "description": "A binary older than this refuses the profile (exit 8)."
+    },
+
+    "project": {
+      "type": "object",
+      "required": ["name"],
+      "additionalProperties": false,
+      "properties": {
+        "name": { "type": "string", "minLength": 1, "pattern": "^[a-z0-9][a-z0-9._-]*$" }
+      }
+    },
+
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "enum": ["git"] },
+        "default_branch": { "type": "string", "minLength": 1 },
+        "auth": {
+          "type": "object",
+          "required": ["mode"],
+          "additionalProperties": false,
+          "description": "Absent = controller-push (the default; workers hold zero forge credentials, Part 8.2 / D-1).",
+          "properties": {
+            "mode": { "enum": ["push", "deploy-key"] },
+            "remote": { "type": "string", "minLength": 1 }
+          },
+          "allOf": [
+            {
+              "$comment": "deploy-key mode needs a remote to fetch from.",
+              "if": { "properties": { "mode": { "const": "deploy-key" } }, "required": ["mode"] },
+              "then": { "required": ["remote"] }
+            }
+          ]
+        }
+      }
+    },
+
+    "workspace": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "strategy": { "enum": ["git-worktree"] },
+        "ephemeral": { "type": "boolean" }
+      }
+    },
+
+    "variables": {
+      "type": "object",
+      "additionalProperties": { "type": "string" },
+      "description": "Expanded per Part 9.3. An undefined variable is a hard error, never an empty substitution."
+    },
+
+    "resource_hints": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Feeds admission arithmetic (7.2). Absent hints use documented defaults (2 GiB memory, 20 GiB disk per job), never implementer-invented constants.",
+      "properties": {
+        "compile_memory_per_job_bytes": { "$ref": "#/$defs/byteCount" },
+        "test_memory_per_job_bytes": { "$ref": "#/$defs/byteCount" },
+        "disk_per_job_bytes": { "$ref": "#/$defs/byteCount" }
+      }
+    },
+
+    "aliases": {
+      "type": "object",
+      "additionalProperties": { "type": "string", "minLength": 1 },
+      "description": "Maps a short CLI verb to a declared workflow name (9.4). An alias naming an undeclared workflow is a validation error."
+    },
+
+    "default_validation": {
+      "type": "string",
+      "description": "Workflow used by context-driven actions such as the Herdr 'Validate current commit' action (Part 12.x)."
+    },
+
+    "workflows": {
+      "type": "object",
+      "minProperties": 1,
+      "propertyNames": { "pattern": "^[a-z0-9][a-z0-9._-]*$" },
+      "additionalProperties": {
+        "type": "object",
+        "required": ["command"],
+        "additionalProperties": false,
+        "properties": {
+          "description": { "type": "string" },
+          "resource_class": {
+            "enum": ["light", "normal", "heavy"],
+            "default": "normal",
+            "description": "`heavy` engages max_heavy_jobs exclusivity (7.6) and heavy-peak admission (7.2)."
+          },
+          "command": {
+            "type": "array",
+            "minItems": 1,
+            "items": { "type": "string" },
+            "description": "argv form, never a shell string: it crosses the RPC boundary without shell re-interpretation (7.10)."
+          },
+          "timeout_seconds": { "type": "integer", "minimum": 1 },
+          "requirements": {
+            "type": "object",
+            "description": "os/arch match [platform]; every other key matches a boolean capability flag (2.3).",
+            "properties": {
+              "os": { "enum": ["linux", "macos", "windows"] },
+              "arch": { "enum": ["x86_64", "aarch64"] }
+            },
+            "additionalProperties": { "type": "boolean" }
+          },
+          "environment": {
+            "type": "object",
+            "additionalProperties": { "type": "string" },
+            "description": "Values may contain ${resources.*}, ${job.*}, ${workspace.*} (9.3)."
+          }
+        }
+      }
+    },
+
+    "matrix": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "required": ["workflows"],
+        "additionalProperties": false,
+        "properties": {
+          "description": { "type": "string" },
+          "workflows": { "type": "array", "minItems": 1, "items": { "type": "string" } }
+        }
+      }
+    },
+
+    "cleanup": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "delete_successful_job_workspace": { "type": "boolean" },
+        "failed_job_retention_hours": { "type": "integer", "minimum": 0 },
+        "log_retention_days": { "type": "integer", "minimum": 0 }
+      }
+    },
+
+    "trust": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "Default `open` per D-5; pinning is opt-in hardening and must not add friction to the default path (9.5).",
+      "properties": {
+        "mode": { "enum": ["open", "pinned", "allowlist"], "default": "open" }
+      }
+    }
+  },
+
+  "$defs": {
+    "byteCount": { "type": "integer", "minimum": 0 }
+  }
+}

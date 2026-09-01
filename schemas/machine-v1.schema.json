@@ -1,0 +1,252 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://styrn.dev/schemas/machine-v1.schema.json",
+  "title": "Styrn machine manifest v1",
+  "description": "Canonical per-machine manifest. Normative source: docs/design.md Part 2.4 (with 2.4.1 machine_id minting and 2.4.2 field constraints). TOML on disk; this schema validates its JSON rendering via `styrn machine manifest --json`.",
+  "type": "object",
+  "required": ["schema_version", "machine_id", "name", "roles", "platform", "paths"],
+  "additionalProperties": false,
+
+  "$comment": "A manifest must never carry secrets (Part 2.4, 4.2). The top-level `not` below is a coarse structural guard, not a substitute for the secret-scanning test (implementation-plan C11 / T0.6).",
+  "not": {
+    "anyOf": [
+      { "required": ["auth_key"] },
+      { "required": ["authkey"] },
+      { "required": ["api_key"] },
+      { "required": ["token"] },
+      { "required": ["password"] },
+      { "required": ["private_key"] },
+      { "required": ["identity"] }
+    ]
+  },
+
+  "properties": {
+    "schema_version": { "const": 1 },
+    "machine_id": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$",
+      "description": "UUIDv7, minted exactly once per machine (2.4.1). Never changes, even if `name` does."
+    },
+    "name": { "type": "string", "minLength": 1 },
+    "roles": {
+      "type": "array",
+      "items": { "enum": ["controller", "worker"] },
+      "uniqueItems": true,
+      "minItems": 1,
+      "description": "JSON renders roles as an array, never a comma-separated string (2.1)."
+    },
+
+    "platform": {
+      "type": "object",
+      "required": ["os", "arch", "hostname"],
+      "additionalProperties": false,
+      "description": "Authoritative for os/arch. Capability matching resolves `os`/`arch` requirements against this object (2.3 schema note).",
+      "properties": {
+        "os": { "enum": ["linux", "macos", "windows"] },
+        "arch": { "enum": ["x86_64", "aarch64"] },
+        "hostname": { "type": "string", "minLength": 1 },
+        "headless": { "type": "boolean", "default": false }
+      }
+    },
+
+    "transport": {
+      "type": "object",
+      "required": ["kind", "host"],
+      "additionalProperties": false,
+      "$comment": "`identity` is deliberately absent: the SSH identity path is controller-local, held in inventory.toml, and never copied into a worker manifest (2.6).",
+      "properties": {
+        "kind": { "enum": ["ssh"] },
+        "host": { "type": "string", "minLength": 1, "description": "MagicDNS name, not a mutable LAN IP (3.1)." },
+        "port": { "type": "integer", "minimum": 1, "maximum": 65535, "default": 22 },
+        "user": { "type": "string", "minLength": 1 }
+      }
+    },
+
+    "paths": {
+      "type": "object",
+      "required": ["root", "repos", "jobs", "cache", "artifacts", "logs"],
+      "additionalProperties": false,
+      "properties": {
+        "root": { "type": "string", "minLength": 1 },
+        "repos": { "type": "string", "minLength": 1 },
+        "jobs": { "type": "string", "minLength": 1 },
+        "cache": { "type": "string", "minLength": 1 },
+        "artifacts": { "type": "string", "minLength": 1 },
+        "logs": { "type": "string", "minLength": 1 }
+      }
+    },
+
+    "controller": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "inventory": { "type": "string" }
+      }
+    },
+    "worker": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "accept_jobs=false makes a host ineligible for scheduling however capable it is (2.1).",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "accept_jobs": { "type": "boolean" }
+      }
+    },
+
+    "resources": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "detected": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "logical_cpus": { "type": "integer", "minimum": 1 },
+            "memory_bytes": { "$ref": "#/$defs/byteCount" },
+            "disk_bytes": { "$ref": "#/$defs/byteCount" }
+          }
+        },
+        "policy": {
+          "type": "object",
+          "additionalProperties": false,
+          "$comment": "2.4.2: exactly one of reserved_disk_bytes / reserved_disk_percent. Both present is a validation error (machine.manifest_invalid).",
+          "oneOf": [
+            { "required": ["reserved_disk_bytes"], "not": { "required": ["reserved_disk_percent"] } },
+            { "required": ["reserved_disk_percent"], "not": { "required": ["reserved_disk_bytes"] } }
+          ],
+          "properties": {
+            "reserved_memory_bytes": { "$ref": "#/$defs/byteCount" },
+            "reserved_disk_bytes": { "$ref": "#/$defs/byteCount" },
+            "reserved_disk_percent": { "type": "integer", "minimum": 0, "maximum": 99 },
+            "reserved_cpus": { "type": "integer", "minimum": 0 },
+            "max_parallel_compile_jobs": { "$ref": "#/$defs/positiveCount" },
+            "max_parallel_test_jobs": { "$ref": "#/$defs/positiveCount" },
+            "max_heavy_jobs": { "$ref": "#/$defs/positiveCount" },
+            "max_job_disk_bytes": { "$ref": "#/$defs/byteCount" }
+          }
+        }
+      }
+    },
+
+    "capabilities": {
+      "type": "object",
+      "description": "Booleans only. Putting os/arch here is a rev. A artifact, normalized to [platform] (2.3 schema note).",
+      "additionalProperties": { "type": "boolean" }
+    },
+
+    "scheduling": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "priority": { "type": "integer" },
+        "prefer_remote_workers": { "type": "boolean" }
+      }
+    },
+
+    "tailscale": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "installed": { "type": "boolean" },
+        "mode": { "enum": ["service", "gui", "tailscaled"] },
+        "unattended": { "type": "boolean" }
+      }
+    },
+    "ssh": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "installed": { "type": "boolean" },
+        "server": { "type": "boolean" },
+        "public_key_auth": { "type": "boolean" }
+      }
+    },
+    "herdr": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "installed": { "type": "boolean" },
+        "session": { "type": "string" },
+        "autostart": { "type": "string" }
+      }
+    },
+    "agents": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "installed": { "type": "boolean" },
+          "command": { "type": "string" },
+          "sandbox": { "type": "string" },
+          "shell": { "type": "string" }
+        }
+      }
+    },
+    "toolchains": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "installed": { "type": "boolean" },
+          "host": { "type": "string" },
+          "version": { "type": "string" }
+        }
+      }
+    },
+    "caches": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "installed": { "type": "boolean" },
+          "max_bytes": { "$ref": "#/$defs/byteCount" }
+        }
+      }
+    },
+
+    "install": {
+      "type": "object",
+      "required": ["channel"],
+      "additionalProperties": false,
+      "description": "Binary provenance, so `fleet versions` can name the right upgrade command (15.14.3). `unknown` is honest for a hand-placed binary; guessing would emit a wrong command.",
+      "properties": {
+        "channel": { "enum": ["direct", "homebrew", "winget", "scoop", "chocolatey", "apt", "cargo", "unknown"] },
+        "version": { "type": "string" },
+        "installed_at": { "type": "string", "format": "date-time" }
+      }
+    },
+
+    "desktop": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "kind": { "enum": ["rdp", "screen-sharing", "vnc", "none"] },
+        "enabled": { "type": "boolean" }
+      }
+    },
+
+    "pending_actions": {
+      "type": "array",
+      "description": "Steps a human must complete (15.2.4). Reported by `styrn host doctor` until resolved.",
+      "items": {
+        "type": "object",
+        "required": ["id", "severity", "message"],
+        "additionalProperties": false,
+        "properties": {
+          "id": { "type": "string", "minLength": 1 },
+          "severity": { "enum": ["info", "warning", "error"] },
+          "message": { "type": "string", "minLength": 1 }
+        }
+      }
+    }
+  },
+
+  "$defs": {
+    "byteCount": { "type": "integer", "minimum": 0, "description": "Sizes are integer bytes in JSON (10.1)." },
+    "positiveCount": { "type": "integer", "minimum": 1 }
+  }
+}

@@ -1,0 +1,24 @@
+{
+  "//": "Styrn tailnet policy (docs/design.md Part 3.1). Grants, not legacy ACLs.",
+  "//controllers": "Use a controller tag only if controllers are trusted machines; a personal tailnet may prefer user selectors over device tags.",
+
+  "tagOwners": {
+    "tag:styrn-controller": ["autogroup:admin"],
+    "tag:styrn-worker": ["autogroup:admin"]
+  },
+
+  "grants": [
+    {
+      "//": "SSH is the only transport Styrn requires. Everything else is optional.",
+      "src": ["tag:styrn-controller"],
+      "dst": ["tag:styrn-worker"],
+      "ip": ["tcp:22"]
+    },
+    {
+      "//": "Optional GUI/admin surfaces: RDP (Windows) and Cockpit (Linux). Remove if unused — neither is required for build or agent control (Part 3.4).",
+      "src": ["tag:styrn-controller"],
+      "dst": ["tag:styrn-worker"],
+      "ip": ["tcp:3389", "tcp:9090"]
+    }
+  ]
+}

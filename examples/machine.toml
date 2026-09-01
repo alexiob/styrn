@@ -1,0 +1,112 @@
+# Styrn machine manifest — headless Windows worker.
+# Canonical shape: docs/design.md Part 2.4. Validated by schemas/machine-v1.schema.json.
+#
+# Location on disk:
+#   Linux    /etc/styrn/machine.toml
+#   Windows  C:\ProgramData\Styrn\machine.toml
+#   macOS    /Library/Application Support/Styrn/machine.toml
+#
+# This file MUST NOT contain private SSH keys, API keys, Tailscale auth keys,
+# agent tokens, or passwords (Part 2.4, 4.2). It is root-owned and read-only to
+# the `styrn` worker account so a job cannot rewrite its own policy (Part 4.5).
+
+schema_version = 1
+machine_id = "01991f5d-d72f-7b5e-a43d-9fcb61bd3265"   # UUIDv7, minted once (2.4.1)
+name = "win-mini"
+
+roles = ["worker"]
+
+[platform]
+os = "windows"
+arch = "x86_64"
+hostname = "win-mini"
+headless = true
+
+[transport]
+kind = "ssh"
+host = "win-mini"          # Tailscale MagicDNS name, not a mutable LAN IP (3.1)
+port = 22
+user = "styrn"
+
+[paths]
+root = "C:\\Styrn"
+repos = "C:\\Styrn\\repos"
+jobs = "C:\\Styrn\\jobs"
+cache = "C:\\Styrn\\cache"
+artifacts = "C:\\Styrn\\artifacts"
+logs = "C:\\Styrn\\logs"
+
+[resources.detected]
+logical_cpus = 8
+memory_bytes = 17179869184                # 16 GiB
+disk_bytes = 480000000000
+
+[resources.policy]
+reserved_memory_bytes = 5368709120        # 5 GiB
+reserved_disk_bytes = 85899345920         # 80 GiB
+# reserved_disk_percent = 15              # mutually exclusive with the line above (2.4.2)
+reserved_cpus = 1
+max_parallel_compile_jobs = 3
+max_parallel_test_jobs = 3
+max_heavy_jobs = 1
+max_job_disk_bytes = 37580963840          # 35 GiB per job (S-28)
+
+# Capability values are booleans only. `os` and `arch` live under [platform],
+# which is authoritative for them (2.3 schema note).
+[capabilities]
+agent = true
+build = true
+heavy_build = false
+heavy_test = false
+native_windows = true
+interactive_gui = true
+
+[tailscale]
+installed = true
+mode = "service"
+unattended = true
+
+[ssh]
+installed = true
+server = true
+public_key_auth = true
+
+[herdr]
+installed = true
+session = "fleet"
+autostart = "on-demand-ssh"
+
+[agents.codex]
+installed = true
+sandbox = "elevated"
+
+[agents.claude]
+installed = true
+sandbox = "unsupported-native-windows"
+shell = "powershell"
+
+[toolchains.rust]
+installed = true
+host = "x86_64-pc-windows-msvc"
+
+[caches.sccache]
+installed = true
+max_bytes = 8589934592                    # 8 GiB
+
+# Binary provenance — which channel installed this styrn, so `fleet versions`
+# can name the correct upgrade command for this host (15.14.3).
+[install]
+channel = "direct"                        # direct | homebrew | winget | apt | cargo | unknown
+version = "0.4.0"
+installed_at = "2026-09-01T10:00:00+02:00"
+
+[desktop]
+kind = "rdp"
+enabled = true
+
+# Populated by `styrn setup` for steps a human must complete (15.2.4).
+# `styrn host doctor` reports unresolved entries.
+# [[pending_actions]]
+# id = "codex-first-login"
+# severity = "info"
+# message = "Run `codex` once as the styrn user to complete first-time login."

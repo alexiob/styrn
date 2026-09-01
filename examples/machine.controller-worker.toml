@@ -1,0 +1,108 @@
+# Styrn machine manifest — daily laptop carrying BOTH roles.
+# Companion to machine.toml; shows the role/capability split of Part 2.1.
+#
+# Roles say what Styrn may do FROM this host. Capabilities say what work the
+# host may execute. They are independent: controller status grants no
+# scheduling eligibility, and worker status grants no fleet-admin rights.
+# There is no permanent master node.
+
+schema_version = 1
+machine_id = "01991f5d-d72f-7b5e-a43d-9fcb61bd3266"
+name = "mbp-main"
+
+roles = ["controller", "worker"]
+
+[platform]
+os = "macos"
+arch = "aarch64"
+hostname = "mbp-main"
+headless = false
+
+[transport]
+kind = "ssh"
+host = "mbp-main"
+port = 22
+user = "styrn"
+
+[paths]
+root = "/Users/Shared/Styrn"
+repos = "/Users/Shared/Styrn/repos"
+jobs = "/Users/Shared/Styrn/jobs"
+cache = "/Users/Shared/Styrn/cache"
+artifacts = "/Users/Shared/Styrn/artifacts"
+logs = "/Users/Shared/Styrn/logs"
+
+[controller]
+enabled = true
+inventory = "local"
+
+[worker]
+enabled = true
+accept_jobs = true          # set false to make this host controller-only:
+                            # the scheduler must then never select it, however
+                            # capable it is (2.1)
+
+[resources.detected]
+logical_cpus = 10
+memory_bytes = 68719476736                # 64 GiB
+disk_bytes = 2000000000000
+
+[resources.policy]
+reserved_memory_bytes = 12884901888       # 12 GiB
+reserved_disk_percent = 15                # percent form; not both (2.4.2)
+reserved_cpus = 2
+max_parallel_compile_jobs = 8
+max_parallel_test_jobs = 8
+max_heavy_jobs = 1
+max_job_disk_bytes = 107374182400         # 100 GiB
+
+[capabilities]
+agent = true
+build = true
+heavy_build = true
+heavy_test = true
+interactive_gui = true
+xcode = true
+
+[scheduling]
+priority = 20                             # self-penalty: prefer remote workers
+prefer_remote_workers = true
+
+[tailscale]
+installed = true
+mode = "gui"                              # "tailscaled" for a headless Mac (3.2)
+unattended = false
+
+[ssh]
+installed = true
+server = true
+public_key_auth = true
+
+[herdr]
+installed = true
+session = "fleet"
+autostart = "on-demand-ssh"
+
+[agents.codex]
+installed = true
+
+[agents.claude]
+installed = true
+sandbox = "seatbelt"
+
+[toolchains.rust]
+installed = true
+host = "aarch64-apple-darwin"
+
+[caches.sccache]
+installed = true
+max_bytes = 21474836480                   # 20 GiB
+
+[install]
+channel = "homebrew"
+version = "0.4.0"
+installed_at = "2026-09-01T10:00:00+02:00"
+
+[desktop]
+kind = "screen-sharing"
+enabled = true
