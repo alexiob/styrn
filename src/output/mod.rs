@@ -100,6 +100,7 @@ define_error_codes! {
     ResourceJobDiskLimitExceeded => ("resource.job_disk_limit_exceeded", Workflow),
     ResourceHostDiskFloor => ("resource.host_disk_floor", Workflow),
     CapabilityUnsatisfied => ("capability.unsatisfied", CapabilityUnavailable),
+    CapabilitySubstrateUnregistered => ("capability.substrate_unregistered", CapabilityUnavailable),
     JobNotFound => ("job.not_found", Usage),
     JobTimeout => ("job.timeout", Timeout),
     JobCancelled => ("job.cancelled", Workflow),

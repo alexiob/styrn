@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::OnceLock;
 
-const EXPECTED_REGISTRY: [(&str, i32); 37] = [
+const EXPECTED_REGISTRY: [(&str, i32); 38] = [
     ("usage.invalid_argument", 2),
     ("usage.config_invalid", 2),
     ("transport.unreachable", 3),
@@ -27,6 +27,7 @@ const EXPECTED_REGISTRY: [(&str, i32); 37] = [
     ("resource.job_disk_limit_exceeded", 12),
     ("resource.host_disk_floor", 12),
     ("capability.unsatisfied", 7),
+    ("capability.substrate_unregistered", 7),
     ("job.not_found", 2),
     ("job.timeout", 10),
     ("job.cancelled", 12),

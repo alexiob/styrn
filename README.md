@@ -124,7 +124,11 @@ Styrn is not literally dependency-free: v1 relies on system OpenSSH for transpor
 
 ## Repository status
 
-Implementation is in **Phase 0 of 0–8**: the crate, command-line surface, output envelope, exit-code registry, machine manifest, and setup probe layer are taking shape, with a three-OS CI matrix enforcing formatting, build, tests, and lints. Everything from Phase 1 onward is unstarted.
+Implementation is in **early Phase 0 of nine phases (0–8)**: the crate,
+command-line surface, output envelope, exit-code registry, machine manifest,
+and setup probe layer are taking shape. The repository defines a three-OS CI
+matrix for formatting, build, tests, and lints. Everything from Phase 1 onward
+is unstarted; there is no release or supported installation path yet.
 
 | Phase | Intended outcome |
 |---:|---|
@@ -152,14 +156,25 @@ When documents disagree, `docs/design.md` wins. Historical examples described by
 
 ## Contributing
 
-Until the codebase is scaffolded, the most useful starting point is:
+The Rust workspace is scaffolded, but Styrn is still an early Phase-0 project.
+To contribute:
 
 1. Read the [canonical design](docs/design.md), especially the part governing the subsystem you plan to change.
 2. Choose an unchecked task from the [implementation plan](docs/implementation-plan.md), beginning with Phase 0 unless a dependency has already landed.
 3. Implement both its positive and negative behavior. A task is complete only when both are tested.
 4. Preserve the binding contracts for structured output, exit codes, secret handling, worker-side admission, and cross-platform behavior.
 
-There are currently no build, test, lint, or installation commands. Add them to this README when the Rust workspace is introduced.
+Run the local validation suite with the pinned toolchain:
+
+```console
+cargo fmt --all -- --check
+cargo build --locked
+cargo test --locked
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+```
+
+These commands validate the current foundation; they do not install a usable
+Styrn release. There is no supported installation path yet.
 
 ## Naming
 

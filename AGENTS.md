@@ -10,7 +10,7 @@ project-build-system dependency to the core design.
 Work from the most specific applicable source, in this order:
 
 1. The user's request and security constraints.
-2. [`docs/design.md`](docs/design.md), revision E: the canonical, binding
+2. [`docs/design.md`](docs/design.md), revision F: the canonical, binding
    architecture and protocol specification. Cite its Part numbers in design
    discussions. If it conflicts with the plan, the design wins.
 3. [`docs/implementation-plan.md`](docs/implementation-plan.md): ordered work,
