@@ -47,8 +47,22 @@ pub(crate) fn verify_manifest_security(
     path: &Path,
     owner: ManifestOwner,
     worker: &str,
+    trusted_root: &Path,
 ) -> std::io::Result<()> {
-    platform_impl::verify_manifest_security(path, owner, worker)
+    platform_impl::verify_manifest_security(path, owner, worker, trusted_root)
+}
+
+pub(crate) fn verify_manifest_ancestors(
+    directory: &Path,
+    owner: ManifestOwner,
+    worker: &str,
+    trusted_root: &Path,
+) -> std::io::Result<()> {
+    platform_impl::verify_manifest_ancestors(directory, owner, worker, trusted_root)
+}
+
+pub(crate) fn verify_manifest_file_target(path: &Path) -> std::io::Result<()> {
+    platform_impl::verify_manifest_file_target(path)
 }
 
 /// Replaces a completed temporary file with its destination. Ownership and

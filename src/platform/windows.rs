@@ -20,16 +20,15 @@ const WIN_BUILTIN_ADMINISTRATORS_SID: i32 = 26;
 const FILE_READ: u32 = 0x0012_0089;
 const FILE_EXECUTE: u32 = 0x0000_0020;
 const FILE_ALL_ACCESS: u32 = 0x001f_01ff;
-const MUTATING_ACCESS: u32 = 0x0001_0000
-    | 0x0004_0000
-    | 0x0008_0000
-    | 0x0000_0002
-    | 0x0000_0004
-    | 0x0000_0010
-    | 0x0000_0040
-    | 0x0000_0100
-    | 0x4000_0000
-    | 0x1000_0000;
+const ACCESS_ALLOWED_ACE_TYPE: u8 = 0;
+const ACCESS_DENIED_ACE_TYPE: u8 = 1;
+const OBJECT_INHERIT_ACE: u8 = 0x01;
+const CONTAINER_INHERIT_ACE: u8 = 0x02;
+const INHERIT_ONLY_ACE: u8 = 0x08;
+const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+const INVALID_FILE_ATTRIBUTES: u32 = 0xffff_ffff;
+const PARENT_TAKEOVER_ACCESS: u32 =
+    0x0000_0040 | 0x0004_0000 | 0x0008_0000 | 0x4000_0000 | 0x1000_0000;
 
 #[repr(C)]
 struct Acl {
@@ -41,12 +40,17 @@ struct Acl {
 }
 
 #[repr(C)]
-struct TrusteeW {
-    multiple_trustee: *mut TrusteeW,
-    multiple_trustee_operation: i32,
-    trustee_form: i32,
-    trustee_type: i32,
-    name: *mut u16,
+struct AceHeader {
+    kind: u8,
+    flags: u8,
+    size: u16,
+}
+
+#[repr(C)]
+struct AccessAllowedAce {
+    header: AceHeader,
+    mask: u32,
+    sid_start: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -56,12 +60,26 @@ enum AclKind {
     Lock,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Principal {
+    System,
+    Administrators,
+    Worker,
+    Unexpected,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct AceInspection {
+    principal: Principal,
+    mask: u32,
+    flags: u8,
+    allowed: bool,
+}
+
 struct AclInspection {
     owner_is_administrators: bool,
     dacl_is_protected: bool,
-    worker_rights: u32,
-    system_rights: u32,
-    administrator_rights: u32,
+    entries: Vec<AceInspection>,
 }
 
 #[link(name = "advapi32")]
@@ -102,11 +120,7 @@ unsafe extern "system" {
         control: *mut u16,
         revision: *mut u32,
     ) -> i32;
-    fn GetEffectiveRightsFromAclW(
-        acl: *const Acl,
-        trustee: *const TrusteeW,
-        access_rights: *mut u32,
-    ) -> u32;
+    fn GetAce(acl: *const Acl, index: u32, ace: *mut *mut c_void) -> i32;
     fn CreateWellKnownSid(
         sid_type: i32,
         domain_sid: *const c_void,
@@ -114,11 +128,27 @@ unsafe extern "system" {
         sid_size: *mut u32,
     ) -> i32;
     fn EqualSid(first: *const c_void, second: *const c_void) -> i32;
+    #[cfg(test)]
+    fn LogonUserW(
+        username: *const u16,
+        domain: *const u16,
+        password: *const u16,
+        logon_type: u32,
+        provider: u32,
+        token: *mut *mut c_void,
+    ) -> i32;
+    #[cfg(test)]
+    fn ImpersonateLoggedOnUser(token: *mut c_void) -> i32;
+    #[cfg(test)]
+    fn RevertToSelf() -> i32;
 }
 
 #[link(name = "kernel32")]
 unsafe extern "system" {
     fn LocalFree(memory: *mut c_void) -> *mut c_void;
+    fn GetFileAttributesW(file_name: *const u16) -> u32;
+    #[cfg(test)]
+    fn CloseHandle(handle: *mut c_void) -> i32;
 }
 
 pub(crate) fn replace_file(temporary: &Path, destination: &Path) -> io::Result<()> {
@@ -220,6 +250,7 @@ pub(super) fn verify_manifest_security(
     path: &Path,
     owner: ManifestOwner,
     worker: &str,
+    trusted_root: &Path,
 ) -> io::Result<()> {
     require_kind(path, false)?;
     let parent = path
@@ -229,8 +260,41 @@ pub(super) fn verify_manifest_security(
     if is_test_owner(owner) {
         return Ok(());
     }
+    verify_manifest_ancestors(parent, owner, worker, trusted_root)?;
     inspect_acl(parent, worker, AclKind::Directory)?;
     inspect_acl(path, worker, AclKind::Manifest)
+}
+
+pub(super) fn verify_manifest_file_target(path: &Path) -> io::Result<()> {
+    require_kind(path, false)
+}
+
+pub(super) fn verify_manifest_ancestors(
+    directory: &Path,
+    owner: ManifestOwner,
+    worker: &str,
+    trusted_root: &Path,
+) -> io::Result<()> {
+    if !directory.starts_with(trusted_root) {
+        return Err(permission_denied(
+            "manifest directory is outside its trusted root",
+        ));
+    }
+    if directory == trusted_root || is_test_owner(owner) {
+        return require_kind(directory, true);
+    }
+    let mut current = directory.parent();
+    while let Some(ancestor) = current {
+        require_kind(ancestor, true)?;
+        inspect_ancestor_acl(ancestor, worker)?;
+        if ancestor == trusted_root {
+            return Ok(());
+        }
+        current = ancestor.parent();
+    }
+    Err(permission_denied(
+        "manifest trusted root is not an ancestor",
+    ))
 }
 
 fn is_test_owner(owner: ManifestOwner) -> bool {
@@ -245,7 +309,11 @@ fn apply_acl(path: &Path, worker: &str, kind: AclKind) -> io::Result<()> {
     let worker_sid = lookup_account_sid(worker)?;
     let worker_sid_string = sid_to_string(worker_sid.as_ptr().cast())?;
     let sddl = acl_sddl(&worker_sid_string, kind);
-    let wide_sddl = wide(&sddl);
+    apply_sddl(path, &sddl)
+}
+
+fn apply_sddl(path: &Path, sddl: &str) -> io::Result<()> {
+    let wide_sddl = wide(sddl);
     let mut descriptor = std::ptr::null_mut();
     if unsafe {
         ConvertStringSecurityDescriptorToSecurityDescriptorW(
@@ -325,11 +393,67 @@ fn inspect_acl(path: &Path, worker: &str, kind: AclKind) -> io::Result<()> {
     let inspection = AclInspection {
         owner_is_administrators: unsafe { EqualSid(owner, administrators.as_ptr().cast()) } != 0,
         dacl_is_protected: control & SE_DACL_PROTECTED != 0,
-        worker_rights: effective_rights(dacl, worker.as_ptr().cast_mut().cast())?,
-        system_rights: effective_rights(dacl, system.as_ptr().cast_mut().cast())?,
-        administrator_rights: effective_rights(dacl, administrators.as_ptr().cast_mut().cast())?,
+        entries: inspect_aces(dacl, &system, &administrators, &worker)?,
     };
     validate_acl_contract(&inspection, kind)
+}
+
+fn inspect_ancestor_acl(path: &Path, worker: &str) -> io::Result<()> {
+    let mut path = wide_os(path);
+    let mut owner = std::ptr::null_mut();
+    let mut dacl = std::ptr::null_mut();
+    let mut descriptor = std::ptr::null_mut();
+    let status = unsafe {
+        GetNamedSecurityInfoW(
+            path.as_mut_ptr(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            &mut owner,
+            std::ptr::null_mut(),
+            &mut dacl,
+            std::ptr::null_mut(),
+            &mut descriptor,
+        )
+    };
+    if status != 0 {
+        return Err(io::Error::from_raw_os_error(status as i32));
+    }
+    let _descriptor = LocalAllocation(descriptor);
+    if dacl.is_null() || owner.is_null() {
+        return Err(permission_denied(
+            "manifest ancestor security descriptor is incomplete",
+        ));
+    }
+    let administrators = well_known_sid(WIN_BUILTIN_ADMINISTRATORS_SID)?;
+    let system = well_known_sid(WIN_LOCAL_SYSTEM_SID)?;
+    let worker = lookup_account_sid(worker)?;
+    validate_ancestor_entries(
+        unsafe { EqualSid(owner, worker.as_ptr().cast()) } != 0,
+        &inspect_aces(dacl, &system, &administrators, &worker)?,
+    )
+}
+
+fn validate_ancestor_entries(worker_is_owner: bool, entries: &[AceInspection]) -> io::Result<()> {
+    if worker_is_owner {
+        return Err(permission_denied("styrn worker owns a manifest ancestor"));
+    }
+    for entry in entries {
+        let applies_here = entry.flags & INHERIT_ONLY_ACE == 0;
+        let trusted_principal = matches!(
+            entry.principal,
+            Principal::System | Principal::Administrators
+        );
+        if entry.allowed
+            && applies_here
+            && !trusted_principal
+            && entry.mask & PARENT_TAKEOVER_ACCESS != 0
+        {
+            return Err(permission_denied(
+                "manifest ancestor grants delete-child or ACL takeover access",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn validate_acl_contract(inspection: &AclInspection, kind: AclKind) -> io::Result<()> {
@@ -343,61 +467,96 @@ fn validate_acl_contract(inspection: &AclInspection, kind: AclKind) -> io::Resul
             "manifest DACL must be protected from inherited grants",
         ));
     }
-    if inspection.system_rights & FILE_ALL_ACCESS != FILE_ALL_ACCESS
-        || inspection.administrator_rights & FILE_ALL_ACCESS != FILE_ALL_ACCESS
+    let inherited_flags = if matches!(kind, AclKind::Directory) {
+        OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE
+    } else {
+        0
+    };
+    let mut expected = vec![
+        AceInspection {
+            principal: Principal::System,
+            mask: FILE_ALL_ACCESS,
+            flags: inherited_flags,
+            allowed: true,
+        },
+        AceInspection {
+            principal: Principal::Administrators,
+            mask: FILE_ALL_ACCESS,
+            flags: inherited_flags,
+            allowed: true,
+        },
+    ];
+    match kind {
+        AclKind::Manifest => expected.push(AceInspection {
+            principal: Principal::Worker,
+            mask: FILE_READ,
+            flags: 0,
+            allowed: true,
+        }),
+        AclKind::Directory => expected.push(AceInspection {
+            principal: Principal::Worker,
+            mask: FILE_READ | FILE_EXECUTE,
+            flags: inherited_flags,
+            allowed: true,
+        }),
+        AclKind::Lock => {}
+    }
+    if inspection.entries.len() != expected.len()
+        || expected
+            .iter()
+            .any(|entry| !inspection.entries.contains(entry))
     {
         return Err(permission_denied(
-            "SYSTEM and Administrators must retain full control",
+            "manifest DACL does not match the exact principal and rights contract",
         ));
-    }
-    match kind {
-        AclKind::Manifest => {
-            if inspection.worker_rights & FILE_READ != FILE_READ
-                || inspection.worker_rights & MUTATING_ACCESS != 0
-                || inspection.worker_rights & !(FILE_READ) != 0
-            {
-                return Err(permission_denied(
-                    "styrn worker must have read-only manifest access",
-                ));
-            }
-        }
-        AclKind::Directory => {
-            if inspection.worker_rights & FILE_READ != FILE_READ
-                || inspection.worker_rights & FILE_EXECUTE == 0
-                || inspection.worker_rights & MUTATING_ACCESS != 0
-                || inspection.worker_rights & !(FILE_READ | FILE_EXECUTE) != 0
-            {
-                return Err(permission_denied(
-                    "styrn worker must not have directory replacement access",
-                ));
-            }
-        }
-        AclKind::Lock => {
-            if inspection.worker_rights != 0 {
-                return Err(permission_denied(
-                    "styrn worker must not access the manifest lock",
-                ));
-            }
-        }
     }
     Ok(())
 }
 
-fn effective_rights(acl: *const Acl, sid: *mut u16) -> io::Result<u32> {
-    let trustee = TrusteeW {
-        multiple_trustee: std::ptr::null_mut(),
-        multiple_trustee_operation: 0,
-        trustee_form: 0,
-        trustee_type: 0,
-        name: sid,
-    };
-    let mut rights = 0;
-    let status = unsafe { GetEffectiveRightsFromAclW(acl, &trustee, &mut rights) };
-    if status == 0 {
-        Ok(rights)
-    } else {
-        Err(io::Error::from_raw_os_error(status as i32))
+fn inspect_aces(
+    acl: *const Acl,
+    system: &[u8],
+    administrators: &[u8],
+    worker: &[u8],
+) -> io::Result<Vec<AceInspection>> {
+    let mut entries = Vec::with_capacity(unsafe { (*acl).ace_count as usize });
+    for index in 0..unsafe { (*acl).ace_count as u32 } {
+        let mut raw = std::ptr::null_mut();
+        if unsafe { GetAce(acl, index, &mut raw) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let header = unsafe { &*raw.cast::<AceHeader>() };
+        if !matches!(
+            header.kind,
+            ACCESS_ALLOWED_ACE_TYPE | ACCESS_DENIED_ACE_TYPE
+        ) {
+            entries.push(AceInspection {
+                principal: Principal::Unexpected,
+                mask: PARENT_TAKEOVER_ACCESS,
+                flags: header.flags,
+                allowed: true,
+            });
+            continue;
+        }
+        let ace = unsafe { &*raw.cast::<AccessAllowedAce>() };
+        let sid = std::ptr::addr_of!(ace.sid_start).cast::<c_void>();
+        let principal = if unsafe { EqualSid(sid, system.as_ptr().cast()) } != 0 {
+            Principal::System
+        } else if unsafe { EqualSid(sid, administrators.as_ptr().cast()) } != 0 {
+            Principal::Administrators
+        } else if unsafe { EqualSid(sid, worker.as_ptr().cast()) } != 0 {
+            Principal::Worker
+        } else {
+            Principal::Unexpected
+        };
+        entries.push(AceInspection {
+            principal,
+            mask: ace.mask,
+            flags: ace.header.flags,
+            allowed: ace.header.kind == ACCESS_ALLOWED_ACE_TYPE,
+        });
     }
+    Ok(entries)
 }
 
 fn lookup_account_sid(account: &str) -> io::Result<Vec<u8>> {
@@ -464,6 +623,16 @@ fn sid_to_string(sid: *const c_void) -> io::Result<String> {
 }
 
 fn require_kind(path: &Path, directory: bool) -> io::Result<()> {
+    let wide_path = wide_os(path);
+    let attributes = unsafe { GetFileAttributesW(wide_path.as_ptr()) };
+    if attributes == INVALID_FILE_ATTRIBUTES {
+        return Err(io::Error::last_os_error());
+    }
+    if attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(permission_denied(
+            "manifest security path crosses a reparse point",
+        ));
+    }
     let metadata = std::fs::symlink_metadata(path)?;
     let valid = if directory {
         metadata.file_type().is_dir()
@@ -540,35 +709,114 @@ mod tests {
         let inherited_write = AclInspection {
             owner_is_administrators: true,
             dacl_is_protected: false,
-            worker_rights: FILE_READ | 0x2,
-            system_rights: FILE_ALL_ACCESS,
-            administrator_rights: FILE_ALL_ACCESS,
+            entries: manifest_entries(),
         };
         assert!(validate_acl_contract(&inherited_write, AclKind::Manifest).is_err());
 
+        let mut explicit_entries = manifest_entries();
+        explicit_entries[2].mask |= 0x2;
         let explicit_write = AclInspection {
+            owner_is_administrators: true,
             dacl_is_protected: true,
-            ..inherited_write
+            entries: explicit_entries,
         };
         assert!(validate_acl_contract(&explicit_write, AclKind::Manifest).is_err());
     }
 
     #[test]
-    fn inspection_accepts_exact_read_only_worker_contract() {
-        let inspection = AclInspection {
-            owner_is_administrators: true,
-            dacl_is_protected: true,
-            worker_rights: FILE_READ,
-            system_rights: FILE_ALL_ACCESS,
-            administrator_rights: FILE_ALL_ACCESS,
-        };
-        assert!(validate_acl_contract(&inspection, AclKind::Manifest).is_ok());
+    fn inspection_rejects_users_authenticated_users_and_unexpected_principals() {
+        for mask in [FILE_READ, FILE_READ | 0x2, FILE_ALL_ACCESS] {
+            let mut entries = manifest_entries();
+            entries.push(AceInspection {
+                principal: Principal::Unexpected,
+                mask,
+                flags: 0,
+                allowed: true,
+            });
+            assert!(validate_acl_contract(
+                &AclInspection {
+                    owner_is_administrators: true,
+                    dacl_is_protected: true,
+                    entries,
+                },
+                AclKind::Manifest,
+            )
+            .is_err());
+        }
     }
 
     #[test]
-    #[ignore = "environmental: run elevated on Windows with a real styrn account"]
-    fn real_windows_acl_round_trip_requires_administrator_and_worker_account() {
-        let directory = std::env::temp_dir().join(format!(
+    fn ancestor_rejects_worker_or_group_delete_child_and_acl_takeover() {
+        for mask in [0x40, 0x0004_0000, 0x0008_0000, 0x1000_0000] {
+            assert!(validate_ancestor_entries(
+                false,
+                &[AceInspection {
+                    principal: Principal::Unexpected,
+                    mask,
+                    flags: 0,
+                    allowed: true,
+                }]
+            )
+            .is_err());
+        }
+        assert!(validate_ancestor_entries(true, &[]).is_err());
+        assert!(validate_ancestor_entries(
+            false,
+            &[AceInspection {
+                principal: Principal::Unexpected,
+                mask: 0x40,
+                flags: INHERIT_ONLY_ACE,
+                allowed: true,
+            }]
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn inspection_accepts_exact_read_only_worker_contract() {
+        assert!(validate_acl_contract(
+            &AclInspection {
+                owner_is_administrators: true,
+                dacl_is_protected: true,
+                entries: manifest_entries(),
+            },
+            AclKind::Manifest,
+        )
+        .is_ok());
+    }
+
+    fn manifest_entries() -> Vec<AceInspection> {
+        vec![
+            AceInspection {
+                principal: Principal::System,
+                mask: FILE_ALL_ACCESS,
+                flags: 0,
+                allowed: true,
+            },
+            AceInspection {
+                principal: Principal::Administrators,
+                mask: FILE_ALL_ACCESS,
+                flags: 0,
+                allowed: true,
+            },
+            AceInspection {
+                principal: Principal::Worker,
+                mask: FILE_READ,
+                flags: 0,
+                allowed: true,
+            },
+        ]
+    }
+
+    #[test]
+    #[ignore = "environmental: elevated Windows, real styrn account, and STYRN_WINDOWS_TEST_PASSWORD"]
+    fn real_windows_worker_can_read_but_cannot_write_delete_rename_or_replace() {
+        let password = std::env::var("STYRN_WINDOWS_TEST_PASSWORD")
+            .expect("STYRN_WINDOWS_TEST_PASSWORD is required for worker impersonation");
+        let public = std::path::PathBuf::from(
+            std::env::var_os("PUBLIC").expect("Windows PUBLIC directory is required"),
+        );
+        let directory = public.join(format!(
             "styrn-acl-test-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
@@ -581,8 +829,81 @@ mod tests {
         let manifest = directory.join("machine.toml");
         std::fs::write(&manifest, "schema_version = 1\n").unwrap();
         harden_manifest_file(&manifest, ManifestOwner::System, "styrn").unwrap();
-        verify_manifest_security(&manifest, ManifestOwner::System, "styrn").unwrap();
+        verify_manifest_security(&manifest, ManifestOwner::System, "styrn", &directory).unwrap();
+
+        let replacement_directory = public.join(format!(
+            "styrn-acl-replacement-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&replacement_directory).unwrap();
+        let worker_sid = lookup_account_sid("styrn").unwrap();
+        let worker_sid = sid_to_string(worker_sid.as_ptr().cast()).unwrap();
+        apply_sddl(
+            &replacement_directory,
+            &format!("O:BAD:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;{worker_sid})"),
+        )
+        .unwrap();
+        let replacement = replacement_directory.join("replacement.toml");
+        std::fs::write(&replacement, "replacement = true\n").unwrap();
+        apply_sddl(
+            &replacement,
+            &format!("O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)(A;;FA;;;{worker_sid})"),
+        )
+        .unwrap();
+
+        let username = wide("styrn");
+        let domain = wide(".");
+        let mut password = wide(&password);
+        let mut token = std::ptr::null_mut();
+        assert_ne!(
+            unsafe {
+                LogonUserW(
+                    username.as_ptr(),
+                    domain.as_ptr(),
+                    password.as_ptr(),
+                    2,
+                    0,
+                    &mut token,
+                )
+            },
+            0,
+            "LogonUserW failed: {}",
+            io::Error::last_os_error()
+        );
+        password.fill(0);
+        assert_ne!(unsafe { ImpersonateLoggedOnUser(token) }, 0);
+        let impersonation = ImpersonationGuard(token);
+
+        assert!(std::fs::read_to_string(&manifest).is_ok());
+        assert_access_denied(std::fs::OpenOptions::new().write(true).open(&manifest));
+        assert_access_denied(std::fs::remove_file(&manifest));
+        assert_access_denied(std::fs::rename(&manifest, directory.join("renamed.toml")));
+        assert_access_denied(replace_file(&replacement, &manifest));
+
+        drop(impersonation);
         std::fs::remove_file(manifest).unwrap();
         std::fs::remove_dir(directory).unwrap();
+        std::fs::remove_file(replacement).unwrap();
+        std::fs::remove_dir(replacement_directory).unwrap();
+    }
+
+    fn assert_access_denied<T: std::fmt::Debug>(result: io::Result<T>) {
+        let error = result.expect_err("worker mutation unexpectedly succeeded");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied, "{error}");
+    }
+
+    struct ImpersonationGuard(*mut c_void);
+
+    impl Drop for ImpersonationGuard {
+        fn drop(&mut self) {
+            unsafe {
+                RevertToSelf();
+                CloseHandle(self.0);
+            }
+        }
     }
 }

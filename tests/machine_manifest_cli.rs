@@ -9,31 +9,27 @@ use uuid::Uuid;
 use std::os::unix::fs::MetadataExt;
 
 #[test]
-fn manifest_json_keeps_a_stable_schema_valid_id_without_rewriting() {
+#[cfg(unix)]
+fn manifest_read_requires_hardened_ownership_and_never_rewrites() {
     let temp = TestDir::new();
-    fs::write(
-        temp.path().join("machine.toml"),
-        fs::read_to_string("examples/machine.toml").unwrap(),
-    )
-    .unwrap();
+    let path = temp.path().join("machine.toml");
+    let original = fs::read("examples/machine.toml").unwrap();
+    fs::write(&path, &original).unwrap();
 
     let first = run(temp.path(), &["machine", "manifest", "--json"]);
-    assert!(first.status.success(), "{first:?}");
     let first_json = exactly_one_json(&first.stdout);
     assert_schema_valid(&first_json);
-    assert_eq!(first_json["ok"], true);
     assert_eq!(first_json["command"], "machine manifest");
-    assert_eq!(first_json["warnings"].as_array().unwrap().len(), 0);
-
-    let second = run(temp.path(), &["machine", "manifest", "--json"]);
-    assert!(second.status.success(), "{second:?}");
-    let second_json = exactly_one_json(&second.stdout);
-    assert_schema_valid(&second_json);
-    assert_eq!(second_json["warnings"].as_array().unwrap().len(), 0);
-    assert_eq!(
-        second_json["data"]["machine_id"],
-        first_json["data"]["machine_id"]
-    );
+    if system_manifest_prerequisites_available() {
+        assert!(first.status.success(), "{first:?}");
+        assert_eq!(first_json["ok"], true);
+        assert_eq!(first_json["warnings"].as_array().unwrap().len(), 0);
+    } else {
+        assert_eq!(first.status.code(), Some(2), "{first:?}");
+        assert_eq!(first_json["ok"], false);
+        assert_eq!(first_json["errors"][0]["code"], "machine.manifest_invalid");
+    }
+    assert_eq!(fs::read(path).unwrap(), original);
 }
 
 #[test]
@@ -73,7 +69,7 @@ fn init_never_reports_an_unhardened_repair_as_success_and_never_invents_one() {
     let repaired = run(repaired_dir.path(), &["machine", "init", "--json"]);
     let repaired_json = exactly_one_json(&repaired.stdout);
     assert_eq!(repaired_json["command"], "machine init");
-    if unsafe { libc::geteuid() } == 0 {
+    if system_manifest_prerequisites_available() {
         assert!(repaired.status.success(), "{repaired:?}");
         assert_eq!(
             repaired_json["warnings"][0]["code"],
@@ -99,6 +95,12 @@ fn init_never_reports_an_unhardened_repair_as_success_and_never_invents_one() {
     let absent_json = exactly_one_json(&absent.stdout);
     assert_eq!(absent_json["errors"][0]["code"], "machine.manifest_invalid");
     assert!(!absent_dir.path().join("machine.toml").exists());
+}
+
+#[cfg(unix)]
+fn system_manifest_prerequisites_available() -> bool {
+    let account = std::ffi::CString::new("styrn").unwrap();
+    unsafe { libc::geteuid() == 0 && !libc::getpwnam(account.as_ptr()).is_null() }
 }
 
 #[test]

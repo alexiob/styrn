@@ -49,7 +49,11 @@ fn run(parsed: cli::ParsedCli) {
         cli::MachineAction::Init => "machine init",
     };
     let store = manifest::MachineManifestStore::new(manifest::configured_manifest_path());
-    match store.read_or_repair() {
+    let result = match action {
+        cli::MachineAction::Manifest => store.read(),
+        cli::MachineAction::Init => store.reconcile(),
+    };
+    match result {
         Ok(outcome) => {
             if outcome.machine_id_minted {
                 eprintln!("machine_id was minted and persisted");

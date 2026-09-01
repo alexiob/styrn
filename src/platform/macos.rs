@@ -1,9 +1,46 @@
 use super::ManifestOwner;
 use std::fs;
 use std::io;
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::OpenOptionsExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::Path;
+
+type Acl = *mut std::ffi::c_void;
+type AclEntry = *mut std::ffi::c_void;
+#[cfg(test)]
+type AclPermset = *mut std::ffi::c_void;
+
+const ACL_TYPE_EXTENDED: i32 = 0x100;
+const ACL_FIRST_ENTRY: i32 = 0;
+#[cfg(test)]
+const ACL_EXTENDED_ALLOW: i32 = 1;
+#[cfg(test)]
+const ACL_WRITE_DATA: i32 = 1 << 2;
+#[cfg(test)]
+const ACL_DELETE: i32 = 1 << 4;
+#[cfg(test)]
+const ACL_DELETE_CHILD: i32 = 1 << 6;
+
+unsafe extern "C" {
+    fn acl_init(count: i32) -> Acl;
+    fn acl_free(object: *mut std::ffi::c_void) -> i32;
+    fn acl_get_file(path: *const i8, kind: i32) -> Acl;
+    fn acl_set_file(path: *const i8, kind: i32, acl: Acl) -> i32;
+    fn acl_get_entry(acl: Acl, entry_id: i32, entry: *mut AclEntry) -> i32;
+    #[cfg(test)]
+    fn acl_create_entry(acl: *mut Acl, entry: *mut AclEntry) -> i32;
+    #[cfg(test)]
+    fn acl_set_tag_type(entry: AclEntry, tag: i32) -> i32;
+    #[cfg(test)]
+    fn acl_set_qualifier(entry: AclEntry, qualifier: *const std::ffi::c_void) -> i32;
+    #[cfg(test)]
+    fn acl_get_permset(entry: AclEntry, permset: *mut AclPermset) -> i32;
+    #[cfg(test)]
+    fn acl_add_perm(permset: AclPermset, permission: i32) -> i32;
+    #[cfg(test)]
+    fn mbr_uid_to_uuid(uid: u32, uuid: *mut u8) -> i32;
+}
 
 #[allow(dead_code)]
 pub(crate) fn platform_name() -> &'static str {
@@ -16,6 +53,7 @@ pub(super) fn harden_manifest_directory(
     _worker: &str,
 ) -> io::Result<()> {
     require_real_directory(path)?;
+    clear_extended_acl(path)?;
     apply_owner(path, owner)?;
     fs::set_permissions(path, fs::Permissions::from_mode(0o755))?;
     verify_directory(path, owner)
@@ -27,6 +65,7 @@ pub(super) fn harden_manifest_file(
     _worker: &str,
 ) -> io::Result<()> {
     require_regular_file(path)?;
+    clear_extended_acl(path)?;
     apply_owner(path, owner)?;
     fs::set_permissions(path, fs::Permissions::from_mode(0o644))?;
     verify_file(path, owner, 0o644, "manifest")
@@ -34,6 +73,7 @@ pub(super) fn harden_manifest_file(
 
 pub(super) fn harden_manifest_lock(path: &Path, owner: ManifestOwner) -> io::Result<()> {
     require_regular_file(path)?;
+    clear_extended_acl(path)?;
     apply_owner(path, owner)?;
     fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
     verify_file(path, owner, 0o600, "manifest lock")
@@ -69,13 +109,16 @@ pub(super) fn create_manifest_temporary(path: &Path) -> io::Result<fs::File> {
 pub(super) fn verify_manifest_security(
     path: &Path,
     owner: ManifestOwner,
-    _worker: &str,
+    worker: &str,
+    trusted_root: &Path,
 ) -> io::Result<()> {
     let parent = path
         .parent()
         .ok_or_else(|| invalid_data("manifest path has no parent directory"))?;
     require_real_directory(parent)?;
     require_regular_file(path)?;
+    verify_no_extended_acl(parent)?;
+    verify_no_extended_acl(path)?;
     let file = fs::metadata(path)?;
     let directory = fs::metadata(parent)?;
     let expected_uid = match owner {
@@ -89,7 +132,97 @@ pub(super) fn verify_manifest_security(
         file_mode: file.mode() & 0o777,
         directory_uid: directory.uid(),
         directory_mode: directory.mode() & 0o777,
-    })
+    })?;
+    verify_manifest_ancestors(parent, owner, worker, trusted_root)
+}
+
+pub(super) fn verify_manifest_file_target(path: &Path) -> io::Result<()> {
+    require_regular_file(path)
+}
+
+pub(super) fn verify_manifest_ancestors(
+    directory: &Path,
+    owner: ManifestOwner,
+    worker: &str,
+    trusted_root: &Path,
+) -> io::Result<()> {
+    if !directory.starts_with(trusted_root) {
+        return Err(permission_denied(
+            "manifest directory is outside its trusted root",
+        ));
+    }
+    if directory == trusted_root {
+        return require_real_directory(directory);
+    }
+    let worker_uid = match owner {
+        ManifestOwner::System => Some(lookup_worker_uid(worker)?),
+        #[cfg(test)]
+        ManifestOwner::CurrentProcess => None,
+    };
+    let mut child_uid = fs::symlink_metadata(directory)?.uid();
+    let mut current = directory.parent();
+    while let Some(ancestor) = current {
+        require_real_directory(ancestor)?;
+        verify_no_extended_acl(ancestor)?;
+        let metadata = fs::metadata(ancestor)?;
+        let mode = metadata.mode();
+        if matches!(owner, ManifestOwner::System) && mode & 0o001 == 0 {
+            return Err(permission_denied(
+                "manifest ancestor is not traversable by the styrn worker",
+            ));
+        }
+        if worker_uid.is_some_and(|uid| uid == metadata.uid()) && mode & 0o200 != 0 {
+            return Err(permission_denied(
+                "styrn worker owns a writable manifest ancestor",
+            ));
+        }
+        if mode & 0o022 != 0 {
+            let safe_sticky_root = matches!(owner, ManifestOwner::System)
+                && mode & 0o1000 != 0
+                && metadata.uid() == 0
+                && child_uid == 0;
+            if !safe_sticky_root {
+                return Err(permission_denied(
+                    "manifest ancestor grants replacement access",
+                ));
+            }
+        }
+        child_uid = metadata.uid();
+        if ancestor == trusted_root {
+            return Ok(());
+        }
+        current = ancestor.parent();
+    }
+    Err(permission_denied(
+        "manifest trusted root is not an ancestor",
+    ))
+}
+
+fn lookup_worker_uid(worker: &str) -> io::Result<u32> {
+    let worker = std::ffi::CString::new(worker)
+        .map_err(|_| invalid_data("worker account contains a NUL byte"))?;
+    let mut entry = unsafe { std::mem::zeroed::<libc::passwd>() };
+    let mut result = std::ptr::null_mut();
+    let mut buffer = vec![0_u8; 16 * 1024];
+    let status = unsafe {
+        libc::getpwnam_r(
+            worker.as_ptr(),
+            &mut entry,
+            buffer.as_mut_ptr().cast(),
+            buffer.len(),
+            &mut result,
+        )
+    };
+    if status != 0 {
+        return Err(io::Error::from_raw_os_error(status));
+    }
+    if result.is_null() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "styrn worker account is unavailable",
+        ));
+    }
+    Ok(entry.pw_uid)
 }
 
 #[derive(Clone, Copy)]
@@ -130,6 +263,7 @@ fn apply_owner(path: &Path, owner: ManifestOwner) -> io::Result<()> {
 
 fn verify_directory(path: &Path, owner: ManifestOwner) -> io::Result<()> {
     require_real_directory(path)?;
+    verify_no_extended_acl(path)?;
     let metadata = fs::metadata(path)?;
     verify_owner(&metadata, owner, "manifest directory")?;
     if metadata.mode() & 0o022 != 0 {
@@ -142,6 +276,7 @@ fn verify_directory(path: &Path, owner: ManifestOwner) -> io::Result<()> {
 
 fn verify_file(path: &Path, owner: ManifestOwner, mode: u32, label: &str) -> io::Result<()> {
     require_regular_file(path)?;
+    verify_no_extended_acl(path)?;
     let metadata = fs::metadata(path)?;
     verify_owner(&metadata, owner, label)?;
     if metadata.mode() & 0o777 != mode {
@@ -151,6 +286,58 @@ fn verify_file(path: &Path, owner: ManifestOwner, mode: u32, label: &str) -> io:
         )));
     }
     Ok(())
+}
+
+fn clear_extended_acl(path: &Path) -> io::Result<()> {
+    let acl = unsafe { acl_init(0) };
+    if acl.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    let acl = OwnedAcl(acl);
+    let path = c_path(path)?;
+    if unsafe { acl_set_file(path.as_ptr(), ACL_TYPE_EXTENDED, acl.0) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    verify_no_extended_acl_c_path(&path)
+}
+
+fn verify_no_extended_acl(path: &Path) -> io::Result<()> {
+    verify_no_extended_acl_c_path(&c_path(path)?)
+}
+
+fn verify_no_extended_acl_c_path(path: &std::ffi::CString) -> io::Result<()> {
+    let acl = unsafe { acl_get_file(path.as_ptr(), ACL_TYPE_EXTENDED) };
+    if acl.is_null() {
+        let error = io::Error::last_os_error();
+        return if error.kind() == io::ErrorKind::NotFound {
+            Ok(())
+        } else {
+            Err(error)
+        };
+    }
+    let acl = OwnedAcl(acl);
+    let mut entry = std::ptr::null_mut();
+    match unsafe { acl_get_entry(acl.0, ACL_FIRST_ENTRY, &mut entry) } {
+        0 => Err(permission_denied(
+            "manifest security target has an extended ACL",
+        )),
+        _ => Err(io::Error::last_os_error()),
+    }
+}
+
+fn c_path(path: &Path) -> io::Result<std::ffi::CString> {
+    std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| invalid_data("manifest path contains a NUL byte"))
+}
+
+struct OwnedAcl(Acl);
+
+impl Drop for OwnedAcl {
+    fn drop(&mut self) {
+        unsafe {
+            acl_free(self.0);
+        }
+    }
 }
 
 fn verify_owner(metadata: &fs::Metadata, owner: ManifestOwner, label: &str) -> io::Result<()> {
@@ -225,5 +412,76 @@ mod tests {
         })
         .is_err());
         assert!(validate_manifest_inspection(&valid).is_ok());
+    }
+
+    #[test]
+    fn extended_mutation_acl_survives_chmod_and_must_be_rejected() {
+        let directory = std::env::temp_dir().join(format!(
+            "styrn-macos-acl-red-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let path = directory.join("machine.toml");
+        fs::write(&path, "schema_version = 1\n").unwrap();
+        seed_current_user_mutation_acl(&path);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+
+        assert!(verify_manifest_security(
+            &path,
+            ManifestOwner::CurrentProcess,
+            "styrn",
+            &directory,
+        )
+        .is_err());
+
+        harden_manifest_file(&path, ManifestOwner::CurrentProcess, "styrn").unwrap();
+        verify_manifest_security(&path, ManifestOwner::CurrentProcess, "styrn", &directory)
+            .unwrap();
+
+        seed_current_user_mutation_acl(&directory);
+        assert!(verify_manifest_security(
+            &path,
+            ManifestOwner::CurrentProcess,
+            "styrn",
+            &directory,
+        )
+        .is_err());
+        harden_manifest_directory(&directory, ManifestOwner::CurrentProcess, "styrn").unwrap();
+        verify_manifest_security(&path, ManifestOwner::CurrentProcess, "styrn", &directory)
+            .unwrap();
+
+        let _ = fs::remove_file(path);
+        let _ = fs::remove_dir(directory);
+    }
+
+    fn seed_current_user_mutation_acl(path: &Path) {
+        let mut acl = unsafe { acl_init(1) };
+        assert!(!acl.is_null());
+        let mut entry = std::ptr::null_mut();
+        assert_eq!(unsafe { acl_create_entry(&mut acl, &mut entry) }, 0);
+        assert_eq!(unsafe { acl_set_tag_type(entry, ACL_EXTENDED_ALLOW) }, 0);
+        let mut uuid = [0_u8; 16];
+        assert_eq!(
+            unsafe { mbr_uid_to_uuid(libc::geteuid(), uuid.as_mut_ptr()) },
+            0
+        );
+        assert_eq!(unsafe { acl_set_qualifier(entry, uuid.as_ptr().cast()) }, 0);
+        let mut permissions = std::ptr::null_mut();
+        assert_eq!(unsafe { acl_get_permset(entry, &mut permissions) }, 0);
+        assert_eq!(unsafe { acl_add_perm(permissions, ACL_WRITE_DATA) }, 0);
+        assert_eq!(unsafe { acl_add_perm(permissions, ACL_DELETE) }, 0);
+        assert_eq!(unsafe { acl_add_perm(permissions, ACL_DELETE_CHILD) }, 0);
+        let path = c_path(path).unwrap();
+        assert_eq!(
+            unsafe { acl_set_file(path.as_ptr(), ACL_TYPE_EXTENDED, acl) },
+            0
+        );
+        unsafe {
+            acl_free(acl);
+        }
     }
 }

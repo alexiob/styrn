@@ -449,6 +449,7 @@ pub(crate) struct ReadOutcome {
 #[derive(Debug)]
 pub(crate) struct MachineManifestStore {
     path: PathBuf,
+    trusted_root: PathBuf,
     security: ManifestSecurity,
 }
 
@@ -460,6 +461,8 @@ enum ManifestSecurity {
     CurrentProcess,
     #[cfg(test)]
     FailBeforeReplace,
+    #[cfg(test)]
+    FailAfterReplace,
 }
 
 #[allow(dead_code)] // Referenced by the executable; integration tests compile this module separately.
@@ -484,8 +487,15 @@ pub(crate) fn configured_manifest_path() -> PathBuf {
 impl MachineManifestStore {
     #[allow(dead_code)] // Integration test crates include this module without the executable.
     pub(crate) fn new(path: impl Into<PathBuf>) -> Self {
+        let path = path.into();
+        let trusted_root = path
+            .ancestors()
+            .last()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_default();
         Self {
-            path: path.into(),
+            path,
+            trusted_root,
             security: ManifestSecurity::System,
         }
     }
@@ -493,8 +503,27 @@ impl MachineManifestStore {
     #[cfg(test)]
     #[allow(dead_code)]
     pub(crate) fn new_for_test(path: impl Into<PathBuf>) -> Self {
+        let path = path.into();
+        let trusted_root = path
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_default();
+        Self {
+            path,
+            trusted_root,
+            security: ManifestSecurity::CurrentProcess,
+        }
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn new_for_test_with_trusted_root(
+        path: impl Into<PathBuf>,
+        trusted_root: impl Into<PathBuf>,
+    ) -> Self {
         Self {
             path: path.into(),
+            trusted_root: trusted_root.into(),
             security: ManifestSecurity::CurrentProcess,
         }
     }
@@ -502,31 +531,58 @@ impl MachineManifestStore {
     #[cfg(test)]
     #[allow(dead_code)]
     pub(crate) fn new_with_failing_hardening(path: impl Into<PathBuf>) -> Self {
+        let path = path.into();
+        let trusted_root = path
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_default();
         Self {
-            path: path.into(),
+            path,
+            trusted_root,
             security: ManifestSecurity::FailBeforeReplace,
         }
     }
 
-    pub(crate) fn read_or_repair(&self) -> Result<ReadOutcome, ManifestError> {
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn new_with_failing_post_replace_verification(path: impl Into<PathBuf>) -> Self {
+        let path = path.into();
+        let trusted_root = path
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_default();
+        Self {
+            path,
+            trusted_root,
+            security: ManifestSecurity::FailAfterReplace,
+        }
+    }
+
+    pub(crate) fn read(&self) -> Result<ReadOutcome, ManifestError> {
+        platform::verify_manifest_file_target(&self.path).map_err(ManifestError::Security)?;
+        self.verify_security()?;
         let raw = parse_raw(&fs::read_to_string(&self.path).map_err(ManifestError::Read)?)?;
         let machine_id = raw
             .machine_id
             .as_deref()
             .map(parse_canonical_uuid)
             .transpose()?;
-        if let Some(machine_id) = machine_id {
-            let manifest = raw.into_manifest(machine_id);
-            manifest.validate()?;
-            return Ok(ReadOutcome {
-                manifest,
-                machine_id_minted: false,
-            });
-        }
-        self.with_mutation_lock(|| self.read_or_repair_locked())
+        let machine_id = machine_id
+            .ok_or_else(|| ManifestError::Validation("machine_id is required".to_owned()))?;
+        let manifest = raw.into_manifest(machine_id);
+        manifest.validate()?;
+        Ok(ReadOutcome {
+            manifest,
+            machine_id_minted: false,
+        })
     }
 
-    fn read_or_repair_locked(&self) -> Result<ReadOutcome, ManifestError> {
+    pub(crate) fn reconcile(&self) -> Result<ReadOutcome, ManifestError> {
+        self.with_mutation_lock(|| self.reconcile_locked())
+    }
+
+    fn reconcile_locked(&self) -> Result<ReadOutcome, ManifestError> {
+        platform::verify_manifest_file_target(&self.path).map_err(ManifestError::Write)?;
         let raw = parse_raw(&fs::read_to_string(&self.path).map_err(ManifestError::Read)?)?;
         let machine_id = raw
             .machine_id
@@ -537,6 +593,7 @@ impl MachineManifestStore {
             Some(machine_id) => {
                 let manifest = raw.into_manifest(machine_id);
                 manifest.validate()?;
+                self.write_manifest(&manifest)?;
                 Ok(ReadOutcome {
                     manifest,
                     machine_id_minted: false,
@@ -593,6 +650,13 @@ impl MachineManifestStore {
             ManifestError::Validation("manifest path has no parent directory".to_owned())
         })?;
         fs::create_dir_all(destination_dir).map_err(ManifestError::Write)?;
+        platform::verify_manifest_ancestors(
+            destination_dir,
+            self.platform_owner(),
+            "styrn",
+            &self.trusted_root,
+        )
+        .map_err(ManifestError::Write)?;
         self.harden_directory(destination_dir)?;
         let lock_path = destination_dir.join(format!(
             ".{}.lock",
@@ -629,7 +693,7 @@ impl MachineManifestStore {
             file.sync_all().map_err(ManifestError::Write)?;
             self.harden_temporary(&temporary)?;
             platform::replace_file(&temporary, &self.path).map_err(ManifestError::Write)?;
-            self.verify_security()
+            self.verify_security_after_replace()
         })();
         if result.is_err() {
             let _ = fs::remove_file(&temporary);
@@ -650,8 +714,28 @@ impl MachineManifestStore {
     }
 
     fn verify_security(&self) -> Result<(), ManifestError> {
-        platform::verify_manifest_security(&self.path, self.platform_owner(), "styrn")
-            .map_err(ManifestError::Write)
+        self.verify_security_io().map_err(ManifestError::Security)
+    }
+
+    fn verify_security_after_replace(&self) -> Result<(), ManifestError> {
+        #[cfg(test)]
+        if matches!(self.security, ManifestSecurity::FailAfterReplace) {
+            return Err(ManifestError::PostReplaceSecurity(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "injected post-replacement verification failure",
+            )));
+        }
+        self.verify_security_io()
+            .map_err(ManifestError::PostReplaceSecurity)
+    }
+
+    fn verify_security_io(&self) -> std::io::Result<()> {
+        platform::verify_manifest_security(
+            &self.path,
+            self.platform_owner(),
+            "styrn",
+            &self.trusted_root,
+        )
     }
 
     fn platform_owner(&self) -> platform::ManifestOwner {
@@ -661,6 +745,8 @@ impl MachineManifestStore {
             ManifestSecurity::CurrentProcess | ManifestSecurity::FailBeforeReplace => {
                 platform::ManifestOwner::CurrentProcess
             }
+            #[cfg(test)]
+            ManifestSecurity::FailAfterReplace => platform::ManifestOwner::CurrentProcess,
         }
     }
 
@@ -846,6 +932,10 @@ pub(crate) enum ManifestError {
     Read(std::io::Error),
     #[error("could not write machine manifest: {0}")]
     Write(std::io::Error),
+    #[error("machine manifest security verification failed: {0}")]
+    Security(std::io::Error),
+    #[error("machine manifest was replaced but security verification failed: {0}")]
+    PostReplaceSecurity(std::io::Error),
     #[error("manifest secret rejected at {path}: {reason}")]
     Secret { path: String, reason: &'static str },
     #[error("invalid machine manifest: {0}")]

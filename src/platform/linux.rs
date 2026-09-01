@@ -69,7 +69,8 @@ pub(super) fn create_manifest_temporary(path: &Path) -> io::Result<fs::File> {
 pub(super) fn verify_manifest_security(
     path: &Path,
     owner: ManifestOwner,
-    _worker: &str,
+    worker: &str,
+    trusted_root: &Path,
 ) -> io::Result<()> {
     let parent = path
         .parent()
@@ -89,7 +90,96 @@ pub(super) fn verify_manifest_security(
         file_mode: file.mode() & 0o777,
         directory_uid: directory.uid(),
         directory_mode: directory.mode() & 0o777,
-    })
+    })?;
+    verify_manifest_ancestors(parent, owner, worker, trusted_root)
+}
+
+pub(super) fn verify_manifest_file_target(path: &Path) -> io::Result<()> {
+    require_regular_file(path)
+}
+
+pub(super) fn verify_manifest_ancestors(
+    directory: &Path,
+    owner: ManifestOwner,
+    worker: &str,
+    trusted_root: &Path,
+) -> io::Result<()> {
+    if !directory.starts_with(trusted_root) {
+        return Err(permission_denied(
+            "manifest directory is outside its trusted root",
+        ));
+    }
+    if directory == trusted_root {
+        return require_real_directory(directory);
+    }
+    let worker_uid = match owner {
+        ManifestOwner::System => Some(lookup_worker_uid(worker)?),
+        #[cfg(test)]
+        ManifestOwner::CurrentProcess => None,
+    };
+    let mut child_uid = fs::symlink_metadata(directory)?.uid();
+    let mut current = directory.parent();
+    while let Some(ancestor) = current {
+        require_real_directory(ancestor)?;
+        let metadata = fs::metadata(ancestor)?;
+        let mode = metadata.mode();
+        if matches!(owner, ManifestOwner::System) && mode & 0o001 == 0 {
+            return Err(permission_denied(
+                "manifest ancestor is not traversable by the styrn worker",
+            ));
+        }
+        if worker_uid.is_some_and(|uid| uid == metadata.uid()) && mode & 0o200 != 0 {
+            return Err(permission_denied(
+                "styrn worker owns a writable manifest ancestor",
+            ));
+        }
+        if mode & 0o022 != 0 {
+            let safe_sticky_root = matches!(owner, ManifestOwner::System)
+                && mode & 0o1000 != 0
+                && metadata.uid() == 0
+                && child_uid == 0;
+            if !safe_sticky_root {
+                return Err(permission_denied(
+                    "manifest ancestor grants replacement access",
+                ));
+            }
+        }
+        child_uid = metadata.uid();
+        if ancestor == trusted_root {
+            return Ok(());
+        }
+        current = ancestor.parent();
+    }
+    Err(permission_denied(
+        "manifest trusted root is not an ancestor",
+    ))
+}
+
+fn lookup_worker_uid(worker: &str) -> io::Result<u32> {
+    let worker = std::ffi::CString::new(worker)
+        .map_err(|_| invalid_data("worker account contains a NUL byte"))?;
+    let mut entry = unsafe { std::mem::zeroed::<libc::passwd>() };
+    let mut result = std::ptr::null_mut();
+    let mut buffer = vec![0_u8; 16 * 1024];
+    let status = unsafe {
+        libc::getpwnam_r(
+            worker.as_ptr(),
+            &mut entry,
+            buffer.as_mut_ptr().cast(),
+            buffer.len(),
+            &mut result,
+        )
+    };
+    if status != 0 {
+        return Err(io::Error::from_raw_os_error(status));
+    }
+    if result.is_null() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "styrn worker account is unavailable",
+        ));
+    }
+    Ok(entry.pw_uid)
 }
 
 #[derive(Clone, Copy)]
