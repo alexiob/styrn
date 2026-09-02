@@ -13,6 +13,12 @@
       "type": "array",
       "description": "Entry IDs are additionally checked across the complete array, and resource ownership conflicts are checked within each entry by the runtime semantic validator.",
       "items": { "$ref": "#/$defs/entry" }
+    },
+    "pending_publications": {
+      "type": "array",
+      "description": "Append-only witnessed-current pending epochs. The runtime additionally requires unique publication IDs and timestamps, no publication ID collision with a receipt entry, unique action and entry IDs within each epoch, monotonic receipt entry counts, immutable publication prefixes, and links to the latest earlier pending entry with the same action ID.",
+      "uniqueItems": true,
+      "items": { "$ref": "#/$defs/pendingPublication" }
     }
   },
   "allOf": [
@@ -34,6 +40,42 @@
     }
   ],
   "$defs": {
+    "pendingPublication": {
+      "type": "object",
+      "required": ["publication_id", "timestamp", "receipt_entry_count", "pending"],
+      "additionalProperties": false,
+      "properties": {
+        "publication_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+        },
+        "timestamp": {
+          "type": "string",
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]+)?Z$"
+        },
+        "receipt_entry_count": { "type": "integer", "minimum": 0 },
+        "pending": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/pendingPublicationLink" }
+        }
+      }
+    },
+    "pendingPublicationLink": {
+      "type": "object",
+      "required": ["action_id", "entry_id"],
+      "additionalProperties": false,
+      "properties": {
+        "action_id": {
+          "type": "string",
+          "pattern": "^[a-z](?:[a-z0-9-]*[a-z0-9])?(?:\\.[a-z](?:[a-z0-9-]*[a-z0-9])?)+$"
+        },
+        "entry_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+        }
+      }
+    },
     "entry": {
       "type": "object",
       "required": [

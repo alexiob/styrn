@@ -3,7 +3,7 @@ use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use chrono::{DateTime, FixedOffset};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
@@ -388,9 +388,13 @@ impl MachineManifest {
             }
         }
         if let Some(actions) = &self.pending_actions {
+            let mut ids = HashSet::with_capacity(actions.len());
             for action in actions {
                 non_empty("pending_actions.id", &action.id)?;
                 non_empty("pending_actions.message", &action.message)?;
+                if !ids.insert(action.id.as_str()) {
+                    return invalid("pending action identifiers must be unique");
+                }
             }
         }
         self.ensure_secret_free()?;

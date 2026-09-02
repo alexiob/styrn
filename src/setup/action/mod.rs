@@ -267,7 +267,7 @@ pub(crate) struct PendingAction {
 }
 
 impl PendingAction {
-    pub(super) fn new(id: ActionName, needs_human: NeedsHuman) -> Self {
+    fn new(id: ActionName, needs_human: NeedsHuman) -> Self {
         Self { id, needs_human }
     }
 
@@ -789,8 +789,6 @@ mod execution;
 #[cfg(not(action_core_fixture))]
 #[allow(unused_imports)] // Private canonical route; T0.20 adds its authorized frontend.
 use execution::apply_plan_with_journal;
-#[cfg(not(any(action_core_fixture, action_compile_fixture)))]
-pub(in crate::setup) use execution::ApplyReport;
 
 fn checked_text(value: &str, error: ActionError) -> Result<String, ActionError> {
     if super::validate_probe_static_text(value) {

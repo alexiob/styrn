@@ -1,7 +1,7 @@
 use super::*;
 use crate::setup::{
     action::Privilege,
-    probe::{test_support, ProbeId, ProbeStatus},
+    probe::{test_support, ProbeFailure, ProbeId, ProbeStatus},
 };
 use std::io::Cursor;
 use std::sync::{
@@ -417,7 +417,7 @@ fn converge_rejects_status_inverting_create_and_done_templates() {
 
 #[test]
 fn exceptional_lines_require_their_declared_observed_states() {
-    let exceptional = vec![
+    let exceptional = [
         DesiredChange::needs_human(
             id("tool.human"),
             "human",
@@ -465,7 +465,7 @@ fn exceptional_lines_require_their_declared_observed_states() {
             reason: "inconsistent state".to_owned(),
         },
     ] {
-        for change in &exceptional {
+        for change in &exceptional[1..] {
             let catalog = test_support::catalog(vec![test_support::TestProbe::fixed(
                 change.subject.as_str(),
                 status.clone(),
@@ -478,6 +478,74 @@ fn exceptional_lines_require_their_declared_observed_states() {
                 PlanError::ExceptionalObservationMismatch
             );
         }
+    }
+}
+
+#[test]
+fn remote_login_observation_failures_truthfully_require_human_action_without_elevation() {
+    const INSTRUCTIONS: &str =
+        "System Settings → General → Sharing → Remote Login → on; then re-run styrn doctor.";
+
+    enum SyntheticObservation {
+        Status(ProbeStatus),
+        Failure(ProbeFailure),
+    }
+
+    let cases = [
+        SyntheticObservation::Status(ProbeStatus::Broken {
+            reason: "automation was unavailable".to_owned(),
+        }),
+        SyntheticObservation::Failure(ProbeFailure::missing_prerequisite(
+            "launchctl was not installed",
+        )),
+        SyntheticObservation::Failure(ProbeFailure::permission_denied(
+            "sharing preferences were revoked",
+        )),
+        SyntheticObservation::Status(ProbeStatus::Unknowable {
+            reason: "remote login state was unknowable".to_owned(),
+        }),
+    ];
+
+    for (index, observation) in cases.into_iter().enumerate() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let probe = match observation {
+            SyntheticObservation::Status(status) => {
+                test_support::TestProbe::fixed("macos.remote-login", status, Arc::clone(&calls))
+            }
+            SyntheticObservation::Failure(failure) => {
+                test_support::TestProbe::failure("macos.remote-login", failure, Arc::clone(&calls))
+            }
+        };
+        let catalog = test_support::catalog(vec![probe]);
+        let desired = DesiredState::new(vec![DesiredChange::needs_human(
+            id("macos.remote-login"),
+            "Remote Login",
+            action(
+                "macos.remote-login",
+                "macos.remote-login-enable",
+                INSTRUCTIONS,
+                Privilege::None,
+                PlanOperation::NeedsHuman,
+            ),
+        )
+        .unwrap()]);
+        let mut output = Vec::new();
+
+        let plan = dry_run(&catalog, &desired, &mut output)
+            .unwrap_or_else(|error| panic!("case {index} must remain actionable: {error}"));
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        let entries = plan.entries().collect::<Vec<_>>();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].operation(), PlanOperation::NeedsHuman);
+        let rendered = String::from_utf8(output).unwrap();
+        assert!(rendered.contains("!"));
+        assert!(rendered.contains(INSTRUCTIONS));
+        assert!(!rendered.contains("[sudo]"));
+        assert!(!rendered.contains("[admin]"));
+        assert!(!rendered.contains("+ "));
+        assert!(!rendered.contains("~ "));
+        assert!(!rendered.contains("= "));
     }
 }
 

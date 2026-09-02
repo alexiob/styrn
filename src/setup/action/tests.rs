@@ -422,7 +422,7 @@ fn succeeded_intent_recovers_stored_dynamic_before_hash_without_recomputation() 
 }
 
 #[test]
-fn all_needs_human_plan_journals_each_stable_identity_once_without_mutation_or_noop() {
+fn needs_human_journals_each_current_occurrence_once_and_recurrence_after_witnessed_resolution() {
     let fixture = JournalFixture::new("needs-human-report");
     let store = ReceiptStore::new_for_test(fixture.receipt_path());
     let state = Arc::new(Mutex::new(Vec::new()));
@@ -462,6 +462,10 @@ fn all_needs_human_plan_journals_each_stable_identity_once_without_mutation_or_n
             "019cafd0-5c00-7000-8000-000000000002",
             "2026-09-02T10:00:01Z",
         ),
+        (
+            "019cafd0-5c00-7000-8000-000000000003",
+            "2026-09-02T10:00:02Z",
+        ),
     ]);
 
     let report = apply_plan_with_journal(&mut plan, &store, &mut metadata).unwrap();
@@ -490,7 +494,7 @@ fn all_needs_human_plan_journals_each_stable_identity_once_without_mutation_or_n
     ))
     .unwrap()
     .without_machine_id();
-    crate::setup::pending::project_manifest(&mut draft, report.pending()).unwrap();
+    crate::setup::pending::project_manifest_for_test(&mut draft, report.pending()).unwrap();
     let projected = draft.pending_actions.as_ref().unwrap();
     assert_eq!(projected.len(), 2);
     assert_eq!(projected[0].id, "test.remote-login");
@@ -509,8 +513,14 @@ fn all_needs_human_plan_journals_each_stable_identity_once_without_mutation_or_n
     );
     let manifest_path = fixture.root.join("machine.toml");
     let manifest_store = crate::manifest::MachineManifestStore::new_for_test(&manifest_path);
-    let machine_id =
-        crate::setup::pending::publish_manifest(&manifest_store, &mut draft, &report).unwrap();
+    let machine_id = crate::setup::pending::publish_manifest(
+        &manifest_store,
+        &store,
+        &mut draft,
+        report.pending(),
+        &mut metadata,
+    )
+    .unwrap();
     let first_manifest = fs::read(&manifest_path).unwrap();
 
     let timestamp = Utc.with_ymd_and_hms(2026, 9, 2, 10, 0, 2).unwrap();
@@ -606,10 +616,38 @@ fn all_needs_human_plan_journals_each_stable_identity_once_without_mutation_or_n
     let rerun = apply_plan_with_journal(&mut plan, &store, &mut no_metadata).unwrap();
     assert_eq!(rerun.pending_count(), 2);
     assert_eq!(store.read_snapshot().unwrap().entry_count(), 2);
-    let rerun_machine_id =
-        crate::setup::pending::publish_manifest(&manifest_store, &mut draft, &rerun).unwrap();
+    let rerun_machine_id = crate::setup::pending::publish_manifest(
+        &manifest_store,
+        &store,
+        &mut draft,
+        rerun.pending(),
+        &mut no_metadata,
+    )
+    .unwrap();
     assert_eq!(rerun_machine_id, machine_id);
     assert_eq!(fs::read(&manifest_path).unwrap(), first_manifest);
+    let rerun_default_json = crate::output::to_json(
+        crate::setup::pending::PendingPolicy::default()
+            .evaluate(timestamp, rerun.pending())
+            .unwrap()
+            .envelope(),
+    )
+    .unwrap();
+    assert_eq!(
+        rerun_default_json,
+        crate::output::to_json(default_outcome.envelope()).unwrap()
+    );
+    let rerun_strict_json = crate::output::to_json(
+        crate::setup::pending::PendingPolicy::new(true)
+            .evaluate(timestamp, rerun.pending())
+            .unwrap()
+            .envelope(),
+    )
+    .unwrap();
+    assert_eq!(
+        rerun_strict_json,
+        crate::output::to_json(strict_outcome.envelope()).unwrap()
+    );
 
     let receipt_before_resolution = store.read_snapshot().unwrap().to_json().unwrap();
     let (still_pending, still_pending_metrics) = Action::test_named_needs_human(
@@ -619,21 +657,98 @@ fn all_needs_human_plan_journals_each_stable_identity_once_without_mutation_or_n
         second,
     );
     let mut resolved_plan = vec![still_pending];
-    let mut resolution_metadata = ReceiptMetadataSource::for_test([]);
+    let mut resolution_metadata = ReceiptMetadataSource::for_test([(
+        "019cafd0-5c00-7000-8000-000000000004",
+        "2026-09-02T10:00:03Z",
+    )]);
     let resolved =
         apply_plan_with_journal(&mut resolved_plan, &store, &mut resolution_metadata).unwrap();
-    crate::setup::pending::publish_manifest(&manifest_store, &mut draft, &resolved).unwrap();
+    crate::setup::pending::publish_manifest(
+        &manifest_store,
+        &store,
+        &mut draft,
+        resolved.pending(),
+        &mut resolution_metadata,
+    )
+    .unwrap();
     assert_eq!(resolved.pending_count(), 1);
     assert_eq!(resolved.pending()[0].id().as_str(), "test.package-login");
     assert_eq!(still_pending_metrics.mutation_calls(), 0);
+    let receipt_after_resolution = store.read_snapshot().unwrap().to_json().unwrap();
     assert_eq!(
-        store.read_snapshot().unwrap().to_json().unwrap(),
-        receipt_before_resolution
+        serde_json::from_slice::<serde_json::Value>(&receipt_after_resolution).unwrap()["entries"],
+        serde_json::from_slice::<serde_json::Value>(&receipt_before_resolution).unwrap()["entries"]
     );
     let current = manifest_store.read().unwrap().manifest;
     let current_pending = current.pending_actions.unwrap();
     assert_eq!(current_pending.len(), 1);
     assert_eq!(current_pending[0].id, "test.package-login");
+
+    let (recurring, recurring_metrics) = Action::test_named_needs_human(
+        "test.remote-login",
+        Privilege::None,
+        Arc::clone(&state),
+        first,
+    );
+    let mut recurring_plan = vec![recurring];
+    let mut recurrence_metadata = ReceiptMetadataSource::for_test([(
+        "019cafd0-5c00-7000-8000-000000000005",
+        "2026-09-02T10:00:04Z",
+    )]);
+    let recurrence =
+        apply_plan_with_journal(&mut recurring_plan, &store, &mut recurrence_metadata).unwrap();
+    assert_eq!(recurrence.pending_count(), 1);
+    assert_eq!(recurrence.pending()[0].id().as_str(), "test.remote-login");
+    assert_eq!(store.read_snapshot().unwrap().entry_count(), 3);
+    let mut failed_checkpoint_metadata = ReceiptMetadataSource::for_test([(
+        "019cafd0-5c00-7000-8000-000000000006",
+        "2026-09-02T10:00:05Z",
+    )]);
+    let publication_error = crate::setup::pending::publish_manifest(
+        &crate::manifest::MachineManifestStore::new_with_failing_hardening(&manifest_path),
+        &store,
+        &mut draft,
+        recurrence.pending(),
+        &mut failed_checkpoint_metadata,
+    )
+    .unwrap_err();
+    assert_eq!(publication_error.error_code(), "setup.apply_failed");
+    let mut repair_entry_metadata = ReceiptMetadataSource::for_test([]);
+    let repaired_recurrence =
+        apply_plan_with_journal(&mut recurring_plan, &store, &mut repair_entry_metadata).unwrap();
+    assert_eq!(store.read_snapshot().unwrap().entry_count(), 3);
+    let mut recurrence_checkpoint_metadata = ReceiptMetadataSource::for_test([(
+        "019cafd0-5c00-7000-8000-000000000006",
+        "2026-09-02T10:00:05Z",
+    )]);
+    crate::setup::pending::publish_manifest(
+        &manifest_store,
+        &store,
+        &mut draft,
+        repaired_recurrence.pending(),
+        &mut recurrence_checkpoint_metadata,
+    )
+    .unwrap();
+    let recurring_manifest = fs::read(&manifest_path).unwrap();
+    let recurring_receipt = store.read_snapshot().unwrap().to_json().unwrap();
+    let mut current_metadata = ReceiptMetadataSource::for_test([]);
+    let current_recurrence =
+        apply_plan_with_journal(&mut recurring_plan, &store, &mut current_metadata).unwrap();
+    crate::setup::pending::publish_manifest(
+        &manifest_store,
+        &store,
+        &mut draft,
+        current_recurrence.pending(),
+        &mut current_metadata,
+    )
+    .unwrap();
+    assert_eq!(store.read_snapshot().unwrap().entry_count(), 3);
+    assert_eq!(
+        store.read_snapshot().unwrap().to_json().unwrap(),
+        recurring_receipt
+    );
+    assert_eq!(fs::read(&manifest_path).unwrap(), recurring_manifest);
+    assert_eq!(recurring_metrics.mutation_calls(), 0);
     assert_eq!(first_metrics.mutation_calls(), 0);
     assert_eq!(second_metrics.mutation_calls(), 0);
 }
@@ -697,8 +812,13 @@ fn failed_manifest_publication_repairs_on_rerun_without_duplicate_pending_histor
 
     let error = crate::setup::pending::publish_manifest(
         &crate::manifest::MachineManifestStore::new_with_failing_hardening(&manifest_path),
+        &receipt_store,
         &mut draft,
-        &report,
+        report.pending(),
+        &mut ReceiptMetadataSource::for_test([(
+            "019cafd0-5c00-7000-8000-000000000014",
+            "2026-09-02T10:02:01Z",
+        )]),
     )
     .unwrap_err();
 
@@ -710,15 +830,22 @@ fn failed_manifest_publication_repairs_on_rerun_without_duplicate_pending_histor
 
     let mut no_metadata = ReceiptMetadataSource::for_test([]);
     let rerun = apply_plan_with_journal(&mut plan, &receipt_store, &mut no_metadata).unwrap();
+    let mut repair_metadata = ReceiptMetadataSource::for_test([(
+        "019cafd0-5c00-7000-8000-000000000014",
+        "2026-09-02T10:02:01Z",
+    )]);
     crate::setup::pending::publish_manifest(
         &crate::manifest::MachineManifestStore::new_for_test(&manifest_path),
+        &receipt_store,
         &mut draft,
-        &rerun,
+        rerun.pending(),
+        &mut repair_metadata,
     )
     .unwrap();
+    let repaired_receipt = receipt_store.read_snapshot().unwrap().to_json().unwrap();
     assert_eq!(
-        receipt_store.read_snapshot().unwrap().to_json().unwrap(),
-        receipt_before
+        serde_json::from_slice::<serde_json::Value>(&repaired_receipt).unwrap()["entries"],
+        serde_json::from_slice::<serde_json::Value>(&receipt_before).unwrap()["entries"]
     );
     assert_eq!(
         crate::manifest::MachineManifestStore::new_for_test(&manifest_path)
@@ -729,6 +856,160 @@ fn failed_manifest_publication_repairs_on_rerun_without_duplicate_pending_histor
             .unwrap()[0]
             .id,
         "test.local-approval"
+    );
+}
+
+#[test]
+fn failed_receipt_checkpoint_leaves_a_valid_manifest_and_repairs_without_duplication() {
+    let fixture = JournalFixture::new("pending-checkpoint-recovery");
+    let receipt_path = fixture.receipt_path().to_path_buf();
+    let receipt_store = ReceiptStore::new_for_test(receipt_path.clone());
+    let manifest_path = fixture.root.join("machine.toml");
+    let pending = NeedsHuman::new(
+        HumanInstructions::new("Complete the local approval, then rerun setup.").unwrap(),
+        None,
+    );
+    let mut plan = vec![
+        Action::test_named_needs_human(
+            "test.local-approval",
+            Privilege::None,
+            Arc::new(Mutex::new(Vec::new())),
+            pending,
+        )
+        .0,
+    ];
+    let mut entry_metadata = ReceiptMetadataSource::for_test([(
+        "019cafd0-5c00-7000-8000-000000000021",
+        "2026-09-02T10:04:00Z",
+    )]);
+    let report = apply_plan_with_journal(&mut plan, &receipt_store, &mut entry_metadata).unwrap();
+    let mut draft = pending_manifest_draft();
+    let manifest_store = crate::manifest::MachineManifestStore::new_for_test(&manifest_path);
+    let failing_receipt = ReceiptStore::new_for_test_failing_before_replace(receipt_path);
+    let mut checkpoint_metadata = ReceiptMetadataSource::for_test([(
+        "019cafd0-5c00-7000-8000-000000000022",
+        "2026-09-02T10:04:01Z",
+    )]);
+
+    let error = crate::setup::pending::publish_manifest(
+        &manifest_store,
+        &failing_receipt,
+        &mut draft,
+        report.pending(),
+        &mut checkpoint_metadata,
+    )
+    .unwrap_err();
+
+    assert_eq!(error.error_code(), "setup.receipt_conflict");
+    assert_eq!(error.exit_code().as_i32(), 13);
+    assert!(draft.pending_actions.is_none());
+    assert_eq!(
+        manifest_store
+            .read()
+            .unwrap()
+            .manifest
+            .pending_actions
+            .unwrap()[0]
+            .id,
+        "test.local-approval"
+    );
+    let after_failure: serde_json::Value =
+        serde_json::from_slice(&receipt_store.read_snapshot().unwrap().to_json().unwrap()).unwrap();
+    assert_eq!(after_failure["entries"].as_array().unwrap().len(), 1);
+    assert!(after_failure["pending_publications"].is_null());
+
+    let mut no_entry_metadata = ReceiptMetadataSource::for_test([]);
+    let rerun = apply_plan_with_journal(&mut plan, &receipt_store, &mut no_entry_metadata).unwrap();
+    let mut repair_metadata = ReceiptMetadataSource::for_test([(
+        "019cafd0-5c00-7000-8000-000000000022",
+        "2026-09-02T10:04:01Z",
+    )]);
+    crate::setup::pending::publish_manifest(
+        &manifest_store,
+        &receipt_store,
+        &mut draft,
+        rerun.pending(),
+        &mut repair_metadata,
+    )
+    .unwrap();
+    let repaired: serde_json::Value =
+        serde_json::from_slice(&receipt_store.read_snapshot().unwrap().to_json().unwrap()).unwrap();
+    assert_eq!(repaired["entries"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        repaired["pending_publications"].as_array().unwrap().len(),
+        1
+    );
+    assert_eq!(
+        repaired["pending_publications"][0]["pending"][0]["entry_id"],
+        "019cafd0-5c00-7000-8000-000000000021"
+    );
+}
+
+#[test]
+fn concurrent_pending_publications_select_one_occurrence_checkpoint() {
+    let fixture = JournalFixture::new("pending-publication-race");
+    let receipt_path = fixture.receipt_path().to_path_buf();
+    let receipt_store = ReceiptStore::new_for_test(&receipt_path);
+    let manifest_path = fixture.root.join("machine.toml");
+    let mut plan = vec![
+        Action::test_named_needs_human(
+            "test.local-approval",
+            Privilege::None,
+            Arc::new(Mutex::new(Vec::new())),
+            NeedsHuman::new(
+                HumanInstructions::new("Complete the local approval, then rerun setup.").unwrap(),
+                None,
+            ),
+        )
+        .0,
+    ];
+    let mut entry_metadata = ReceiptMetadataSource::for_test([(
+        "019cafd0-5c00-7000-8000-000000000031",
+        "2026-09-02T10:05:00Z",
+    )]);
+    let report = apply_plan_with_journal(&mut plan, &receipt_store, &mut entry_metadata).unwrap();
+    let barrier = Arc::new(std::sync::Barrier::new(2));
+
+    std::thread::scope(|scope| {
+        for sequence in 32..=33 {
+            let barrier = Arc::clone(&barrier);
+            let receipt_path = receipt_path.clone();
+            let manifest_path = manifest_path.clone();
+            let pending = report.pending();
+            scope.spawn(move || {
+                let mut draft = pending_manifest_draft();
+                let checkpoint = if sequence == 32 {
+                    (
+                        "019cafd0-5c00-7000-8000-000000000032",
+                        "2026-09-02T10:05:01Z",
+                    )
+                } else {
+                    (
+                        "019cafd0-5c00-7000-8000-000000000033",
+                        "2026-09-02T10:05:02Z",
+                    )
+                };
+                let mut metadata = ReceiptMetadataSource::for_test([checkpoint]);
+                barrier.wait();
+                crate::setup::pending::publish_manifest(
+                    &crate::manifest::MachineManifestStore::new_for_test(manifest_path),
+                    &ReceiptStore::new_for_test(receipt_path),
+                    &mut draft,
+                    pending,
+                    &mut metadata,
+                )
+                .unwrap();
+            });
+        }
+    });
+
+    let receipt: serde_json::Value =
+        serde_json::from_slice(&receipt_store.read_snapshot().unwrap().to_json().unwrap()).unwrap();
+    assert_eq!(receipt["entries"].as_array().unwrap().len(), 1);
+    assert_eq!(receipt["pending_publications"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        receipt["pending_publications"][0]["pending"][0]["entry_id"],
+        "019cafd0-5c00-7000-8000-000000000031"
     );
 }
 
@@ -752,7 +1033,8 @@ fn pending_projection_rejects_duplicate_ids_without_partial_state_and_empty_poli
     let duplicate = vec![report.pending()[0].clone(), report.pending()[0].clone()];
     let mut draft = pending_manifest_draft();
 
-    let error = crate::setup::pending::project_manifest(&mut draft, &duplicate).unwrap_err();
+    let error =
+        crate::setup::pending::project_manifest_for_test(&mut draft, &duplicate).unwrap_err();
 
     assert_eq!(error.error_code(), "setup.plan_invalid");
     assert_eq!(error.exit_code().as_i32(), 13);
@@ -767,6 +1049,27 @@ fn pending_projection_rejects_duplicate_ids_without_partial_state_and_empty_poli
     assert_eq!(json["ok"], true);
     assert_eq!(json["data"]["pending"], serde_json::json!([]));
     assert_eq!(json["warnings"], serde_json::json!([]));
+}
+
+#[test]
+fn pending_publication_boundary_accepts_the_complete_authorized_report_slice() {
+    fn publish_authorized(
+        report: &super::authorization::AuthorizedExecutionReport,
+        manifest_store: &crate::manifest::MachineManifestStore,
+        receipt_store: &ReceiptStore,
+        draft: &mut crate::manifest::MachineManifestDraft,
+        metadata: &mut ReceiptMetadataSource,
+    ) -> Result<uuid::Uuid, crate::setup::pending::PendingError> {
+        crate::setup::pending::publish_manifest(
+            manifest_store,
+            receipt_store,
+            draft,
+            report.pending(),
+            metadata,
+        )
+    }
+
+    let _ = publish_authorized;
 }
 
 #[cfg(unix)]
@@ -1538,6 +1841,51 @@ fn callers_cannot_construct_forged_receipt_entries() {
 }
 
 #[test]
+fn setup_plan_cannot_construct_pending_actions() {
+    assert_fixture_fails_with_cfg(
+        "real_plan_apply.rs",
+        &["plan_pending_forge_fixture"],
+        FixtureExpectation::new(
+            "E0624",
+            "associated function `new` is private",
+            5,
+            Some("private associated function"),
+            "hostile_pending.rs",
+        ),
+    );
+}
+
+#[test]
+fn setup_plan_cannot_construct_pending_publication_authority() {
+    assert_fixture_fails_with_cfg(
+        "pending_publication_forge.rs",
+        &["plan_pending_publication_forge_fixture"],
+        FixtureExpectation::new(
+            "E0603",
+            "tuple struct constructor `PendingPublicationAuthority` is private",
+            2,
+            Some("private tuple struct constructor"),
+            "hostile_pending_publication.rs",
+        ),
+    );
+}
+
+#[test]
+fn setup_plan_cannot_project_pending_manifest_state_directly() {
+    assert_fixture_fails_with_cfg(
+        "pending_publication_forge.rs",
+        &["plan_pending_projection_fixture"],
+        FixtureExpectation::new(
+            "E0603",
+            "function `project_manifest` is private",
+            2,
+            Some("private function"),
+            "hostile_pending_projection.rs",
+        ),
+    );
+}
+
+#[test]
 fn an_outside_module_cannot_unseal_an_action_implementation() {
     assert_fixture_fails(
         "unsealed_action.rs",
@@ -1673,9 +2021,10 @@ fn compile_fixture(name: &str, configurations: &[&str]) -> Output {
         name,
         "plan_journal_apply.rs" | "forged_action_effect.rs" | "forged_receipt_entry.rs"
     );
-    if !full_journal_fixture {
+    let full_setup_fixture = name == "pending_publication_forge.rs";
+    if !full_journal_fixture && !full_setup_fixture {
         command.arg("--cfg").arg("action_core_fixture");
-    } else {
+    } else if full_journal_fixture {
         command.arg("--cfg").arg("action_compile_fixture");
     }
     if configurations.contains(&"test") {
@@ -1692,6 +2041,7 @@ fn compile_fixture(name: &str, configurations: &[&str]) -> Output {
         "serde_json",
         "sha2",
         "thiserror",
+        "toml",
         "uuid",
     ] {
         command.arg("--extern").arg(format!(
@@ -1747,6 +2097,7 @@ impl CargoArtifacts {
                 "serde_json",
                 "sha2",
                 "thiserror",
+                "toml",
                 "uuid",
             ]
             .contains(&name)
@@ -1771,6 +2122,7 @@ impl CargoArtifacts {
             "serde_json",
             "sha2",
             "thiserror",
+            "toml",
             "uuid",
         ] {
             assert!(

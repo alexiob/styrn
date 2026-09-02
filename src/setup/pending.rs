@@ -84,18 +84,16 @@ impl PendingOutcome {
     }
 }
 
-/// Replaces only the manifest's current unresolved projection. Receipt
-/// history is deliberately not consulted here.
-pub(crate) fn project_manifest(
+pub(super) struct PendingPublicationAuthority(());
+
+/// Replaces only the manifest's current unresolved projection.
+fn project_manifest(
     draft: &mut manifest::MachineManifestDraft,
     pending: &[PendingAction],
 ) -> Result<(), PendingError> {
-    let mut ids = HashSet::with_capacity(pending.len());
+    validate_unique_pending(pending)?;
     let mut projected = Vec::with_capacity(pending.len());
     for action in pending {
-        if !ids.insert(action.id().as_str()) {
-            return Err(PendingError::DuplicateId);
-        }
         projected.push(manifest::PendingAction {
             id: action.id().as_str().to_owned(),
             severity: manifest_severity(action.severity()),
@@ -106,17 +104,43 @@ pub(crate) fn project_manifest(
     Ok(())
 }
 
-/// Publishes the current projection only from a completed apply report, which
-/// proves the action executor has already attempted each required receipt
-/// append. T0.20 will own invocation ordering and CLI integration.
-pub(crate) fn publish_manifest(
-    store: &manifest::MachineManifestStore,
+fn validate_unique_pending(pending: &[PendingAction]) -> Result<(), PendingError> {
+    let mut ids = HashSet::with_capacity(pending.len());
+    if pending
+        .iter()
+        .all(|action| ids.insert(action.id().as_str()))
+    {
+        Ok(())
+    } else {
+        Err(PendingError::DuplicateId)
+    }
+}
+
+#[cfg(test)]
+pub(super) fn project_manifest_for_test(
     draft: &mut manifest::MachineManifestDraft,
-    report: &super::action::ApplyReport,
+    pending: &[PendingAction],
+) -> Result<(), PendingError> {
+    project_manifest(draft, pending)
+}
+
+/// Publishes the complete current projection from either ordinary apply or the
+/// authorization-aware execution report. T0.20 owns CLI invocation ordering.
+pub(crate) fn publish_manifest(
+    manifest_store: &manifest::MachineManifestStore,
+    receipt_store: &super::receipt::ReceiptStore,
+    draft: &mut manifest::MachineManifestDraft,
+    pending: &[PendingAction],
+    metadata: &mut super::receipt::ReceiptMetadataSource,
 ) -> Result<uuid::Uuid, PendingError> {
+    validate_unique_pending(pending)?;
+    let authority = PendingPublicationAuthority(());
+    let session = receipt_store.begin_pending_publication(&authority)?;
+    let prepared = session.prepare(pending, metadata, &authority)?;
     let mut candidate = draft.clone();
-    project_manifest(&mut candidate, report.pending())?;
-    let machine_id = store.write_generated(&candidate)?;
+    project_manifest(&mut candidate, pending)?;
+    let machine_id = manifest_store.write_generated(&candidate)?;
+    session.commit(prepared, &authority)?;
     *draft = candidate;
     Ok(machine_id)
 }
@@ -192,6 +216,8 @@ pub(crate) enum PendingError {
     Output(#[from] output::OutputError),
     #[error(transparent)]
     Manifest(#[from] manifest::ManifestError),
+    #[error(transparent)]
+    Receipt(#[from] super::receipt::ReceiptStoreError),
     #[error("could not render pending actions")]
     Render(#[from] std::io::Error),
 }
@@ -200,6 +226,7 @@ impl PendingError {
     pub(crate) fn error_code(&self) -> &'static str {
         match self {
             Self::DuplicateId => output::ErrorCode::SetupPlanInvalid.as_str(),
+            Self::Receipt(error) => error.error_code(),
             Self::Output(_) | Self::Manifest(_) | Self::Render(_) => {
                 output::ErrorCode::SetupApplyFailed.as_str()
             }

@@ -372,7 +372,8 @@
 
     "pending_actions": {
       "type": "array",
-      "description": "Steps a human must complete (15.2.4). Reported by `styrn host doctor` until resolved.",
+      "description": "Steps a human must complete (15.2.4). Reported by `styrn host doctor` until resolved. Exact duplicate objects are rejected by this schema; the runtime semantic validator additionally rejects repeated IDs across distinct objects.",
+      "uniqueItems": true,
       "items": {
         "type": "object",
         "required": ["id", "severity", "message"],

@@ -2,6 +2,24 @@ use super::*;
 use std::sync::{Arc, Barrier};
 use std::{fs, path::PathBuf};
 
+fn pending_receipt_value() -> serde_json::Value {
+    let mut pending = serde_json::from_str::<serde_json::Value>(COMPLETE_RECEIPT).unwrap();
+    pending["entries"][0]["status"] = serde_json::json!("pending");
+    pending["entries"][0]["privilege_used"] = serde_json::json!("none");
+    for field in [
+        "files_created",
+        "files_modified",
+        "services",
+        "accounts",
+        "registry_keys",
+        "firewall_rules",
+    ] {
+        pending["entries"][0][field] = serde_json::json!([]);
+    }
+    pending["entries"][0]["download_provenance"] = serde_json::Value::Null;
+    pending
+}
+
 #[cfg(not(target_os = "windows"))]
 const COMPLETE_RECEIPT: &str = r#"{
   "schema_version": 1,
@@ -170,9 +188,20 @@ fn checked_in_schema_example_and_canonical_serialization_stay_synchronized() {
     #[cfg(not(target_os = "windows"))]
     let example = ReceiptDocument::from_json(example_bytes).unwrap();
 
+    let mut checkpointed = pending_receipt_value();
+    checkpointed["pending_publications"] = serde_json::json!([{
+        "publication_id": "019cafd0-5c00-7000-8000-000000000002",
+        "timestamp": "2026-09-02T10:00:01Z",
+        "receipt_entry_count": 1,
+        "pending": [{
+            "action_id": "test.first",
+            "entry_id": "019cafd0-5c00-7000-8000-000000000001"
+        }]
+    }]);
     let valid_values = vec![
         serde_json::from_slice::<serde_json::Value>(example_bytes).unwrap(),
         serde_json::from_str::<serde_json::Value>(COMPLETE_RECEIPT).unwrap(),
+        checkpointed,
     ];
     #[cfg(not(target_os = "windows"))]
     let valid_values = {
@@ -276,6 +305,30 @@ fn unknown_fields_are_rejected_at_every_receipt_object_boundary() {
             ReceiptDocument::from_json(&serde_json::to_vec(&value).unwrap()).is_err(),
             "unknown field at {pointer:?} must be rejected"
         );
+    }
+
+    let mut checkpointed = pending_receipt_value();
+    checkpointed["pending_publications"] = serde_json::json!([{
+        "publication_id": "019cafd0-5c00-7000-8000-000000000002",
+        "timestamp": "2026-09-02T10:00:01Z",
+        "receipt_entry_count": 1,
+        "pending": [{
+            "action_id": "test.first",
+            "entry_id": "019cafd0-5c00-7000-8000-000000000001"
+        }]
+    }]);
+    for pointer in [
+        "/pending_publications/0",
+        "/pending_publications/0/pending/0",
+    ] {
+        let mut forged = checkpointed.clone();
+        forged
+            .pointer_mut(pointer)
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .insert("forged".to_owned(), serde_json::Value::Bool(true));
+        assert!(ReceiptDocument::from_json(&serde_json::to_vec(&forged).unwrap()).is_err());
     }
 }
 
@@ -420,20 +473,7 @@ fn conflicting_or_duplicate_effect_records_are_rejected() {
 
 #[test]
 fn pending_entries_must_describe_no_mutation_and_no_privilege_use() {
-    let mut pending = serde_json::from_str::<serde_json::Value>(COMPLETE_RECEIPT).unwrap();
-    pending["entries"][0]["status"] = serde_json::json!("pending");
-    pending["entries"][0]["privilege_used"] = serde_json::json!("none");
-    for field in [
-        "files_created",
-        "files_modified",
-        "services",
-        "accounts",
-        "registry_keys",
-        "firewall_rules",
-    ] {
-        pending["entries"][0][field] = serde_json::json!([]);
-    }
-    pending["entries"][0]["download_provenance"] = serde_json::Value::Null;
+    let pending = pending_receipt_value();
     ReceiptDocument::from_json(&serde_json::to_vec(&pending).unwrap()).unwrap();
 
     let mut privileged = pending.clone();
@@ -462,6 +502,145 @@ fn pending_entries_must_describe_no_mutation_and_no_privilege_use() {
             "pending entry with {field} must be rejected"
         );
     }
+}
+
+#[test]
+fn pending_publications_are_optional_but_strictly_linked_append_only_epochs() {
+    let legacy = ReceiptDocument::from_json(COMPLETE_RECEIPT.as_bytes()).unwrap();
+    assert!(
+        serde_json::from_slice::<serde_json::Value>(&legacy.to_json().unwrap()).unwrap()
+            ["pending_publications"]
+            .is_null()
+    );
+
+    let mut valid = pending_receipt_value();
+    valid["pending_publications"] = serde_json::json!([{
+        "publication_id": "019cafd0-5c00-7000-8000-000000000002",
+        "timestamp": "2026-09-02T10:00:01Z",
+        "receipt_entry_count": 1,
+        "pending": [{
+            "action_id": "test.first",
+            "entry_id": "019cafd0-5c00-7000-8000-000000000001"
+        }]
+    }]);
+    let parsed = ReceiptDocument::from_json(&serde_json::to_vec(&valid).unwrap()).unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&parsed.to_json().unwrap()).unwrap()
+            ["pending_publications"],
+        valid["pending_publications"]
+    );
+
+    let mut wrong_action = valid.clone();
+    wrong_action["pending_publications"][0]["pending"][0]["action_id"] =
+        serde_json::json!("test.other");
+    assert_eq!(
+        ReceiptDocument::from_json(&serde_json::to_vec(&wrong_action).unwrap()).unwrap_err(),
+        ReceiptError::InvalidPendingPublicationLink
+    );
+
+    let mut later_entry = valid.clone();
+    later_entry["pending_publications"][0]["receipt_entry_count"] = serde_json::json!(0);
+    assert_eq!(
+        ReceiptDocument::from_json(&serde_json::to_vec(&later_entry).unwrap()).unwrap_err(),
+        ReceiptError::InvalidPendingPublicationLink
+    );
+
+    let mut entry_id_collision = valid.clone();
+    entry_id_collision["pending_publications"][0]["publication_id"] =
+        serde_json::json!("019cafd0-5c00-7000-8000-000000000001");
+    assert_eq!(
+        ReceiptDocument::from_json(&serde_json::to_vec(&entry_id_collision).unwrap()).unwrap_err(),
+        ReceiptError::DuplicatePendingPublicationId
+    );
+
+    let mut duplicate_link = valid.clone();
+    duplicate_link["pending_publications"][0]["pending"]
+        .as_array_mut()
+        .unwrap()
+        .push(valid["pending_publications"][0]["pending"][0].clone());
+    assert_eq!(
+        ReceiptDocument::from_json(&serde_json::to_vec(&duplicate_link).unwrap()).unwrap_err(),
+        ReceiptError::DuplicatePendingPublicationLink
+    );
+
+    let mut duplicate_id = valid.clone();
+    let mut second = valid["pending_publications"][0].clone();
+    second["timestamp"] = serde_json::json!("2026-09-02T10:00:02Z");
+    duplicate_id["pending_publications"]
+        .as_array_mut()
+        .unwrap()
+        .push(second);
+    assert_eq!(
+        ReceiptDocument::from_json(&serde_json::to_vec(&duplicate_id).unwrap()).unwrap_err(),
+        ReceiptError::DuplicatePendingPublicationId
+    );
+
+    let mut duplicate_timestamp = valid.clone();
+    let mut second = valid["pending_publications"][0].clone();
+    second["publication_id"] = serde_json::json!("019cafd0-5c00-7000-8000-000000000003");
+    duplicate_timestamp["pending_publications"]
+        .as_array_mut()
+        .unwrap()
+        .push(second);
+    assert_eq!(
+        ReceiptDocument::from_json(&serde_json::to_vec(&duplicate_timestamp).unwrap()).unwrap_err(),
+        ReceiptError::DuplicatePendingPublicationTimestamp
+    );
+
+    let mut decreasing_count = valid.clone();
+    decreasing_count["pending_publications"]
+        .as_array_mut()
+        .unwrap()
+        .push(serde_json::json!({
+            "publication_id": "019cafd0-5c00-7000-8000-000000000003",
+            "timestamp": "2026-09-02T10:00:02Z",
+            "receipt_entry_count": 0,
+            "pending": []
+        }));
+    assert_eq!(
+        ReceiptDocument::from_json(&serde_json::to_vec(&decreasing_count).unwrap()).unwrap_err(),
+        ReceiptError::InvalidPendingPublicationOrder
+    );
+}
+
+#[test]
+fn pending_publication_append_cannot_modify_entry_or_checkpoint_prefixes() {
+    let mut value = pending_receipt_value();
+    value["pending_publications"] = serde_json::json!([{
+        "publication_id": "019cafd0-5c00-7000-8000-000000000002",
+        "timestamp": "2026-09-02T10:00:01Z",
+        "receipt_entry_count": 1,
+        "pending": [{
+            "action_id": "test.first",
+            "entry_id": "019cafd0-5c00-7000-8000-000000000001"
+        }]
+    }]);
+    let existing = ReceiptDocument::from_json(&serde_json::to_vec(&value).unwrap()).unwrap();
+    let next = PendingPublication {
+        publication_id: ReceiptEntryId("019cafd0-5c00-7000-8000-000000000003".to_owned()),
+        timestamp: ReceiptTimestamp("2026-09-02T10:00:02Z".to_owned()),
+        receipt_entry_count: 1,
+        pending: Vec::new(),
+    };
+
+    let mut valid = existing.clone();
+    valid.pending_publications.push(next.clone());
+    validate_pending_publication_append_candidate(&existing, &valid).unwrap();
+
+    let mut modified_entry = valid.clone();
+    modified_entry.entries[0].action = ReceiptAction::Foundation(FoundationActionParameters {
+        action_id: ActionIdentifier("test.changed".to_owned()),
+    });
+    assert!(validate_pending_publication_append_candidate(&existing, &modified_entry).is_err());
+
+    let mut modified_checkpoint = existing.clone();
+    modified_checkpoint.pending_publications[0].timestamp =
+        ReceiptTimestamp("2026-09-02T10:00:03Z".to_owned());
+    modified_checkpoint.pending_publications.push(next);
+    assert!(matches!(
+        validate_pending_publication_append_candidate(&existing, &modified_checkpoint),
+        Err(ReceiptStoreError::PrefixConflict)
+    ));
 }
 
 #[test]

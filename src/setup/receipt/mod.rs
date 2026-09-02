@@ -29,6 +29,8 @@ pub(in crate::setup) struct ReceiptDocument {
     schema_version: u32,
     installation_scope: InstallationScope,
     entries: Vec<ReceiptEntry>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pending_publications: Vec<PendingPublication>,
 }
 
 impl ReceiptDocument {
@@ -37,6 +39,7 @@ impl ReceiptDocument {
             schema_version: SCHEMA_VERSION,
             installation_scope,
             entries: Vec::new(),
+            pending_publications: Vec::new(),
         }
     }
 
@@ -53,6 +56,7 @@ impl ReceiptDocument {
                 .installation_scope
                 .ok_or(ReceiptError::MissingInstallationScope)?,
             entries: wire.entries,
+            pending_publications: wire.pending_publications,
         };
         document.validate()?;
         Ok(document)
@@ -101,6 +105,22 @@ impl ReceiptDocument {
                 return Err(ReceiptError::DuplicateEntryId);
             }
         }
+        let mut publication_ids = HashSet::with_capacity(self.pending_publications.len());
+        let mut publication_timestamps = HashSet::with_capacity(self.pending_publications.len());
+        let mut previous_entry_count = 0;
+        for publication in &self.pending_publications {
+            publication.validate(&self.entries)?;
+            if publication.receipt_entry_count < previous_entry_count {
+                return Err(ReceiptError::InvalidPendingPublicationOrder);
+            }
+            previous_entry_count = publication.receipt_entry_count;
+            if !publication_ids.insert(publication.publication_id.as_str()) {
+                return Err(ReceiptError::DuplicatePendingPublicationId);
+            }
+            if !publication_timestamps.insert(publication.timestamp.as_str()) {
+                return Err(ReceiptError::DuplicatePendingPublicationTimestamp);
+            }
+        }
         Ok(())
     }
 }
@@ -111,6 +131,8 @@ struct ReceiptDocumentWire {
     schema_version: u32,
     installation_scope: Option<InstallationScope>,
     entries: Vec<ReceiptEntry>,
+    #[serde(default)]
+    pending_publications: Vec<PendingPublication>,
 }
 
 #[derive(Clone, Debug)]
@@ -131,6 +153,71 @@ pub(crate) struct ReceiptStore {
 pub(crate) struct ReceiptApplySession<'a> {
     store: &'a ReceiptStore,
     _lock: fs::File,
+}
+
+#[cfg(not(any(action_core_fixture, action_compile_fixture)))]
+pub(in crate::setup) struct ReceiptPendingPublicationSession<'a> {
+    store: &'a ReceiptStore,
+    _lock: fs::File,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PendingPublication {
+    publication_id: ReceiptEntryId,
+    timestamp: ReceiptTimestamp,
+    receipt_entry_count: usize,
+    pending: Vec<PendingPublicationLink>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PendingPublicationLink {
+    action_id: ActionIdentifier,
+    entry_id: ReceiptEntryId,
+}
+
+impl PendingPublication {
+    fn validate(&self, entries: &[ReceiptEntry]) -> Result<(), ReceiptError> {
+        self.publication_id.validate()?;
+        self.timestamp.validate()?;
+        if entries
+            .iter()
+            .any(|entry| entry.entry_id == self.publication_id)
+        {
+            return Err(ReceiptError::DuplicatePendingPublicationId);
+        }
+        if self.receipt_entry_count > entries.len() {
+            return Err(ReceiptError::InvalidPendingPublicationLink);
+        }
+        let mut actions = HashSet::with_capacity(self.pending.len());
+        let mut entry_ids = HashSet::with_capacity(self.pending.len());
+        for link in &self.pending {
+            link.action_id.validate()?;
+            link.entry_id.validate()?;
+            if !actions.insert(link.action_id.0.as_str())
+                || !entry_ids.insert(link.entry_id.as_str())
+            {
+                return Err(ReceiptError::DuplicatePendingPublicationLink);
+            }
+            let target = entries[..self.receipt_entry_count]
+                .iter()
+                .rev()
+                .find(|entry| {
+                    entry.status == ReceiptStatus::Pending
+                        && entry.action.action_id() == link.action_id.0
+                })
+                .ok_or(ReceiptError::InvalidPendingPublicationLink)?;
+            if target.entry_id != link.entry_id {
+                return Err(ReceiptError::InvalidPendingPublicationLink);
+            }
+        }
+        Ok(())
+    }
+}
+
+pub(in crate::setup) struct PreparedPendingPublication {
+    publication: Option<PendingPublication>,
 }
 
 #[derive(Clone)]
@@ -439,6 +526,25 @@ impl ReceiptStore {
         lock.lock().map_err(ReceiptStoreError::Write)?;
         self.read_locked()?;
         Ok(ReceiptApplySession {
+            store: self,
+            _lock: lock,
+        })
+    }
+
+    #[cfg(not(any(action_core_fixture, action_compile_fixture)))]
+    pub(in crate::setup) fn begin_pending_publication<'a>(
+        &'a self,
+        _authority: &crate::setup::pending::PendingPublicationAuthority,
+    ) -> Result<ReceiptPendingPublicationSession<'a>, ReceiptStoreError> {
+        let destination = self.validate_destination_policy()?.to_path_buf();
+        self.verify_bound_principal()?;
+        self.prepare_destination(&destination)?;
+        self.preflight_writer_state()?;
+        let lock = crate::platform::open_manifest_lock(&self.lock_path(), self.owner, &self.worker)
+            .map_err(ReceiptStoreError::Write)?;
+        lock.lock().map_err(ReceiptStoreError::Write)?;
+        self.read_locked()?;
+        Ok(ReceiptPendingPublicationSession {
             store: self,
             _lock: lock,
         })
@@ -846,9 +952,10 @@ impl ReceiptStore {
 }
 
 impl ReceiptApplySession<'_> {
-    /// Records the first observation of a human-owned action. Pending entries
-    /// are immutable history, carry no effects, and are deduplicated by the
-    /// action's stable identity while this receipt lock is held.
+    /// Records one unresolved occurrence of a human-owned action. Pending
+    /// entries are immutable zero-effect history. A current or not-yet-
+    /// published occurrence is reused; a new occurrence is appended only
+    /// after a witnessed epoch no longer contained the stable action ID.
     pub(in crate::setup) fn record_pending(
         &self,
         action: &crate::setup::action::ActionName,
@@ -856,9 +963,7 @@ impl ReceiptApplySession<'_> {
         _authority: &crate::setup::action::JournalAuthority,
     ) -> Result<bool, ReceiptStoreError> {
         let existing = self.store.read_locked()?;
-        if existing.entries.iter().any(|entry| {
-            entry.status == ReceiptStatus::Pending && entry.action.action_id() == action.as_str()
-        }) {
+        if pending_entry_is_current_or_unpublished(&existing, action.as_str()) {
             return Ok(false);
         }
 
@@ -1175,6 +1280,74 @@ impl ReceiptApplySession<'_> {
     }
 }
 
+#[cfg(not(any(action_core_fixture, action_compile_fixture)))]
+impl ReceiptPendingPublicationSession<'_> {
+    pub(in crate::setup) fn prepare(
+        &self,
+        pending: &[crate::setup::action::PendingAction],
+        metadata: &mut ReceiptMetadataSource,
+        _authority: &crate::setup::pending::PendingPublicationAuthority,
+    ) -> Result<PreparedPendingPublication, ReceiptStoreError> {
+        let existing = self.store.read_locked()?;
+        let mut action_ids = HashSet::with_capacity(pending.len());
+        let mut links = Vec::with_capacity(pending.len());
+        for action in pending {
+            if !action_ids.insert(action.id().as_str()) {
+                return Err(ReceiptStoreError::PrefixConflict);
+            }
+            let entry = existing
+                .entries
+                .iter()
+                .rev()
+                .find(|entry| {
+                    entry.status == ReceiptStatus::Pending
+                        && entry.action.action_id() == action.id().as_str()
+                })
+                .ok_or(ReceiptStoreError::PrefixConflict)?;
+            links.push(PendingPublicationLink {
+                action_id: ActionIdentifier(action.id().as_str().to_owned()),
+                entry_id: entry.entry_id.clone(),
+            });
+        }
+
+        if existing
+            .pending_publications
+            .last()
+            .is_some_and(|publication| publication.pending == links)
+        {
+            return Ok(PreparedPendingPublication { publication: None });
+        }
+
+        let metadata = metadata.next()?;
+        let publication = PendingPublication {
+            publication_id: metadata.entry_id,
+            timestamp: metadata.timestamp,
+            receipt_entry_count: existing.entries.len(),
+            pending: links,
+        };
+        publication.validate(&existing.entries)?;
+        Ok(PreparedPendingPublication {
+            publication: Some(publication),
+        })
+    }
+
+    pub(in crate::setup) fn commit(
+        &self,
+        prepared: PreparedPendingPublication,
+        _authority: &crate::setup::pending::PendingPublicationAuthority,
+    ) -> Result<bool, ReceiptStoreError> {
+        let Some(publication) = prepared.publication else {
+            return Ok(false);
+        };
+        let existing = self.store.read_locked()?;
+        let mut candidate = existing.clone();
+        candidate.pending_publications.push(publication);
+        validate_pending_publication_append_candidate(&existing, &candidate)?;
+        self.store.write_document(&candidate)?;
+        Ok(true)
+    }
+}
+
 #[derive(Clone, Copy)]
 enum PublicationInterruptionPoint {
     BeforeReplace,
@@ -1263,11 +1436,42 @@ fn validate_pending_append_candidate(
         || !candidate.entries.starts_with(&existing.entries)
         || appended.map(|entry| entry.status) != Some(ReceiptStatus::Pending)
         || appended.is_some_and(|entry| {
-            existing.entries.iter().any(|existing_entry| {
-                existing_entry.status == ReceiptStatus::Pending
-                    && existing_entry.action.action_id() == entry.action.action_id()
-            })
+            pending_entry_is_current_or_unpublished(existing, entry.action.action_id())
         })
+    {
+        return Err(ReceiptStoreError::PrefixConflict);
+    }
+    Ok(())
+}
+
+fn pending_entry_is_current_or_unpublished(document: &ReceiptDocument, action_id: &str) -> bool {
+    let Some(latest) = document.pending_publications.last() else {
+        return document.entries.iter().any(|entry| {
+            entry.status == ReceiptStatus::Pending && entry.action.action_id() == action_id
+        });
+    };
+    latest
+        .pending
+        .iter()
+        .any(|link| link.action_id.0 == action_id)
+        || document.entries[latest.receipt_entry_count..]
+            .iter()
+            .any(|entry| {
+                entry.status == ReceiptStatus::Pending && entry.action.action_id() == action_id
+            })
+}
+
+fn validate_pending_publication_append_candidate(
+    existing: &ReceiptDocument,
+    candidate: &ReceiptDocument,
+) -> Result<(), ReceiptStoreError> {
+    candidate.validate()?;
+    if candidate.installation_scope != existing.installation_scope
+        || candidate.entries != existing.entries
+        || candidate.pending_publications.len() != existing.pending_publications.len() + 1
+        || !candidate
+            .pending_publications
+            .starts_with(&existing.pending_publications)
     {
         return Err(ReceiptStoreError::PrefixConflict);
     }
@@ -1644,6 +1848,10 @@ fn valid_action_segment(segment: &str) -> bool {
 struct ReceiptTimestamp(String);
 
 impl ReceiptTimestamp {
+    fn as_str(&self) -> &str {
+        &self.0
+    }
+
     fn validate(&self) -> Result<(), ReceiptError> {
         let timestamp = DateTime::<FixedOffset>::parse_from_rfc3339(&self.0)
             .map_err(|_| ReceiptError::InvalidTimestamp)?;
@@ -1979,6 +2187,16 @@ pub(crate) enum ReceiptError {
     PrivilegeOutsideScope,
     #[error("setup receipt contains a duplicate entry ID")]
     DuplicateEntryId,
+    #[error("setup receipt contains a duplicate pending publication ID")]
+    DuplicatePendingPublicationId,
+    #[error("setup receipt contains a duplicate pending publication timestamp")]
+    DuplicatePendingPublicationTimestamp,
+    #[error("setup receipt contains duplicate pending publication links")]
+    DuplicatePendingPublicationLink,
+    #[error("setup receipt contains an invalid pending publication link")]
+    InvalidPendingPublicationLink,
+    #[error("setup receipt pending publication entry counts must be monotonic")]
+    InvalidPendingPublicationOrder,
     #[error("setup receipt entry ID is not a canonical UUIDv7")]
     InvalidEntryId,
     #[error("setup receipt action identifier is invalid")]

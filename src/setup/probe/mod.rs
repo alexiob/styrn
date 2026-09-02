@@ -127,7 +127,7 @@ pub(crate) mod test_support {
 
     pub(crate) struct TestProbe {
         descriptor: ProbeDescriptorSpec,
-        observe: Box<dyn Fn() -> ProbeStatus + Send + Sync>,
+        observe: Box<dyn Fn() -> Result<ProbeStatus, ProbeFailure> + Send + Sync>,
     }
 
     impl TestProbe {
@@ -136,7 +136,17 @@ pub(crate) mod test_support {
                 descriptor: descriptor(id),
                 observe: Box::new(move || {
                     calls.fetch_add(1, Ordering::SeqCst);
-                    status.clone()
+                    Ok(status.clone())
+                }),
+            }
+        }
+
+        pub(crate) fn failure(id: &str, failure: ProbeFailure, calls: Arc<AtomicUsize>) -> Self {
+            Self {
+                descriptor: descriptor(id),
+                observe: Box::new(move || {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    Err(failure.clone())
                 }),
             }
         }
@@ -156,12 +166,12 @@ pub(crate) mod test_support {
                         .as_slice()
                         == [0]
                     {
-                        ProbeStatus::Absent
+                        Ok(ProbeStatus::Absent)
                     } else {
-                        ProbeStatus::Present {
+                        Ok(ProbeStatus::Present {
                             version: Some("1.0.0".to_owned()),
                             healthy: true,
-                        }
+                        })
                     }
                 }),
             }
@@ -176,7 +186,7 @@ pub(crate) mod test_support {
         }
 
         fn observe(&self) -> Result<ProbeStatus, ProbeFailure> {
-            Ok((self.observe)())
+            (self.observe)()
         }
     }
 

@@ -1521,6 +1521,101 @@ fn complete_legitimate_manifest_round_trips_and_persists_without_false_positives
 }
 
 #[test]
+fn duplicate_pending_ids_are_rejected_semantically_without_echo_or_replacement() {
+    let sensitive_id = "api_key=duplicate-secret-value";
+    let duplicate_fragment = format!(
+        r#"
+[[pending_actions]]
+id = "{sensitive_id}"
+severity = "warning"
+message = "Complete the first manual step."
+
+[[pending_actions]]
+id = "{sensitive_id}"
+severity = "error"
+message = "Complete the second manual step."
+"#
+    );
+    let duplicate_toml = format!(
+        "{}{}",
+        fs::read_to_string("examples/machine.controller-worker.toml").unwrap(),
+        duplicate_fragment
+    );
+    let error = MachineManifest::parse_toml(&duplicate_toml).unwrap_err();
+    assert!(matches!(error, manifest::ManifestError::Validation(_)));
+    assert_eq!(
+        error.to_string(),
+        "invalid machine manifest: pending action identifiers must be unique"
+    );
+    assert!(!error.to_string().contains(sensitive_id));
+
+    let temp = TestDir::new();
+    let path = temp.path().join("machine.toml");
+    fs::write(&path, &duplicate_toml).unwrap();
+    let store = MachineManifestStore::new_for_test(&path);
+    let stored_error = store.read().unwrap_err();
+    assert!(matches!(
+        stored_error,
+        manifest::ManifestError::Validation(_)
+    ));
+    assert!(!stored_error.to_string().contains(sensitive_id));
+    assert_eq!(fs::read_to_string(&path).unwrap(), duplicate_toml);
+    assert_no_manifest_temporaries(temp.path());
+
+    let original = fs::read("examples/machine.toml").unwrap();
+    fs::write(&path, &original).unwrap();
+    let mut draft = MachineManifest::parse_toml(
+        &fs::read_to_string("examples/machine.controller-worker.toml").unwrap(),
+    )
+    .unwrap()
+    .without_machine_id();
+    draft.pending_actions = Some(vec![
+        manifest::PendingAction {
+            id: sensitive_id.to_owned(),
+            severity: manifest::PendingSeverity::Warning,
+            message: "Complete the first manual step.".to_owned(),
+        },
+        manifest::PendingAction {
+            id: sensitive_id.to_owned(),
+            severity: manifest::PendingSeverity::Error,
+            message: "Complete the second manual step.".to_owned(),
+        },
+    ]);
+    let generated_error = store.write_generated(&draft).unwrap_err();
+    assert!(matches!(
+        generated_error,
+        manifest::ManifestError::Validation(_)
+    ));
+    assert!(!generated_error.to_string().contains(sensitive_id));
+    assert_eq!(fs::read(&path).unwrap(), original);
+    assert_no_manifest_temporaries(temp.path());
+
+    let mut distinct_objects = MachineManifest::parse_toml(
+        &fs::read_to_string("examples/machine.controller-worker.toml").unwrap(),
+    )
+    .unwrap()
+    .to_json_value()
+    .unwrap();
+    distinct_objects["pending_actions"] = serde_json::json!([
+        {"id": "same-id", "severity": "warning", "message": "first"},
+        {"id": "same-id", "severity": "error", "message": "second"}
+    ]);
+    assert!(schema_validator().is_valid(&distinct_objects));
+    let mut exact_objects = distinct_objects.clone();
+    exact_objects["pending_actions"][1] = exact_objects["pending_actions"][0].clone();
+    assert_schema_invalid(&exact_objects);
+    let schema: Value = serde_json::from_str(include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/schemas/machine-v1.schema.json"
+    )))
+    .unwrap();
+    assert!(schema["properties"]["pending_actions"]["description"]
+        .as_str()
+        .unwrap()
+        .contains("runtime semantic validator additionally rejects repeated IDs"));
+}
+
+#[test]
 fn secret_bearing_generated_writes_preserve_destinations_and_leave_no_temporary_files() {
     let temp = TestDir::new();
     let path = temp.path().join("machine.toml");

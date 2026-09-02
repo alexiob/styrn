@@ -11,6 +11,18 @@ use super::{
 use std::{collections::HashSet, fmt, io::Write};
 use thiserror::Error;
 
+#[cfg(plan_pending_forge_fixture)]
+#[path = "hostile_pending.rs"]
+mod hostile_pending;
+
+#[cfg(plan_pending_publication_forge_fixture)]
+#[path = "hostile_pending_publication.rs"]
+mod hostile_pending_publication;
+
+#[cfg(plan_pending_projection_fixture)]
+#[path = "hostile_pending_projection.rs"]
+mod hostile_pending_projection;
+
 pub(crate) use super::action::PlanOperation;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -87,6 +99,7 @@ enum DesiredBehavior {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum ExceptionalObservation {
     Absent,
+    HumanRequired,
     Healthy,
 }
 
@@ -119,7 +132,8 @@ impl DesiredChange {
         })
     }
 
-    /// A missing capability whose next step cannot be automated.
+    /// A missing, broken, or unobservable capability whose next step cannot be
+    /// automated and has explicit safe human instructions.
     pub(crate) fn needs_human(
         subject: ProbeId,
         component: &str,
@@ -130,7 +144,7 @@ impl DesiredChange {
             component,
             action,
             PlanOperation::NeedsHuman,
-            ExceptionalObservation::Absent,
+            ExceptionalObservation::HumanRequired,
         )
     }
 
@@ -256,7 +270,15 @@ impl SetupPlan {
             let Some(observation) = observed.get(&change.subject) else {
                 return Err(PlanError::MissingObservation);
             };
-            if matches!(observation.status(), ProbeStatus::Unknowable { .. }) {
+            if matches!(observation.status(), ProbeStatus::Unknowable { .. })
+                && !matches!(
+                    &change.behavior,
+                    DesiredBehavior::Exceptional {
+                        required_observation: ExceptionalObservation::HumanRequired,
+                        ..
+                    }
+                )
+            {
                 return Err(PlanError::UnknowableObservation);
             }
             if let DesiredBehavior::Exceptional {
@@ -268,6 +290,12 @@ impl SetupPlan {
                     ExceptionalObservation::Absent => {
                         matches!(observation.status(), ProbeStatus::Absent)
                     }
+                    ExceptionalObservation::HumanRequired => matches!(
+                        observation.status(),
+                        ProbeStatus::Absent
+                            | ProbeStatus::Broken { .. }
+                            | ProbeStatus::Unknowable { .. }
+                    ),
                     ExceptionalObservation::Healthy => {
                         matches!(
                             observation.status(),
