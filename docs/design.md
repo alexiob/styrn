@@ -5784,6 +5784,7 @@ uuid              machine/job IDs (UUIDv7 — rev. B)
 chrono/time       timestamps
 sysinfo           cross-platform resource discovery
 tracing           structured internal logs
+sha2              privileged setup request digest binding
 ```
 
 Potentially:

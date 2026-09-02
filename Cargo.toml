@@ -28,6 +28,7 @@ uuid = { version = "1.26", features = ["v7", "serde"] }
 chrono = { version = "0.4", features = ["serde"] }
 sysinfo = "0.39"
 tracing = "0.1"
+sha2 = "0.11"
 
 [dev-dependencies]
 jsonschema = { version = "0.52", default-features = false }

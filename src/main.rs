@@ -41,6 +41,20 @@ fn main() {
 }
 
 fn run(parsed: cli::ParsedCli) {
+    if parsed.privileged_setup_request().is_some() {
+        fail_unavailable_setup(
+            &parsed,
+            "setup privileged-phase",
+            "privileged setup execution is not available in this build",
+        );
+    }
+    if parsed.is_setup_command() {
+        fail_unavailable_setup(
+            &parsed,
+            "setup",
+            "setup orchestration is not available in this build",
+        );
+    }
     let Some(action) = parsed.machine_action() else {
         return;
     };
@@ -110,4 +124,21 @@ fn run(parsed: cli::ParsedCli) {
             output::exit_process(output::StyrnExit::Usage);
         }
     }
+}
+
+fn fail_unavailable_setup(parsed: &cli::ParsedCli, command: &str, message: &str) -> ! {
+    if parsed.json_output() {
+        let failure = output::CommandFailure::new(
+            command,
+            chrono::Utc::now(),
+            output::ErrorCode::SetupPlanInvalid,
+            message,
+        )
+        .expect("the built-in setup error must be valid");
+        output::write_json(std::io::stdout().lock(), failure.envelope())
+            .expect("writing command output must succeed");
+        output::exit_process(failure.exit_code());
+    }
+    eprintln!("{message}");
+    output::exit_process(output::StyrnExit::Setup);
 }

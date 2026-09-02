@@ -732,6 +732,8 @@ mod gate {
 }
 
 #[cfg(not(action_core_fixture))]
+mod authorization;
+#[cfg(not(action_core_fixture))]
 mod execution;
 #[cfg(not(action_core_fixture))]
 #[allow(unused_imports)] // Private canonical route; T0.20 adds its authorized frontend.

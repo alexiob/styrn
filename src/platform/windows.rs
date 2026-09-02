@@ -3,7 +3,9 @@ pub(crate) fn platform_name() -> &'static str {
     "windows"
 }
 
-use super::{ManifestOwner, PrincipalKind, PrivateFileIdentity, WorkerPrincipal};
+use super::{
+    ManifestOwner, PrincipalKind, PrivateFileIdentity, SetupExecutionContext, WorkerPrincipal,
+};
 use std::ffi::c_void;
 use std::io;
 use std::os::windows::ffi::OsStrExt;
@@ -33,6 +35,8 @@ const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0000_0010;
 const INVALID_FILE_ATTRIBUTES: u32 = 0xffff_ffff;
 const GENERIC_READ: u32 = 0x8000_0000;
 const GENERIC_WRITE: u32 = 0x4000_0000;
+#[allow(dead_code)] // Source-including manifest tests omit authorization execution.
+const DELETE_ACCESS: u32 = 0x0001_0000;
 const FILE_SHARE_READ: u32 = 0x0000_0001;
 const FILE_SHARE_WRITE: u32 = 0x0000_0002;
 const FILE_SHARE_DELETE: u32 = 0x0000_0004;
@@ -147,6 +151,12 @@ struct ByHandleFileInformation {
     file_index_low: u32,
 }
 
+#[repr(C)]
+#[allow(dead_code)] // Source-including manifest tests omit authorization execution.
+struct FileDispositionInformation {
+    delete_file: u8,
+}
+
 #[link(name = "advapi32")]
 unsafe extern "system" {
     fn ConvertStringSecurityDescriptorToSecurityDescriptorW(
@@ -241,6 +251,59 @@ unsafe extern "system" {
 pub(super) fn resolve_current_worker_principal() -> io::Result<WorkerPrincipal> {
     let sid = current_user_sid()?;
     principal_for_sid(&sid)
+}
+
+/// Placeholder opaque token type for the cfg-safe setup boundary.
+///
+/// Native capture must populate this only after validating elevation type,
+/// integrity, Administrators group attributes, and any linked limited token.
+#[allow(dead_code)]
+pub(super) struct UserExecutionToken(OwnedHandle);
+
+pub(super) fn capture_setup_execution_context() -> io::Result<SetupExecutionContext> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "native Windows setup token capture requires the Windows elevated-token gate",
+    ))
+}
+
+pub(super) fn invoke_setup_authorization(
+    executable: &Path,
+    request_path: &Path,
+    request_digest: &str,
+) -> io::Result<()> {
+    let current = std::env::current_exe()?;
+    let _arguments = super::validated_privileged_phase_arguments(
+        executable,
+        request_path,
+        request_digest,
+        &current,
+    )?;
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "native Windows inline-sudo/UAC authorization gate is unavailable in this build",
+    ))
+}
+
+#[allow(dead_code)] // Native Windows authorization is an explicit unavailable gate.
+pub(super) fn verify_setup_authorization_executable(
+    _executable: &Path,
+) -> io::Result<std::path::PathBuf> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "native Windows setup authorization provenance verification is not implemented",
+    ))
+}
+
+pub(super) fn run_as_original(
+    _token: &UserExecutionToken,
+    _executable: &Path,
+    _arguments: &[std::ffi::OsString],
+) -> io::Result<std::process::ExitStatus> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "native Windows user execution requires a validated limited primary token",
+    ))
 }
 
 #[allow(dead_code)] // Explicit system-account selection is exercised by environmental gates.
@@ -367,6 +430,13 @@ unsafe extern "system" {
     fn GetFileInformationByHandle(
         file: *mut c_void,
         information: *mut ByHandleFileInformation,
+    ) -> i32;
+    #[allow(dead_code)]
+    fn SetFileInformationByHandle(
+        file: *mut c_void,
+        information_class: u32,
+        information: *const c_void,
+        information_size: u32,
     ) -> i32;
     fn MoveFileExW(existing: *const u16, replacement: *const u16, flags: u32) -> i32;
     fn CloseHandle(handle: *mut c_void) -> i32;
@@ -598,14 +668,70 @@ pub(super) fn open_verified_private_file_for_read(
     Ok(file)
 }
 
+#[allow(dead_code)] // Source-including manifest tests omit authorization execution.
+pub(crate) struct PrivateFileRemoval {
+    file: std::fs::File,
+}
+
+#[allow(dead_code)] // Source-including manifest tests omit authorization execution.
+pub(super) fn prepare_verified_private_file_removal(
+    path: &Path,
+    owner: ManifestOwner,
+    principal: &WorkerPrincipal,
+    expected_identity: PrivateFileIdentity,
+) -> io::Result<PrivateFileRemoval> {
+    let (file, information) =
+        open_private_file_handle_with_access(path, GENERIC_READ | DELETE_ACCESS)?;
+    if file_identity(&information) != expected_identity {
+        return Err(permission_denied("private store target identity changed"));
+    }
+    if !is_test_owner(owner) {
+        match owner {
+            ManifestOwner::System => inspect_handle_private_acl(&file, AclKind::Lock)?,
+            ManifestOwner::User => inspect_handle_user_acl(&file, principal, AclKind::UserFile)?,
+            #[cfg(test)]
+            ManifestOwner::CurrentProcess | ManifestOwner::CurrentProcessWorker => unreachable!(),
+        }
+    }
+    Ok(PrivateFileRemoval { file })
+}
+
+#[allow(dead_code)] // Source-including manifest tests omit authorization execution.
+pub(super) fn consume_verified_private_file(removal: PrivateFileRemoval) -> io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+
+    const FILE_DISPOSITION_INFO: u32 = 4;
+    let information = FileDispositionInformation { delete_file: 1 };
+    if unsafe {
+        SetFileInformationByHandle(
+            removal.file.as_raw_handle(),
+            FILE_DISPOSITION_INFO,
+            std::ptr::addr_of!(information).cast(),
+            std::mem::size_of::<FileDispositionInformation>() as u32,
+        )
+    } == 0
+    {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
 fn open_private_file_handle(path: &Path) -> io::Result<(std::fs::File, ByHandleFileInformation)> {
+    open_private_file_handle_with_access(path, GENERIC_READ)
+}
+
+fn open_private_file_handle_with_access(
+    path: &Path,
+    desired_access: u32,
+) -> io::Result<(std::fs::File, ByHandleFileInformation)> {
     use std::os::windows::io::{AsRawHandle, FromRawHandle};
 
     let path = wide_os(path);
     let handle = unsafe {
         CreateFileW(
             path.as_ptr(),
-            GENERIC_READ,
+            desired_access,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             std::ptr::null(),
             OPEN_EXISTING,

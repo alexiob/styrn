@@ -436,6 +436,48 @@ impl ReceiptStore {
         }
     }
 
+    /// Atomically records one privileged authorization request before any of
+    /// its actions run. The system-owned directory makes request IDs one-use
+    /// even when the ordinary user retained a copy of the request file.
+    pub(in crate::setup) fn reserve_authorization(
+        &self,
+        request_id: &str,
+    ) -> Result<(), ReceiptStoreError> {
+        let request_id_text = request_id;
+        let request_id =
+            Uuid::parse_str(request_id_text).map_err(|_| ReceiptStoreError::IntentConflict)?;
+        if request_id.get_version_num() != 7 || request_id.to_string() != request_id_text {
+            return Err(ReceiptStoreError::IntentConflict);
+        }
+        if self.scope != InstallationScope::System {
+            return Err(ReceiptStoreError::ScopeMismatch);
+        }
+        let destination = self.validate_destination_policy()?.to_path_buf();
+        self.verify_bound_principal()?;
+        self.prepare_destination(&destination)?;
+        let marker = destination.join(format!(".authorization-{request_id}.consumed"));
+        let mut file = match crate::platform::create_private_file(&marker, self.owner, &self.worker)
+        {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                return Err(ReceiptStoreError::IntentConflict);
+            }
+            Err(error) => return Err(ReceiptStoreError::Write(error)),
+        };
+        let result = (|| {
+            file.write_all(b"styrn.authorization-consumed.v1\n")
+                .map_err(ReceiptStoreError::Write)?;
+            file.sync_all().map_err(ReceiptStoreError::Write)?;
+            crate::platform::harden_manifest_file(&marker, self.owner, &self.worker)
+                .map_err(ReceiptStoreError::Write)?;
+            crate::platform::sync_parent_directory(&destination).map_err(ReceiptStoreError::Write)
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&marker);
+        }
+        result
+    }
+
     #[cfg(test)]
     fn append_entry(&self, entry: ReceiptEntry) -> Result<(), ReceiptStoreError> {
         entry.validate()?;

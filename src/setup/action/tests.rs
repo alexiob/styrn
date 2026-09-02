@@ -1374,6 +1374,7 @@ fn compile_fixture(name: &str, configurations: &[&str]) -> Output {
         "libc",
         "serde",
         "serde_json",
+        "sha2",
         "thiserror",
         "uuid",
     ] {
@@ -1428,6 +1429,7 @@ impl CargoArtifacts {
                 "libc",
                 "serde",
                 "serde_json",
+                "sha2",
                 "thiserror",
                 "uuid",
             ]
@@ -1451,6 +1453,7 @@ impl CargoArtifacts {
             "libc",
             "serde",
             "serde_json",
+            "sha2",
             "thiserror",
             "uuid",
         ] {

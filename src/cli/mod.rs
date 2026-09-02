@@ -45,6 +45,20 @@ pub(crate) enum MachineAction {
 }
 
 impl ParsedCli {
+    pub(crate) fn is_setup_command(&self) -> bool {
+        matches!(self.cli.command, RootCommand::Setup(_))
+    }
+
+    pub(crate) fn privileged_setup_request(&self) -> Option<&std::path::Path> {
+        match &self.cli.command {
+            RootCommand::Setup(SetupArgs {
+                internal: Some(SetupInternalCommand::PrivilegedPhase { request, .. }),
+                ..
+            }) => Some(request),
+            _ => None,
+        }
+    }
+
     pub(crate) fn machine_action(&self) -> Option<MachineAction> {
         match &self.cli.command {
             RootCommand::Machine {
@@ -563,7 +577,12 @@ struct UpgradeArgs {
 }
 
 #[derive(Args, Debug)]
+#[command(args_conflicts_with_subcommands = true)]
 struct SetupArgs {
+    #[command(subcommand)]
+    internal: Option<SetupInternalCommand>,
+    #[arg(long)]
+    scope: Option<crate::platform::InstallationScope>,
     #[arg(long)]
     role: Option<String>,
     #[arg(long)]
@@ -574,12 +593,27 @@ struct SetupArgs {
     interactive: bool,
     #[arg(long)]
     yes: bool,
+    #[arg(long, conflicts_with = "authorize_system")]
+    no_elevate: bool,
+    #[arg(long)]
+    authorize_system: bool,
     #[arg(long)]
     dry_run: bool,
     #[arg(long, num_args = 0..=1, default_missing_value = "", require_equals = true)]
     emit_script: Option<String>,
     #[arg(long)]
     uninstall: bool,
+}
+
+#[derive(Debug, Subcommand)]
+enum SetupInternalCommand {
+    #[command(name = "privileged-phase", hide = true)]
+    PrivilegedPhase {
+        #[arg(long)]
+        request: PathBuf,
+        #[arg(long)]
+        digest: String,
+    },
 }
 
 #[derive(Clone, Debug, ValueEnum)]
@@ -712,6 +746,109 @@ mod tests {
             let parsed = Cli::try_parse_with_terminals(args(arguments), false, false).unwrap();
             assert_eq!(parsed.machine_action(), Some(expected));
         }
+    }
+
+    #[test]
+    fn setup_scope_and_authorization_flags_are_closed_and_non_implicit() {
+        let parsed = Cli::try_parse_with_terminals(
+            args([
+                "styrn",
+                "setup",
+                "--scope",
+                "system",
+                "--yes",
+                "--authorize-system",
+            ]),
+            false,
+            false,
+        )
+        .unwrap();
+        let super::RootCommand::Setup(setup) = parsed.cli.command else {
+            panic!("setup command expected")
+        };
+        assert_eq!(
+            setup.scope,
+            Some(crate::platform::InstallationScope::System)
+        );
+        assert!(setup.yes);
+        assert!(setup.authorize_system);
+        assert!(!setup.no_elevate);
+
+        let parsed =
+            Cli::try_parse_with_terminals(args(["styrn", "setup", "--yes"]), false, false).unwrap();
+        let super::RootCommand::Setup(setup) = parsed.cli.command else {
+            panic!("setup command expected")
+        };
+        assert!(
+            !setup.authorize_system,
+            "--yes must not authorize privilege"
+        );
+
+        assert!(Cli::try_parse_with_terminals(
+            args(["styrn", "setup", "--no-elevate", "--authorize-system"]),
+            false,
+            false,
+        )
+        .is_err());
+        assert!(Cli::try_parse_with_terminals(
+            args(["styrn", "setup", "--scope", "machine"]),
+            false,
+            false,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn privileged_setup_phase_is_hidden_and_accepts_only_its_fixed_request_shape() {
+        let parsed = Cli::try_parse_with_terminals(
+            args([
+                "styrn",
+                "setup",
+                "privileged-phase",
+                "--request",
+                "/private/state/authorization-request.json",
+                "--digest",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            ]),
+            false,
+            false,
+        )
+        .unwrap();
+        let super::RootCommand::Setup(setup) = parsed.cli.command else {
+            panic!("setup command expected")
+        };
+        assert!(matches!(
+            setup.internal,
+            Some(super::SetupInternalCommand::PrivilegedPhase { request, digest })
+                if request == std::path::Path::new("/private/state/authorization-request.json")
+                    && digest == "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        ));
+
+        assert!(Cli::try_parse_with_terminals(
+            args([
+                "styrn",
+                "setup",
+                "--yes",
+                "privileged-phase",
+                "--request",
+                "/private/state/authorization-request.json",
+                "--digest",
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            ]),
+            false,
+            false,
+        )
+        .is_err());
+
+        let failure =
+            Cli::try_parse_with_terminals(args(["styrn", "setup", "--help"]), false, false)
+                .unwrap_err();
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        render_parse_failure(&failure, &mut stdout, &mut stderr).unwrap();
+        assert!(!String::from_utf8(stdout)
+            .unwrap()
+            .contains("privileged-phase"));
     }
 
     fn args<const N: usize>(values: [&str; N]) -> Vec<OsString> {

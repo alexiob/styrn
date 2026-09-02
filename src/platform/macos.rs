@@ -1,6 +1,11 @@
-use super::{ManifestOwner, PrincipalKind, PrivateFileIdentity, WorkerPrincipal};
+use super::{
+    ManifestOwner, PrincipalKind, PrivateFileIdentity, SetupExecutionContext, SetupHostPrivilege,
+    UnixCallerIds, WorkerPrincipal,
+};
+use std::ffi::CString;
 use std::fs;
 use std::io;
+use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -58,6 +63,80 @@ pub(super) fn resolve_current_worker_principal() -> io::Result<WorkerPrincipal> 
     principal_for_uid(super::validate_unix_caller_ids(real_uid, effective_uid)?)
 }
 
+#[allow(dead_code)] // Opaque authority retained by SetupExecutionContext.
+pub(super) struct UserExecutionToken {
+    uid: u32,
+    gid: u32,
+}
+
+pub(super) fn capture_setup_execution_context() -> io::Result<SetupExecutionContext> {
+    let caller = UnixCallerIds::new(
+        unsafe { libc::getuid() },
+        unsafe { libc::geteuid() },
+        unsafe { libc::getgid() },
+        unsafe { libc::getegid() },
+    );
+    let mut original_name = None;
+    let selected = super::select_unix_execution(caller, || {
+        let (identity, name) = super::parse_sudo_origin_entries(std::env::vars_os())?;
+        original_name = Some(name);
+        Ok(identity)
+    })?;
+    let (principal, primary_gid) = account_for_uid(selected.uid)?;
+    if primary_gid != selected.gid
+        || (selected.privilege == SetupHostPrivilege::Root
+            && original_name.as_deref() != Some(principal.name()))
+    {
+        return Err(permission_denied(
+            "sudo original uid, gid, and account name do not identify one native user",
+        ));
+    }
+    Ok(SetupExecutionContext::new(
+        selected.privilege,
+        principal,
+        UserExecutionToken {
+            uid: selected.uid,
+            gid: selected.gid,
+        },
+    ))
+}
+
+pub(super) fn invoke_setup_authorization(
+    executable: &Path,
+    request_path: &Path,
+    request_digest: &str,
+) -> io::Result<()> {
+    let current = std::env::current_exe()?;
+    let executable = super::verify_setup_authorization_executable(executable)?;
+    let invocation =
+        super::unix_authorization_invocation(&executable, request_path, request_digest, &current)?;
+    let status = std::process::Command::new(invocation.program)
+        .args(invocation.arguments)
+        .status()?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(permission_denied(
+            "native setup authorization was declined or failed",
+        ))
+    }
+}
+
+pub(super) fn verify_setup_authorization_path_security(path: &Path) -> io::Result<()> {
+    verify_no_extended_acl(path)
+}
+
+pub(super) fn run_as_original(
+    _token: &UserExecutionToken,
+    _executable: &Path,
+    _arguments: &[std::ffi::OsString],
+) -> io::Result<std::process::ExitStatus> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "native Unix user execution requires safe uid, gid, and supplementary-group restoration",
+    ))
+}
+
 #[allow(dead_code)] // Explicit system-account selection is exercised by environmental gates.
 pub(super) fn resolve_named_worker_principal(name: &str) -> io::Result<WorkerPrincipal> {
     let uid = lookup_worker_uid(name)?;
@@ -82,6 +161,10 @@ pub(super) fn verify_worker_principal(principal: &WorkerPrincipal) -> io::Result
 }
 
 fn principal_for_uid(uid: u32) -> io::Result<WorkerPrincipal> {
+    account_for_uid(uid).map(|(principal, _)| principal)
+}
+
+fn account_for_uid(uid: u32) -> io::Result<(WorkerPrincipal, u32)> {
     if uid == 0 {
         return Err(permission_denied("root cannot be a worker principal"));
     }
@@ -109,7 +192,10 @@ fn principal_for_uid(uid: u32) -> io::Result<WorkerPrincipal> {
     let name = unsafe { std::ffi::CStr::from_ptr(entry.pw_name) }
         .to_str()
         .map_err(|_| invalid_data("worker account name is not UTF-8"))?;
-    WorkerPrincipal::new(PrincipalKind::UnixUid, uid.to_string(), name)
+    Ok((
+        WorkerPrincipal::new(PrincipalKind::UnixUid, uid.to_string(), name)?,
+        entry.pw_gid,
+    ))
 }
 
 pub(super) fn create_private_manifest_staging_directory(
@@ -238,6 +324,121 @@ pub(super) fn open_verified_private_file_for_read(
     }
     verify_no_extended_acl_fd(file.as_raw_fd())?;
     Ok(file)
+}
+
+pub(crate) struct PrivateFileRemoval {
+    parent: fs::File,
+    leaf: CString,
+    expected_identity: PrivateFileIdentity,
+}
+
+pub(super) fn prepare_verified_private_file_removal(
+    path: &Path,
+    owner: ManifestOwner,
+    principal: &WorkerPrincipal,
+    expected_identity: PrivateFileIdentity,
+) -> io::Result<PrivateFileRemoval> {
+    let parent_path = path
+        .parent()
+        .ok_or_else(|| invalid_data("private file has no parent directory"))?;
+    let leaf = path
+        .file_name()
+        .ok_or_else(|| invalid_data("private file has no leaf name"))?;
+    let leaf = CString::new(leaf.as_bytes())
+        .map_err(|_| invalid_data("private file leaf contains a NUL byte"))?;
+    let parent = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(parent_path)?;
+    let parent_metadata = parent.metadata()?;
+    let expected_uid = match owner {
+        ManifestOwner::System => 0,
+        ManifestOwner::User => principal.unix_uid()?,
+        #[cfg(test)]
+        ManifestOwner::CurrentProcess | ManifestOwner::CurrentProcessWorker => unsafe {
+            libc::geteuid()
+        },
+    };
+    if !parent_metadata.is_dir()
+        || parent_metadata.uid() != expected_uid
+        || parent_metadata.mode() & 0o077 != 0
+    {
+        return Err(permission_denied(
+            "private file parent ownership or mode is insecure",
+        ));
+    }
+    verify_no_extended_acl_fd(parent.as_raw_fd())?;
+    verify_private_file_at(parent.as_raw_fd(), &leaf, expected_uid, expected_identity)?;
+    Ok(PrivateFileRemoval {
+        parent,
+        leaf,
+        expected_identity,
+    })
+}
+
+pub(super) fn consume_verified_private_file(removal: PrivateFileRemoval) -> io::Result<()> {
+    let parent = removal.parent.as_raw_fd();
+    let expected_uid = unsafe {
+        let mut stat = std::mem::zeroed::<libc::stat>();
+        if libc::fstatat(
+            parent,
+            removal.leaf.as_ptr(),
+            &mut stat,
+            libc::AT_SYMLINK_NOFOLLOW,
+        ) == -1
+        {
+            return Err(io::Error::last_os_error());
+        }
+        stat.st_uid
+    };
+    verify_private_file_at(
+        parent,
+        &removal.leaf,
+        expected_uid,
+        removal.expected_identity,
+    )?;
+    let tombstone = CString::new(format!(".styrn-consumed-{}", uuid::Uuid::now_v7()))
+        .expect("UUID tombstone names contain no NUL bytes");
+    if unsafe {
+        libc::renameatx_np(
+            parent,
+            removal.leaf.as_ptr(),
+            parent,
+            tombstone.as_ptr(),
+            libc::RENAME_EXCL,
+        )
+    } == -1
+    {
+        return Err(io::Error::last_os_error());
+    }
+    verify_private_file_at(parent, &tombstone, expected_uid, removal.expected_identity)?;
+    if unsafe { libc::unlinkat(parent, tombstone.as_ptr(), 0) } == -1 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+fn verify_private_file_at(
+    parent: libc::c_int,
+    leaf: &CString,
+    expected_uid: u32,
+    expected_identity: PrivateFileIdentity,
+) -> io::Result<()> {
+    let mut stat = unsafe { std::mem::zeroed::<libc::stat>() };
+    if unsafe { libc::fstatat(parent, leaf.as_ptr(), &mut stat, libc::AT_SYMLINK_NOFOLLOW) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    if stat.st_mode & libc::S_IFMT != libc::S_IFREG
+        || PrivateFileIdentity::new(stat.st_dev as u64, stat.st_ino as u64) != expected_identity
+        || stat.st_uid != expected_uid
+        || stat.st_mode & 0o777 != 0o600
+    {
+        return Err(permission_denied(
+            "private file identity, ownership, or mode changed before consumption",
+        ));
+    }
+    Ok(())
 }
 
 pub(super) fn verify_manifest_security(

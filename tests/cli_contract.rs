@@ -47,6 +47,58 @@ fn version_is_a_normal_success_response_on_stdout() {
 }
 
 #[test]
+fn inactive_privileged_setup_route_fails_closed() {
+    let output = run(&[
+        "setup",
+        "privileged-phase",
+        "--request",
+        "/definitely/missing/styrn-request.json",
+        "--digest",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    ]);
+
+    assert_eq!(output.status.code(), Some(13));
+    assert!(output.stdout.is_empty());
+    assert!(!output.stderr.is_empty());
+}
+
+#[test]
+fn inactive_privileged_setup_route_has_a_typed_json_failure() {
+    let output = run(&[
+        "--json",
+        "setup",
+        "privileged-phase",
+        "--request",
+        "/definitely/missing/styrn-request.json",
+        "--digest",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    ]);
+
+    assert_eq!(output.status.code(), Some(13));
+    assert!(output.stderr.is_empty());
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["schema"], "styrn.command.v1");
+    assert_eq!(value["ok"], false);
+    assert_eq!(value["errors"][0]["code"], "setup.plan_invalid");
+}
+
+#[test]
+fn inactive_setup_orchestration_never_reports_false_success() {
+    let human = run(&["setup", "--yes", "--authorize-system"]);
+    assert_eq!(human.status.code(), Some(13));
+    assert!(human.stdout.is_empty());
+    assert!(!human.stderr.is_empty());
+
+    let json = run(&["--json", "setup", "--yes", "--authorize-system"]);
+    assert_eq!(json.status.code(), Some(13));
+    assert!(json.stderr.is_empty());
+    let value: serde_json::Value = serde_json::from_slice(&json.stdout).unwrap();
+    assert_eq!(value["schema"], "styrn.command.v1");
+    assert_eq!(value["ok"], false);
+    assert_eq!(value["errors"][0]["code"], "setup.plan_invalid");
+}
+
+#[test]
 fn root_and_finite_help_advertise_the_global_machine_output_option() {
     for args in [
         &["--help"][..],
@@ -214,14 +266,6 @@ fn representative_paths_from_every_command_family_parse() {
         &["harness-hook", "claude", "session-start"][..],
         &["upgrade", "alpha"][..],
         &["upgrade", "--all"][..],
-        &[
-            "setup",
-            "--role",
-            "worker",
-            "--install",
-            "one,two",
-            "--emit-script",
-        ][..],
         &["bootstrap-script", "--os", "linux"][..],
         &["env"][..],
         &["monitor", "--notify"][..],
