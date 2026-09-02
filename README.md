@@ -103,8 +103,9 @@ The worker—not the controller or coding agent—makes the final admission deci
 
 - **Frictionless by default:** autodetect what can be discovered, provide useful defaults, and prefer one convergent command over setup rituals.
 - **Rootless first:** the primary user-scope installation runs entirely as the
-  invoking account and never asks for sudo/UAC; system/dedicated provisioning
-  is explicit optional hardening.
+  invoking account. Missing machine integrations may be completed through one
+  optional, itemized native sudo/UAC authorization; declining remains a useful
+  supported rootless installation.
 - **Native and cross-platform:** support macOS, Linux, and native Windows without requiring WSL or a language runtime.
 - **Persistent by design:** worker-owned job supervisors outlive controller connections; where Herdr is registered, agent sessions do too.
 - **Generic, not abstract:** provide durable fleet primitives while leaving Cargo or other build-system knowledge in the project profile.

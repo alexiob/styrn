@@ -114,9 +114,9 @@ passing negative test.
   - [ ] − negative: interruption leaves exactly the durably acknowledged prefix. `succeeded`-before-append recovers from its stored finalized entry even when pre-state cannot be recomputed or the action left the current plan; `prepared` plus already-`Done` refuses ownership. Private intent reads are opened no-follow and verified by handle.
 
 - [ ] **T0.12** — Elevation strategy (15.5)
-      User scope is rootless by construction and Styrn never acquires privilege. Explicit system scope is accepted only from an already-root/Administrator process; dedicated mode implies it.
-  - [ ] + positive: an ordinary non-admin user probes, plans, applies, journals, and reruns a user installation without any sudo/UAC/helper query or prompt. Independent user actions still apply when a system prerequisite is `NeedsHuman`.
-  - [ ] − negative: an unelevated `--scope system` mutates nothing, exits 13, and prints an operator-controlled rerun instruction that Styrn never executes. No self-reexec/resume plan or detached UAC path exists; an elevated current-user system launch without a trustworthy original principal refuses before mutation.
+      Rootless user work never needs privilege. When displayed machine-wide actions are necessary, interactive setup offers exactly one optional OS-owned authorization; system/dedicated scope uses the same closed runner.
+  - [ ] + positive: a non-admin completes all user actions with zero auth calls. If the user accepts the one grouped system delta, sudo/UAC—not Styrn—collects credentials and only the displayed closed actions run; user-level effects remain under the original principal.
+  - [ ] − negative: declining/`--no-elevate` still completes independent user work and preserves system actions as pending. `--yes` never grants privilege. The runner rejects arbitrary commands/paths/URLs, secrets, tampered/expired/replayed requests, action drift, missing original principal, and wrong token before privileged mutation.
 
 - [ ] **T0.13** — `NeedsHuman` pending actions (15.2.4, 3.4)
       Non-automatable residue (macOS Sharing toggle, Tailscale login, Codex/Claude first login) reported as structured pending actions, never as false success.
@@ -159,7 +159,7 @@ passing negative test.
 
 - [ ] **T0.20** — Three invocation modes and the zero-argument path (15.4, 15.4.1)
       `--scope user|system`, `--install a,b --role both`, `--account current-user|dedicated[:NAME]`, config, interactive, and bare setup. Zero-arg = rootless user-scope probe → plan → one confirmation → apply.
-  - [ ] + positive: bare setup as a non-admin creates no account, never prompts for privilege, and yields a useful local worker plus an enrollment card when existing transport is ready; the dedicated flag accepts a non-literal configured name.
+  - [ ] + positive: bare setup as a non-admin creates no account and yields a useful local worker; it asks for native authorization at most once and only when missing system capabilities are needed. Declining remains supported. The dedicated flag accepts a non-literal configured name.
   - [ ] − negative: with no TTY and no `--yes`, it prints the plan and exits 13 rather than guessing consent. `--install` naming an unknown component exits 2 listing valid components.
 
 - [ ] **T0.21** — `--interactive` wizard (15.4.2)

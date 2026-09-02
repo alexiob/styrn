@@ -156,22 +156,29 @@ Raised by a new operator requirement, verbatim and binding:
 
 > "we have to assume that the vast majority of styrn users will use it in their own user account, almost always without root or admin privileges . they do not whant to give it to a cli tool. styrn must work fine in that case, which is the main use case"
 
-1. **User scope is the default and requires no elevation.** Bare `styrn setup`
-   reads and writes only the invoking user's standard config/state/data
-   directories. It never invokes `sudo`, UAC, `runas`, or a privileged helper.
-2. **System scope is explicit optional hardening.** `--scope system` and every
-   dedicated-account installation require the operator to launch an already
-   elevated process. Styrn never acquires privilege on the user's behalf.
-3. **Security claims follow storage scope.** User-owned manifests, receipts,
+1. **User scope is the default and core setup requires no elevation.** Bare
+   `styrn setup` can complete a useful local installation using only the
+   invoking user's standard config/state/data directories.
+2. **Machine completion is one explicit, optional native authorization.** If
+   the requested outcome needs missing OS packages/services/firewall changes,
+   interactive setup groups the exact closed actions and asks once. On consent,
+   the OS owns the `sudo`/UAC credential UI; Styrn never sees or stores a
+   password. Declining completes user scope and records the remote/system delta
+   as pending. Noninteractive setup never surprise-prompts.
+3. **System scope is explicit optional hardening.** `--scope system` and every
+   dedicated-account installation may use the same one-shot native
+   authorization path or an already-elevated invocation. User-level actions
+   still execute as the original user.
+4. **Security claims follow storage scope.** User-owned manifests, receipts,
    locks, authorized keys, and registries are integrity-checked and atomic, but
    are not a containment boundary against hostile code running as that same
    user. System scope retains the protected-state boundary.
-4. **Missing machine-wide prerequisites degrade honestly.** User scope uses
+5. **Missing machine-wide prerequisites degrade honestly.** User scope uses
    existing SSH/Tailscale services and user-level service managers where
    present. A missing system service becomes a structured `NeedsHuman` or an
    unavailable remote capability; local workflows/controller functions remain
    usable. Setup never fails merely because root was not granted.
-5. **User services are first class.** systemd user units, LaunchAgents, and a
+6. **User services are first class.** systemd user units, LaunchAgents, and a
    credential-free per-user Windows task/startup mechanism provide maintenance
    and broker behavior within the login-session guarantees of each OS. Always-
    on, pre-login, or logout-surviving service guarantees require explicit
@@ -5172,19 +5179,22 @@ Bare `styrn setup` on a fresh machine [judgment; adopted]:
 1. Probe everything (unprivileged, seconds), render current state.
 2. DesiredState from pure defaults: **scope = `user`, role = `worker`, account mode = `current-user`** — a controller and system/dedicated installation are deliberate acts; promote later with `styrn setup --role both` or harden with `--scope system --account dedicated[:<name>]`. Components = the rootless worker baseline; missing machine-wide SSH/Tailscale/sleep-policy changes appear as optional `NeedsHuman`, never elevation requests. Dev-tool extras appear as `skipped (enable with --install rust,sccache,herdr,codex,claude)`.
 3. Print the plan with privilege badges and pending-human items.
-4. **Human decision 1:** one Enter to confirm; no privilege prompt follows.
+4. **Human decision 1:** one Enter to confirm the whole plan.
 5. Apply. A Tailscale browser login may be a second decision only when an
    already-installed user-usable Tailscale client needs authentication.
-6. Finish: user-scope manifest written; print Tailscale name/IP and the
+6. If machine-wide actions are required, offer **one optional OS authorization
+   decision** for their exact displayed subset. Declining leaves them pending.
+7. Finish: user-scope manifest written; print Tailscale name/IP and the
    **enrollment card** only when SSH transport is actually ready; always print
    local capability and pending-action summaries.
 
-That is **one human decision** for ordinary local setup, optionally a browser
-login, and **zero** with `--yes` when prerequisites are already usable. There
-is no Windows elevation bounce. No TTY and no `--yes` prints the plan and exits
-13 / `setup.confirmation_required`. Identity, dirs, shell, and versions have
-working defaults. Selecting system/dedicated mode is explicit because it
-changes the trust and privilege contract.
+That is **one human decision** for ordinary local setup, plus at most one native
+authorization decision and optionally a browser login when those capabilities
+are missing. `--yes` never grants privilege. No TTY and no `--yes` prints the
+plan and exits 13 / `setup.confirmation_required`; with `--yes`, rootless work
+may proceed but system actions remain pending unless the process is already
+elevated or explicit authorization policy is supplied. Identity, dirs, shell,
+and versions have working defaults.
 
 ### 15.4.2 `--interactive` wizard — `inquire`-style prompts, not a ratatui TUI (decided)
 
@@ -5207,30 +5217,43 @@ identity      ✓ current user alex (dedicated isolation disabled)
 rust          . skipped (enable with --install rust)
 ```
 
-Symbols: `+` create/install, `~` reconfigure, `✓` already satisfied, `!` needs human, `.` skipped, `-` remove (uninstall mode). Every system-scope line carries a `[sudo]`/`[admin]` badge so the user sees that it will **not** run in default user scope; Styrn never turns the badge into an elevation request. Downloads show size and origin.
+Symbols: `+` create/install, `~` reconfigure, `✓` already satisfied, `!` needs human, `.` skipped, `-` remove (uninstall mode). Every machine-wide line carries a `[sudo]`/`[admin]` badge. Interactive setup groups those lines into one optional native-authorization decision; downloads show size and origin.
 
 ## 15.5 Elevation strategy (decided)
 
 - **Probe always runs unprivileged** (15.2.1).
-- **User scope is rootless by construction.** Its planner may emit only
-  `Privilege::None` actions. Bare setup never calls `sudo`, UAC, `runas`, an
-  inbox elevation tool, or a privileged helper. User-owned intent, receipt, and
-  manifest publication is part of the same durable action session.
-- A machine-wide prerequisite absent in user scope is `NeedsHuman` with an
-  exact optional remediation or an unavailable remote capability. It is not an
-  invitation for setup to elevate itself, and it does not stop independent
-  local/user-scoped actions.
+- **User scope is rootless-complete first.** `Privilege::None` actions apply and
+  journal as the invoking user without consulting an elevation mechanism.
+  Machine-wide actions may appear in the same confirmed plan but remain pending
+  until the separate authorization decision; declining them never rolls back or
+  blocks independent user actions.
+- **One prompt, only when necessary.** In an interactive TTY, after the exact
+  privileged delta is displayed, ask once: `Authorize these N system changes?
+  [y/N]`. The default is no. Consent launches the exact current Styrn binary
+  through the OS-owned authorization surface: terminal `sudo` on Unix/macOS;
+  verified Windows inline `sudo` when available, otherwise UAC `runas`. The OS,
+  never Styrn, reads credentials. macOS TCC/FDA consent that cannot be granted
+  by root remains `NeedsHuman` with a System Settings instruction.
+- **The privileged runner is closed.** It accepts a versioned, size-bounded,
+  short-lived request containing only closed Action variants and non-secret
+  normalized parameters. It runs no project code, plugin, shell fragment,
+  user PATH executable, arbitrary URL/path/argv, or setup renderer. It uses the
+  absolute current executable, re-probes every action, and requires the
+  recomputed privileged set to be an exact subset of the plan the user saw;
+  drift that adds or changes an action aborts for re-confirmation. Results
+  return over a typed local channel and are journaled by the owning scope.
+- **Noninteractive behavior is deterministic.** `--yes` confirms ordinary
+  actions but never implies privilege consent. Without an already-elevated
+  process or an explicit future `--authorize-system` policy flag, privileged
+  lines become pending and no auth UI appears. `--no-elevate` forbids even the
+  interactive offer.
 - **System scope is explicit.** `--scope system` (implied by
-  `--account dedicated[:NAME]`) is accepted only when the process is already
-  root/Administrator. If not, setup mutates nothing in that scope, exits 13 /
-  `setup.elevation_required`, and prints an exact operator-controlled rerun
-  instruction. Styrn never executes that instruction itself.
+  `--account dedicated[:NAME]`) uses the same one-shot authorization path when
+  interactive, or accepts a process the operator started elevated. User-level
+  effects still execute through the captured original principal/token.
 - An elevated process must not accidentally select root/SYSTEM for
   current-user identity. System-scope per-user effects use the captured original
   principal/token; if it cannot be established, setup refuses before mutation.
-- `--no-elevate` remains as an explicit policy assertion and is also the
-  behavior of bare user scope. `--resume` and self-reexec are removed from the
-  public/internal contract; no privilege-bearing plan file crosses a boundary.
 
 ## 15.6 Receipts, idempotency, `--uninstall`, and the failure policy
 
@@ -5533,11 +5556,13 @@ styrn setup [--role controller|worker|both] [--install <c1,c2,...>]
             [--scope user|system]
             [--name NAME] [--account current-user|dedicated[:NAME]]
             [--authorized-keys K...]
-            [--auth-key TSKEY] [--yes] [--dry-run] [--no-elevate] [--keep-going]
+            [--auth-key TSKEY] [--yes] [--dry-run]
+            [--authorize-system|--no-elevate] [--keep-going]
             [--emit-script[=PATH]] [--target-os linux|macos|windows]
             [--uninstall [--force]] [--adopt] [--rotate-account]
             [--json]
 styrn setup user-phase                        (internal plumbing; Windows user phase, 15.8)
+styrn setup privileged-phase --request PATH   (internal closed runner; 15.5)
 styrn bootstrap-script --os <os> [--role R] [--install ...] [--config URL] [--json]
 styrn daemon run                              (internal plumbing; the styrnd loop, 15.9)
 styrn env                                     (prints shell-appropriate PATH/env lines, 15.7.6)

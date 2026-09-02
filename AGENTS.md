@@ -60,9 +60,12 @@ project workflows; project-specific build knowledge belongs in `.styrn.toml`.
   generated/rendered setup scripts, command payloads/envelopes, or diagnostics
   a private key, auth/API key, token, password, or secret-shaped value. Secret
   rejection must occur before a write and must not echo the secret in an error.
-- Default user scope runs entirely without root/Administrator, writes only the
-  invoking user's standard config/state/data directories, and never invokes an
-  elevation mechanism. Its manifest, receipt, registry, locks, and authorized
+- Default user-scope core runs entirely without root/Administrator and writes
+  only the invoking user's standard directories. If missing machine-wide
+  capabilities matter, interactive setup may offer exactly one optional,
+  itemized OS-owned sudo/UAC authorization; declining must leave a useful
+  rootless installation, and `--yes` never implies privilege consent. Its
+  manifest, receipt, registry, locks, and authorized
   keys are user-owned and therefore **not** a containment boundary against
   hostile same-user code; preserve atomic/no-follow/corruption checks without
   claiming worker non-writability. Explicit system scope retains root/Admin-
