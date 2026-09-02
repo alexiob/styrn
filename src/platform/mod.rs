@@ -44,11 +44,18 @@ pub(crate) struct WorkerDirectoryLayout {
     cache: PathBuf,
     artifacts: PathBuf,
     logs: PathBuf,
+    creation_policy: WorkerRootCreationPolicy,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) enum WorkerRootCreationPolicy {
+    ExistingParent { require_trusted_ancestry: bool },
+    CreateMissingFrom(PathBuf),
 }
 
 #[allow(dead_code)] // Consumed by the T0.14 setup action integration follow-up.
 impl WorkerDirectoryLayout {
-    fn new(root: PathBuf) -> Self {
+    fn new(root: PathBuf, creation_policy: WorkerRootCreationPolicy) -> Self {
         Self {
             repos: root.join("repos"),
             jobs: root.join("jobs"),
@@ -56,6 +63,7 @@ impl WorkerDirectoryLayout {
             artifacts: root.join("artifacts"),
             logs: root.join("logs"),
             root,
+            creation_policy,
         }
     }
 
@@ -83,15 +91,8 @@ impl WorkerDirectoryLayout {
         &self.logs
     }
 
-    fn directories(&self) -> [&Path; 6] {
-        [
-            &self.root,
-            &self.repos,
-            &self.jobs,
-            &self.cache,
-            &self.artifacts,
-            &self.logs,
-        ]
+    fn child_names() -> [&'static str; 5] {
+        ["repos", "jobs", "cache", "artifacts", "logs"]
     }
 }
 
@@ -102,16 +103,21 @@ pub(crate) fn resolve_worker_directory_layout(
     override_root: Option<&Path>,
 ) -> std::io::Result<WorkerDirectoryLayout> {
     platform_impl::validate_worker_root_principal(scope, principal)?;
-    let root = if let Some(root) = override_root {
+    let (root, creation_policy) = if let Some(root) = override_root {
         validate_worker_root_override(root)?;
-        root.to_path_buf()
+        (
+            root.to_path_buf(),
+            WorkerRootCreationPolicy::ExistingParent {
+                require_trusted_ancestry: true,
+            },
+        )
     } else {
         platform_impl::default_worker_root(scope, principal)?
     };
-    Ok(WorkerDirectoryLayout::new(root))
+    Ok(WorkerDirectoryLayout::new(root, creation_policy))
 }
 
-/// Creates the fixed worker layout without walking or rewriting existing trees.
+/// Creates the fixed worker layout without enumerating or rewriting descendants.
 ///
 /// Ownership assignment for a future dedicated principal is intentionally a
 /// separate setup action; this primitive never recursively changes metadata.
@@ -119,35 +125,7 @@ pub(crate) fn resolve_worker_directory_layout(
 pub(crate) fn create_worker_directory_layout(
     layout: &WorkerDirectoryLayout,
 ) -> std::io::Result<()> {
-    for path in layout.directories() {
-        match std::fs::symlink_metadata(path) {
-            Ok(metadata) => require_real_worker_directory(&metadata)?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error),
-        }
-    }
-    for path in layout.directories() {
-        match std::fs::create_dir(path) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                let metadata = std::fs::symlink_metadata(path)?;
-                require_real_worker_directory(&metadata)?;
-            }
-            Err(error) => return Err(error),
-        }
-    }
-    Ok(())
-}
-
-#[allow(dead_code)] // Reached through the deferred T0.14 action integration.
-fn require_real_worker_directory(metadata: &std::fs::Metadata) -> std::io::Result<()> {
-    if !metadata.is_dir() || metadata.file_type().is_symlink() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "worker layout path is not a real directory",
-        ));
-    }
-    Ok(())
+    platform_impl::create_worker_directory_layout(layout)
 }
 
 #[allow(dead_code)] // Reached through the deferred T0.14 action integration.
@@ -168,6 +146,82 @@ fn validate_worker_root_override(root: &Path) -> std::io::Result<()> {
         ));
     }
     Ok(())
+}
+
+#[allow(dead_code)] // Used by the Windows adapter and its cross-host pure policy test.
+fn windows_worker_root_text_is_normalized(units: &[u16]) -> bool {
+    if units.len() < 4
+        || !matches!(units[0], 0x0041..=0x005a | 0x0061..=0x007a)
+        || units[1] != b':' as u16
+        || units[2] != b'\\' as u16
+        || units.contains(&0)
+    {
+        return false;
+    }
+
+    units[3..]
+        .split(|unit| *unit == b'\\' as u16)
+        .all(windows_worker_component_is_normalized)
+}
+
+fn windows_worker_component_is_normalized(component: &[u16]) -> bool {
+    if component.is_empty()
+        || matches!(component.last(), Some(unit) if *unit == b'.' as u16 || *unit == b' ' as u16)
+        || component.iter().any(|unit| {
+            *unit <= 31
+                || matches!(
+                    *unit,
+                    unit if unit == b'<' as u16
+                        || unit == b'>' as u16
+                        || unit == b':' as u16
+                        || unit == b'"' as u16
+                        || unit == b'/' as u16
+                        || unit == b'|' as u16
+                        || unit == b'?' as u16
+                        || unit == b'*' as u16
+                )
+        })
+    {
+        return false;
+    }
+
+    let base = &component[..component
+        .iter()
+        .position(|unit| *unit == b'.' as u16)
+        .unwrap_or(component.len())];
+    let base = base
+        .iter()
+        .rposition(|unit| *unit != b' ' as u16 && *unit != b'.' as u16)
+        .map_or(&[][..], |last| &base[..=last]);
+    !windows_reserved_dos_name(base)
+}
+
+fn windows_reserved_dos_name(name: &[u16]) -> bool {
+    if [
+        b"CON".as_slice(),
+        b"PRN",
+        b"AUX",
+        b"NUL",
+        b"CONIN$",
+        b"CONOUT$",
+        b"CLOCK$",
+    ]
+    .into_iter()
+    .any(|expected| windows_utf16_eq_ascii(name, expected))
+    {
+        return true;
+    }
+    name.len() == 4
+        && (windows_utf16_eq_ascii(&name[..3], b"COM")
+            || windows_utf16_eq_ascii(&name[..3], b"LPT"))
+        && matches!(name[3], 0x0031..=0x0039 | 0x00b9 | 0x00b2 | 0x00b3)
+}
+
+fn windows_utf16_eq_ascii(actual: &[u16], expected: &[u8]) -> bool {
+    actual.len() == expected.len()
+        && actual.iter().zip(expected).all(|(actual, expected)| {
+            u8::try_from(*actual).is_ok_and(|actual| actual.eq_ignore_ascii_case(expected))
+        })
 }
 
 #[allow(dead_code)] // Reached through the deferred T0.14 action integration.
@@ -1393,6 +1447,14 @@ mod worker_directory_tests {
     use std::collections::BTreeSet;
 
     const PROFILE_CHILD_ENV: &str = "STYRN_TEST_WORKER_PROFILE_CHILD";
+    const PROFILE_EXPECTED_ENV: &str = "STYRN_TEST_WORKER_PROFILE_EXPECTED";
+    #[cfg(target_os = "linux")]
+    const NATIVE_PROFILE_CHILD_ENV: &str = "STYRN_TEST_WORKER_NATIVE_PROFILE_CHILD";
+    #[cfg(unix)]
+    const MODE_CHILD_ROOT_ENV: &str = "STYRN_TEST_WORKER_MODE_CHILD_ROOT";
+    const CONCURRENT_CHILD_ROOT_ENV: &str = "STYRN_TEST_WORKER_CONCURRENT_CHILD_ROOT";
+    #[cfg(target_os = "linux")]
+    const XDG_CHILD_ROOT_ENV: &str = "STYRN_TEST_WORKER_XDG_CHILD_ROOT";
 
     #[test]
     fn system_worker_directory_layout_has_the_exact_cross_scope_contract() {
@@ -1417,25 +1479,38 @@ mod worker_directory_tests {
 
     #[test]
     fn user_worker_directory_layout_is_bound_to_the_current_native_profile() {
+        #[cfg(target_os = "linux")]
+        if std::env::var_os(NATIVE_PROFILE_CHILD_ENV).is_none() {
+            let expected = native_profile_home_for_test().join(".local/share/styrn");
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "platform::worker_directory_tests::user_worker_directory_layout_is_bound_to_the_current_native_profile",
+                ])
+                .env(NATIVE_PROFILE_CHILD_ENV, "1")
+                .env(PROFILE_EXPECTED_ENV, expected)
+                .env_remove("XDG_DATA_HOME")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "child failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
         let principal = resolve_current_worker_principal().unwrap();
         let layout =
             resolve_worker_directory_layout(InstallationScope::User, &principal, None).unwrap();
 
         #[cfg(target_os = "linux")]
-        let expected_base = std::env::var_os("XDG_DATA_HOME")
-            .filter(|value| Path::new(value).is_absolute())
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                PathBuf::from(std::env::var_os("HOME").unwrap()).join(".local/share")
-            });
+        let expected_root = PathBuf::from(std::env::var_os(PROFILE_EXPECTED_ENV).unwrap());
         #[cfg(target_os = "macos")]
-        let expected_base =
-            PathBuf::from(std::env::var_os("HOME").unwrap()).join("Library/Application Support");
+        let expected_base = native_profile_home_for_test().join("Library/Application Support");
         #[cfg(target_os = "windows")]
-        let expected_base = PathBuf::from(std::env::var_os("LOCALAPPDATA").unwrap());
+        let expected_base = platform_impl::native_profile_data_root_for_test().unwrap();
 
-        #[cfg(target_os = "linux")]
-        let expected_root = expected_base.join("styrn");
         #[cfg(any(target_os = "macos", target_os = "windows"))]
         let expected_root = expected_base.join("Styrn");
 
@@ -1449,9 +1524,21 @@ mod worker_directory_tests {
             let principal = resolve_current_worker_principal().unwrap();
             let layout =
                 resolve_worker_directory_layout(InstallationScope::User, &principal, None).unwrap();
-            assert!(!layout.root().starts_with(&forged));
+            assert_eq!(
+                layout.root(),
+                Path::new(&std::env::var_os(PROFILE_EXPECTED_ENV).unwrap())
+            );
             return;
         }
+
+        #[cfg(target_os = "linux")]
+        let expected = native_profile_home_for_test().join(".local/share/styrn");
+        #[cfg(target_os = "macos")]
+        let expected = native_profile_home_for_test().join("Library/Application Support/Styrn");
+        #[cfg(target_os = "windows")]
+        let expected = platform_impl::native_profile_data_root_for_test()
+            .unwrap()
+            .join("Styrn");
 
         let mut child = std::process::Command::new(std::env::current_exe().unwrap());
         child
@@ -1460,6 +1547,7 @@ mod worker_directory_tests {
                 "platform::worker_directory_tests::user_worker_root_ignores_spoofed_profile_environment",
             ])
             .env(PROFILE_CHILD_ENV, "1")
+            .env(PROFILE_EXPECTED_ENV, expected)
             .env("HOME", &forged)
             .env("LOCALAPPDATA", &forged)
             .env("USERPROFILE", &forged);
@@ -1534,6 +1622,14 @@ mod worker_directory_tests {
             Path::new(r"C:\temp\..\worker"),
             Path::new(r"C:\temp\.\worker"),
             Path::new(r"C:\"),
+            Path::new(r"C:\work\root."),
+            Path::new(r"C:\work\root "),
+            Path::new(r"C:\work\CON.logs"),
+            Path::new(r"C:\work\LPT9"),
+            Path::new(r"C:\work\bad|name"),
+            Path::new(r"C:/work\mixed"),
+            Path::new(r"\\server\share\worker"),
+            Path::new(r"\\?\C:\work\worker"),
         ];
 
         for root in invalid {
@@ -1541,6 +1637,45 @@ mod worker_directory_tests {
                 resolve_worker_directory_layout(InstallationScope::System, &principal, Some(root))
                     .unwrap_err();
             assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput, "{root:?}");
+        }
+    }
+
+    #[test]
+    fn windows_worker_root_text_rejects_win32_alias_and_device_spellings() {
+        for valid in [r"C:\Styrn", r"z:\Worker Data\build.cache"] {
+            assert!(
+                windows_worker_root_text_is_normalized(&valid.encode_utf16().collect::<Vec<_>>()),
+                "{valid:?}"
+            );
+        }
+        for invalid in [
+            r"C:\Styrn.",
+            r"C:\Styrn ",
+            r"C:\CON",
+            r"C:\con.logs",
+            r"C:\CON .logs",
+            r"C:\AUX.tar",
+            r"C:\NUL.txt",
+            r"C:\LPT9.cache",
+            "C:\\COM\u{00b9}\\jobs",
+            r"C:\COM1\jobs",
+            r"C:\bad<name",
+            r#"C:\bad"name"#,
+            r"C:\bad*name",
+            r"C:\bad|name",
+            r"C:\bad:name",
+            r"C:/mixed\separators",
+            r"\\server\share\Styrn",
+            r"\\?\C:\Styrn",
+            r"\\.\C:\Styrn",
+            r"C:\Styrn\\jobs",
+        ] {
+            assert!(
+                !windows_worker_root_text_is_normalized(
+                    &invalid.encode_utf16().collect::<Vec<_>>()
+                ),
+                "{invalid:?}"
+            );
         }
     }
 
@@ -1645,8 +1780,372 @@ mod worker_directory_tests {
         std::fs::remove_dir_all(parent).unwrap();
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn worker_directory_creation_rejects_an_intermediate_symlink_without_touching_its_target() {
+        use std::os::unix::fs::symlink;
+
+        let principal = resolve_current_worker_principal().unwrap();
+        let parent = unique_test_directory("intermediate-symlink");
+        let target = unique_test_directory("intermediate-symlink-target");
+        std::fs::create_dir(&parent).unwrap();
+        std::fs::create_dir(&target).unwrap();
+        symlink(&target, parent.join("redirected-parent")).unwrap();
+        let root = parent.join("redirected-parent/chosen-root");
+        let layout =
+            resolve_worker_directory_layout(InstallationScope::System, &principal, Some(&root))
+                .unwrap();
+
+        let error = create_worker_directory_layout(&layout).unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(directory_entry_names(&target).is_empty());
+
+        std::fs::remove_file(parent.join("redirected-parent")).unwrap();
+        std::fs::remove_dir_all(parent).unwrap();
+        std::fs::remove_dir_all(target).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worker_directory_creation_rejects_a_link_at_a_fixed_child() {
+        use std::os::unix::fs::symlink;
+
+        let principal = resolve_current_worker_principal().unwrap();
+        let parent = unique_test_directory("child-symlink");
+        let root = parent.join("chosen-root");
+        let target = unique_test_directory("child-symlink-target");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir(&target).unwrap();
+        symlink(&target, root.join("repos")).unwrap();
+        let layout =
+            resolve_worker_directory_layout(InstallationScope::System, &principal, Some(&root))
+                .unwrap();
+
+        let error = create_worker_directory_layout(&layout).unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(directory_entry_names(&target).is_empty());
+        assert_eq!(
+            directory_entry_names(&root),
+            BTreeSet::from(["repos".to_owned()])
+        );
+        std::fs::remove_file(root.join("repos")).unwrap();
+        std::fs::remove_dir_all(parent).unwrap();
+        std::fs::remove_dir_all(target).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn new_worker_directories_are_mode_0700_even_with_a_permissive_umask() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if let Some(root) = std::env::var_os(MODE_CHILD_ROOT_ENV) {
+            let principal = resolve_current_worker_principal().unwrap();
+            let layout = resolve_worker_directory_layout(
+                InstallationScope::System,
+                &principal,
+                Some(Path::new(&root)),
+            )
+            .unwrap();
+            let previous = unsafe { libc::umask(0) };
+            let result = create_worker_directory_layout(&layout);
+            unsafe { libc::umask(previous) };
+            result.unwrap();
+            return;
+        }
+
+        let parent = unique_test_directory("restrictive-mode");
+        std::fs::create_dir(&parent).unwrap();
+        let root = parent.join("chosen-root");
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "platform::worker_directory_tests::new_worker_directories_are_mode_0700_even_with_a_permissive_umask",
+            ])
+            .env(MODE_CHILD_ROOT_ENV, &root)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "child failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        for path in std::iter::once(root.as_path()).chain(
+            WorkerDirectoryLayout::child_names()
+                .into_iter()
+                .map(|name| root.join(name))
+                .collect::<Vec<_>>()
+                .iter()
+                .map(PathBuf::as_path),
+        ) {
+            assert_eq!(
+                std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o700,
+                "{path:?}"
+            );
+        }
+        std::fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fresh_native_profile_materializes_only_the_missing_standard_base_and_layout() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let parent = unique_test_directory("fresh-profile");
+        let profile = parent.join("profile");
+        std::fs::create_dir_all(&profile).unwrap();
+        let root = profile.join("new/data/base/styrn");
+        let layout = WorkerDirectoryLayout::new(
+            root.clone(),
+            WorkerRootCreationPolicy::CreateMissingFrom(profile.clone()),
+        );
+
+        create_worker_directory_layout(&layout).unwrap();
+
+        assert_eq!(
+            directory_entry_names(&profile),
+            BTreeSet::from(["new".to_owned()])
+        );
+        for path in [
+            profile.join("new"),
+            profile.join("new/data"),
+            profile.join("new/data/base"),
+            root.clone(),
+        ] {
+            assert_eq!(
+                std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
+        assert_eq!(directory_entry_names(&root).len(), 5);
+
+        std::fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn override_parent_must_exist_and_is_never_materialized() {
+        let principal = resolve_current_worker_principal().unwrap();
+        let parent = unique_test_directory("missing-override-parent");
+        std::fs::create_dir(&parent).unwrap();
+        let missing_parent = parent.join("must-not-be-created");
+        let root = missing_parent.join("chosen-root");
+        let layout =
+            resolve_worker_directory_layout(InstallationScope::System, &principal, Some(&root))
+                .unwrap();
+
+        let error = create_worker_directory_layout(&layout).unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        assert!(!missing_parent.exists());
+        assert!(directory_entry_names(&parent).is_empty());
+        std::fs::remove_dir(parent).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn system_override_rejects_an_untrusted_writable_parent_before_any_creation() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let principal = resolve_current_worker_principal().unwrap();
+        let parent = unique_test_directory("writable-override-parent");
+        std::fs::create_dir(&parent).unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let before = std::fs::metadata(&parent).unwrap();
+        let root = parent.join("chosen-root");
+        let layout =
+            resolve_worker_directory_layout(InstallationScope::System, &principal, Some(&root))
+                .unwrap();
+
+        let error = create_worker_directory_layout(&layout).unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(directory_entry_names(&parent).is_empty());
+        let after = std::fs::metadata(&parent).unwrap();
+        assert_eq!((before.dev(), before.ino()), (after.dev(), after.ino()));
+        assert_eq!(before.mode(), after.mode());
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::remove_dir(parent).unwrap();
+    }
+
+    #[test]
+    fn unrelated_preexisting_root_entry_is_preserved_and_not_claimed() {
+        let principal = resolve_current_worker_principal().unwrap();
+        let parent = unique_test_directory("unrelated-root-entry");
+        let root = parent.join("chosen-root");
+        std::fs::create_dir_all(&root).unwrap();
+        let unrelated = root.join("operator-notes.txt");
+        std::fs::write(&unrelated, b"leave this entry alone\n").unwrap();
+        let before = std::fs::metadata(&unrelated).unwrap();
+        let layout =
+            resolve_worker_directory_layout(InstallationScope::System, &principal, Some(&root))
+                .unwrap();
+
+        create_worker_directory_layout(&layout).unwrap();
+
+        assert_eq!(
+            std::fs::read(&unrelated).unwrap(),
+            b"leave this entry alone\n"
+        );
+        let after = std::fs::metadata(&unrelated).unwrap();
+        assert_eq!(before.len(), after.len());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!((before.dev(), before.ino()), (after.dev(), after.ino()));
+            assert_eq!(before.mode(), after.mode());
+            assert_eq!(before.uid(), after.uid());
+            assert_eq!(before.gid(), after.gid());
+        }
+
+        std::fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn concurrent_creators_converge_on_one_stable_fixed_layout() {
+        if let Some(root) = std::env::var_os(CONCURRENT_CHILD_ROOT_ENV) {
+            let principal = resolve_current_worker_principal().unwrap();
+            let layout = resolve_worker_directory_layout(
+                InstallationScope::System,
+                &principal,
+                Some(Path::new(&root)),
+            )
+            .unwrap();
+            create_worker_directory_layout(&layout).unwrap();
+            return;
+        }
+
+        let parent = unique_test_directory("concurrent-creators");
+        std::fs::create_dir(&parent).unwrap();
+        let root = parent.join("chosen-root");
+        let children = (0..4)
+            .map(|_| {
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "platform::worker_directory_tests::concurrent_creators_converge_on_one_stable_fixed_layout",
+                    ])
+                    .env(CONCURRENT_CHILD_ROOT_ENV, &root)
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        for child in children {
+            let output = child.wait_with_output().unwrap();
+            assert!(
+                output.status.success(),
+                "child failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        assert_eq!(
+            directory_entry_names(&root),
+            BTreeSet::from([
+                "artifacts".to_owned(),
+                "cache".to_owned(),
+                "jobs".to_owned(),
+                "logs".to_owned(),
+                "repos".to_owned(),
+            ])
+        );
+        std::fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn absolute_xdg_data_home_is_a_separate_materializable_user_base() {
+        if let Some(expected) = std::env::var_os(XDG_CHILD_ROOT_ENV) {
+            let principal = resolve_current_worker_principal().unwrap();
+            let layout =
+                resolve_worker_directory_layout(InstallationScope::User, &principal, None).unwrap();
+            assert_eq!(layout.root(), Path::new(&expected));
+            create_worker_directory_layout(&layout).unwrap();
+            return;
+        }
+
+        let parent = unique_test_directory("xdg-base");
+        std::fs::create_dir(&parent).unwrap();
+        let data_home = parent.join("fresh/xdg/data");
+        let root = data_home.join("styrn");
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "platform::worker_directory_tests::absolute_xdg_data_home_is_a_separate_materializable_user_base",
+            ])
+            .env("XDG_DATA_HOME", &data_home)
+            .env(XDG_CHILD_ROOT_ENV, &root)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "child failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(directory_entry_names(&root).len(), 5);
+        std::fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    #[ignore = "environmental: native Windows Developer Mode or SeCreateSymbolicLinkPrivilege"]
+    fn native_windows_reparse_ancestor_is_rejected_without_touching_its_target() {
+        use std::os::windows::fs::symlink_dir;
+
+        let principal = resolve_current_worker_principal().unwrap();
+        let parent = unique_test_directory("windows-reparse");
+        let target = unique_test_directory("windows-reparse-target");
+        std::fs::create_dir(&parent).unwrap();
+        std::fs::create_dir(&target).unwrap();
+        symlink_dir(&target, parent.join("redirected-parent")).unwrap();
+        let root = parent.join("redirected-parent/chosen-root");
+        let layout =
+            resolve_worker_directory_layout(InstallationScope::System, &principal, Some(&root))
+                .unwrap();
+
+        let error = create_worker_directory_layout(&layout).unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(directory_entry_names(&target).is_empty());
+        std::fs::remove_dir(parent.join("redirected-parent")).unwrap();
+        std::fs::remove_dir_all(parent).unwrap();
+        std::fs::remove_dir_all(target).unwrap();
+    }
+
+    #[cfg(unix)]
+    fn native_profile_home_for_test() -> PathBuf {
+        use std::os::unix::ffi::OsStringExt;
+
+        let mut entry = unsafe { std::mem::zeroed::<libc::passwd>() };
+        let mut result = std::ptr::null_mut();
+        let mut buffer = vec![0_u8; 16 * 1024];
+        let status = unsafe {
+            libc::getpwuid_r(
+                libc::getuid(),
+                &mut entry,
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+                &mut result,
+            )
+        };
+        assert_eq!(status, 0);
+        assert!(!result.is_null());
+        assert!(!entry.pw_dir.is_null());
+        PathBuf::from(std::ffi::OsString::from_vec(
+            unsafe { std::ffi::CStr::from_ptr(entry.pw_dir) }
+                .to_bytes()
+                .to_vec(),
+        ))
+    }
+
     fn unique_test_directory(label: &str) -> PathBuf {
-        std::env::temp_dir().join(format!(
+        #[cfg(unix)]
+        let temporary = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        #[cfg(target_os = "windows")]
+        let temporary = std::env::temp_dir();
+        temporary.join(format!(
             "styrn-worker-layout-{label}-{}-{}",
             std::process::id(),
             uuid::Uuid::now_v7()
