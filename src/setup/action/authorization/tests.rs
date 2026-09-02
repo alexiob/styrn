@@ -16,6 +16,39 @@ use std::{
 };
 
 #[test]
+fn native_authorization_classifies_denial_launch_failure_and_child_exit() {
+    #[cfg(unix)]
+    fn status(code: i32) -> std::process::ExitStatus {
+        use std::os::unix::process::ExitStatusExt;
+        std::process::ExitStatus::from_raw(code << 8)
+    }
+    #[cfg(windows)]
+    fn status(code: i32) -> std::process::ExitStatus {
+        use std::os::windows::process::ExitStatusExt;
+        std::process::ExitStatus::from_raw(code as u32)
+    }
+
+    assert!(classify_native_authorization(Ok(status(0))).is_ok());
+    assert!(matches!(
+        classify_native_authorization(Ok(status(13))),
+        Err(AuthorizationInvocationError::ChildFailed {
+            exit_code: Some(13)
+        })
+    ));
+    assert!(matches!(
+        classify_native_authorization(Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "cancelled",
+        ))),
+        Err(AuthorizationInvocationError::Failed)
+    ));
+    assert!(matches!(
+        classify_native_authorization(Err(std::io::Error::other("launch"))),
+        Err(AuthorizationInvocationError::Launch(_))
+    ));
+}
+
+#[test]
 fn ordinary_user_plan_applies_and_reruns_without_authorization() {
     let fixture = AuthorizationFixture::new("ordinary-only");
     let store = ReceiptStore::new_user_for_test(fixture.user_receipt());

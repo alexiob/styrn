@@ -38,6 +38,45 @@ pub(super) trait AuthorizationInvoker {
     ) -> Result<(), AuthorizationInvocationError>;
 }
 
+/// The only production authorization launcher. It delegates credential UI to
+/// the native OS adapter and accepts success only from a zero-exit child.
+#[allow(dead_code)] // T0.20 wires this into the setup command orchestration.
+pub(super) struct NativeAuthorizationInvoker;
+
+impl AuthorizationInvoker for NativeAuthorizationInvoker {
+    fn invoke(
+        &mut self,
+        executable: &Path,
+        request_path: &Path,
+        request_digest: &str,
+    ) -> Result<(), AuthorizationInvocationError> {
+        classify_native_authorization(crate::platform::invoke_setup_authorization(
+            executable,
+            request_path,
+            request_digest,
+        ))
+    }
+}
+
+fn classify_native_authorization(
+    result: std::io::Result<std::process::ExitStatus>,
+) -> Result<(), AuthorizationInvocationError> {
+    let status = result.map_err(|error| {
+        if error.kind() == std::io::ErrorKind::PermissionDenied {
+            AuthorizationInvocationError::Failed
+        } else {
+            AuthorizationInvocationError::Launch(error)
+        }
+    })?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(AuthorizationInvocationError::ChildFailed {
+            exit_code: status.code(),
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum PrivilegeConsent {
     NotGranted,
@@ -221,6 +260,10 @@ impl AuthorizedExecutionReport {
 pub(super) enum AuthorizationInvocationError {
     #[error("native authorization was cancelled or failed")]
     Failed,
+    #[error("native authorization could not be launched")]
+    Launch(#[source] std::io::Error),
+    #[error("privileged setup child failed with exit code {exit_code:?}")]
+    ChildFailed { exit_code: Option<i32> },
 }
 
 #[derive(Debug, Error)]
