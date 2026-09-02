@@ -10,8 +10,8 @@ use super::{
 };
 use std::ffi::c_void;
 use std::io;
-use std::os::windows::ffi::OsStrExt;
-use std::path::Path;
+use std::os::windows::ffi::{OsStrExt, OsStringExt};
+use std::path::{Path, PathBuf};
 
 const OWNER_SECURITY_INFORMATION: u32 = 0x0000_0001;
 const DACL_SECURITY_INFORMATION: u32 = 0x0000_0004;
@@ -196,6 +196,23 @@ struct ShellExecuteInfoW {
 }
 
 #[repr(C)]
+#[allow(dead_code)] // Used by the deferred T0.14 Windows action integration.
+struct Guid {
+    data1: u32,
+    data2: u16,
+    data3: u16,
+    data4: [u8; 8],
+}
+
+#[allow(dead_code)] // Used by the deferred T0.14 Windows action integration.
+const FOLDER_ID_LOCAL_APP_DATA: Guid = Guid {
+    data1: 0xf1b3_2785,
+    data2: 0x6fba,
+    data3: 0x4fcf,
+    data4: [0x9d, 0x55, 0x7b, 0x8e, 0x7f, 0x15, 0x70, 0x91],
+};
+
+#[repr(C)]
 #[derive(Clone, Copy)]
 struct FileTime {
     low_date_time: u32,
@@ -326,17 +343,121 @@ unsafe extern "system" {
 #[link(name = "shell32")]
 unsafe extern "system" {
     fn ShellExecuteExW(execute_info: *mut ShellExecuteInfoW) -> i32;
+    #[allow(dead_code)]
+    fn SHGetKnownFolderPath(
+        folder_id: *const Guid,
+        flags: u32,
+        token: *mut c_void,
+        path: *mut *mut u16,
+    ) -> i32;
 }
 
 #[link(name = "ole32")]
 unsafe extern "system" {
     fn CoInitializeEx(reserved: *mut c_void, concurrency_model: u32) -> i32;
     fn CoUninitialize();
+    #[allow(dead_code)]
+    fn CoTaskMemFree(memory: *mut c_void);
 }
 
 pub(super) fn resolve_current_worker_principal() -> io::Result<WorkerPrincipal> {
     let sid = current_user_sid()?;
     principal_for_sid(&sid)
+}
+
+#[allow(dead_code)] // Consumed by the T0.14 setup action integration follow-up.
+pub(super) fn default_worker_root(
+    scope: super::InstallationScope,
+    principal: &WorkerPrincipal,
+) -> io::Result<PathBuf> {
+    validate_worker_root_principal(scope, principal)?;
+    match scope {
+        super::InstallationScope::System => Ok(PathBuf::from(r"C:\Styrn")),
+        super::InstallationScope::User => {
+            let current = resolve_current_worker_principal()?;
+            super::validate_user_scope_principal(principal, &current)?;
+            Ok(current_local_app_data()?.join("Styrn"))
+        }
+    }
+}
+
+#[allow(dead_code)] // Consumed by the T0.14 setup action integration follow-up.
+pub(super) fn validate_worker_root_principal(
+    scope: super::InstallationScope,
+    principal: &WorkerPrincipal,
+) -> io::Result<()> {
+    verify_worker_principal(principal)?;
+    if scope == super::InstallationScope::User {
+        let current = resolve_current_worker_principal()?;
+        super::validate_user_scope_principal(principal, &current)?;
+    }
+    Ok(())
+}
+
+#[allow(dead_code)] // Consumed by the T0.14 setup action integration follow-up.
+pub(super) fn worker_root_path_is_normalized(path: &Path) -> bool {
+    use std::path::{Component, Prefix};
+
+    let mut components = path.components();
+    if !matches!(
+        components.next(),
+        Some(Component::Prefix(prefix)) if matches!(prefix.kind(), Prefix::Disk(_))
+    ) || !matches!(components.next(), Some(Component::RootDir))
+        || components.any(|component| !matches!(component, Component::Normal(_)))
+    {
+        return false;
+    }
+    let units = path.as_os_str().encode_wide().collect::<Vec<_>>();
+    !units.contains(&0)
+        && !units.ends_with(&[b'\\' as u16])
+        && !units.ends_with(&[b'/' as u16])
+        && !units.windows(2).any(|pair| {
+            matches!(pair, [first, second] if (*first == b'\\' as u16 || *first == b'/' as u16)
+                && (*second == b'\\' as u16 || *second == b'/' as u16))
+        })
+        && !units.iter().skip(2).any(|unit| *unit == b':' as u16)
+}
+
+#[allow(dead_code)] // Reached through the deferred T0.14 action integration.
+fn current_local_app_data() -> io::Result<PathBuf> {
+    let mut raw_path = std::ptr::null_mut();
+    let status = unsafe {
+        SHGetKnownFolderPath(
+            &FOLDER_ID_LOCAL_APP_DATA,
+            0,
+            std::ptr::null_mut(),
+            &mut raw_path,
+        )
+    };
+    if status < 0 || raw_path.is_null() {
+        return Err(io::Error::other(
+            "Windows could not resolve the current LocalAppData profile folder",
+        ));
+    }
+    let raw_path = CoTaskMemWideString(raw_path);
+    let mut length = 0_usize;
+    while length < 32_768 && unsafe { *raw_path.0.add(length) } != 0 {
+        length += 1;
+    }
+    if length == 32_768 {
+        return Err(invalid_data("Windows LocalAppData path is not terminated"));
+    }
+    let path = PathBuf::from(std::ffi::OsString::from_wide(unsafe {
+        std::slice::from_raw_parts(raw_path.0, length)
+    }));
+    if !path.is_absolute() {
+        return Err(invalid_data("Windows LocalAppData path is not absolute"));
+    }
+    Ok(path)
+}
+
+#[allow(dead_code)] // Reached through the deferred T0.14 action integration.
+struct CoTaskMemWideString(*mut u16);
+
+impl Drop for CoTaskMemWideString {
+    fn drop(&mut self) {
+        unsafe { CoTaskMemFree(self.0.cast()) };
+    }
 }
 
 #[allow(dead_code)]

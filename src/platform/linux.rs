@@ -11,7 +11,7 @@ use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[allow(dead_code)]
 pub(crate) fn platform_name() -> &'static str {
@@ -22,6 +22,51 @@ pub(super) fn resolve_current_worker_principal() -> io::Result<WorkerPrincipal> 
     let real_uid = unsafe { libc::getuid() };
     let effective_uid = unsafe { libc::geteuid() };
     principal_for_uid(super::validate_unix_caller_ids(real_uid, effective_uid)?)
+}
+
+#[allow(dead_code)] // Consumed by the T0.14 setup action integration follow-up.
+pub(super) fn default_worker_root(
+    scope: super::InstallationScope,
+    principal: &WorkerPrincipal,
+) -> io::Result<PathBuf> {
+    validate_worker_root_principal(scope, principal)?;
+    match scope {
+        super::InstallationScope::System => Ok(PathBuf::from("/srv/styrn")),
+        super::InstallationScope::User => {
+            let current = resolve_current_worker_principal()?;
+            super::validate_user_scope_principal(principal, &current)?;
+            let account = account_details_for_uid(principal.unix_uid()?)?;
+            let data_home = std::env::var_os("XDG_DATA_HOME")
+                .filter(|value| Path::new(value).is_absolute())
+                .map(PathBuf::from)
+                .unwrap_or_else(|| PathBuf::from(account.home).join(".local/share"));
+            Ok(data_home.join("styrn"))
+        }
+    }
+}
+
+#[allow(dead_code)] // Consumed by the T0.14 setup action integration follow-up.
+pub(super) fn validate_worker_root_principal(
+    scope: super::InstallationScope,
+    principal: &WorkerPrincipal,
+) -> io::Result<()> {
+    verify_worker_principal(principal)?;
+    if scope == super::InstallationScope::User {
+        let current = resolve_current_worker_principal()?;
+        super::validate_user_scope_principal(principal, &current)?;
+    }
+    Ok(())
+}
+
+#[allow(dead_code)] // Consumed by the T0.14 setup action integration follow-up.
+pub(super) fn worker_root_path_is_normalized(path: &Path) -> bool {
+    let bytes = path.as_os_str().as_bytes();
+    !bytes.contains(&0)
+        && !bytes.ends_with(b"/")
+        && !bytes.windows(2).any(|pair| pair == b"//")
+        && !bytes
+            .split(|byte| *byte == b'/')
+            .any(|component| component == b"." || component == b"..")
 }
 
 #[allow(dead_code)] // Opaque authority retained by SetupExecutionContext.
