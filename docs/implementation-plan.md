@@ -141,9 +141,9 @@ passing negative test.
   - [ ] − negative: a machine marked `headless = true` whose Tailscale cannot run before login is flagged by doctor rather than silently accepted (3.2). An auth key is never written to the manifest or receipt.
 
 - [ ] **T0.17** — git, sleep-policy, and remaining baseline components (15.7, S-38)
-      Including the sleep-policy component and its doctor check.
-  - [ ] + positive: components install and report `Done` on re-run.
-  - [ ] − negative: a worker configured to sleep is flagged by doctor with the remediation command for that OS — the failure mode this prevents is a worker that is "unreachable" only because it is asleep.
+      Including scope-first package-channel selection and sleep-policy/doctor. Prefer existing → verified per-user → one optional system authorization delta; never silently change scope.
+  - [ ] + positive: as a non-admin, compatible components install through user channels and report `Done` on re-run. Accepting the grouped system delta invokes native authorization once and completes only displayed machine actions.
+  - [ ] − negative: cancelled/failed authorization leaves user installs intact and system actions pending; no password enters Styrn and no user installer runs elevated. A worker configured to sleep is flagged by doctor with the exact remediation.
 
 - [ ] **T0.18** — Windows worker identity modes: current-user + hardened transient logon (15.8, rev. G)
       Current-user is the no-account-creation default. Optional dedicated mode accepts a configurable account, generates its password in memory, uses it for the profile-materializing user phase via `CreateProcessWithLogonW`, then discards it.

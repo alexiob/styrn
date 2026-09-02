@@ -5366,9 +5366,37 @@ In either mode, the worker principal is a typed value validated before native ca
 
 ### 15.7.6 Package substrates and component channels
 
+**Scope-first channel selection (rev. H; binding):** for every requested package
+or application, the planner chooses in this order:
+
+1. adopt a compatible existing installation after probing its actual version;
+2. use a verified per-user channel (portable signed/checksummed release into the
+   Styrn user bin/app directory, `winget --scope user`, a vendor per-user
+   installer, Homebrew without sudo, or an existing user package manager);
+3. only when no adequate user channel exists—or the operator explicitly asks
+   for machine scope—put the exact package/service action in the single
+   optional authorization delta from 15.5.
+
+Package-manager authentication belongs to that manager/OS. Styrn never asks
+for a password in its own prompt, accepts one on stdin/argv/env, or caches it.
+User and system variants are different typed Action parameters with different
+paths and receipt effects; a fallback may not silently change scope. Downloads
+are acquired and verified before the authorization prompt when safe, so the
+privileged phase is short and performs no network fetch unless the native
+system package manager itself owns download/signature verification. A failed or
+cancelled system install leaves the user installation and exact pending delta
+intact.
+
 **The winget finding (S-35; the decisive one):** winget is per-user MSIX; it is not resolvable/runnable under the SYSTEM account or typical service contexts, and commonly fails in non-interactive SSH sessions [verified: S13, S14] — i.e., **exactly the contexts in which Styrn provisions Windows workers**. The rev. A `bootstrap-windows.ps1` is built entirely on a winget helper and therefore fails precisely where Styrn needs it. Consequences, adopted:
 
-- **winget = opportunistic only** (interactive elevated console, when detected): non-interactive flags `--silent --accept-package-agreements --accept-source-agreements --disable-interactivity`, target `--id <Id> -e`, pin `--version`, scope `--scope machine`; exit codes are HRESULTs decodable via `winget error <code>` [verified: S4, S21]. Exact package ids (`Tailscale.Tailscale`, `Git.Git`, …) are **[unverified — confirm via `winget search` at implement time]**.
+- **winget is a user-session channel, never a service dependency.** In user
+  scope, when detected and the package supports it, use exact id/version with
+  `--scope user --silent --accept-package-agreements
+  --accept-source-agreements --disable-interactivity`. Machine-scope winget is
+  opportunistic only in an interactive user session; a LocalSystem runner may
+  not depend on it. Exit codes are HRESULTs decodable via `winget error <code>`
+  [verified: S4, S21]. Exact package ids and scope support are probed at plan
+  time, not assumed.
 - **Direct download + silent MSI/EXE (`msiexec /quiet /norestart`) is the dependable path Styrn specs against** on Windows [verified: S13, S14 for the rationale].
 - **Homebrew** [verified: S5]: never install brew itself (its installer wants interaction/sudo; absence = "substrate unavailable", not an error). Detect at `/opt/homebrew/bin/brew` (Apple Silicon) / `/usr/local/bin/brew` (Intel); `brew install` is non-interactive; bottles/casks need no Xcode CLT, source builds do.
 - **apt (Ubuntu)** [well-established: S33]: `DEBIAN_FRONTEND=noninteractive apt-get install -y <pkg>` (use `apt-get`, not `apt`, in automation); exit 0 ok / 100 error; root required; third-party repos = keyring in `/usr/share/keyrings/` + sources entry + `apt-get update`.
