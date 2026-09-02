@@ -10,7 +10,7 @@
     "schema_version": { "const": 1 },
     "entries": {
       "type": "array",
-      "description": "Entry IDs and resource ownership conflicts are additionally checked across the complete array by the runtime semantic validator.",
+      "description": "Entry IDs are additionally checked across the complete array, and resource ownership conflicts are checked within each entry by the runtime semantic validator.",
       "items": { "$ref": "#/$defs/entry" }
     }
   },
