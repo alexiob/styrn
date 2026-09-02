@@ -963,6 +963,9 @@ name = "win-mini"
 
 roles = ["worker"]
 
+[installation]
+scope = "user"
+
 [platform]
 os = "windows"
 arch = "x86_64"
@@ -1078,6 +1081,10 @@ Revision A's canonical manifest requires `machine_id`, but none of the reference
 - `[installation].scope` is required and is `user | system`. It selects the
   single canonical path family and states the integrity posture; it is not
   inferred from the file's owner or location. Bare setup emits `user`.
+- `[paths].root` is a normalized absolute native path in the selected
+  platform/scope family. `repos`, `jobs`, `cache`, `artifacts`, and `logs` are
+  exactly the correspondingly named children of that root; cross-platform,
+  cross-scope, traversal, and detached-child spellings are invalid.
 - Exactly one of `reserved_disk_bytes` or `reserved_disk_percent` may be present in `[resources.policy]`. Both present is a validation error (`project.profile_invalid` analog for manifests: `machine.manifest_invalid`). `reserved_disk_percent` is evaluated against the *total size* of the filesystem containing `[paths].root`, computed at admission time.
 - All `*_bytes` fields are non-negative integers (bytes). All `max_*` counts are positive integers.
 - `[pending_actions]` (Part 15.2.4) is a list of tables and may be present in the manifest after bootstrap; `styrn host doctor` reports unresolved entries.
@@ -1186,6 +1193,9 @@ schema_version = 1
 machine_id = "<minted by styrn machine init>"   # rev. B: required; see 2.4.1
 name = "win-mini"
 roles = ["worker"]
+
+[installation]
+scope = "user"
 
 [platform]
 os = "windows"
@@ -5170,7 +5180,8 @@ All three modes differ **only** in how `DesiredState` is constructed; probe/diff
 Shared tail for all modes: print plan → confirm (skipped by `--yes`) → apply in
 the already-selected scope → print manifest summary + an enrollment card when
 remote transport is ready + pending-actions block. Styrn never inserts an
-elevation step. `--dry-run` stops after the plan.
+unannounced elevation step: the optional, separately confirmed system subset
+uses the OS-owned authorization flow in 15.5. `--dry-run` stops after the plan.
 
 ### 15.4.1 The zero-argument path (the §0.6 benchmark)
 
