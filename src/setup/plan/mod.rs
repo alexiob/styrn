@@ -15,13 +15,24 @@ use thiserror::Error;
 #[path = "hostile_pending.rs"]
 mod hostile_pending;
 
-#[cfg(plan_pending_publication_forge_fixture)]
+#[cfg(any(
+    plan_pending_publication_forge_fixture,
+    plan_pending_authority_forge_fixture
+))]
 #[path = "hostile_pending_publication.rs"]
 mod hostile_pending_publication;
 
 #[cfg(plan_pending_projection_fixture)]
 #[path = "hostile_pending_projection.rs"]
 mod hostile_pending_projection;
+
+#[cfg(plan_completed_execution_construct_fixture)]
+#[path = "hostile_completed_execution_construct.rs"]
+mod hostile_completed_execution_construct;
+
+#[cfg(plan_completed_execution_mutate_fixture)]
+#[path = "hostile_completed_execution_mutate.rs"]
+mod hostile_completed_execution_mutate;
 
 pub(crate) use super::action::PlanOperation;
 

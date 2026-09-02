@@ -2,7 +2,7 @@
 //!
 //! Full `setup` CLI orchestration remains owned by T0.20.
 
-use super::action::{PendingAction, PendingSeverity};
+use super::action::{CompletedExecutionToken, PendingAction, PendingSeverity};
 use crate::{manifest, output};
 use chrono::{DateTime, Utc};
 use serde::Serialize;
@@ -126,13 +126,14 @@ pub(super) fn project_manifest_for_test(
 
 /// Publishes the complete current projection from either ordinary apply or the
 /// authorization-aware execution report. T0.20 owns CLI invocation ordering.
-pub(crate) fn publish_manifest(
+pub(in crate::setup) fn publish_manifest(
     manifest_store: &manifest::MachineManifestStore,
     receipt_store: &super::receipt::ReceiptStore,
     draft: &mut manifest::MachineManifestDraft,
-    pending: &[PendingAction],
+    completed: &CompletedExecutionToken,
     metadata: &mut super::receipt::ReceiptMetadataSource,
 ) -> Result<uuid::Uuid, PendingError> {
+    let pending = completed.pending();
     validate_unique_pending(pending)?;
     let authority = PendingPublicationAuthority(());
     let session = receipt_store.begin_pending_publication(&authority)?;

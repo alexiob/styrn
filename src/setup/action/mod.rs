@@ -789,6 +789,9 @@ mod execution;
 #[cfg(not(action_core_fixture))]
 #[allow(unused_imports)] // Private canonical route; T0.20 adds its authorized frontend.
 use execution::apply_plan_with_journal;
+#[cfg(not(action_core_fixture))]
+#[allow(unused_imports)] // Opaque completion capability consumed by setup projections.
+pub(in crate::setup) use execution::CompletedExecutionToken;
 
 fn checked_text(value: &str, error: ActionError) -> Result<String, ActionError> {
     if super::validate_probe_static_text(value) {

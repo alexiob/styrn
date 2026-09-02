@@ -517,7 +517,7 @@ fn needs_human_journals_each_current_occurrence_once_and_recurrence_after_witnes
         &manifest_store,
         &store,
         &mut draft,
-        report.pending(),
+        report.completion(),
         &mut metadata,
     )
     .unwrap();
@@ -620,7 +620,7 @@ fn needs_human_journals_each_current_occurrence_once_and_recurrence_after_witnes
         &manifest_store,
         &store,
         &mut draft,
-        rerun.pending(),
+        rerun.completion(),
         &mut no_metadata,
     )
     .unwrap();
@@ -667,7 +667,7 @@ fn needs_human_journals_each_current_occurrence_once_and_recurrence_after_witnes
         &manifest_store,
         &store,
         &mut draft,
-        resolved.pending(),
+        resolved.completion(),
         &mut resolution_metadata,
     )
     .unwrap();
@@ -710,7 +710,7 @@ fn needs_human_journals_each_current_occurrence_once_and_recurrence_after_witnes
         ),
         &store,
         &mut draft,
-        recurrence.pending(),
+        recurrence.completion(),
         &mut failed_checkpoint_metadata,
     )
     .unwrap_err();
@@ -727,7 +727,7 @@ fn needs_human_journals_each_current_occurrence_once_and_recurrence_after_witnes
         &manifest_store,
         &store,
         &mut draft,
-        repaired_recurrence.pending(),
+        repaired_recurrence.completion(),
         &mut recurrence_checkpoint_metadata,
     )
     .unwrap();
@@ -740,7 +740,7 @@ fn needs_human_journals_each_current_occurrence_once_and_recurrence_after_witnes
         &manifest_store,
         &store,
         &mut draft,
-        current_recurrence.pending(),
+        current_recurrence.completion(),
         &mut current_metadata,
     )
     .unwrap();
@@ -818,7 +818,7 @@ fn failed_manifest_publication_repairs_on_rerun_without_duplicate_pending_histor
         ),
         &receipt_store,
         &mut draft,
-        report.pending(),
+        report.completion(),
         &mut ReceiptMetadataSource::for_test([(
             "019cafd0-5c00-7000-8000-000000000014",
             "2026-09-02T10:02:01Z",
@@ -840,7 +840,7 @@ fn failed_manifest_publication_repairs_on_rerun_without_duplicate_pending_histor
         &crate::manifest::MachineManifestStore::new_for_test(&manifest_path),
         &receipt_store,
         &mut draft,
-        rerun.pending(),
+        rerun.completion(),
         &mut repair_metadata,
     )
     .unwrap();
@@ -898,7 +898,7 @@ fn failed_receipt_checkpoint_leaves_a_valid_manifest_and_repairs_without_duplica
         &manifest_store,
         &failing_receipt,
         &mut draft,
-        report.pending(),
+        report.completion(),
         &mut checkpoint_metadata,
     )
     .unwrap_err();
@@ -931,7 +931,7 @@ fn failed_receipt_checkpoint_leaves_a_valid_manifest_and_repairs_without_duplica
         ),
         &receipt_store,
         &mut draft,
-        rerun.pending(),
+        rerun.completion(),
         &mut repair_metadata,
     )
     .unwrap();
@@ -984,7 +984,7 @@ fn manifest_parent_sync_precedes_checkpoint_and_exact_after_recovery_resyncs_wit
         &failing_sync,
         &receipt_store,
         &mut draft,
-        report.pending(),
+        report.completion(),
         &mut ReceiptMetadataSource::for_test([(
             "019cafd0-5c00-7000-8000-000000000072",
             "2026-09-02T10:09:01Z",
@@ -1004,7 +1004,7 @@ fn manifest_parent_sync_precedes_checkpoint_and_exact_after_recovery_resyncs_wit
         &failing_sync,
         &receipt_store,
         &mut draft,
-        report.pending(),
+        report.completion(),
         &mut ReceiptMetadataSource::for_test([]),
     )
     .unwrap_err();
@@ -1023,7 +1023,7 @@ fn manifest_parent_sync_precedes_checkpoint_and_exact_after_recovery_resyncs_wit
         ),
         &receipt_store,
         &mut draft,
-        report.pending(),
+        report.completion(),
         &mut ReceiptMetadataSource::for_test([]),
     )
     .unwrap();
@@ -1095,7 +1095,7 @@ fn pending_publication_intent_faults_retain_only_unambiguous_evidence() {
             &crate::manifest::MachineManifestStore::new_for_test(&manifest_path),
             &failing_store(fixture.receipt_path().to_path_buf()),
             &mut draft,
-            report.pending(),
+            report.completion(),
             &mut ReceiptMetadataSource::for_test([(publication_id, "2026-09-02T10:10:01Z")]),
         )
         .unwrap_err();
@@ -1181,7 +1181,7 @@ fn pending_publication_intent_reader_observes_only_absent_or_complete_documents(
                     &crate::manifest::MachineManifestStore::new_for_test(&manifest_path),
                     &paused_store,
                     &mut draft,
-                    report.pending(),
+                    report.completion(),
                     &mut ReceiptMetadataSource::for_test([(
                         "019cafd0-5c00-7000-8000-000000000092",
                         "2026-09-02T10:11:01Z",
@@ -1255,7 +1255,7 @@ fn pending_publication_displaced_temporary_after_create_retains_all_evidence() {
                 &crate::manifest::MachineManifestStore::new_for_test(&manifest_path),
                 &paused_store,
                 &mut pending_manifest_draft(),
-                report.pending(),
+                report.completion(),
                 &mut ReceiptMetadataSource::for_test([(publication_id, "2026-09-02T10:11:31Z")]),
             )
         });
@@ -1325,7 +1325,7 @@ fn pending_publication_conflict_retains_raced_preexisting_evidence() {
                 &crate::manifest::MachineManifestStore::new_for_test(&manifest_path),
                 &paused_store,
                 &mut draft,
-                report.pending(),
+                report.completion(),
                 &mut ReceiptMetadataSource::for_test([(
                     "019cafd0-5c00-7000-8000-000000000102",
                     "2026-09-02T10:12:01Z",
@@ -1359,7 +1359,7 @@ fn pending_publication_conflict_retains_raced_preexisting_evidence() {
         &crate::manifest::MachineManifestStore::new_for_test(&manifest_path),
         &receipt_store,
         &mut pending_manifest_draft(),
-        report.pending(),
+        report.completion(),
         &mut ReceiptMetadataSource::for_test([]),
     )
     .unwrap_err();
@@ -1408,7 +1408,7 @@ fn unix_pending_publication_recovery_removes_only_the_bound_orphan_temporary_lin
             fixture.receipt_path(),
         ),
         &mut draft,
-        report.pending(),
+        report.completion(),
         &mut ReceiptMetadataSource::for_test([(publication_id, "2026-09-02T10:13:01Z")]),
     )
     .unwrap_err();
@@ -1435,7 +1435,7 @@ fn unix_pending_publication_recovery_removes_only_the_bound_orphan_temporary_lin
         &crate::manifest::MachineManifestStore::new_for_test(&manifest_path),
         &receipt_store,
         &mut draft,
-        report.pending(),
+        report.completion(),
         &mut ReceiptMetadataSource::for_test([]),
     )
     .unwrap_err();
@@ -1454,7 +1454,7 @@ fn unix_pending_publication_recovery_removes_only_the_bound_orphan_temporary_lin
         &crate::manifest::MachineManifestStore::new_for_test(&manifest_path),
         &receipt_store,
         &mut draft,
-        report.pending(),
+        report.completion(),
         &mut ReceiptMetadataSource::for_test([]),
     )
     .unwrap();
@@ -1505,7 +1505,7 @@ fn resolved_publication_intent_prevents_immediate_recurrence_suppression() {
         &manifest_store,
         &receipt_store,
         &mut draft,
-        initial.pending(),
+        initial.completion(),
         &mut ReceiptMetadataSource::for_test([(
             "019cafd0-5c00-7000-8000-000000000042",
             "2026-09-02T10:06:01Z",
@@ -1524,7 +1524,7 @@ fn resolved_publication_intent_prevents_immediate_recurrence_suppression() {
         &manifest_store,
         &ReceiptStore::new_for_test_failing_before_replace(receipt_path),
         &mut draft,
-        resolved.pending(),
+        resolved.completion(),
         &mut ReceiptMetadataSource::for_test([(
             "019cafd0-5c00-7000-8000-000000000043",
             "2026-09-02T10:06:02Z",
@@ -1565,7 +1565,7 @@ fn resolved_publication_intent_prevents_immediate_recurrence_suppression() {
         &manifest_store,
         &receipt_store,
         &mut draft,
-        recurrence.pending(),
+        recurrence.completion(),
         &mut ReceiptMetadataSource::for_test([(
             "019cafd0-5c00-7000-8000-000000000045",
             "2026-09-02T10:06:04Z",
@@ -1627,7 +1627,7 @@ fn publication_recovery_rejects_a_third_manifest_digest_and_retains_evidence() {
         ),
         &receipt_store,
         &mut draft,
-        report.pending(),
+        report.completion(),
         &mut ReceiptMetadataSource::for_test([(
             "019cafd0-5c00-7000-8000-000000000052",
             "2026-09-02T10:07:01Z",
@@ -1646,7 +1646,7 @@ fn publication_recovery_rejects_a_third_manifest_digest_and_retains_evidence() {
         &manifest_store,
         &receipt_store,
         &mut draft,
-        report.pending(),
+        report.completion(),
         &mut ReceiptMetadataSource::for_test([]),
     )
     .unwrap_err();
@@ -1696,7 +1696,7 @@ fn applied_append_preserves_a_prepared_publication_prefix_until_recovery() {
         ),
         &receipt_store,
         &mut draft,
-        pending.pending(),
+        pending.completion(),
         &mut ReceiptMetadataSource::for_test([(
             "019cafd0-5c00-7000-8000-000000000062",
             "2026-09-02T10:08:01Z",
@@ -1723,7 +1723,7 @@ fn applied_append_preserves_a_prepared_publication_prefix_until_recovery() {
         &manifest_store,
         &receipt_store,
         &mut draft,
-        pending.pending(),
+        pending.completion(),
         &mut ReceiptMetadataSource::for_test([]),
     )
     .unwrap();
@@ -1768,7 +1768,7 @@ fn concurrent_pending_publications_select_one_occurrence_checkpoint() {
             let barrier = Arc::clone(&barrier);
             let receipt_path = receipt_path.clone();
             let manifest_path = manifest_path.clone();
-            let pending = report.pending();
+            let completed = report.completion();
             scope.spawn(move || {
                 let mut draft = pending_manifest_draft();
                 let checkpoint = if sequence == 32 {
@@ -1788,7 +1788,7 @@ fn concurrent_pending_publications_select_one_occurrence_checkpoint() {
                     &crate::manifest::MachineManifestStore::new_for_test(manifest_path),
                     &ReceiptStore::new_for_test(receipt_path),
                     &mut draft,
-                    pending,
+                    completed,
                     &mut metadata,
                 )
                 .unwrap();
@@ -1857,7 +1857,7 @@ fn pending_publication_boundary_accepts_the_complete_authorized_report_slice() {
             manifest_store,
             receipt_store,
             draft,
-            report.pending(),
+            report.ordinary().completion(),
             metadata,
         )
     }
@@ -2652,13 +2652,58 @@ fn setup_plan_cannot_construct_pending_actions() {
 fn setup_plan_cannot_construct_pending_publication_authority() {
     assert_fixture_fails_with_cfg(
         "pending_publication_forge.rs",
-        &["plan_pending_publication_forge_fixture"],
+        &["plan_pending_authority_forge_fixture"],
         FixtureExpectation::new(
             "E0603",
             "tuple struct constructor `PendingPublicationAuthority` is private",
-            2,
+            19,
             Some("private tuple struct constructor"),
             "hostile_pending_publication.rs",
+        ),
+    );
+}
+
+#[test]
+fn setup_plan_cannot_call_real_pending_publisher_with_a_raw_slice() {
+    assert_fixture_fails_with_cfg(
+        "pending_publication_forge.rs",
+        &["plan_pending_publication_forge_fixture"],
+        FixtureExpectation::new(
+            "E0308",
+            "mismatched types",
+            12,
+            Some("expected `&CompletedExecutionToken`, found `&[_; 0]`"),
+            "hostile_pending_publication.rs",
+        ),
+    );
+}
+
+#[test]
+fn setup_plan_cannot_construct_a_completed_execution_token() {
+    assert_fixture_fails_with_cfg(
+        "pending_publication_forge.rs",
+        &["plan_completed_execution_construct_fixture"],
+        FixtureExpectation::new(
+            "E0451",
+            "field `pending` of struct `CompletedExecutionToken` is private",
+            3,
+            Some("private field"),
+            "hostile_completed_execution_construct.rs",
+        ),
+    );
+}
+
+#[test]
+fn setup_plan_cannot_modify_a_completed_execution_token() {
+    assert_fixture_fails_with_cfg(
+        "pending_publication_forge.rs",
+        &["plan_completed_execution_mutate_fixture"],
+        FixtureExpectation::new(
+            "E0616",
+            "field `pending` of struct `CompletedExecutionToken` is private",
+            2,
+            Some("private field"),
+            "hostile_completed_execution_mutate.rs",
         ),
     );
 }

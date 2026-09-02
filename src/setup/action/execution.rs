@@ -3,12 +3,23 @@
 use super::{Action, ActionCheck, ActionEffect, ActionError, JournalAuthority, PendingAction};
 use thiserror::Error;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
+pub(in crate::setup) struct CompletedExecutionToken {
+    pending: Vec<PendingAction>,
+}
+
+impl CompletedExecutionToken {
+    pub(in crate::setup) fn pending(&self) -> &[PendingAction] {
+        &self.pending
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) struct ApplyReport {
     applied_count: usize,
     recovered_count: usize,
     noop_count: usize,
-    pending: Vec<PendingAction>,
+    completion: CompletedExecutionToken,
 }
 
 impl ApplyReport {
@@ -25,21 +36,25 @@ impl ApplyReport {
     }
 
     pub(crate) fn pending_count(&self) -> usize {
-        self.pending.len()
+        self.completion.pending().len()
     }
 
     pub(crate) fn pending(&self) -> &[PendingAction] {
-        &self.pending
+        self.completion.pending()
+    }
+
+    pub(in crate::setup) fn completion(&self) -> &CompletedExecutionToken {
+        &self.completion
     }
 
     pub(crate) fn is_nothing_to_do(&self) -> bool {
-        self.applied_count == 0 && self.recovered_count == 0 && self.pending.is_empty()
+        self.applied_count == 0 && self.recovered_count == 0 && self.completion.pending().is_empty()
     }
 
     pub(crate) fn message(&self) -> &'static str {
         if self.is_nothing_to_do() {
             "nothing to do"
-        } else if self.applied_count == 0 && !self.pending.is_empty() {
+        } else if self.applied_count == 0 && !self.completion.pending().is_empty() {
             "setup actions need human attention"
         } else if self.applied_count == 0 && self.recovered_count != 0 {
             "receipt recovered"
@@ -136,7 +151,9 @@ pub(super) fn apply_plan_with_runner<R: PreparedActionRunner>(
         applied_count: 0,
         recovered_count: 0,
         noop_count: 0,
-        pending: Vec::new(),
+        completion: CompletedExecutionToken {
+            pending: Vec::new(),
+        },
     };
     for intent in session.pending_intents(&authority)? {
         match session.intent_phase(&intent, &authority) {
@@ -204,6 +221,7 @@ pub(super) fn apply_plan_with_runner<R: PreparedActionRunner>(
             ActionCheck::NeedsHuman(needs_human) => {
                 session.record_pending(action.name(), metadata, &authority)?;
                 report
+                    .completion
                     .pending
                     .push(PendingAction::new(action.name().clone(), needs_human));
             }
