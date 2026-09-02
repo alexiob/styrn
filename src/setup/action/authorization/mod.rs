@@ -85,7 +85,7 @@ enum PrivilegeConsent {
 
 #[allow(dead_code)] // T0.20 maps the one prompt or explicit flag to this policy.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum SystemAuthorizationPolicy {
+pub(in crate::setup) enum SystemAuthorizationPolicy {
     NotGranted,
     InteractiveConsent,
     ExplicitNoninteractive,
@@ -269,35 +269,35 @@ impl AuthorizationContext {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum PrivilegedStatus {
+pub(in crate::setup) enum PrivilegedStatus {
     NotNeeded,
     NeedsHuman { count: usize },
     Pending { count: usize },
     AuthorizationLaunched { count: usize },
 }
 
-pub(super) struct AuthorizedExecutionReport {
+pub(in crate::setup) struct AuthorizedExecutionReport {
     ordinary: ApplyReport,
     privileged_status: PrivilegedStatus,
 }
 
 impl AuthorizedExecutionReport {
-    fn ordinary(&self) -> &ApplyReport {
+    pub(in crate::setup) fn ordinary(&self) -> &ApplyReport {
         &self.ordinary
     }
 
-    fn privileged_status(&self) -> PrivilegedStatus {
+    pub(in crate::setup) fn privileged_status(&self) -> PrivilegedStatus {
         self.privileged_status
     }
 
-    fn everything_ready(&self) -> bool {
+    pub(in crate::setup) fn everything_ready(&self) -> bool {
         self.ordinary.pending_count() == 0
             && matches!(self.privileged_status, PrivilegedStatus::NotNeeded)
     }
 }
 
 #[derive(Debug, Error)]
-pub(super) enum AuthorizationInvocationError {
+pub(in crate::setup) enum AuthorizationInvocationError {
     #[error("native authorization was cancelled or failed")]
     Failed,
     #[error("native authorization could not be launched")]
@@ -307,7 +307,7 @@ pub(super) enum AuthorizationInvocationError {
 }
 
 #[derive(Debug, Error)]
-pub(super) enum AuthorizationError {
+pub(in crate::setup) enum AuthorizationError {
     #[error(transparent)]
     Apply(#[from] super::execution::ApplyPlanError),
     #[error("setup authorization request is invalid")]
@@ -326,7 +326,7 @@ pub(super) enum AuthorizationError {
 
 impl AuthorizationError {
     #[allow(dead_code)] // T0.20 maps this through the setup command envelope.
-    fn error_code(&self) -> &'static str {
+    pub(in crate::setup) fn error_code(&self) -> &'static str {
         match self {
             Self::Apply(error) => error.error_code(),
             Self::RequestInvalid
@@ -338,7 +338,7 @@ impl AuthorizationError {
     }
 
     #[allow(dead_code)] // T0.20 maps this through the setup command envelope.
-    fn exit_code(&self) -> u8 {
+    pub(in crate::setup) fn exit_code(&self) -> u8 {
         13
     }
 }
@@ -496,6 +496,32 @@ pub(super) fn execute_with_authorization<I: AuthorizationInvoker>(
         ordinary,
         privileged_status,
     })
+}
+
+/// Production entry point used by the future setup coordinator. Construction
+/// of the authorization context and native launcher stays inside this sealed
+/// module, so an ordinary caller cannot inject a privileged executor.
+#[allow(dead_code)] // T0.20 supplies the merged desired plan and confirmation policy.
+pub(in crate::setup) fn execute_with_native_authorization(
+    plan: &mut Vec<Action>,
+    ordinary_store: &ReceiptStore,
+    ordinary_metadata: &mut ReceiptMetadataSource,
+    host_id: &str,
+    request_path: PathBuf,
+    principal: WorkerPrincipal,
+    policy: SystemAuthorizationPolicy,
+    no_elevate: bool,
+) -> Result<AuthorizedExecutionReport, AuthorizationError> {
+    let context = AuthorizationContext::capture(host_id, request_path, principal)?;
+    let options = AuthorizationOptions::from_policy(policy, no_elevate)?;
+    execute_with_authorization(
+        plan,
+        ordinary_store,
+        ordinary_metadata,
+        &context,
+        options,
+        &mut NativeAuthorizationInvoker,
+    )
 }
 
 fn validate_plan(

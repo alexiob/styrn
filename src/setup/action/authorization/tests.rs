@@ -86,6 +86,38 @@ fn production_authorization_context_captures_the_exact_current_executable() {
 }
 
 #[test]
+fn production_native_entrypoint_applies_user_plan_without_authorization() {
+    let fixture = AuthorizationFixture::new("production-rootless");
+    let store = ReceiptStore::new_user_for_test(fixture.user_receipt());
+    let state = Arc::new(Mutex::new(Vec::new()));
+    let mut plan = vec![
+        Action::test_journaled_state("test.user-action", 1, Privilege::None, Arc::clone(&state)).0,
+    ];
+    let mut metadata = receipt_metadata(&[(
+        "019cb047-3c00-7000-8000-000000000001",
+        "2026-09-02T12:00:00Z",
+    )]);
+
+    let report = execute_with_native_authorization(
+        &mut plan,
+        &store,
+        &mut metadata,
+        "host-019cb047",
+        fixture.request_path().to_owned(),
+        crate::platform::resolve_current_worker_principal().unwrap(),
+        SystemAuthorizationPolicy::NotGranted,
+        false,
+    )
+    .unwrap();
+
+    assert_eq!(*state.lock().unwrap(), vec![1]);
+    assert_eq!(report.ordinary().applied_count(), 1);
+    assert_eq!(report.privileged_status(), PrivilegedStatus::NotNeeded);
+    assert!(report.everything_ready());
+    assert!(!fixture.request_path().exists());
+}
+
+#[test]
 fn ordinary_user_plan_applies_and_reruns_without_authorization() {
     let fixture = AuthorizationFixture::new("ordinary-only");
     let store = ReceiptStore::new_user_for_test(fixture.user_receipt());
