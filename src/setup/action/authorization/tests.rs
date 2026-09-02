@@ -404,6 +404,21 @@ fn privileged_needs_human_is_journaled_and_exposed_without_prompt() {
         assert!(receipt["entries"][0][field].as_array().unwrap().is_empty());
     }
     assert!(receipt["entries"][0]["download_provenance"].is_null());
+
+    let first_receipt = fs::read(fixture.user_receipt()).unwrap();
+    let mut no_metadata = receipt_metadata(&[]);
+    let rerun = execute_with_authorization(
+        &mut plan,
+        &store,
+        &mut no_metadata,
+        &fixture.context(),
+        AuthorizationOptions::interactive_accept(),
+        &mut invoker,
+    )
+    .unwrap();
+    assert_eq!(rerun.pending(), report.pending());
+    assert_eq!(fs::read(fixture.user_receipt()).unwrap(), first_receipt);
+    assert_eq!(invoker.calls(), 0);
 }
 
 #[test]
@@ -462,6 +477,117 @@ fn mixed_needs_human_report_preserves_the_displayed_plan_order() {
     );
     assert_eq!(invoker.calls(), 0);
     assert!(state.lock().unwrap().is_empty());
+}
+
+#[test]
+fn privileged_pending_metadata_exhaustion_keeps_a_valid_prefix_and_repairs_on_rerun() {
+    let fixture = AuthorizationFixture::new("privileged-pending-metadata-exhaustion");
+    let store = ReceiptStore::new_user_for_test(fixture.user_receipt());
+    let state = Arc::new(Mutex::new(Vec::new()));
+    let make_action = |name, instruction| {
+        Action::test_named_needs_human(
+            name,
+            host_privilege(),
+            Arc::clone(&state),
+            NeedsHuman::new(HumanInstructions::new(instruction).unwrap(), None),
+        )
+        .0
+    };
+    let mut plan = vec![
+        make_action(
+            "test.first-system-approval",
+            "Approve the first system setting.",
+        ),
+        make_action(
+            "test.second-system-approval",
+            "Approve the second system setting.",
+        ),
+    ];
+    let mut one_metadata = receipt_metadata(&[(
+        "019cb047-3c00-7000-8000-000000000001",
+        "2026-09-02T12:00:00Z",
+    )]);
+    let mut invoker = SpyInvoker::default();
+
+    let error = match execute_with_authorization(
+        &mut plan,
+        &store,
+        &mut one_metadata,
+        &fixture.context(),
+        AuthorizationOptions::interactive_accept(),
+        &mut invoker,
+    ) {
+        Ok(_) => panic!("metadata exhaustion unexpectedly completed setup"),
+        Err(error) => error,
+    };
+
+    assert_eq!(error.error_code(), "setup.receipt_conflict");
+    assert_eq!(error.exit_code(), 13);
+    assert_eq!(invoker.calls(), 0);
+    assert!(!fixture.request_path().exists());
+    assert!(state.lock().unwrap().is_empty());
+    assert_eq!(store.read_snapshot().unwrap().entry_count(), 1);
+
+    let mut repair_metadata = receipt_metadata(&[(
+        "019cb047-3c00-7000-8000-000000000002",
+        "2026-09-02T12:00:01Z",
+    )]);
+    let repaired = execute_with_authorization(
+        &mut plan,
+        &store,
+        &mut repair_metadata,
+        &fixture.context(),
+        AuthorizationOptions::interactive_accept(),
+        &mut invoker,
+    )
+    .unwrap();
+
+    assert_eq!(repaired.pending().len(), 2);
+    assert_eq!(store.read_snapshot().unwrap().entry_count(), 2);
+    assert_eq!(invoker.calls(), 0);
+    assert!(state.lock().unwrap().is_empty());
+}
+
+#[test]
+fn privileged_pending_receipt_publication_failure_exposes_no_partial_document_or_prompt() {
+    let fixture = AuthorizationFixture::new("privileged-pending-publication-failure");
+    let store = ReceiptStore::new_user_for_test_failing_before_replace(fixture.user_receipt());
+    let state = Arc::new(Mutex::new(Vec::new()));
+    let (action, metrics) = Action::test_named_needs_human(
+        "test.system-approval",
+        host_privilege(),
+        Arc::clone(&state),
+        NeedsHuman::new(
+            HumanInstructions::new("Approve the system setting.").unwrap(),
+            None,
+        ),
+    );
+    let mut plan = vec![action];
+    let mut metadata = receipt_metadata(&[(
+        "019cb047-3c00-7000-8000-000000000001",
+        "2026-09-02T12:00:00Z",
+    )]);
+    let mut invoker = SpyInvoker::default();
+
+    let error = match execute_with_authorization(
+        &mut plan,
+        &store,
+        &mut metadata,
+        &fixture.context(),
+        AuthorizationOptions::interactive_accept(),
+        &mut invoker,
+    ) {
+        Ok(_) => panic!("interrupted receipt publication unexpectedly completed setup"),
+        Err(error) => error,
+    };
+
+    assert_eq!(error.error_code(), "setup.receipt_conflict");
+    assert_eq!(error.exit_code(), 13);
+    assert_eq!(invoker.calls(), 0);
+    assert_eq!(metrics.mutation_calls(), 0);
+    assert!(state.lock().unwrap().is_empty());
+    assert!(!fixture.request_path().exists());
+    assert!(!fixture.user_receipt().exists());
 }
 
 #[test]
