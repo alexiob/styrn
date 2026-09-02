@@ -515,6 +515,35 @@ fn windows_token_posture_from_native(
     ))
 }
 
+#[allow(dead_code)] // Used by the native Windows UAC adapter.
+fn windows_quote_command_argument(argument: &[u16]) -> std::io::Result<Vec<u16>> {
+    if argument.contains(&0) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Windows authorization argument contains a NUL code unit",
+        ));
+    }
+    let mut quoted = Vec::with_capacity(argument.len() + 2);
+    quoted.push(u16::from(b'\"'));
+    let mut backslashes = 0_usize;
+    for &unit in argument {
+        if unit == u16::from(b'\\') {
+            backslashes += 1;
+            continue;
+        }
+        if unit == u16::from(b'\"') {
+            quoted.extend(std::iter::repeat_n(u16::from(b'\\'), backslashes * 2 + 1));
+        } else {
+            quoted.extend(std::iter::repeat_n(u16::from(b'\\'), backslashes));
+        }
+        quoted.push(unit);
+        backslashes = 0;
+    }
+    quoted.extend(std::iter::repeat_n(u16::from(b'\\'), backslashes * 2));
+    quoted.push(u16::from(b'\"'));
+    Ok(quoted)
+}
+
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum WindowsUserTokenChoice {
@@ -741,7 +770,7 @@ pub(crate) fn invoke_setup_authorization(
     executable: &Path,
     request_path: &Path,
     request_digest: &str,
-) -> std::io::Result<()> {
+) -> std::io::Result<std::process::ExitStatus> {
     platform_impl::invoke_setup_authorization(executable, request_path, request_digest)
 }
 
@@ -979,6 +1008,24 @@ mod setup_execution_tests {
         );
         assert!(windows_token_posture_from_native(0, 0x2000, None).is_err());
         assert!(windows_token_posture_from_native(1, 0x5000, None).is_err());
+    }
+
+    #[test]
+    fn windows_authorization_arguments_use_command_line_to_argv_w_quoting() {
+        let quote = |argument: &str| {
+            String::from_utf16(
+                &windows_quote_command_argument(&argument.encode_utf16().collect::<Vec<_>>())
+                    .unwrap(),
+            )
+            .unwrap()
+        };
+        assert_eq!(
+            quote("C:\\Program Files\\Styrn"),
+            "\"C:\\Program Files\\Styrn\""
+        );
+        assert_eq!(quote("a\"b"), "\"a\\\"b\"");
+        assert_eq!(quote("a\\"), "\"a\\\\\"");
+        assert!(windows_quote_command_argument(&[b'a' as u16, 0, b'b' as u16]).is_err());
     }
 
     #[test]

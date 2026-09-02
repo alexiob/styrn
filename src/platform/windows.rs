@@ -56,6 +56,23 @@ const FILE_ATTRIBUTE_NORMAL: u32 = 0x0000_0080;
 const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
 const PARENT_TAKEOVER_ACCESS: u32 =
     0x0000_0040 | 0x0001_0000 | 0x0004_0000 | 0x0008_0000 | 0x4000_0000 | 0x1000_0000;
+const FILE_MUTATION_ACCESS: u32 = 0x0000_0002
+    | 0x0000_0004
+    | 0x0000_0010
+    | 0x0000_0100
+    | 0x0001_0000
+    | 0x0004_0000
+    | 0x0008_0000
+    | 0x4000_0000
+    | 0x1000_0000;
+const SEE_MASK_NOCLOSEPROCESS: u32 = 0x0000_0040;
+const SEE_MASK_NOASYNC: u32 = 0x0000_0100;
+const SW_SHOWNORMAL: i32 = 1;
+const WAIT_OBJECT_0: u32 = 0;
+const INFINITE: u32 = 0xffff_ffff;
+const COINIT_APARTMENTTHREADED: u32 = 0x2;
+const COINIT_DISABLE_OLE1DDE: u32 = 0x4;
+const RPC_E_CHANGED_MODE: i32 = 0x8001_0106_u32 as i32;
 
 #[repr(C)]
 struct Acl {
@@ -157,6 +174,25 @@ struct TokenMandatoryLabel {
 #[derive(Clone, Copy)]
 struct TokenLinkedToken {
     linked_token: *mut c_void,
+}
+
+#[repr(C)]
+struct ShellExecuteInfoW {
+    size: u32,
+    mask: u32,
+    window: *mut c_void,
+    verb: *const u16,
+    file: *const u16,
+    parameters: *const u16,
+    directory: *const u16,
+    show: i32,
+    instance: *mut c_void,
+    id_list: *mut c_void,
+    class: *const u16,
+    class_key: *mut c_void,
+    hot_key: u32,
+    icon_or_monitor: *mut c_void,
+    process: *mut c_void,
 }
 
 #[repr(C)]
@@ -287,6 +323,17 @@ unsafe extern "system" {
     fn RevertToSelf() -> i32;
 }
 
+#[link(name = "shell32")]
+unsafe extern "system" {
+    fn ShellExecuteExW(execute_info: *mut ShellExecuteInfoW) -> i32;
+}
+
+#[link(name = "ole32")]
+unsafe extern "system" {
+    fn CoInitializeEx(reserved: *mut c_void, concurrency_model: u32) -> i32;
+    fn CoUninitialize();
+}
+
 pub(super) fn resolve_current_worker_principal() -> io::Result<WorkerPrincipal> {
     let sid = current_user_sid()?;
     principal_for_sid(&sid)
@@ -366,28 +413,165 @@ pub(super) fn invoke_setup_authorization(
     executable: &Path,
     request_path: &Path,
     request_digest: &str,
-) -> io::Result<()> {
+) -> io::Result<std::process::ExitStatus> {
     let current = std::env::current_exe()?;
-    let _arguments = super::validated_privileged_phase_arguments(
-        executable,
+    let executable = hold_verified_authorization_executable(executable)?;
+    let arguments = super::validated_privileged_phase_arguments(
+        &executable.path,
         request_path,
         request_digest,
         &current,
     )?;
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "native Windows inline-sudo/UAC authorization gate is unavailable in this build",
-    ))
+    let mut parameters = Vec::<u16>::new();
+    for argument in arguments {
+        if !parameters.is_empty() {
+            parameters.push(u16::from(b' '));
+        }
+        parameters.extend(super::windows_quote_command_argument(
+            &argument.encode_wide().collect::<Vec<_>>(),
+        )?);
+    }
+    parameters.push(0);
+    let verb = wide("runas");
+    let file = wide_os(&executable.path);
+    let directory = wide_os(
+        executable
+            .path
+            .parent()
+            .ok_or_else(|| invalid_data("setup authorization executable has no parent"))?,
+    );
+    let (_, launch_information) = open_authorization_executable_handle(&executable.path)?;
+    if file_identity(&launch_information) != executable.identity {
+        return Err(permission_denied(
+            "setup authorization executable identity changed before launch",
+        ));
+    }
+    let _com = initialize_com_for_shell()?;
+    let mut execute_info = ShellExecuteInfoW {
+        size: std::mem::size_of::<ShellExecuteInfoW>() as u32,
+        mask: SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC,
+        window: std::ptr::null_mut(),
+        verb: verb.as_ptr(),
+        file: file.as_ptr(),
+        parameters: parameters.as_ptr(),
+        directory: directory.as_ptr(),
+        show: SW_SHOWNORMAL,
+        instance: std::ptr::null_mut(),
+        id_list: std::ptr::null_mut(),
+        class: std::ptr::null(),
+        class_key: std::ptr::null_mut(),
+        hot_key: 0,
+        icon_or_monitor: std::ptr::null_mut(),
+        process: std::ptr::null_mut(),
+    };
+    if unsafe { ShellExecuteExW(&mut execute_info) } == 0 {
+        let error = io::Error::last_os_error();
+        return if error.raw_os_error() == Some(1223) {
+            Err(permission_denied(
+                "native Windows setup authorization was declined",
+            ))
+        } else {
+            Err(error)
+        };
+    }
+    if execute_info.process as usize <= 32 {
+        return Err(permission_denied(
+            "native Windows authorization did not return a child process",
+        ));
+    }
+    let process = OwnedHandle(execute_info.process);
+    if unsafe { WaitForSingleObject(process.0, INFINITE) } != WAIT_OBJECT_0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut exit_code = 0;
+    if unsafe { GetExitCodeProcess(process.0, &mut exit_code) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    use std::os::windows::process::ExitStatusExt;
+    Ok(std::process::ExitStatus::from_raw(exit_code))
 }
 
-#[allow(dead_code)] // Native Windows authorization is an explicit unavailable gate.
+fn initialize_com_for_shell() -> io::Result<ComInitialization> {
+    let status = unsafe {
+        CoInitializeEx(
+            std::ptr::null_mut(),
+            COINIT_APARTMENTTHREADED | COINIT_DISABLE_OLE1DDE,
+        )
+    };
+    if status >= 0 {
+        Ok(ComInitialization { owns_call: true })
+    } else if status == RPC_E_CHANGED_MODE {
+        Ok(ComInitialization { owns_call: false })
+    } else {
+        Err(io::Error::other(
+            "Windows could not initialize COM for native setup authorization",
+        ))
+    }
+}
+
+struct ComInitialization {
+    owns_call: bool,
+}
+
+impl Drop for ComInitialization {
+    fn drop(&mut self) {
+        if self.owns_call {
+            unsafe { CoUninitialize() };
+        }
+    }
+}
+
 pub(super) fn verify_setup_authorization_executable(
-    _executable: &Path,
+    executable: &Path,
 ) -> io::Result<std::path::PathBuf> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "native Windows setup authorization provenance verification is not implemented",
-    ))
+    Ok(hold_verified_authorization_executable(executable)?.path)
+}
+
+struct VerifiedAuthorizationExecutable {
+    path: std::path::PathBuf,
+    _file: std::fs::File,
+    identity: PrivateFileIdentity,
+}
+
+fn hold_verified_authorization_executable(
+    executable: &Path,
+) -> io::Result<VerifiedAuthorizationExecutable> {
+    use std::path::{Component, Prefix};
+
+    let executable = std::fs::canonicalize(executable)?;
+    if !matches!(
+        executable.components().next(),
+        Some(Component::Prefix(prefix))
+            if matches!(prefix.kind(), Prefix::Disk(_) | Prefix::VerbatimDisk(_))
+    ) {
+        return Err(permission_denied(
+            "setup authorization executable must use a local drive path",
+        ));
+    }
+    if executable != std::fs::canonicalize(std::env::current_exe()?)? {
+        return Err(permission_denied(
+            "setup authorization executable is not the current binary",
+        ));
+    }
+    let worker = resolve_current_worker_principal()?;
+    let (file, information) = open_authorization_executable_handle(&executable)?;
+    inspect_authorization_executable_acl(&file, &worker)?;
+    let mut current = executable.parent();
+    while let Some(ancestor) = current {
+        require_kind(ancestor, true)?;
+        inspect_authorization_ancestor_acl(ancestor, &worker)?;
+        current = ancestor.parent();
+    }
+    if executable != std::fs::canonicalize(std::env::current_exe()?)? {
+        return Err(permission_denied(
+            "setup authorization executable changed during verification",
+        ));
+    }
+    Ok(VerifiedAuthorizationExecutable {
+        path: executable,
+        _file: file,
+        identity: file_identity(&information),
+    })
 }
 
 pub(super) fn run_user_phase(
@@ -733,6 +917,8 @@ unsafe extern "system" {
     fn MoveFileExW(existing: *const u16, replacement: *const u16, flags: u32) -> i32;
     fn CloseHandle(handle: *mut c_void) -> i32;
     fn GetCurrentProcess() -> *mut c_void;
+    fn WaitForSingleObject(handle: *mut c_void, milliseconds: u32) -> u32;
+    fn GetExitCodeProcess(process: *mut c_void, exit_code: *mut u32) -> i32;
 }
 
 pub(super) fn create_private_manifest_staging_directory(
@@ -1011,6 +1197,40 @@ pub(super) fn consume_verified_private_file(removal: PrivateFileRemoval) -> io::
 
 fn open_private_file_handle(path: &Path) -> io::Result<(std::fs::File, ByHandleFileInformation)> {
     open_private_file_handle_with_access(path, GENERIC_READ)
+}
+
+fn open_authorization_executable_handle(
+    path: &Path,
+) -> io::Result<(std::fs::File, ByHandleFileInformation)> {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle};
+
+    let path = wide_os(path);
+    let handle = unsafe {
+        CreateFileW(
+            path.as_ptr(),
+            GENERIC_READ,
+            FILE_SHARE_READ,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_OPEN_REPARSE_POINT,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle as isize == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    let file = unsafe { std::fs::File::from_raw_handle(handle) };
+    let mut information = unsafe { std::mem::zeroed::<ByHandleFileInformation>() };
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut information) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if information.file_attributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY) != 0
+    {
+        return Err(permission_denied(
+            "setup authorization target is not a regular local file",
+        ));
+    }
+    Ok((file, information))
 }
 
 fn open_private_file_handle_with_access(
@@ -1489,6 +1709,134 @@ fn inspect_handle_user_acl(
 fn inspect_handle_private_acl(file: &std::fs::File, kind: AclKind) -> io::Result<()> {
     let non_worker = well_known_sid(WIN_LOCAL_SYSTEM_SID)?;
     inspect_handle_acl_with_principal(file, &non_worker, kind)
+}
+
+fn inspect_authorization_executable_acl(
+    file: &std::fs::File,
+    worker: &WorkerPrincipal,
+) -> io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+
+    let mut owner = std::ptr::null_mut();
+    let mut dacl = std::ptr::null_mut();
+    let mut descriptor = std::ptr::null_mut();
+    let status = unsafe {
+        GetSecurityInfo(
+            file.as_raw_handle(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            &mut owner,
+            std::ptr::null_mut(),
+            &mut dacl,
+            std::ptr::null_mut(),
+            &mut descriptor,
+        )
+    };
+    if status != 0 {
+        return Err(io::Error::from_raw_os_error(status as i32));
+    }
+    let _descriptor = LocalAllocation(descriptor);
+    if owner.is_null() || dacl.is_null() {
+        return Err(permission_denied(
+            "setup authorization executable security descriptor is incomplete",
+        ));
+    }
+    let administrators = well_known_sid(WIN_BUILTIN_ADMINISTRATORS_SID)?;
+    let system = well_known_sid(WIN_LOCAL_SYSTEM_SID)?;
+    let trusted_installer = lookup_account_sid("NT SERVICE\\TrustedInstaller")?;
+    let worker = principal_sid(worker)?;
+    let trusted_owner = unsafe { EqualSid(owner, administrators.as_ptr().cast()) } != 0
+        || unsafe { EqualSid(owner, system.as_ptr().cast()) } != 0
+        || unsafe { EqualSid(owner, trusted_installer.as_ptr().cast()) } != 0;
+    let entries = inspect_aces(dacl, &system, &administrators, &trusted_installer, &worker)?;
+    validate_authorization_executable_acl(trusted_owner, &entries)
+}
+
+fn inspect_authorization_ancestor_acl(path: &Path, worker: &WorkerPrincipal) -> io::Result<()> {
+    let mut path = wide_os(path);
+    let mut owner = std::ptr::null_mut();
+    let mut dacl = std::ptr::null_mut();
+    let mut descriptor = std::ptr::null_mut();
+    let status = unsafe {
+        GetNamedSecurityInfoW(
+            path.as_mut_ptr(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            &mut owner,
+            std::ptr::null_mut(),
+            &mut dacl,
+            std::ptr::null_mut(),
+            &mut descriptor,
+        )
+    };
+    if status != 0 {
+        return Err(io::Error::from_raw_os_error(status as i32));
+    }
+    let _descriptor = LocalAllocation(descriptor);
+    if owner.is_null() || dacl.is_null() {
+        return Err(permission_denied(
+            "setup authorization ancestor security descriptor is incomplete",
+        ));
+    }
+    let administrators = well_known_sid(WIN_BUILTIN_ADMINISTRATORS_SID)?;
+    let system = well_known_sid(WIN_LOCAL_SYSTEM_SID)?;
+    let trusted_installer = lookup_account_sid("NT SERVICE\\TrustedInstaller")?;
+    let worker = principal_sid(worker)?;
+    let trusted_owner = unsafe { EqualSid(owner, administrators.as_ptr().cast()) } != 0
+        || unsafe { EqualSid(owner, system.as_ptr().cast()) } != 0
+        || unsafe { EqualSid(owner, trusted_installer.as_ptr().cast()) } != 0;
+    let entries = inspect_aces(dacl, &system, &administrators, &trusted_installer, &worker)?;
+    validate_authorization_ancestor_acl(trusted_owner, &entries)
+}
+
+fn validate_authorization_executable_acl(
+    trusted_owner: bool,
+    entries: &[AceInspection],
+) -> io::Result<()> {
+    if !trusted_owner {
+        return Err(permission_denied(
+            "setup authorization executable is not owned by a trusted system principal",
+        ));
+    }
+    if entries.iter().any(|entry| {
+        entry.allowed
+            && entry.flags & INHERIT_ONLY_ACE == 0
+            && !matches!(
+                entry.principal,
+                Principal::System | Principal::Administrators | Principal::TrustedInstaller
+            )
+            && entry.mask & FILE_MUTATION_ACCESS != 0
+    }) {
+        return Err(permission_denied(
+            "setup authorization executable is writable by an untrusted principal",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_authorization_ancestor_acl(
+    trusted_owner: bool,
+    entries: &[AceInspection],
+) -> io::Result<()> {
+    if !trusted_owner {
+        return Err(permission_denied(
+            "setup authorization executable has an untrusted ancestor owner",
+        ));
+    }
+    if entries.iter().any(|entry| {
+        entry.allowed
+            && entry.flags & INHERIT_ONLY_ACE == 0
+            && !matches!(
+                entry.principal,
+                Principal::System | Principal::Administrators | Principal::TrustedInstaller
+            )
+            && entry.mask & PARENT_TAKEOVER_ACCESS != 0
+    }) {
+        return Err(permission_denied(
+            "setup authorization executable has a replaceable ancestor",
+        ));
+    }
+    Ok(())
 }
 
 fn inspect_handle_acl_with_principal(
@@ -2030,6 +2378,44 @@ mod tests {
             acl_sddl("S-1-5-21-1-2-3-1001", AclKind::UserDirectory),
             "O:S-1-5-21-1-2-3-1001D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;S-1-5-21-1-2-3-1001)"
         );
+    }
+
+    #[test]
+    fn authorization_executable_acl_allows_read_execute_but_rejects_user_mutation() {
+        let user_read_execute = AceInspection {
+            principal: Principal::Worker,
+            mask: FILE_READ | FILE_EXECUTE,
+            flags: 0,
+            allowed: true,
+        };
+        assert!(validate_authorization_executable_acl(true, &[user_read_execute]).is_ok());
+        assert!(validate_authorization_executable_acl(false, &[user_read_execute]).is_err());
+        for principal in [Principal::Worker, Principal::Unexpected] {
+            let user_write = AceInspection {
+                principal,
+                mask: GENERIC_WRITE,
+                flags: 0,
+                allowed: true,
+            };
+            assert!(validate_authorization_executable_acl(true, &[user_write]).is_err());
+        }
+        let system_write = AceInspection {
+            principal: Principal::System,
+            mask: FILE_ALL_ACCESS,
+            flags: 0,
+            allowed: true,
+        };
+        assert!(validate_authorization_executable_acl(true, &[system_write]).is_ok());
+
+        let user_delete_child = AceInspection {
+            principal: Principal::Worker,
+            mask: 0x0000_0040,
+            flags: 0,
+            allowed: true,
+        };
+        assert!(validate_authorization_ancestor_acl(true, &[user_read_execute]).is_ok());
+        assert!(validate_authorization_ancestor_acl(false, &[]).is_err());
+        assert!(validate_authorization_ancestor_acl(true, &[user_delete_child]).is_err());
     }
 
     #[test]

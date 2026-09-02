@@ -133,21 +133,14 @@ pub(super) fn invoke_setup_authorization(
     executable: &Path,
     request_path: &Path,
     request_digest: &str,
-) -> io::Result<()> {
+) -> io::Result<std::process::ExitStatus> {
     let current = std::env::current_exe()?;
     let executable = super::verify_setup_authorization_executable(executable)?;
     let invocation =
         super::unix_authorization_invocation(&executable, request_path, request_digest, &current)?;
-    let status = std::process::Command::new(invocation.program)
+    std::process::Command::new(invocation.program)
         .args(invocation.arguments)
-        .status()?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(permission_denied(
-            "native setup authorization was declined or failed",
-        ))
-    }
+        .status()
 }
 
 pub(super) fn verify_setup_authorization_path_security(path: &Path) -> io::Result<()> {
