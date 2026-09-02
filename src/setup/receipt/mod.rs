@@ -250,6 +250,8 @@ pub(crate) struct ReceiptStore {
     interrupt_after_prepare: bool,
     #[cfg(test)]
     intent_read_interruption: Option<IntentReadInterruption>,
+    #[cfg(test)]
+    pending_publication_intent_interruption: Option<PendingPublicationIntentInterruption>,
 }
 
 pub(crate) struct ReceiptApplySession<'a> {
@@ -586,6 +588,26 @@ enum IntentReadInterruption {
     Inode,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PendingPublicationIntentInterruptionPoint {
+    DuringWrite,
+    BeforePublish,
+    AfterPublish,
+    AfterDurablePublish,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug)]
+enum PendingPublicationIntentInterruption {
+    Fail(PendingPublicationIntentInterruptionPoint),
+    Pause {
+        point: PendingPublicationIntentInterruptionPoint,
+        entered: std::sync::Arc<std::sync::Barrier>,
+        resume: std::sync::Arc<std::sync::Barrier>,
+    },
+    CrashAfterDurablePublish,
+}
+
 impl ReceiptStore {
     pub(in crate::setup) fn installation_scope(&self) -> InstallationScope {
         self.scope
@@ -626,6 +648,8 @@ impl ReceiptStore {
             interrupt_after_prepare: false,
             #[cfg(test)]
             intent_read_interruption: None,
+            #[cfg(test)]
+            pending_publication_intent_interruption: None,
         };
         store.validate_destination_policy()?;
         store.verify_bound_principal()?;
@@ -654,6 +678,8 @@ impl ReceiptStore {
             interrupt_after_prepare: false,
             #[cfg(test)]
             intent_read_interruption: None,
+            #[cfg(test)]
+            pending_publication_intent_interruption: None,
         };
         store.validate_destination_policy()?;
         store.verify_bound_principal()?;
@@ -673,6 +699,7 @@ impl ReceiptStore {
             interruption: None,
             interrupt_after_prepare: false,
             intent_read_interruption: None,
+            pending_publication_intent_interruption: None,
         }
     }
 
@@ -693,6 +720,7 @@ impl ReceiptStore {
             interruption: None,
             interrupt_after_prepare: false,
             intent_read_interruption: None,
+            pending_publication_intent_interruption: None,
         }
     }
 
@@ -750,6 +778,110 @@ impl ReceiptStore {
     pub(in crate::setup) fn new_for_test_swapping_intent_inode(path: impl Into<PathBuf>) -> Self {
         let mut store = Self::new_for_test(path);
         store.intent_read_interruption = Some(IntentReadInterruption::Inode);
+        store
+    }
+
+    #[cfg(test)]
+    pub(in crate::setup) fn new_for_test_failing_pending_intent_during_write(
+        path: impl Into<PathBuf>,
+    ) -> Self {
+        Self::new_for_test_with_pending_intent_interruption(
+            path,
+            PendingPublicationIntentInterruption::Fail(
+                PendingPublicationIntentInterruptionPoint::DuringWrite,
+            ),
+        )
+    }
+
+    #[cfg(test)]
+    pub(in crate::setup) fn new_for_test_failing_pending_intent_before_publish(
+        path: impl Into<PathBuf>,
+    ) -> Self {
+        Self::new_for_test_with_pending_intent_interruption(
+            path,
+            PendingPublicationIntentInterruption::Fail(
+                PendingPublicationIntentInterruptionPoint::BeforePublish,
+            ),
+        )
+    }
+
+    #[cfg(test)]
+    pub(in crate::setup) fn new_for_test_failing_pending_intent_after_publish(
+        path: impl Into<PathBuf>,
+    ) -> Self {
+        Self::new_for_test_with_pending_intent_interruption(
+            path,
+            PendingPublicationIntentInterruption::Fail(
+                PendingPublicationIntentInterruptionPoint::AfterPublish,
+            ),
+        )
+    }
+
+    #[cfg(test)]
+    pub(in crate::setup) fn new_for_test_pausing_pending_intent_during_write(
+        path: impl Into<PathBuf>,
+        entered: std::sync::Arc<std::sync::Barrier>,
+        resume: std::sync::Arc<std::sync::Barrier>,
+    ) -> Self {
+        Self::new_for_test_with_pending_intent_interruption(
+            path,
+            PendingPublicationIntentInterruption::Pause {
+                point: PendingPublicationIntentInterruptionPoint::DuringWrite,
+                entered,
+                resume,
+            },
+        )
+    }
+
+    #[cfg(test)]
+    pub(in crate::setup) fn new_for_test_pausing_pending_intent_before_publish(
+        path: impl Into<PathBuf>,
+        entered: std::sync::Arc<std::sync::Barrier>,
+        resume: std::sync::Arc<std::sync::Barrier>,
+    ) -> Self {
+        Self::new_for_test_with_pending_intent_interruption(
+            path,
+            PendingPublicationIntentInterruption::Pause {
+                point: PendingPublicationIntentInterruptionPoint::BeforePublish,
+                entered,
+                resume,
+            },
+        )
+    }
+
+    #[cfg(test)]
+    pub(in crate::setup) fn new_for_test_pausing_pending_intent_after_publish(
+        path: impl Into<PathBuf>,
+        entered: std::sync::Arc<std::sync::Barrier>,
+        resume: std::sync::Arc<std::sync::Barrier>,
+    ) -> Self {
+        Self::new_for_test_with_pending_intent_interruption(
+            path,
+            PendingPublicationIntentInterruption::Pause {
+                point: PendingPublicationIntentInterruptionPoint::AfterPublish,
+                entered,
+                resume,
+            },
+        )
+    }
+
+    #[cfg(test)]
+    pub(in crate::setup) fn new_for_test_crashing_pending_intent_after_durable_publish(
+        path: impl Into<PathBuf>,
+    ) -> Self {
+        Self::new_for_test_with_pending_intent_interruption(
+            path,
+            PendingPublicationIntentInterruption::CrashAfterDurablePublish,
+        )
+    }
+
+    #[cfg(test)]
+    fn new_for_test_with_pending_intent_interruption(
+        path: impl Into<PathBuf>,
+        interruption: PendingPublicationIntentInterruption,
+    ) -> Self {
+        let mut store = Self::new_for_test(path);
+        store.pending_publication_intent_interruption = Some(interruption);
         store
     }
 
@@ -1227,6 +1359,7 @@ impl ReceiptStore {
         let intent = self.read_verified_pending_publication_intent()?;
         if let Some(intent) = &intent {
             intent.document.validate_receipt_binding(self, receipt)?;
+            self.remove_bound_pending_publication_temporary(intent)?;
         }
         Ok(intent)
     }
@@ -1265,31 +1398,125 @@ impl ReceiptStore {
         let serialized = document.to_json()?;
         let path = self.pending_publication_intent_path();
         let directory = path.parent().ok_or(ReceiptStoreError::InvalidDestination)?;
-        let result = (|| {
-            let mut file = crate::platform::create_private_file(&path, self.owner, &self.worker)
-                .map_err(|error| {
-                    if error.kind() == std::io::ErrorKind::AlreadyExists {
-                        ReceiptStoreError::IntentConflict
-                    } else {
-                        ReceiptStoreError::Write(error)
-                    }
-                })?;
-            file.write_all(&serialized)
-                .map_err(ReceiptStoreError::Write)?;
-            file.flush().map_err(ReceiptStoreError::Write)?;
-            file.sync_all().map_err(ReceiptStoreError::Write)?;
-            crate::platform::verify_private_file_security(&path, self.owner, &self.worker)
-                .map_err(ReceiptStoreError::Security)?;
-            crate::platform::sync_parent_directory(directory).map_err(ReceiptStoreError::Write)?;
-            crate::platform::private_file_identity(&path).map_err(ReceiptStoreError::Security)
-        })();
-        let identity = match result {
-            Ok(identity) => identity,
-            Err(error) => {
-                let _ = fs::remove_file(&path);
-                return Err(error);
+        let temporary =
+            self.pending_publication_temporary_path(&document.publication.publication_id);
+        let mut file = crate::platform::create_private_file(&temporary, self.owner, &self.worker)
+            .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                ReceiptStoreError::IntentConflict
+            } else {
+                ReceiptStoreError::Write(error)
             }
-        };
+        })?;
+        let identity = crate::platform::private_file_identity(&temporary)
+            .map_err(ReceiptStoreError::Security)?;
+        let mut published = false;
+        let result = (|| {
+            let preparation: Result<(), ReceiptStoreError> = (|| {
+                let midpoint = serialized.len() / 2;
+                file.write_all(&serialized[..midpoint])
+                    .map_err(ReceiptStoreError::Write)?;
+                self.inject_pending_publication_intent_interruption(
+                    PendingPublicationIntentInterruptionPoint::DuringWrite,
+                )?;
+                file.write_all(&serialized[midpoint..])
+                    .map_err(ReceiptStoreError::Write)?;
+                file.flush().map_err(ReceiptStoreError::Write)?;
+                file.sync_all().map_err(ReceiptStoreError::Write)?;
+                crate::platform::verify_private_file_security(&temporary, self.owner, &self.worker)
+                    .map_err(ReceiptStoreError::Security)?;
+                let mut verified = crate::platform::open_verified_private_file_for_read(
+                    &temporary,
+                    self.owner,
+                    &self.worker,
+                    identity,
+                )
+                .map_err(ReceiptStoreError::Security)?;
+                let mut verified_bytes = Vec::new();
+                verified
+                    .read_to_end(&mut verified_bytes)
+                    .map_err(ReceiptStoreError::Read)?;
+                if verified_bytes != serialized
+                    || PendingPublicationIntentDocument::from_json(&verified_bytes)? != document
+                {
+                    return Err(ReceiptStoreError::IntentConflict);
+                }
+                Ok(())
+            })();
+            drop(file);
+            preparation?;
+            match crate::platform::private_file_identity(&path) {
+                Ok(_) => return Err(ReceiptStoreError::IntentConflict),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(ReceiptStoreError::Security(error)),
+            }
+            self.inject_pending_publication_intent_interruption(
+                PendingPublicationIntentInterruptionPoint::BeforePublish,
+            )?;
+            // A same-directory hard link publishes the already-fsynced inode
+            // atomically without replacing evidence that appeared after the
+            // absence check. The receipt lock excludes cooperating writers;
+            // system scope additionally excludes the selected worker.
+            fs::hard_link(&temporary, &path).map_err(|error| {
+                if error.kind() == std::io::ErrorKind::AlreadyExists {
+                    ReceiptStoreError::IntentConflict
+                } else {
+                    ReceiptStoreError::Write(error)
+                }
+            })?;
+            published = true;
+            self.inject_pending_publication_intent_interruption(
+                PendingPublicationIntentInterruptionPoint::AfterPublish,
+            )?;
+            // Make the final link durable before removing the deterministic
+            // temporary link. A crash between these operations leaves two
+            // names for the same complete, verified inode.
+            crate::platform::sync_parent_directory(directory).map_err(ReceiptStoreError::Write)?;
+            let mut verified = crate::platform::open_verified_private_file_for_read(
+                &path,
+                self.owner,
+                &self.worker,
+                identity,
+            )
+            .map_err(ReceiptStoreError::Security)?;
+            let mut verified_bytes = Vec::new();
+            verified
+                .read_to_end(&mut verified_bytes)
+                .map_err(ReceiptStoreError::Read)?;
+            if verified_bytes != serialized
+                || PendingPublicationIntentDocument::from_json(&verified_bytes)? != document
+            {
+                return Err(ReceiptStoreError::IntentConflict);
+            }
+            drop(verified);
+            self.inject_pending_publication_intent_interruption(
+                PendingPublicationIntentInterruptionPoint::AfterDurablePublish,
+            )?;
+            self.remove_created_private_file(&temporary, identity)?;
+            Ok(())
+        })();
+        if let Err(error) = result {
+            let preserve_for_recovery = {
+                #[cfg(test)]
+                {
+                    matches!(
+                        self.pending_publication_intent_interruption,
+                        Some(PendingPublicationIntentInterruption::CrashAfterDurablePublish)
+                    )
+                }
+                #[cfg(not(test))]
+                {
+                    false
+                }
+            };
+            if !preserve_for_recovery {
+                if published {
+                    let _ = self.remove_created_private_file(&path, identity);
+                }
+                let _ = self.remove_created_private_file(&temporary, identity);
+            }
+            return Err(error);
+        }
         Ok(PendingPublicationIntent {
             document,
             path,
@@ -1297,26 +1524,93 @@ impl ReceiptStore {
         })
     }
 
+    fn inject_pending_publication_intent_interruption(
+        &self,
+        _point: PendingPublicationIntentInterruptionPoint,
+    ) -> Result<(), ReceiptStoreError> {
+        #[cfg(test)]
+        match &self.pending_publication_intent_interruption {
+            Some(PendingPublicationIntentInterruption::Fail(point)) if *point == _point => {
+                return Err(ReceiptStoreError::Write(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "injected pending publication intent interruption",
+                )));
+            }
+            Some(PendingPublicationIntentInterruption::Pause {
+                point,
+                entered,
+                resume,
+            }) if *point == _point => {
+                entered.wait();
+                resume.wait();
+            }
+            Some(PendingPublicationIntentInterruption::CrashAfterDurablePublish)
+                if _point == PendingPublicationIntentInterruptionPoint::AfterDurablePublish =>
+            {
+                return Err(ReceiptStoreError::Write(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "injected crash after durable pending intent publication",
+                )));
+            }
+            _ => {}
+        }
+        Ok(())
+    }
+
     fn remove_pending_publication_intent(
         &self,
         intent: PendingPublicationIntent,
     ) -> Result<(), ReceiptStoreError> {
+        self.remove_created_private_file(&intent.path, intent.identity)
+    }
+
+    fn remove_created_private_file(
+        &self,
+        path: &Path,
+        identity: crate::platform::PrivateFileIdentity,
+    ) -> Result<(), ReceiptStoreError> {
         let removal = crate::platform::prepare_verified_private_file_removal(
-            &intent.path,
+            path,
             self.owner,
             &self.worker,
-            intent.identity,
+            identity,
         )
         .map_err(ReceiptStoreError::Security)?;
         crate::platform::consume_verified_private_file(removal)
             .map_err(ReceiptStoreError::Write)?;
         crate::platform::sync_parent_directory(
-            intent
-                .path
-                .parent()
-                .ok_or(ReceiptStoreError::InvalidDestination)?,
+            path.parent().ok_or(ReceiptStoreError::InvalidDestination)?,
         )
         .map_err(ReceiptStoreError::Write)
+    }
+
+    fn pending_publication_temporary_path(&self, publication_id: &ReceiptEntryId) -> PathBuf {
+        self.path
+            .parent()
+            .unwrap_or_else(|| Path::new(""))
+            .join(format!(
+                ".receipt.json.pending-publication.{}.tmp",
+                publication_id.as_str()
+            ))
+    }
+
+    fn remove_bound_pending_publication_temporary(
+        &self,
+        intent: &PendingPublicationIntent,
+    ) -> Result<(), ReceiptStoreError> {
+        let temporary =
+            self.pending_publication_temporary_path(&intent.document.publication.publication_id);
+        let identity = match crate::platform::private_file_identity(&temporary) {
+            Ok(identity) => identity,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(ReceiptStoreError::Security(error)),
+        };
+        if identity != intent.identity {
+            return Err(ReceiptStoreError::IntentConflict);
+        }
+        // Never scan or unlink an arbitrary temporary. This exact path is
+        // derived from the validated intent and must still name its inode.
+        self.remove_created_private_file(&temporary, identity)
     }
 
     fn validate_destination_policy(&self) -> Result<&Path, ReceiptStoreError> {
@@ -1858,7 +2152,10 @@ impl ReceiptPendingPublicationSession<'_> {
             .map(|canonical| manifest_digest(canonical.as_bytes()));
         if current_digest == Some(document.after_manifest_sha256.clone()) {
             // The candidate is already durable. Never rewrite it during
-            // recovery; only finish the receipt checkpoint.
+            // recovery. Re-sync its parent before finishing the receipt
+            // checkpoint because a prior replacement may have returned before
+            // the directory entry became durable.
+            manifest_session.synchronize_parent()?;
         } else if current_digest == document.before_manifest_sha256 {
             let candidate = manifest_session.stored_candidate(&document.candidate_manifest)?;
             if candidate.machine_id().to_string() != document.machine_id.as_str()

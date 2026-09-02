@@ -598,6 +598,8 @@ enum ManifestSecurity {
     #[cfg(test)]
     FailPendingBeforeReplace,
     #[cfg(test)]
+    FailPendingParentSync,
+    #[cfg(test)]
     DirectoryPublicationRace,
     #[cfg(test)]
     DirectoryPublicationAndCleanupFailure,
@@ -856,6 +858,24 @@ impl MachineManifestStore {
             path,
             trusted_root,
             security: ManifestSecurity::FailPendingBeforeReplace,
+            destination_origin: DestinationOrigin::Test,
+        }
+    }
+
+    #[cfg(all(test, not(target_os = "windows")))]
+    #[allow(dead_code)]
+    pub(crate) fn new_with_failing_pending_parent_sync(path: impl Into<PathBuf>) -> Self {
+        let path = path.into();
+        let trusted_root = path
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_default();
+        Self {
+            scope: platform::InstallationScope::System,
+            principal: fixture_worker_principal(),
+            path,
+            trusted_root,
+            security: ManifestSecurity::FailPendingParentSync,
             destination_origin: DestinationOrigin::Test,
         }
     }
@@ -1396,6 +1416,7 @@ impl MachineManifestStore {
             ManifestSecurity::CurrentProcess
             | ManifestSecurity::FailBeforeReplace
             | ManifestSecurity::FailPendingBeforeReplace
+            | ManifestSecurity::FailPendingParentSync
             | ManifestSecurity::DirectoryPublicationRace
             | ManifestSecurity::DirectoryPublicationAndCleanupFailure => {
                 platform::ManifestOwner::CurrentProcess
@@ -1555,7 +1576,22 @@ impl PendingManifestPublicationSession<'_> {
         &self,
         candidate: &PendingManifestCandidate,
     ) -> Result<(), ManifestError> {
-        self.store.write_manifest(&candidate.manifest)
+        self.store.write_manifest(&candidate.manifest)?;
+        self.synchronize_parent()
+    }
+
+    pub(crate) fn synchronize_parent(&self) -> Result<(), ManifestError> {
+        #[cfg(all(test, not(target_os = "windows")))]
+        if matches!(self.store.security, ManifestSecurity::FailPendingParentSync) {
+            return Err(ManifestError::Write(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "injected pending manifest parent synchronization failure",
+            )));
+        }
+        let parent = self.store.path.parent().ok_or_else(|| {
+            ManifestError::Validation("manifest path has no parent directory".to_owned())
+        })?;
+        platform::sync_parent_directory(parent).map_err(ManifestError::Write)
     }
 }
 
