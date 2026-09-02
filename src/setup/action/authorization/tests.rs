@@ -49,6 +49,29 @@ fn native_authorization_classifies_denial_launch_failure_and_child_exit() {
 }
 
 #[test]
+fn authorization_policy_has_only_interactive_or_explicit_noninteractive_grants() {
+    assert!(
+        !AuthorizationOptions::from_policy(SystemAuthorizationPolicy::NotGranted, false)
+            .unwrap()
+            .should_invoke()
+    );
+    for policy in [
+        SystemAuthorizationPolicy::InteractiveConsent,
+        SystemAuthorizationPolicy::ExplicitNoninteractive,
+    ] {
+        assert!(AuthorizationOptions::from_policy(policy, false)
+            .unwrap()
+            .should_invoke());
+        assert!(AuthorizationOptions::from_policy(policy, true).is_err());
+    }
+    assert!(
+        !AuthorizationOptions::from_policy(SystemAuthorizationPolicy::NotGranted, true)
+            .unwrap()
+            .should_invoke()
+    );
+}
+
+#[test]
 fn ordinary_user_plan_applies_and_reruns_without_authorization() {
     let fixture = AuthorizationFixture::new("ordinary-only");
     let store = ReceiptStore::new_user_for_test(fixture.user_receipt());

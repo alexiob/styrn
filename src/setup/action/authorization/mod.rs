@@ -83,6 +83,14 @@ enum PrivilegeConsent {
     Granted,
 }
 
+#[allow(dead_code)] // T0.20 maps the one prompt or explicit flag to this policy.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum SystemAuthorizationPolicy {
+    NotGranted,
+    InteractiveConsent,
+    ExplicitNoninteractive,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct AuthorizationOptions {
     consent: PrivilegeConsent,
@@ -90,6 +98,24 @@ pub(super) struct AuthorizationOptions {
 }
 
 impl AuthorizationOptions {
+    pub(super) fn from_policy(
+        policy: SystemAuthorizationPolicy,
+        no_elevate: bool,
+    ) -> Result<Self, AuthorizationError> {
+        let consent = match policy {
+            SystemAuthorizationPolicy::NotGranted => PrivilegeConsent::NotGranted,
+            SystemAuthorizationPolicy::InteractiveConsent
+            | SystemAuthorizationPolicy::ExplicitNoninteractive => PrivilegeConsent::Granted,
+        };
+        if no_elevate && consent == PrivilegeConsent::Granted {
+            return Err(AuthorizationError::RequestInvalid);
+        }
+        Ok(Self {
+            consent,
+            no_elevate,
+        })
+    }
+
     #[cfg(test)]
     fn noninteractive_yes() -> Self {
         Self::pending()
@@ -107,10 +133,7 @@ impl AuthorizationOptions {
 
     #[cfg(test)]
     fn interactive_no_elevate() -> Self {
-        Self {
-            consent: PrivilegeConsent::NotGranted,
-            no_elevate: true,
-        }
+        Self::from_policy(SystemAuthorizationPolicy::NotGranted, true).unwrap()
     }
 
     #[cfg(test)]
@@ -130,18 +153,12 @@ impl AuthorizationOptions {
 
     #[cfg(test)]
     fn pending() -> Self {
-        Self {
-            consent: PrivilegeConsent::NotGranted,
-            no_elevate: false,
-        }
+        Self::from_policy(SystemAuthorizationPolicy::NotGranted, false).unwrap()
     }
 
     #[cfg(test)]
     fn authorized() -> Self {
-        Self {
-            consent: PrivilegeConsent::Granted,
-            no_elevate: false,
-        }
+        Self::from_policy(SystemAuthorizationPolicy::InteractiveConsent, false).unwrap()
     }
 
     fn should_invoke(self) -> bool {
