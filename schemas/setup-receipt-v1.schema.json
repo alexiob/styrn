@@ -4,16 +4,35 @@
   "title": "Styrn setup receipt v1",
   "description": "Append-only ownership journal for finalized setup actions. Normative source: docs/design.md Part 15.6.1.",
   "type": "object",
-  "required": ["schema_version", "entries"],
+  "required": ["schema_version", "installation_scope", "entries"],
   "additionalProperties": false,
   "properties": {
     "schema_version": { "const": 1 },
+    "installation_scope": { "enum": ["user", "system"] },
     "entries": {
       "type": "array",
       "description": "Entry IDs are additionally checked across the complete array, and resource ownership conflicts are checked within each entry by the runtime semantic validator.",
       "items": { "$ref": "#/$defs/entry" }
     }
   },
+  "allOf": [
+    {
+      "if": {
+        "properties": { "installation_scope": { "const": "user" } },
+        "required": ["installation_scope"]
+      },
+      "then": {
+        "properties": {
+          "entries": {
+            "items": {
+              "properties": { "privilege_used": { "const": "none" } },
+              "required": ["privilege_used"]
+            }
+          }
+        }
+      }
+    }
+  ],
   "$defs": {
     "entry": {
       "type": "object",

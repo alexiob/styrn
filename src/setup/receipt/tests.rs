@@ -5,6 +5,7 @@ use std::{fs, path::PathBuf};
 #[cfg(not(target_os = "windows"))]
 const COMPLETE_RECEIPT: &str = r#"{
   "schema_version": 1,
+  "installation_scope": "system",
   "entries": [
     {
       "entry_id": "019cafd0-5c00-7000-8000-000000000001",
@@ -54,6 +55,7 @@ const COMPLETE_RECEIPT: &str = r#"{
 #[cfg(target_os = "windows")]
 const COMPLETE_RECEIPT: &str = r#"{
   "schema_version": 1,
+  "installation_scope": "system",
   "entries": [
     {
       "entry_id": "019cafd0-5c00-7000-8000-000000000001",
@@ -121,6 +123,39 @@ fn complete_v1_document_validates_and_round_trips_deterministically() {
 }
 
 #[test]
+fn rev_h_installation_scope_is_required_and_user_scope_is_rootless() {
+    let base = serde_json::from_str::<serde_json::Value>(COMPLETE_RECEIPT).unwrap();
+
+    let mut system = base.clone();
+    system["installation_scope"] = serde_json::json!("system");
+    let system = ReceiptDocument::from_json(&serde_json::to_vec(&system).unwrap()).unwrap();
+    assert_eq!(system.installation_scope(), InstallationScope::System);
+
+    let mut user = base.clone();
+    user["installation_scope"] = serde_json::json!("user");
+    user["entries"][0]["privilege_used"] = serde_json::json!("none");
+    let user = ReceiptDocument::from_json(&serde_json::to_vec(&user).unwrap()).unwrap();
+    assert_eq!(user.installation_scope(), InstallationScope::User);
+
+    let mut missing = base.clone();
+    missing
+        .as_object_mut()
+        .unwrap()
+        .remove("installation_scope");
+    assert_eq!(
+        ReceiptDocument::from_json(&serde_json::to_vec(&missing).unwrap()).unwrap_err(),
+        ReceiptError::MissingInstallationScope
+    );
+
+    let mut privileged_user = base;
+    privileged_user["installation_scope"] = serde_json::json!("user");
+    assert_eq!(
+        ReceiptDocument::from_json(&serde_json::to_vec(&privileged_user).unwrap()).unwrap_err(),
+        ReceiptError::PrivilegeOutsideScope
+    );
+}
+
+#[test]
 fn checked_in_schema_example_and_canonical_serialization_stay_synchronized() {
     let schema: serde_json::Value = serde_json::from_str(include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -154,6 +189,13 @@ fn checked_in_schema_example_and_canonical_serialization_stay_synchronized() {
             .collect::<Vec<_>>();
         assert!(errors.is_empty(), "receipt schema drift: {errors:#?}");
     }
+
+    let mut privileged_user = serde_json::from_str::<serde_json::Value>(COMPLETE_RECEIPT).unwrap();
+    privileged_user["installation_scope"] = serde_json::json!("user");
+    assert!(
+        !validator.is_valid(&privileged_user),
+        "schema allowed a user-scope receipt to claim privileged mutation"
+    );
 
     let mut windows_shape = serde_json::from_str::<serde_json::Value>(COMPLETE_RECEIPT).unwrap();
     windows_shape["entries"][0]["files_created"][0]["path"] =
@@ -470,7 +512,7 @@ fn secure_store_atomically_appends_and_reads_one_complete_entry() {
 
     store.append_entry(entry.clone()).unwrap();
 
-    let document = store.read().unwrap();
+    let document = store.read_snapshot().unwrap();
     assert_eq!(document.entries, vec![entry]);
     assert_eq!(
         fs::read(fixture.receipt_path()).unwrap(),
@@ -546,7 +588,7 @@ fn held_verified_reader_observes_one_complete_prefix_and_does_not_block_replacem
             .len(),
         1
     );
-    assert_eq!(store.read().unwrap().entry_count(), 2);
+    assert_eq!(store.read_snapshot().unwrap().entry_count(), 2);
 }
 
 #[test]
@@ -569,7 +611,7 @@ fn concurrent_appenders_serialize_without_lost_or_duplicate_entries() {
         }
     });
 
-    let document = store.read().unwrap();
+    let document = store.read_snapshot().unwrap();
     assert_eq!(document.entries.len(), 9);
     assert_eq!(document.entries[0], base);
     let ids = document
@@ -602,7 +644,7 @@ fn concurrent_first_use_publishers_join_the_winner_and_preserve_every_append() {
     });
 
     let document = ReceiptStore::new_for_test(fixture.receipt_path())
-        .read()
+        .read_snapshot()
         .unwrap();
     assert_eq!(document.entries().len(), 8);
     assert_eq!(
@@ -724,7 +766,7 @@ fn recorded_paths_must_use_the_native_platform_syntax() {
 }
 
 #[test]
-fn receipt_read_does_not_join_the_private_writer_lock() {
+fn receipt_snapshot_does_not_join_the_private_writer_lock() {
     let fixture = ReceiptFixture::new("lock-free-read");
     let store = ReceiptStore::new_for_test(fixture.receipt_path());
     store
@@ -745,7 +787,7 @@ fn receipt_read_does_not_join_the_private_writer_lock() {
 
     std::thread::scope(|scope| {
         scope.spawn(|| {
-            sender.send(store.read()).unwrap();
+            sender.send(store.read_snapshot()).unwrap();
         });
         assert_eq!(
             receiver
@@ -764,7 +806,7 @@ fn read_with_no_receipt_or_lock_is_empty_and_does_not_create_state() {
     let fixture = ReceiptFixture::new("empty-read-no-state");
     let store = ReceiptStore::new_for_test(fixture.receipt_path());
 
-    assert!(store.read().unwrap().entries().is_empty());
+    assert!(store.read_snapshot().unwrap().entries().is_empty());
     assert!(fs::read_dir(fixture.receipt_path().parent().unwrap())
         .unwrap()
         .next()
@@ -783,7 +825,7 @@ fn an_existing_receipt_without_its_persistent_lock_is_a_conflict_not_repaired() 
     let before = fs::read(fixture.receipt_path()).unwrap();
 
     let error = ReceiptStore::new_for_test(fixture.receipt_path())
-        .read()
+        .read_snapshot()
         .unwrap_err();
 
     assert!(matches!(error, ReceiptStoreError::IntentConflict));
@@ -800,18 +842,34 @@ fn an_existing_receipt_without_its_persistent_lock_is_a_conflict_not_repaired() 
 fn canonical_receipt_location_matches_the_native_platform_contract() {
     #[cfg(target_os = "linux")]
     assert_eq!(
-        canonical_receipt_path(),
+        canonical_receipt_path(InstallationScope::System).unwrap(),
         PathBuf::from("/var/lib/styrn/receipt.json")
     );
     #[cfg(target_os = "macos")]
     assert_eq!(
-        canonical_receipt_path(),
+        canonical_receipt_path(InstallationScope::System).unwrap(),
         PathBuf::from("/Library/Application Support/Styrn/receipt.json")
     );
     #[cfg(target_os = "windows")]
     assert_eq!(
-        canonical_receipt_path(),
+        canonical_receipt_path(InstallationScope::System).unwrap(),
         PathBuf::from(r"C:\ProgramData\Styrn\receipt.json")
+    );
+
+    #[cfg(target_os = "linux")]
+    let expected_user = std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(std::env::var_os("HOME").unwrap()).join(".local/state"))
+        .join("styrn/receipt.json");
+    #[cfg(target_os = "macos")]
+    let expected_user = PathBuf::from(std::env::var_os("HOME").unwrap())
+        .join("Library/Application Support/Styrn/receipt.json");
+    #[cfg(target_os = "windows")]
+    let expected_user =
+        PathBuf::from(std::env::var_os("LOCALAPPDATA").unwrap()).join(r"Styrn\receipt.json");
+    assert_eq!(
+        canonical_receipt_path(InstallationScope::User).unwrap(),
+        expected_user
     );
 }
 
@@ -819,13 +877,196 @@ fn canonical_receipt_location_matches_the_native_platform_contract() {
 fn canonical_store_requires_an_explicit_valid_worker_principal() {
     for principal in ["", "worker\0name", "worker\nname"] {
         assert!(matches!(
-            ReceiptStore::new_canonical(canonical_receipt_path(), principal),
+            ReceiptStore::new_system(
+                canonical_receipt_path(InstallationScope::System).unwrap(),
+                principal
+            ),
             Err(ReceiptStoreError::InvalidWorkerPrincipal)
         ));
     }
 
-    let store = configured_receipt_store("build-agent").unwrap();
-    assert_eq!(store.worker.as_str(), "build-agent");
+    let store = configured_system_receipt_store("build-agent").unwrap();
+    assert_eq!(store.worker.as_ref().unwrap().as_str(), "build-agent");
+    assert_eq!(store.scope, InstallationScope::System);
+
+    let user = configured_receipt_store().unwrap();
+    assert!(user.worker.is_none());
+    assert_eq!(user.scope, InstallationScope::User);
+}
+
+#[test]
+fn ordinary_user_scope_creates_a_restricted_rootless_journal() {
+    let fixture = MissingDestinationFixture::new("user-scope");
+    let store = ReceiptStore::new_user_for_test(fixture.receipt_path());
+    let mut entry = entry_with_id("019cafd0-5c00-7000-8000-000000000001");
+    entry.privilege_used = ReceiptPrivilege::None;
+
+    store.append_entry(entry).unwrap();
+
+    let snapshot = store.read_snapshot().unwrap();
+    assert_eq!(snapshot.installation_scope(), InstallationScope::User);
+    assert_eq!(snapshot.entry_count(), 1);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            fs::metadata(fixture.receipt_path().parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777,
+            0o700
+        );
+        for path in [
+            fixture.receipt_path().to_path_buf(),
+            fixture
+                .receipt_path()
+                .parent()
+                .unwrap()
+                .join(".receipt.json.lock"),
+        ] {
+            assert_eq!(
+                fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+}
+
+#[test]
+fn user_scope_creates_a_missing_standard_state_root_from_a_secure_user_anchor() {
+    let fixture = MissingDestinationFixture::new("missing-user-state-root");
+    let receipt = fixture
+        .root
+        .join("state")
+        .join("styrn")
+        .join("receipt.json");
+    let store = ReceiptStore::new_user_for_test(&receipt);
+    let mut entry = entry_with_id("019cafd0-5c00-7000-8000-000000000001");
+    entry.privilege_used = ReceiptPrivilege::None;
+
+    store.append_entry(entry).unwrap();
+
+    assert_eq!(store.read_snapshot().unwrap().entry_count(), 1);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for directory in [fixture.root.join("state"), fixture.root.join("state/styrn")] {
+            assert_eq!(
+                fs::metadata(directory).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn user_scope_rejects_cross_user_writable_trusted_state_root_without_partial_state() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = MissingDestinationFixture::new("user-insecure-state-root");
+    let trusted_root = fixture.receipt_path().parent().unwrap().parent().unwrap();
+    fs::set_permissions(trusted_root, fs::Permissions::from_mode(0o777)).unwrap();
+    let store = ReceiptStore::new_user_for_test(fixture.receipt_path());
+    let mut entry = entry_with_id("019cafd0-5c00-7000-8000-000000000001");
+    entry.privilege_used = ReceiptPrivilege::None;
+
+    let error = store.append_entry(entry).unwrap_err();
+
+    assert_eq!(error.error_code(), "setup.receipt_conflict");
+    assert_eq!(error.exit_code(), 13);
+    assert!(!fixture.receipt_path().parent().unwrap().exists());
+    assert_eq!(
+        fs::metadata(trusted_root).unwrap().permissions().mode() & 0o777,
+        0o777
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn user_scope_rejects_secure_trusted_root_beneath_non_sticky_writable_parent() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = MissingDestinationFixture::new("user-insecure-state-parent");
+    let insecure_parent = fixture.root.join("cross-principal-parent");
+    let trusted_root = insecure_parent.join("state");
+    fs::create_dir_all(&trusted_root).unwrap();
+    fs::set_permissions(&insecure_parent, fs::Permissions::from_mode(0o777)).unwrap();
+    fs::set_permissions(&trusted_root, fs::Permissions::from_mode(0o700)).unwrap();
+    let receipt = trusted_root.join("styrn/receipt.json");
+    let store = ReceiptStore::new_user_for_test(&receipt);
+    let mut entry = entry_with_id("019cafd0-5c00-7000-8000-000000000001");
+    entry.privilege_used = ReceiptPrivilege::None;
+
+    let error = store.append_entry(entry).unwrap_err();
+
+    assert_eq!(error.error_code(), "setup.receipt_conflict");
+    assert_eq!(error.exit_code(), 13);
+    assert!(!trusted_root.join("styrn").exists());
+    assert_eq!(
+        fs::metadata(&insecure_parent).unwrap().permissions().mode() & 0o777,
+        0o777
+    );
+    assert_eq!(
+        fs::metadata(&trusted_root).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn user_scope_accepts_secure_trusted_root_beneath_sticky_shared_parent() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = MissingDestinationFixture::new("user-sticky-state-parent");
+    let sticky_parent = fixture.root.join("sticky-parent");
+    let trusted_root = sticky_parent.join("state");
+    fs::create_dir_all(&trusted_root).unwrap();
+    fs::set_permissions(&sticky_parent, fs::Permissions::from_mode(0o1777)).unwrap();
+    fs::set_permissions(&trusted_root, fs::Permissions::from_mode(0o700)).unwrap();
+    let receipt = trusted_root.join("styrn/receipt.json");
+    let store = ReceiptStore::new_user_for_test(&receipt);
+    let mut entry = entry_with_id("019cafd0-5c00-7000-8000-000000000001");
+    entry.privilege_used = ReceiptPrivilege::None;
+
+    store.append_entry(entry).unwrap();
+
+    assert_eq!(store.read_snapshot().unwrap().entry_count(), 1);
+}
+
+#[test]
+fn selected_store_scope_rejects_a_document_from_the_other_scope_without_rewrite() {
+    let fixture = MissingDestinationFixture::new("scope-mismatch");
+    fs::create_dir_all(fixture.receipt_path().parent().unwrap()).unwrap();
+    crate::platform::harden_manifest_directory(
+        fixture.receipt_path().parent().unwrap(),
+        crate::platform::ManifestOwner::User,
+        "",
+    )
+    .unwrap();
+    let bytes = COMPLETE_RECEIPT.as_bytes();
+    fs::write(fixture.receipt_path(), bytes).unwrap();
+    crate::platform::harden_manifest_file(
+        fixture.receipt_path(),
+        crate::platform::ManifestOwner::User,
+        "",
+    )
+    .unwrap();
+    let lock = fixture
+        .receipt_path()
+        .parent()
+        .unwrap()
+        .join(".receipt.json.lock");
+    drop(
+        crate::platform::create_private_file(&lock, crate::platform::ManifestOwner::User).unwrap(),
+    );
+    let store = ReceiptStore::new_user_for_test(fixture.receipt_path());
+
+    let error = store.read_snapshot().unwrap_err();
+
+    assert!(matches!(error, ReceiptStoreError::ScopeMismatch));
+    assert_eq!(fs::read(fixture.receipt_path()).unwrap(), bytes);
 }
 
 #[test]
@@ -881,7 +1122,9 @@ fn receipt_targets_reject_symlinks_fifos_and_directories_without_rewrite() {
             _ => unreachable!(),
         }
 
-        let error = ReceiptStore::new_for_test(path).read().unwrap_err();
+        let error = ReceiptStore::new_for_test(path)
+            .read_snapshot()
+            .unwrap_err();
 
         assert!(matches!(error, ReceiptStoreError::Security(_)));
         assert_eq!(error.error_code(), "setup.receipt_conflict");
@@ -1003,7 +1246,7 @@ fn real_selected_worker_can_read_but_cannot_mutate_replace_or_take_over_receipt(
         "/Library/Application Support/Styrn Receipt Test {nonce}"
     ));
     let receipt = directory.join("receipt.json");
-    let store = ReceiptStore::new_canonical(&receipt, &worker).unwrap();
+    let store = ReceiptStore::new_system(&receipt, &worker).unwrap();
     store
         .append_entry(entry_with_id("019cafd0-5c00-7000-8000-000000000001"))
         .unwrap();
@@ -1038,7 +1281,7 @@ fn real_selected_worker_can_read_but_cannot_mutate_replace_or_take_over_receipt(
         } == 0;
         let gid_ok = unsafe { libc::setgid(gid) } == 0;
         let uid_ok = unsafe { libc::setuid(uid) } == 0;
-        let readable = store.read().is_ok();
+        let readable = store.read_snapshot().is_ok();
         let lock_denied = fs::File::open(directory.join(".receipt.json.lock"))
             .is_err_and(|error| error.kind() == std::io::ErrorKind::PermissionDenied);
         let intent_denied = fs::File::open(&private_intent)

@@ -171,11 +171,14 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc, Mutex,
 };
+#[cfg(test)]
+use std::{fs, path::Path};
 
 #[cfg(test)]
 #[derive(Clone)]
 pub(super) struct TestMetrics {
     check_calls: Arc<AtomicUsize>,
+    prepare_calls: Arc<AtomicUsize>,
     mutation_calls: Arc<AtomicUsize>,
 }
 
@@ -187,6 +190,10 @@ impl TestMetrics {
 
     pub(super) fn mutation_calls(&self) -> usize {
         self.mutation_calls.load(Ordering::SeqCst)
+    }
+
+    pub(super) fn prepare_calls(&self) -> usize {
+        self.prepare_calls.load(Ordering::SeqCst)
     }
 }
 
@@ -371,6 +378,10 @@ pub(crate) struct TestAction {
 #[derive(Clone)]
 enum TestBehavior {
     StateDriven,
+    DynamicFile {
+        path: std::path::PathBuf,
+        replacement: Vec<u8>,
+    },
     NeedsHuman(NeedsHuman),
     CheckFailure,
     ApplyFailure,
@@ -453,13 +464,40 @@ mod gate {
         }
 
         #[cfg(test)]
+        pub(super) fn test_dynamic_file_modification(
+            name: &str,
+            path: std::path::PathBuf,
+        ) -> (Self, TestMetrics) {
+            Self::test_action(
+                name,
+                1,
+                Privilege::None,
+                Arc::new(Mutex::new(Vec::new())),
+                TestBehavior::DynamicFile {
+                    path,
+                    replacement: b"after-state\n".to_vec(),
+                },
+            )
+        }
+
+        #[cfg(test)]
         pub(super) fn test_needs_human(
             privilege: Privilege,
             state: Arc<Mutex<Vec<u8>>>,
             needs_human: NeedsHuman,
         ) -> (Self, TestMetrics) {
+            Self::test_named_needs_human("test.state", privilege, state, needs_human)
+        }
+
+        #[cfg(test)]
+        pub(super) fn test_named_needs_human(
+            name: &str,
+            privilege: Privilege,
+            state: Arc<Mutex<Vec<u8>>>,
+            needs_human: NeedsHuman,
+        ) -> (Self, TestMetrics) {
             Self::test_action(
-                "test.state",
+                name,
                 1,
                 privilege,
                 state,
@@ -505,6 +543,7 @@ mod gate {
         ) -> (Self, TestMetrics) {
             let metrics = TestMetrics {
                 check_calls: Arc::new(AtomicUsize::new(0)),
+                prepare_calls: Arc::new(AtomicUsize::new(0)),
                 mutation_calls: Arc::new(AtomicUsize::new(0)),
             };
             let action = TestAction {
@@ -543,6 +582,15 @@ mod gate {
                                 Ok(ActionCheck::Todo)
                             }
                         }
+                        TestBehavior::DynamicFile { path, replacement } => fs::read(path)
+                            .map(|contents| {
+                                if contents == *replacement {
+                                    ActionCheck::Done
+                                } else {
+                                    ActionCheck::Todo
+                                }
+                            })
+                            .map_err(|_| ActionError::check_failed(action.name.clone())),
                         TestBehavior::NeedsHuman(needs_human) => {
                             Ok(ActionCheck::NeedsHuman(needs_human.clone()))
                         }
@@ -590,7 +638,14 @@ mod gate {
             match self {
                 Self::Foundation(action) => Err(ActionError::apply_failed(action.name.clone())),
                 #[cfg(test)]
-                Self::Test(action) => Ok((*action.effect).clone()),
+                Self::Test(action) => {
+                    action.metrics.prepare_calls.fetch_add(1, Ordering::SeqCst);
+                    match &action.behavior {
+                        TestBehavior::DynamicFile { path, .. } => dynamic_file_effect(path)
+                            .ok_or_else(|| ActionError::apply_failed(action.name.clone())),
+                        _ => Ok((*action.effect).clone()),
+                    }
+                }
             }
         }
 
@@ -631,10 +686,48 @@ mod gate {
                 if matches!(action.behavior, TestBehavior::ApplyFailure) {
                     return Err(ActionError::apply_failed(action.name.clone()));
                 }
+                if let TestBehavior::DynamicFile { path, replacement } = &action.behavior {
+                    let effect = dynamic_file_effect(path)
+                        .ok_or_else(|| ActionError::apply_failed(action.name.clone()))?;
+                    let before = fs::read(path)
+                        .map_err(|_| ActionError::apply_failed(action.name.clone()))?;
+                    fs::write(dynamic_backup_path(path), before)
+                        .and_then(|()| fs::write(path, replacement))
+                        .map_err(|_| ActionError::apply_failed(action.name.clone()))?;
+                    return Ok(effect);
+                }
                 action.state.lock().unwrap().push(action.marker);
                 Ok((*action.effect).clone())
             }
         }
+    }
+
+    #[cfg(test)]
+    fn dynamic_file_effect(path: &Path) -> Option<ActionEffect> {
+        let contents = fs::read(path).ok()?;
+        let before_sha256 = match contents.as_slice() {
+            b"before-state\n" => "b40af702b6375903b1e09c6c851d1828ac225b5356aef2c1c60e308efaf89944",
+            b"after-state\n" => "e540ab86e563981f2e832b9162298afa4877a49f2eea547eb59bda35008e4f80",
+            _ => return None,
+        };
+        Some(ActionEffect {
+            files_created: Vec::new(),
+            files_modified: vec![ModifiedFileEffect {
+                path: path.to_string_lossy().into_owned(),
+                before_sha256: before_sha256.to_owned(),
+                backup_path: dynamic_backup_path(path).to_string_lossy().into_owned(),
+            }],
+            services: Vec::new(),
+            accounts: Vec::new(),
+            registry_keys: Vec::new(),
+            firewall_rules: Vec::new(),
+            download_provenance: None,
+        })
+    }
+
+    #[cfg(test)]
+    fn dynamic_backup_path(path: &Path) -> std::path::PathBuf {
+        path.with_extension("styrn-backup")
     }
 }
 

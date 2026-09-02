@@ -18,13 +18,15 @@ const SCHEMA_VERSION: u32 = 1;
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub(in crate::setup) struct ReceiptDocument {
     schema_version: u32,
+    installation_scope: InstallationScope,
     entries: Vec<ReceiptEntry>,
 }
 
 impl ReceiptDocument {
-    fn empty() -> Self {
+    fn empty(installation_scope: InstallationScope) -> Self {
         Self {
             schema_version: SCHEMA_VERSION,
+            installation_scope,
             entries: Vec::new(),
         }
     }
@@ -38,6 +40,9 @@ impl ReceiptDocument {
         })?;
         let document = Self {
             schema_version: wire.schema_version,
+            installation_scope: wire
+                .installation_scope
+                .ok_or(ReceiptError::MissingInstallationScope)?,
             entries: wire.entries,
         };
         document.validate()?;
@@ -53,6 +58,10 @@ impl ReceiptDocument {
 
     fn schema_version(&self) -> u32 {
         self.schema_version
+    }
+
+    pub(in crate::setup) fn installation_scope(&self) -> InstallationScope {
+        self.installation_scope
     }
 
     fn entries(&self) -> &[ReceiptEntry] {
@@ -74,6 +83,11 @@ impl ReceiptDocument {
         let mut ids = HashSet::with_capacity(self.entries.len());
         for entry in &self.entries {
             entry.validate()?;
+            if self.installation_scope == InstallationScope::User
+                && entry.privilege_used != ReceiptPrivilege::None
+            {
+                return Err(ReceiptError::PrivilegeOutsideScope);
+            }
             if !ids.insert(entry.entry_id.as_str()) {
                 return Err(ReceiptError::DuplicateEntryId);
             }
@@ -86,19 +100,30 @@ impl ReceiptDocument {
 #[serde(deny_unknown_fields)]
 struct ReceiptDocumentWire {
     schema_version: u32,
+    installation_scope: Option<InstallationScope>,
     entries: Vec<ReceiptEntry>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum InstallationScope {
+    User,
+    System,
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct ReceiptStore {
+    scope: InstallationScope,
     path: PathBuf,
     trusted_root: PathBuf,
     owner: crate::platform::ManifestOwner,
-    worker: WorkerPrincipal,
+    worker: Option<WorkerPrincipal>,
     #[cfg(test)]
     interruption: Option<PublicationInterruption>,
     #[cfg(test)]
     interrupt_after_prepare: bool,
+    #[cfg(test)]
+    intent_read_interruption: Option<IntentReadInterruption>,
 }
 
 pub(crate) struct ReceiptApplySession<'a> {
@@ -124,6 +149,7 @@ pub(in crate::setup) enum ReceiptIntentPhase {
 #[serde(deny_unknown_fields)]
 struct ReceiptIntentDocument {
     schema_version: u32,
+    installation_scope: InstallationScope,
     phase: ReceiptIntentPhase,
     entry: ReceiptEntry,
 }
@@ -132,6 +158,11 @@ impl ReceiptIntentDocument {
     fn validate(&self) -> Result<(), ReceiptError> {
         if self.schema_version != SCHEMA_VERSION {
             return Err(ReceiptError::UnknownSchemaVersion);
+        }
+        if self.installation_scope == InstallationScope::User
+            && self.entry.privilege_used != ReceiptPrivilege::None
+        {
+            return Err(ReceiptError::PrivilegeOutsideScope);
         }
         self.entry.validate()
     }
@@ -161,6 +192,18 @@ enum PublicationInterruption {
     AfterReplace,
 }
 
+#[cfg(test)]
+#[derive(Clone, Debug)]
+enum IntentReadInterruption {
+    #[cfg(unix)]
+    Symlink(PathBuf),
+    #[cfg(unix)]
+    Fifo,
+    #[cfg(windows)]
+    Reparse(PathBuf),
+    Inode,
+}
+
 #[derive(Clone, Debug)]
 struct WorkerPrincipal(String);
 
@@ -182,18 +225,21 @@ impl WorkerPrincipal {
 }
 
 impl ReceiptStore {
-    fn new_canonical(path: impl Into<PathBuf>, worker: &str) -> Result<Self, ReceiptStoreError> {
+    fn new_system(path: impl Into<PathBuf>, worker: &str) -> Result<Self, ReceiptStoreError> {
         let path = path.into();
         let trusted_root = path.parent().map(Path::to_path_buf).unwrap_or_default();
         Ok(Self {
+            scope: InstallationScope::System,
             path,
             trusted_root,
             owner: crate::platform::ManifestOwner::System,
-            worker: WorkerPrincipal::parse(worker)?,
+            worker: Some(WorkerPrincipal::parse(worker)?),
             #[cfg(test)]
             interruption: None,
             #[cfg(test)]
             interrupt_after_prepare: false,
+            #[cfg(test)]
+            intent_read_interruption: None,
         })
     }
 
@@ -202,12 +248,34 @@ impl ReceiptStore {
         let path = path.into();
         let trusted_root = path.parent().map(Path::to_path_buf).unwrap_or_default();
         Self {
+            scope: InstallationScope::System,
             path,
             trusted_root,
             owner: crate::platform::ManifestOwner::CurrentProcess,
-            worker: WorkerPrincipal("fixture-worker".to_owned()),
+            worker: Some(WorkerPrincipal("fixture-worker".to_owned())),
             interruption: None,
             interrupt_after_prepare: false,
+            intent_read_interruption: None,
+        }
+    }
+
+    #[cfg(test)]
+    pub(in crate::setup) fn new_user_for_test(path: impl Into<PathBuf>) -> Self {
+        let path = path.into();
+        let trusted_root = path
+            .parent()
+            .and_then(Path::parent)
+            .map(Path::to_path_buf)
+            .unwrap_or_default();
+        Self {
+            scope: InstallationScope::User,
+            path,
+            trusted_root,
+            owner: crate::platform::ManifestOwner::User,
+            worker: None,
+            interruption: None,
+            interrupt_after_prepare: false,
+            intent_read_interruption: None,
         }
     }
 
@@ -227,20 +295,67 @@ impl ReceiptStore {
     }
 
     #[cfg(test)]
+    pub(in crate::setup) fn new_user_for_test_failing_before_replace(
+        path: impl Into<PathBuf>,
+    ) -> Self {
+        let mut store = Self::new_user_for_test(path);
+        store.interruption = Some(PublicationInterruption::BeforeReplace);
+        store
+    }
+
+    #[cfg(test)]
     pub(in crate::setup) fn new_for_test_failing_after_prepare(path: impl Into<PathBuf>) -> Self {
         let mut store = Self::new_for_test(path);
         store.interrupt_after_prepare = true;
         store
     }
 
-    pub(in crate::setup) fn read(&self) -> Result<ReceiptDocument, ReceiptStoreError> {
+    #[cfg(all(test, unix))]
+    pub(in crate::setup) fn new_for_test_swapping_intent_with_symlink(
+        path: impl Into<PathBuf>,
+        target: PathBuf,
+    ) -> Self {
+        let mut store = Self::new_for_test(path);
+        store.intent_read_interruption = Some(IntentReadInterruption::Symlink(target));
+        store
+    }
+
+    #[cfg(all(test, unix))]
+    pub(in crate::setup) fn new_for_test_swapping_intent_with_fifo(
+        path: impl Into<PathBuf>,
+    ) -> Self {
+        let mut store = Self::new_for_test(path);
+        store.intent_read_interruption = Some(IntentReadInterruption::Fifo);
+        store
+    }
+
+    #[cfg(test)]
+    pub(in crate::setup) fn new_for_test_swapping_intent_inode(path: impl Into<PathBuf>) -> Self {
+        let mut store = Self::new_for_test(path);
+        store.intent_read_interruption = Some(IntentReadInterruption::Inode);
+        store
+    }
+
+    #[cfg(all(test, windows))]
+    pub(in crate::setup) fn new_for_test_swapping_intent_with_reparse(
+        path: impl Into<PathBuf>,
+        target: PathBuf,
+    ) -> Self {
+        let mut store = Self::new_for_test(path);
+        store.intent_read_interruption = Some(IntentReadInterruption::Reparse(target));
+        store
+    }
+
+    /// Returns a lock-free, complete old-or-new snapshot for status and doctor.
+    /// Receipt-driven mutation must use [`ReceiptStore::begin_apply`] instead.
+    pub(in crate::setup) fn read_snapshot(&self) -> Result<ReceiptDocument, ReceiptStoreError> {
         let destination = self.validate_destination_policy()?;
         match fs::symlink_metadata(destination) {
             Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
                 // With no destination directory there is no lock namespace
                 // to join and therefore no existing receipt to observe.
-                return Ok(ReceiptDocument::empty());
+                return Ok(ReceiptDocument::empty(self.scope));
             }
             Err(error) => return Err(ReceiptStoreError::Read(error)),
         }
@@ -248,12 +363,12 @@ impl ReceiptStore {
         let mut receipt = match crate::platform::open_verified_manifest_file_for_read(
             &self.path,
             self.owner,
-            self.worker.as_str(),
+            self.worker_name(),
             &self.trusted_root,
         ) {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(ReceiptDocument::empty());
+                return Ok(ReceiptDocument::empty(self.scope));
             }
             Err(error) => return Err(ReceiptStoreError::Security(error)),
         };
@@ -270,7 +385,7 @@ impl ReceiptStore {
         receipt
             .read_to_end(&mut input)
             .map_err(ReceiptStoreError::Read)?;
-        ReceiptDocument::from_json(&input).map_err(ReceiptStoreError::Document)
+        self.parse_for_scope(&input)
     }
 
     pub(in crate::setup) fn begin_apply<'a>(
@@ -290,6 +405,20 @@ impl ReceiptStore {
         })
     }
 
+    pub(in crate::setup) fn validate_action_privilege(
+        &self,
+        privilege: crate::setup::action::Privilege,
+    ) -> Result<(), ReceiptStoreError> {
+        if self.scope == InstallationScope::User
+            && privilege != crate::setup::action::Privilege::None
+        {
+            Err(ReceiptError::PrivilegeOutsideScope.into())
+        } else {
+            Ok(())
+        }
+    }
+
+    #[cfg(test)]
     fn append_entry(&self, entry: ReceiptEntry) -> Result<(), ReceiptStoreError> {
         entry.validate()?;
         if entry.status != ReceiptStatus::Applied {
@@ -313,19 +442,19 @@ impl ReceiptStore {
         let mut file = match crate::platform::open_verified_manifest_file_for_read(
             &self.path,
             self.owner,
-            self.worker.as_str(),
+            self.worker_name(),
             &self.trusted_root,
         ) {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(ReceiptDocument::empty());
+                return Ok(ReceiptDocument::empty(self.scope));
             }
             Err(error) => return Err(ReceiptStoreError::Security(error)),
         };
         let mut input = Vec::new();
         file.read_to_end(&mut input)
             .map_err(ReceiptStoreError::Read)?;
-        ReceiptDocument::from_json(&input).map_err(ReceiptStoreError::Document)
+        self.parse_for_scope(&input)
     }
 
     fn preflight_existing_receipt(&self) -> Result<bool, ReceiptStoreError> {
@@ -369,7 +498,7 @@ impl ReceiptStore {
                 .map_err(ReceiptStoreError::Write)?;
             file.flush().map_err(ReceiptStoreError::Write)?;
             file.sync_all().map_err(ReceiptStoreError::Write)?;
-            crate::platform::harden_manifest_file(&temporary, self.owner, self.worker.as_str())
+            crate::platform::harden_manifest_file(&temporary, self.owner, self.worker_name())
                 .map_err(ReceiptStoreError::Write)?;
             self.inject_publication_interruption(PublicationInterruptionPoint::BeforeReplace)?;
             crate::platform::replace_file(&temporary, &self.path)
@@ -414,6 +543,9 @@ impl ReceiptStore {
     }
 
     fn prepare_destination(&self, destination: &Path) -> Result<(), ReceiptStoreError> {
+        if self.scope == InstallationScope::User {
+            self.prepare_user_trusted_root()?;
+        }
         match fs::symlink_metadata(destination) {
             Ok(_) => self.verify_directory(destination),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -421,6 +553,62 @@ impl ReceiptStore {
             }
             Err(error) => Err(ReceiptStoreError::Write(error)),
         }
+    }
+
+    fn prepare_user_trusted_root(&self) -> Result<(), ReceiptStoreError> {
+        let mut missing = Vec::new();
+        let mut current = self.trusted_root.as_path();
+        loop {
+            match fs::symlink_metadata(current) {
+                Ok(_) => {
+                    crate::platform::verify_manifest_ancestors(
+                        current,
+                        self.owner,
+                        self.worker_name(),
+                        current,
+                    )
+                    .map_err(ReceiptStoreError::Security)?;
+                    break;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    missing.push(current.to_path_buf());
+                    current = current
+                        .parent()
+                        .ok_or(ReceiptStoreError::InvalidDestination)?;
+                }
+                Err(error) => return Err(ReceiptStoreError::Read(error)),
+            }
+        }
+
+        for directory in missing.into_iter().rev() {
+            let parent = directory
+                .parent()
+                .ok_or(ReceiptStoreError::InvalidDestination)?;
+            match crate::platform::create_private_manifest_staging_directory(&directory, self.owner)
+            {
+                Ok(_) => {
+                    crate::platform::harden_manifest_directory(
+                        &directory,
+                        self.owner,
+                        self.worker_name(),
+                    )
+                    .map_err(ReceiptStoreError::Write)?;
+                    crate::platform::sync_parent_directory(parent)
+                        .map_err(ReceiptStoreError::Write)?;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    crate::platform::verify_manifest_ancestors(
+                        &directory,
+                        self.owner,
+                        self.worker_name(),
+                        &directory,
+                    )
+                    .map_err(ReceiptStoreError::Security)?;
+                }
+                Err(error) => return Err(ReceiptStoreError::Write(error)),
+            }
+        }
+        Ok(())
     }
 
     fn create_and_publish_directory(&self, destination: &Path) -> Result<(), ReceiptStoreError> {
@@ -432,7 +620,16 @@ impl ReceiptStore {
                 crate::platform::verify_manifest_parent_chain(
                     parent,
                     self.owner,
-                    self.worker.as_str(),
+                    self.worker_name(),
+                )
+                .map_err(ReceiptStoreError::Security)?;
+            }
+            crate::platform::ManifestOwner::User => {
+                crate::platform::verify_manifest_ancestors(
+                    parent,
+                    self.owner,
+                    self.worker_name(),
+                    &self.trusted_root,
                 )
                 .map_err(ReceiptStoreError::Security)?;
             }
@@ -441,7 +638,7 @@ impl ReceiptStore {
                 crate::platform::verify_manifest_ancestors(
                     parent,
                     self.owner,
-                    self.worker.as_str(),
+                    self.worker_name(),
                     parent,
                 )
                 .map_err(ReceiptStoreError::Security)?;
@@ -451,7 +648,7 @@ impl ReceiptStore {
                 crate::platform::verify_manifest_parent_chain(
                     parent,
                     self.owner,
-                    self.worker.as_str(),
+                    self.worker_name(),
                 )
                 .map_err(ReceiptStoreError::Security)?;
             }
@@ -464,7 +661,7 @@ impl ReceiptStore {
             crate::platform::harden_manifest_directory(
                 staging.path(),
                 self.owner,
-                self.worker.as_str(),
+                self.worker_name(),
             )
             .map_err(ReceiptStoreError::Write)?;
             match crate::platform::publish_manifest_directory(&staging, destination) {
@@ -487,14 +684,14 @@ impl ReceiptStore {
         crate::platform::verify_manifest_ancestors(
             destination,
             self.owner,
-            self.worker.as_str(),
+            self.worker_name(),
             &self.trusted_root,
         )
         .map_err(ReceiptStoreError::Security)?;
         crate::platform::verify_manifest_directory_security(
             destination,
             self.owner,
-            self.worker.as_str(),
+            self.worker_name(),
         )
         .map_err(ReceiptStoreError::Security)
     }
@@ -503,7 +700,7 @@ impl ReceiptStore {
         crate::platform::verify_manifest_security(
             &self.path,
             self.owner,
-            self.worker.as_str(),
+            self.worker_name(),
             &self.trusted_root,
         )
         .map_err(ReceiptStoreError::Security)
@@ -528,7 +725,12 @@ impl ReceiptStore {
                 .components()
                 .any(|component| matches!(component, Component::CurDir | Component::ParentDir))
             || self.path.components().collect::<PathBuf>().as_os_str() != self.path.as_os_str()
-            || destination != self.trusted_root
+            || match self.scope {
+                InstallationScope::System => destination != self.trusted_root,
+                InstallationScope::User => {
+                    destination.parent() != Some(self.trusted_root.as_path())
+                }
+            }
             || destination
                 .components()
                 .filter(|component| matches!(component, Component::Normal(_)))
@@ -538,6 +740,21 @@ impl ReceiptStore {
             return Err(ReceiptStoreError::InvalidDestination);
         }
         Ok(destination)
+    }
+
+    fn worker_name(&self) -> &str {
+        self.worker
+            .as_ref()
+            .map(WorkerPrincipal::as_str)
+            .unwrap_or("")
+    }
+
+    fn parse_for_scope(&self, input: &[u8]) -> Result<ReceiptDocument, ReceiptStoreError> {
+        let document = ReceiptDocument::from_json(input)?;
+        if document.installation_scope != self.scope {
+            return Err(ReceiptStoreError::ScopeMismatch);
+        }
+        Ok(document)
     }
 }
 
@@ -571,16 +788,23 @@ impl ReceiptApplySession<'_> {
             let name = entry.file_name();
             let name = name.to_string_lossy();
             if name.starts_with(".receipt.json.transaction.") {
-                paths.push(entry.path());
+                let path = entry.path();
+                let identity = crate::platform::private_file_identity(&path)
+                    .map_err(ReceiptStoreError::Security)?;
+                paths.push((path, identity));
             }
         }
-        paths.sort();
+        paths.sort_by(|left, right| left.0.cmp(&right.0));
         if paths.len() > 1 {
             return Err(ReceiptStoreError::IntentConflict);
         }
+        #[cfg(test)]
+        if let Some((path, _)) = paths.first() {
+            self.inject_intent_read_interruption(path)?;
+        }
         paths
             .into_iter()
-            .map(|path| self.read_intent(&path))
+            .map(|(path, identity)| self.read_intent(&path, identity))
             .collect()
     }
 
@@ -592,10 +816,16 @@ impl ReceiptApplySession<'_> {
         metadata: &mut ReceiptMetadataSource,
         _authority: &crate::setup::action::JournalAuthority,
     ) -> Result<ReceiptIntent, ReceiptStoreError> {
+        if self.store.scope == InstallationScope::User
+            && privilege != crate::setup::action::Privilege::None
+        {
+            return Err(ReceiptError::PrivilegeOutsideScope.into());
+        }
         let entry = ReceiptEntry::applied(action, privilege, effect, metadata.next()?)?;
         let path = self.transaction_path(&entry.entry_id);
         let document = ReceiptIntentDocument {
             schema_version: SCHEMA_VERSION,
+            installation_scope: self.store.scope,
             phase: ReceiptIntentPhase::Prepared,
             entry: entry.clone(),
         };
@@ -636,6 +866,7 @@ impl ReceiptApplySession<'_> {
         }
         let document = ReceiptIntentDocument {
             schema_version: SCHEMA_VERSION,
+            installation_scope: self.store.scope,
             phase: ReceiptIntentPhase::Succeeded,
             entry: intent.entry.clone(),
         };
@@ -724,15 +955,24 @@ impl ReceiptApplySession<'_> {
             ))
     }
 
-    fn read_intent(&self, path: &Path) -> Result<ReceiptIntent, ReceiptStoreError> {
-        crate::platform::verify_manifest_file_target(path).map_err(ReceiptStoreError::Security)?;
-        crate::platform::verify_private_file_security(path, self.store.owner)
-            .map_err(ReceiptStoreError::Security)?;
-        let mut file = fs::File::open(path).map_err(ReceiptStoreError::Read)?;
+    fn read_intent(
+        &self,
+        path: &Path,
+        expected_identity: crate::platform::PrivateFileIdentity,
+    ) -> Result<ReceiptIntent, ReceiptStoreError> {
+        let mut file = crate::platform::open_verified_private_file_for_read(
+            path,
+            self.store.owner,
+            expected_identity,
+        )
+        .map_err(ReceiptStoreError::Security)?;
         let mut input = Vec::new();
         file.read_to_end(&mut input)
             .map_err(ReceiptStoreError::Read)?;
         let document = ReceiptIntentDocument::from_json(&input)?;
+        if document.installation_scope != self.store.scope {
+            return Err(ReceiptStoreError::ScopeMismatch);
+        }
         let entry = document.entry;
         if self.transaction_path(&entry.entry_id) != path {
             return Err(ReceiptStoreError::IntentConflict);
@@ -742,6 +982,49 @@ impl ReceiptApplySession<'_> {
             path: path.to_path_buf(),
             phase: document.phase,
         })
+    }
+
+    #[cfg(test)]
+    fn inject_intent_read_interruption(&self, path: &Path) -> Result<(), ReceiptStoreError> {
+        let Some(interruption) = &self.store.intent_read_interruption else {
+            return Ok(());
+        };
+        let saved = path.with_extension("enumerated-original");
+        fs::rename(path, &saved).map_err(ReceiptStoreError::Write)?;
+        match interruption {
+            #[cfg(unix)]
+            IntentReadInterruption::Symlink(target) => {
+                std::os::unix::fs::symlink(target, path).map_err(ReceiptStoreError::Write)?;
+            }
+            #[cfg(unix)]
+            IntentReadInterruption::Fifo => {
+                use std::os::unix::ffi::OsStrExt;
+                let path = std::ffi::CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+                    ReceiptStoreError::Write(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "intent path contains a NUL byte",
+                    ))
+                })?;
+                if unsafe { libc::mkfifo(path.as_ptr(), 0o600) } != 0 {
+                    return Err(ReceiptStoreError::Write(std::io::Error::last_os_error()));
+                }
+            }
+            #[cfg(windows)]
+            IntentReadInterruption::Reparse(target) => {
+                std::os::windows::fs::symlink_file(target, path)
+                    .map_err(ReceiptStoreError::Write)?;
+            }
+            IntentReadInterruption::Inode => {
+                let bytes = fs::read(&saved).map_err(ReceiptStoreError::Read)?;
+                let mut replacement = crate::platform::create_private_file(path, self.store.owner)
+                    .map_err(ReceiptStoreError::Write)?;
+                replacement
+                    .write_all(&bytes)
+                    .map_err(ReceiptStoreError::Write)?;
+                replacement.sync_all().map_err(ReceiptStoreError::Write)?;
+            }
+        }
+        Ok(())
     }
 
     fn replace_intent(&self, path: &Path, serialized: &[u8]) -> Result<(), ReceiptStoreError> {
@@ -834,6 +1117,7 @@ fn validate_append_candidate(
 ) -> Result<(), ReceiptStoreError> {
     candidate.validate()?;
     if candidate.entries.len() != existing.entries.len() + 1
+        || candidate.installation_scope != existing.installation_scope
         || !candidate.entries.starts_with(&existing.entries)
         || candidate.entries.last().map(|entry| entry.status) != Some(ReceiptStatus::Applied)
     {
@@ -842,23 +1126,68 @@ fn validate_append_candidate(
     Ok(())
 }
 
-fn canonical_receipt_path() -> PathBuf {
-    #[cfg(target_os = "linux")]
-    {
-        PathBuf::from("/var/lib/styrn/receipt.json")
-    }
-    #[cfg(target_os = "macos")]
-    {
-        PathBuf::from("/Library/Application Support/Styrn/receipt.json")
-    }
-    #[cfg(target_os = "windows")]
-    {
-        PathBuf::from(r"C:\ProgramData\Styrn\receipt.json")
+fn canonical_receipt_path(scope: InstallationScope) -> Result<PathBuf, ReceiptStoreError> {
+    match scope {
+        InstallationScope::System => {
+            #[cfg(target_os = "linux")]
+            let path = PathBuf::from("/var/lib/styrn/receipt.json");
+            #[cfg(target_os = "macos")]
+            let path = PathBuf::from("/Library/Application Support/Styrn/receipt.json");
+            #[cfg(target_os = "windows")]
+            let path = PathBuf::from(r"C:\ProgramData\Styrn\receipt.json");
+            Ok(path)
+        }
+        InstallationScope::User => {
+            #[cfg(target_os = "linux")]
+            let root = std::env::var_os("XDG_STATE_HOME")
+                .map(PathBuf::from)
+                .or_else(|| {
+                    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state"))
+                });
+            #[cfg(target_os = "macos")]
+            let root = std::env::var_os("HOME")
+                .map(|home| PathBuf::from(home).join("Library/Application Support"));
+            #[cfg(target_os = "windows")]
+            let root = std::env::var_os("LOCALAPPDATA").map(PathBuf::from);
+            let root = root.ok_or(ReceiptStoreError::UserStateDirectoryUnavailable)?;
+            if !root.is_absolute() {
+                return Err(ReceiptStoreError::UserStateDirectoryUnavailable);
+            }
+            #[cfg(target_os = "linux")]
+            let application = "styrn";
+            #[cfg(any(target_os = "macos", target_os = "windows"))]
+            let application = "Styrn";
+            Ok(root.join(application).join("receipt.json"))
+        }
     }
 }
 
-pub(crate) fn configured_receipt_store(worker: &str) -> Result<ReceiptStore, ReceiptStoreError> {
-    ReceiptStore::new_canonical(canonical_receipt_path(), worker)
+pub(crate) fn configured_receipt_store() -> Result<ReceiptStore, ReceiptStoreError> {
+    let path = canonical_receipt_path(InstallationScope::User)?;
+    let trusted_root = path
+        .parent()
+        .and_then(Path::parent)
+        .map(Path::to_path_buf)
+        .ok_or(ReceiptStoreError::InvalidDestination)?;
+    Ok(ReceiptStore {
+        scope: InstallationScope::User,
+        path,
+        trusted_root,
+        owner: crate::platform::ManifestOwner::User,
+        worker: None,
+        #[cfg(test)]
+        interruption: None,
+        #[cfg(test)]
+        interrupt_after_prepare: false,
+        #[cfg(test)]
+        intent_read_interruption: None,
+    })
+}
+
+pub(crate) fn configured_system_receipt_store(
+    worker: &str,
+) -> Result<ReceiptStore, ReceiptStoreError> {
+    ReceiptStore::new_system(canonical_receipt_path(InstallationScope::System)?, worker)
 }
 
 #[derive(Debug, Error)]
@@ -883,6 +1212,10 @@ pub(crate) enum ReceiptStoreError {
     IntentConflict,
     #[error("setup receipt worker principal is invalid")]
     InvalidWorkerPrincipal,
+    #[error("setup receipt scope does not match the selected installation scope")]
+    ScopeMismatch,
+    #[error("the current user's standard state directory is unavailable")]
+    UserStateDirectoryUnavailable,
 }
 
 impl ReceiptStoreError {
@@ -1467,6 +1800,10 @@ pub(crate) enum ReceiptError {
     Serialize,
     #[error("setup receipt schema version is unsupported")]
     UnknownSchemaVersion,
+    #[error("setup receipt installation scope is required")]
+    MissingInstallationScope,
+    #[error("user-scope setup receipt entries cannot claim privileged mutation")]
+    PrivilegeOutsideScope,
     #[error("setup receipt contains a duplicate entry ID")]
     DuplicateEntryId,
     #[error("setup receipt entry ID is not a canonical UUIDv7")]

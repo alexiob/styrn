@@ -1,5 +1,6 @@
 {
   "schema_version": 1,
+  "installation_scope": "user",
   "entries": [
     {
       "entry_id": "019cafd0-5c00-7000-8000-000000000001",
@@ -10,10 +11,10 @@
         }
       },
       "timestamp": "2026-09-02T10:00:00Z",
-      "privilege_used": "root",
+      "privilege_used": "none",
       "files_created": [
         {
-          "path": "/opt/styrn/bin/tool",
+          "path": "/home/alex/.local/share/styrn/bin/tool",
           "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         }
       ],

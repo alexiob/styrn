@@ -1,6 +1,6 @@
 //! Action-owned setup execution and receipt orchestration.
 
-use super::{Action, ActionCheck, ActionError, JournalAuthority};
+use super::{Action, ActionCheck, ActionError, JournalAuthority, NeedsHuman};
 use thiserror::Error;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -8,6 +8,7 @@ pub(crate) struct ApplyReport {
     applied_count: usize,
     recovered_count: usize,
     noop_count: usize,
+    pending: Vec<NeedsHuman>,
 }
 
 impl ApplyReport {
@@ -19,13 +20,27 @@ impl ApplyReport {
         self.recovered_count
     }
 
+    pub(crate) fn noop_count(&self) -> usize {
+        self.noop_count
+    }
+
+    pub(crate) fn pending_count(&self) -> usize {
+        self.pending.len()
+    }
+
+    pub(crate) fn pending(&self) -> &[NeedsHuman] {
+        &self.pending
+    }
+
     pub(crate) fn is_nothing_to_do(&self) -> bool {
-        self.applied_count == 0 && self.recovered_count == 0
+        self.applied_count == 0 && self.recovered_count == 0 && self.pending.is_empty()
     }
 
     pub(crate) fn message(&self) -> &'static str {
         if self.is_nothing_to_do() {
             "nothing to do"
+        } else if self.applied_count == 0 && !self.pending.is_empty() {
+            "setup actions need human attention"
         } else if self.applied_count == 0 && self.recovered_count != 0 {
             "receipt recovered"
         } else {
@@ -67,49 +82,57 @@ pub(super) fn apply_plan_with_journal(
     {
         return Err(crate::setup::receipt::ReceiptStoreError::IntentConflict.into());
     }
+    for action in plan.iter() {
+        store.validate_action_privilege(action.privilege())?;
+    }
     let authority = JournalAuthority(());
     let session = store.begin_apply(&authority)?;
     let mut report = ApplyReport {
         applied_count: 0,
         recovered_count: 0,
         noop_count: 0,
+        pending: Vec::new(),
     };
     for intent in session.pending_intents(&authority)? {
-        let action_id = session.intent_action_id(&intent, &authority);
-        let action = plan
-            .iter_mut()
-            .find(|action| action.name().as_str() == action_id)
-            .ok_or(crate::setup::receipt::ReceiptStoreError::IntentConflict)?;
-        let prepared = action.prepare_effect()?;
-        if !session.intent_matches(
-            &intent,
-            action.name(),
-            action.privilege(),
-            &prepared,
-            &authority,
-        )? {
-            return Err(crate::setup::receipt::ReceiptStoreError::IntentConflict.into());
-        }
         match session.intent_phase(&intent, &authority) {
             crate::setup::receipt::ReceiptIntentPhase::Succeeded => {
                 session.finalize_intent(&intent, &authority)?;
                 report.recovered_count += 1;
             }
-            crate::setup::receipt::ReceiptIntentPhase::Prepared => match action.check()? {
-                ActionCheck::Todo => {
-                    let finalized = action.execute_prepared()?;
-                    if finalized != prepared {
-                        return Err(crate::setup::receipt::ReceiptStoreError::IntentConflict.into());
-                    }
-                    let mut intent = intent;
-                    session.mark_intent_succeeded(&mut intent, &authority)?;
-                    session.finalize_intent(&intent, &authority)?;
-                    report.applied_count += 1;
-                }
-                ActionCheck::Done | ActionCheck::NeedsHuman(_) => {
+            crate::setup::receipt::ReceiptIntentPhase::Prepared => {
+                let action_id = session.intent_action_id(&intent, &authority);
+                let action = plan
+                    .iter_mut()
+                    .find(|action| action.name().as_str() == action_id)
+                    .ok_or(crate::setup::receipt::ReceiptStoreError::IntentConflict)?;
+                let prepared = action.prepare_effect()?;
+                if !session.intent_matches(
+                    &intent,
+                    action.name(),
+                    action.privilege(),
+                    &prepared,
+                    &authority,
+                )? {
                     return Err(crate::setup::receipt::ReceiptStoreError::IntentConflict.into());
                 }
-            },
+                match action.check()? {
+                    ActionCheck::Todo => {
+                        let finalized = action.execute_prepared()?;
+                        if finalized != prepared {
+                            return Err(
+                                crate::setup::receipt::ReceiptStoreError::IntentConflict.into()
+                            );
+                        }
+                        let mut intent = intent;
+                        session.mark_intent_succeeded(&mut intent, &authority)?;
+                        session.finalize_intent(&intent, &authority)?;
+                        report.applied_count += 1;
+                    }
+                    ActionCheck::Done | ActionCheck::NeedsHuman(_) => {
+                        return Err(crate::setup::receipt::ReceiptStoreError::IntentConflict.into());
+                    }
+                }
+            }
         }
     }
     for action in plan {
@@ -133,7 +156,7 @@ pub(super) fn apply_plan_with_journal(
                 session.finalize_intent(&intent, &authority)?;
                 report.applied_count += 1;
             }
-            ActionCheck::NeedsHuman(_) => report.noop_count += 1,
+            ActionCheck::NeedsHuman(needs_human) => report.pending.push(needs_human),
         }
     }
     Ok(report)

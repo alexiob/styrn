@@ -119,7 +119,7 @@ fn failure_stops_before_unattempted_action_and_rerun_appends_only_new_successes(
     assert_eq!(failing_metrics.mutation_calls(), 1);
     assert_eq!(third_metrics.check_calls(), 0);
     assert_eq!(third_metrics.mutation_calls(), 0);
-    let first_run = store.read().unwrap().to_json().unwrap();
+    let first_run = store.read_snapshot().unwrap().to_json().unwrap();
     let first_value = serde_json::from_slice::<serde_json::Value>(&first_run).unwrap();
     assert_eq!(first_value["entries"].as_array().unwrap().len(), 1);
 
@@ -137,9 +137,10 @@ fn failure_stops_before_unattempted_action_and_rerun_appends_only_new_successes(
 
     assert_eq!(report.applied_count(), 2);
     assert_eq!(*state.lock().unwrap(), vec![1, 2, 3]);
-    let final_value =
-        serde_json::from_slice::<serde_json::Value>(&store.read().unwrap().to_json().unwrap())
-            .unwrap();
+    let final_value = serde_json::from_slice::<serde_json::Value>(
+        &store.read_snapshot().unwrap().to_json().unwrap(),
+    )
+    .unwrap();
     assert_eq!(
         final_value["entries"]
             .as_array()
@@ -181,7 +182,7 @@ fn receipt_publication_failure_stops_after_mutation_and_rerun_recovers_ownership
     );
 
     let store = ReceiptStore::new_for_test(fixture.receipt_path());
-    assert!(store.read().unwrap().is_empty());
+    assert!(store.read_snapshot().unwrap().is_empty());
     let mut retry = vec![
         Action::test_journaled_state("test.first", 1, Privilege::Root, Arc::clone(&state)).0,
         Action::test_journaled_state("test.second", 2, Privilege::Root, Arc::clone(&state)).0,
@@ -196,9 +197,10 @@ fn receipt_publication_failure_stops_after_mutation_and_rerun_recovers_ownership
     assert_eq!(report.applied_count(), 1);
     assert_eq!(report.recovered_count(), 1);
     assert_eq!(*state.lock().unwrap(), vec![1, 2]);
-    let value =
-        serde_json::from_slice::<serde_json::Value>(&store.read().unwrap().to_json().unwrap())
-            .unwrap();
+    let value = serde_json::from_slice::<serde_json::Value>(
+        &store.read_snapshot().unwrap().to_json().unwrap(),
+    )
+    .unwrap();
     assert_eq!(
         value["entries"]
             .as_array()
@@ -236,7 +238,7 @@ fn crash_after_durable_prepare_before_mutation_retries_under_the_same_intent() {
     assert_eq!(metrics.mutation_calls(), 0);
     assert!(state.lock().unwrap().is_empty());
     let store = ReceiptStore::new_for_test(fixture.receipt_path());
-    assert!(store.read().unwrap().is_empty());
+    assert!(store.read_snapshot().unwrap().is_empty());
 
     let mut retry =
         vec![Action::test_journaled_state("test.first", 1, Privilege::Root, Arc::clone(&state)).0];
@@ -245,9 +247,10 @@ fn crash_after_durable_prepare_before_mutation_retries_under_the_same_intent() {
 
     assert_eq!(report.applied_count(), 1);
     assert_eq!(*state.lock().unwrap(), vec![1]);
-    let value =
-        serde_json::from_slice::<serde_json::Value>(&store.read().unwrap().to_json().unwrap())
-            .unwrap();
+    let value = serde_json::from_slice::<serde_json::Value>(
+        &store.read_snapshot().unwrap().to_json().unwrap(),
+    )
+    .unwrap();
     assert_eq!(
         value["entries"][0]["entry_id"],
         "019cafd0-5c00-7000-8000-000000000001"
@@ -289,7 +292,7 @@ fn prepared_intent_that_became_done_externally_refuses_receipt_ownership() {
         before_intent
     );
     assert!(ReceiptStore::new_for_test(fixture.receipt_path())
-        .read()
+        .read_snapshot()
         .unwrap()
         .is_empty());
 }
@@ -320,7 +323,286 @@ fn recovery_without_new_mutation_is_reported_as_receipt_recovery() {
     assert!(!report.is_nothing_to_do());
     assert_eq!(report.message(), "receipt recovered");
     assert_eq!(metrics.mutation_calls(), 0);
-    assert_eq!(store.read().unwrap().entry_count(), 1);
+    assert_eq!(store.read_snapshot().unwrap().entry_count(), 1);
+}
+
+#[test]
+fn succeeded_intent_recovers_after_its_action_leaves_the_current_plan() {
+    let fixture = JournalFixture::new("succeeded-removed-plan");
+    let failing_store = ReceiptStore::new_for_test_failing_before_replace(fixture.receipt_path());
+    let state = Arc::new(Mutex::new(Vec::new()));
+    let mut interrupted = vec![
+        Action::test_journaled_state("test.removed", 1, Privilege::Root, Arc::clone(&state)).0,
+    ];
+    let mut metadata = ReceiptMetadataSource::for_test([(
+        "019cafd0-5c00-7000-8000-000000000001",
+        "2026-09-02T10:00:00Z",
+    )]);
+    apply_plan_with_journal(&mut interrupted, &failing_store, &mut metadata).unwrap_err();
+    assert_eq!(*state.lock().unwrap(), vec![1]);
+
+    let store = ReceiptStore::new_for_test(fixture.receipt_path());
+    let mut empty_plan = Vec::new();
+    let mut no_metadata = ReceiptMetadataSource::for_test([]);
+    let report = apply_plan_with_journal(&mut empty_plan, &store, &mut no_metadata).unwrap();
+
+    assert_eq!(report.applied_count(), 0);
+    assert_eq!(report.recovered_count(), 1);
+    assert_eq!(report.message(), "receipt recovered");
+    let receipt = serde_json::from_slice::<serde_json::Value>(
+        &store.read_snapshot().unwrap().to_json().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        receipt["entries"][0]["action"]["parameters"]["action_id"],
+        "test.removed"
+    );
+    assert!(fs::read_dir(fixture.receipt_path().parent().unwrap())
+        .unwrap()
+        .all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .contains("transaction")));
+}
+
+#[test]
+fn succeeded_intent_recovers_stored_dynamic_before_hash_without_recomputation() {
+    let fixture = JournalFixture::new("succeeded-dynamic-before-hash");
+    let target = fixture.receipt_path().parent().unwrap().join("dynamic.txt");
+    fs::write(&target, b"before-state\n").unwrap();
+    let failing_store = ReceiptStore::new_for_test_failing_before_replace(fixture.receipt_path());
+    let (action, initial_metrics) =
+        Action::test_dynamic_file_modification("test.dynamic-file", target.clone());
+    let mut interrupted = vec![action];
+    let mut metadata = ReceiptMetadataSource::for_test([(
+        "019cafd0-5c00-7000-8000-000000000001",
+        "2026-09-02T10:00:00Z",
+    )]);
+
+    apply_plan_with_journal(&mut interrupted, &failing_store, &mut metadata).unwrap_err();
+
+    assert_eq!(initial_metrics.prepare_calls(), 1);
+    assert_eq!(initial_metrics.mutation_calls(), 1);
+    assert_eq!(fs::read(&target).unwrap(), b"after-state\n");
+    let (retry, retry_metrics) =
+        Action::test_dynamic_file_modification("test.dynamic-file", target.clone());
+    let mut plan = vec![retry];
+    let mut no_metadata = ReceiptMetadataSource::for_test([]);
+
+    let report = apply_plan_with_journal(
+        &mut plan,
+        &ReceiptStore::new_for_test(fixture.receipt_path()),
+        &mut no_metadata,
+    )
+    .unwrap();
+
+    assert_eq!(report.recovered_count(), 1);
+    assert_eq!(report.applied_count(), 0);
+    assert_eq!(retry_metrics.prepare_calls(), 0);
+    assert_eq!(retry_metrics.mutation_calls(), 0);
+    let receipt = serde_json::from_slice::<serde_json::Value>(
+        &ReceiptStore::new_for_test(fixture.receipt_path())
+            .read_snapshot()
+            .unwrap()
+            .to_json()
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        receipt["entries"][0]["files_modified"][0]["before_sha256"],
+        "b40af702b6375903b1e09c6c851d1828ac225b5356aef2c1c60e308efaf89944"
+    );
+    assert_eq!(
+        receipt["entries"][0]["files_modified"][0]["path"],
+        target.to_string_lossy().as_ref()
+    );
+}
+
+#[test]
+fn all_needs_human_plan_preserves_safe_pending_instructions_without_receipt_or_noop() {
+    let fixture = JournalFixture::new("needs-human-report");
+    let store = ReceiptStore::new_for_test(fixture.receipt_path());
+    let state = Arc::new(Mutex::new(Vec::new()));
+    let first = NeedsHuman::new(
+        HumanInstructions::new("Enable Remote Login, then rerun setup.").unwrap(),
+        None,
+    );
+    let second = NeedsHuman::new(
+        HumanInstructions::new("Sign in to the package provider, then rerun setup.").unwrap(),
+        None,
+    );
+    let (first_action, first_metrics) = Action::test_named_needs_human(
+        "test.remote-login",
+        Privilege::None,
+        Arc::clone(&state),
+        first.clone(),
+    );
+    let (second_action, second_metrics) = Action::test_named_needs_human(
+        "test.package-login",
+        Privilege::None,
+        Arc::clone(&state),
+        second.clone(),
+    );
+    let mut plan = vec![first_action, second_action];
+    let mut metadata = ReceiptMetadataSource::for_test([]);
+
+    let report = apply_plan_with_journal(&mut plan, &store, &mut metadata).unwrap();
+
+    assert_eq!(report.applied_count(), 0);
+    assert_eq!(report.recovered_count(), 0);
+    assert_eq!(report.noop_count(), 0);
+    assert_eq!(report.pending_count(), 2);
+    assert_eq!(report.pending(), &[first, second]);
+    assert!(!report.is_nothing_to_do());
+    assert_eq!(report.message(), "setup actions need human attention");
+    assert_eq!(first_metrics.mutation_calls(), 0);
+    assert_eq!(second_metrics.mutation_calls(), 0);
+    assert!(state.lock().unwrap().is_empty());
+    assert!(!fixture.receipt_path().exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn user_scope_rejects_privileged_actions_before_private_state_or_mutation() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = JournalFixture::new("user-privilege-refusal");
+    fs::set_permissions(
+        fixture.receipt_path().parent().unwrap(),
+        fs::Permissions::from_mode(0o700),
+    )
+    .unwrap();
+    let store = ReceiptStore::new_user_for_test(fixture.receipt_path());
+    let state = Arc::new(Mutex::new(Vec::new()));
+    let (action, metrics) =
+        Action::test_journaled_state("test.root", 1, Privilege::Root, Arc::clone(&state));
+    let mut plan = vec![action];
+    let mut metadata = ReceiptMetadataSource::for_test([(
+        "019cafd0-5c00-7000-8000-000000000001",
+        "2026-09-02T10:00:00Z",
+    )]);
+
+    let error = apply_plan_with_journal(&mut plan, &store, &mut metadata).unwrap_err();
+
+    assert_eq!(error.error_code(), "setup.receipt_conflict");
+    assert_eq!(error.exit_code(), 13);
+    assert_eq!(metrics.check_calls(), 0);
+    assert_eq!(metrics.mutation_calls(), 0);
+    assert!(state.lock().unwrap().is_empty());
+    assert!(!fixture.receipt_path().exists());
+    assert!(fs::read_dir(fixture.receipt_path().parent().unwrap())
+        .unwrap()
+        .next()
+        .is_none());
+}
+
+#[test]
+fn ordinary_current_user_scope_can_recover_its_restricted_journal_without_privilege() {
+    let fixture = JournalFixture::new("user-scope-recovery");
+    crate::platform::harden_manifest_directory(
+        &fixture.root,
+        crate::platform::ManifestOwner::User,
+        "",
+    )
+    .unwrap();
+    crate::platform::harden_manifest_directory(
+        fixture.receipt_path().parent().unwrap(),
+        crate::platform::ManifestOwner::User,
+        "",
+    )
+    .unwrap();
+    let failing_store =
+        ReceiptStore::new_user_for_test_failing_before_replace(fixture.receipt_path());
+    let state = Arc::new(Mutex::new(Vec::new()));
+    let mut interrupted = vec![
+        Action::test_journaled_state("test.user-action", 1, Privilege::None, Arc::clone(&state)).0,
+    ];
+    let mut metadata = ReceiptMetadataSource::for_test([(
+        "019cafd0-5c00-7000-8000-000000000001",
+        "2026-09-02T10:00:00Z",
+    )]);
+    apply_plan_with_journal(&mut interrupted, &failing_store, &mut metadata).unwrap_err();
+
+    let mut empty_plan = Vec::new();
+    let mut no_metadata = ReceiptMetadataSource::for_test([]);
+    let store = ReceiptStore::new_user_for_test(fixture.receipt_path());
+    let report = apply_plan_with_journal(&mut empty_plan, &store, &mut no_metadata).unwrap();
+
+    assert_eq!(report.recovered_count(), 1);
+    assert_eq!(*state.lock().unwrap(), vec![1]);
+    assert_eq!(
+        store.read_snapshot().unwrap().installation_scope(),
+        crate::setup::receipt::InstallationScope::User
+    );
+    assert_eq!(store.read_snapshot().unwrap().entry_count(), 1);
+}
+
+#[test]
+fn mixed_plan_reports_applied_recovered_noop_and_pending_outcomes_independently() {
+    let fixture = JournalFixture::new("mixed-report");
+    let interrupted_store =
+        ReceiptStore::new_for_test_failing_before_replace(fixture.receipt_path());
+    let state = Arc::new(Mutex::new(Vec::new()));
+    let mut interrupted = vec![
+        Action::test_journaled_state("test.recovered", 1, Privilege::None, Arc::clone(&state)).0,
+    ];
+    let mut interrupted_metadata = ReceiptMetadataSource::for_test([(
+        "019cafd0-5c00-7000-8000-000000000001",
+        "2026-09-02T10:00:00Z",
+    )]);
+    apply_plan_with_journal(
+        &mut interrupted,
+        &interrupted_store,
+        &mut interrupted_metadata,
+    )
+    .unwrap_err();
+
+    let pending = NeedsHuman::new(
+        HumanInstructions::new("Complete the one remaining local step.").unwrap(),
+        None,
+    );
+    let (applied, applied_metrics) =
+        Action::test_journaled_state("test.applied", 2, Privilege::None, Arc::clone(&state));
+    let (noop, noop_metrics) =
+        Action::test_journaled_state("test.noop", 1, Privilege::None, Arc::clone(&state));
+    let (needs_human, pending_metrics) = Action::test_named_needs_human(
+        "test.pending",
+        Privilege::None,
+        Arc::clone(&state),
+        pending.clone(),
+    );
+    let mut plan = vec![applied, noop, needs_human];
+    let mut metadata = ReceiptMetadataSource::for_test([(
+        "019cafd0-5c00-7000-8000-000000000002",
+        "2026-09-02T10:00:01Z",
+    )]);
+
+    let report = apply_plan_with_journal(
+        &mut plan,
+        &ReceiptStore::new_for_test(fixture.receipt_path()),
+        &mut metadata,
+    )
+    .unwrap();
+
+    assert_eq!(report.applied_count(), 1);
+    assert_eq!(report.recovered_count(), 1);
+    assert_eq!(report.noop_count(), 1);
+    assert_eq!(report.pending_count(), 1);
+    assert_eq!(report.pending(), &[pending]);
+    assert!(!report.is_nothing_to_do());
+    assert_eq!(report.message(), "setup actions applied");
+    assert_eq!(applied_metrics.mutation_calls(), 1);
+    assert_eq!(noop_metrics.mutation_calls(), 0);
+    assert_eq!(pending_metrics.mutation_calls(), 0);
+    assert_eq!(*state.lock().unwrap(), vec![1, 2]);
+    assert_eq!(
+        ReceiptStore::new_for_test(fixture.receipt_path())
+            .read_snapshot()
+            .unwrap()
+            .entry_count(),
+        2
+    );
 }
 
 #[test]
@@ -474,6 +756,112 @@ fn renamed_or_insecure_pending_intents_are_not_silently_trusted_or_repaired() {
     }
 }
 
+#[cfg(unix)]
+#[test]
+fn private_intent_open_rejects_post_enumeration_symlink_fifo_and_inode_substitution() {
+    for kind in ["symlink", "fifo", "inode"] {
+        let fixture = JournalFixture::new(&format!("intent-open-race-{kind}"));
+        let interrupted_store =
+            ReceiptStore::new_for_test_failing_after_prepare(fixture.receipt_path());
+        let state = Arc::new(Mutex::new(Vec::new()));
+        let mut interrupted = vec![
+            Action::test_journaled_state("test.first", 1, Privilege::None, Arc::clone(&state)).0,
+        ];
+        let mut metadata = ReceiptMetadataSource::for_test([(
+            "019cafd0-5c00-7000-8000-000000000001",
+            "2026-09-02T10:00:00Z",
+        )]);
+        apply_plan_with_journal(&mut interrupted, &interrupted_store, &mut metadata).unwrap_err();
+        let intent = fixture.only_transaction_path();
+        let before = fs::read(&intent).unwrap();
+        let outside = fixture
+            .receipt_path()
+            .parent()
+            .unwrap()
+            .join("outside.json");
+        fs::write(&outside, &before).unwrap();
+        make_private(&outside);
+        let store = match kind {
+            "symlink" => ReceiptStore::new_for_test_swapping_intent_with_symlink(
+                fixture.receipt_path(),
+                outside.clone(),
+            ),
+            "fifo" => ReceiptStore::new_for_test_swapping_intent_with_fifo(fixture.receipt_path()),
+            "inode" => ReceiptStore::new_for_test_swapping_intent_inode(fixture.receipt_path()),
+            _ => unreachable!(),
+        };
+        let (retry, metrics) =
+            Action::test_journaled_state("test.first", 1, Privilege::None, Arc::clone(&state));
+        let mut plan = vec![retry];
+        let mut no_metadata = ReceiptMetadataSource::for_test([]);
+
+        let error = apply_plan_with_journal(&mut plan, &store, &mut no_metadata).unwrap_err();
+
+        assert_eq!(error.error_code(), "setup.receipt_conflict", "{kind}");
+        assert_eq!(error.exit_code(), 13, "{kind}");
+        assert_eq!(metrics.check_calls(), 0, "{kind}");
+        assert_eq!(metrics.mutation_calls(), 0, "{kind}");
+        assert!(state.lock().unwrap().is_empty(), "{kind}");
+        assert!(!fixture.receipt_path().exists(), "{kind}");
+        assert_eq!(fs::read(&outside).unwrap(), before, "{kind}");
+    }
+}
+
+#[cfg(windows)]
+#[test]
+fn private_intent_open_rejects_post_enumeration_reparse_and_inode_substitution() {
+    for kind in ["reparse", "inode"] {
+        let fixture = JournalFixture::new(&format!("intent-open-race-{kind}"));
+        let interrupted_store =
+            ReceiptStore::new_for_test_failing_after_prepare(fixture.receipt_path());
+        let state = Arc::new(Mutex::new(Vec::new()));
+        let mut interrupted = vec![
+            Action::test_journaled_state("test.first", 1, Privilege::None, Arc::clone(&state)).0,
+        ];
+        let mut metadata = ReceiptMetadataSource::for_test([(
+            "019cafd0-5c00-7000-8000-000000000001",
+            "2026-09-02T10:00:00Z",
+        )]);
+        apply_plan_with_journal(&mut interrupted, &interrupted_store, &mut metadata).unwrap_err();
+        let intent = fixture.only_transaction_path();
+        let before = fs::read(&intent).unwrap();
+        let outside = fixture
+            .receipt_path()
+            .parent()
+            .unwrap()
+            .join("outside.json");
+        fs::write(&outside, &before).unwrap();
+        let store = if kind == "reparse" {
+            ReceiptStore::new_for_test_swapping_intent_with_reparse(
+                fixture.receipt_path(),
+                outside.clone(),
+            )
+        } else {
+            ReceiptStore::new_for_test_swapping_intent_inode(fixture.receipt_path())
+        };
+        let (retry, metrics) =
+            Action::test_journaled_state("test.first", 1, Privilege::None, Arc::clone(&state));
+        let mut plan = vec![retry];
+        let mut no_metadata = ReceiptMetadataSource::for_test([]);
+
+        let error = apply_plan_with_journal(&mut plan, &store, &mut no_metadata).unwrap_err();
+
+        assert_eq!(error.error_code(), "setup.receipt_conflict", "{kind}");
+        assert_eq!(metrics.check_calls(), 0, "{kind}");
+        assert_eq!(metrics.mutation_calls(), 0, "{kind}");
+        assert!(!fixture.receipt_path().exists(), "{kind}");
+        assert_eq!(fs::read(&outside).unwrap(), before, "{kind}");
+        if kind == "reparse" {
+            assert!(fs::symlink_metadata(&intent)
+                .unwrap()
+                .file_type()
+                .is_symlink());
+        } else {
+            assert!(fs::symlink_metadata(&intent).unwrap().file_type().is_file());
+        }
+    }
+}
+
 #[test]
 fn recovered_intent_must_match_the_exact_action_effect_and_recovery_state() {
     for kind in ["missing-action", "effect-mismatch", "needs-human"] {
@@ -568,7 +956,7 @@ fn concurrent_apply_sessions_mutate_and_journal_one_action_exactly_once() {
             .count(),
         1
     );
-    assert_eq!(store.read().unwrap().entry_count(), 1);
+    assert_eq!(store.read_snapshot().unwrap().entry_count(), 1);
 }
 
 #[test]
@@ -1133,11 +1521,14 @@ struct JournalFixture {
 impl JournalFixture {
     fn new(label: &str) -> Self {
         static NEXT: AtomicUsize = AtomicUsize::new(0);
-        let root = std::env::temp_dir().join(format!(
-            "styrn-action-journal-{label}-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
+        let root = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join(format!(
+                "styrn-action-journal-{label}-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
         let directory = root.join("styrn");
         fs::create_dir_all(&directory).unwrap();
         #[cfg(unix)]

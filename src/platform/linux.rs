@@ -1,4 +1,4 @@
-use super::ManifestOwner;
+use super::{ManifestOwner, PrivateFileIdentity};
 use std::fs;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
@@ -26,7 +26,12 @@ pub(super) fn harden_manifest_directory(
 ) -> io::Result<()> {
     require_real_directory(path)?;
     apply_owner(path, owner)?;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o755))?;
+    let mode = if matches!(owner, ManifestOwner::User) {
+        0o700
+    } else {
+        0o755
+    };
+    fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
     verify_directory(path, owner)
 }
 
@@ -37,8 +42,13 @@ pub(super) fn harden_manifest_file(
 ) -> io::Result<()> {
     require_regular_file(path)?;
     apply_owner(path, owner)?;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o644))?;
-    verify_file(path, owner, 0o644, "manifest")
+    let mode = if matches!(owner, ManifestOwner::User) {
+        0o600
+    } else {
+        0o644
+    };
+    fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
+    verify_file(path, owner, mode, "manifest")
 }
 
 pub(super) fn open_manifest_lock(path: &Path, owner: ManifestOwner) -> io::Result<fs::File> {
@@ -68,6 +78,47 @@ pub(super) fn create_private_file(path: &Path, _owner: ManifestOwner) -> io::Res
         .open(path)
 }
 
+pub(super) fn private_file_identity(path: &Path) -> io::Result<PrivateFileIdentity> {
+    let metadata = fs::symlink_metadata(path)?;
+    if !metadata.is_file() {
+        return Err(permission_denied(
+            "private store target is not a regular file",
+        ));
+    }
+    Ok(PrivateFileIdentity::new(metadata.dev(), metadata.ino()))
+}
+
+pub(super) fn open_verified_private_file_for_read(
+    path: &Path,
+    owner: ManifestOwner,
+    expected_identity: PrivateFileIdentity,
+) -> io::Result<fs::File> {
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file()
+        || PrivateFileIdentity::new(metadata.dev(), metadata.ino()) != expected_identity
+    {
+        return Err(permission_denied(
+            "private store target identity or type changed",
+        ));
+    }
+    let expected_uid = match owner {
+        ManifestOwner::System => 0,
+        ManifestOwner::User => unsafe { libc::geteuid() },
+        #[cfg(test)]
+        ManifestOwner::CurrentProcess | ManifestOwner::CurrentProcessWorker => metadata.uid(),
+    };
+    if metadata.uid() != expected_uid || metadata.mode() & 0o777 != 0o600 {
+        return Err(permission_denied(
+            "private store file ownership or mode is insecure",
+        ));
+    }
+    Ok(file)
+}
+
 pub(super) fn verify_manifest_security(
     path: &Path,
     owner: ManifestOwner,
@@ -83,16 +134,20 @@ pub(super) fn verify_manifest_security(
     let directory = fs::metadata(parent)?;
     let expected_uid = match owner {
         ManifestOwner::System => 0,
+        ManifestOwner::User => unsafe { libc::geteuid() },
         #[cfg(test)]
         ManifestOwner::CurrentProcess | ManifestOwner::CurrentProcessWorker => file.uid(),
     };
-    validate_manifest_inspection(&UnixManifestInspection {
-        expected_uid,
-        file_uid: file.uid(),
-        file_mode: file.mode() & 0o777,
-        directory_uid: directory.uid(),
-        directory_mode: directory.mode() & 0o777,
-    })?;
+    validate_store_inspection(
+        owner,
+        &UnixManifestInspection {
+            expected_uid,
+            file_uid: file.uid(),
+            file_mode: file.mode() & 0o777,
+            directory_uid: directory.uid(),
+            directory_mode: directory.mode() & 0o777,
+        },
+    )?;
     verify_manifest_ancestors(parent, owner, worker, trusted_root)
 }
 
@@ -119,16 +174,20 @@ pub(super) fn open_verified_manifest_file_for_read(
     let directory = fs::metadata(parent)?;
     let expected_uid = match owner {
         ManifestOwner::System => 0,
+        ManifestOwner::User => unsafe { libc::geteuid() },
         #[cfg(test)]
         ManifestOwner::CurrentProcess | ManifestOwner::CurrentProcessWorker => file_metadata.uid(),
     };
-    validate_manifest_inspection(&UnixManifestInspection {
-        expected_uid,
-        file_uid: file_metadata.uid(),
-        file_mode: file_metadata.mode() & 0o777,
-        directory_uid: directory.uid(),
-        directory_mode: directory.mode() & 0o777,
-    })?;
+    validate_store_inspection(
+        owner,
+        &UnixManifestInspection {
+            expected_uid,
+            file_uid: file_metadata.uid(),
+            file_mode: file_metadata.mode() & 0o777,
+            directory_uid: directory.uid(),
+            directory_mode: directory.mode() & 0o777,
+        },
+    )?;
     verify_manifest_ancestors(parent, owner, worker, trusted_root)?;
     Ok(file)
 }
@@ -172,10 +231,14 @@ pub(super) fn verify_manifest_parent_chain(
     owner: ManifestOwner,
     worker: &str,
 ) -> io::Result<()> {
+    if matches!(owner, ManifestOwner::User) {
+        return verify_user_trusted_root_chain(parent);
+    }
     require_real_directory(parent)?;
     let worker_uid = worker_uid(owner, worker)?;
     let child_uid = match owner {
         ManifestOwner::System => 0,
+        ManifestOwner::User => unsafe { libc::geteuid() },
         #[cfg(test)]
         ManifestOwner::CurrentProcess | ManifestOwner::CurrentProcessWorker => unsafe {
             libc::geteuid()
@@ -197,6 +260,9 @@ pub(super) fn verify_manifest_ancestors(
         return Err(permission_denied(
             "manifest directory is outside its trusted root",
         ));
+    }
+    if matches!(owner, ManifestOwner::User) {
+        return verify_user_manifest_ancestors(directory, trusted_root);
     }
     if !system_owner && directory == trusted_root {
         return require_real_directory(directory);
@@ -236,6 +302,88 @@ pub(super) fn verify_manifest_ancestors(
     }
 }
 
+fn verify_user_manifest_ancestors(directory: &Path, trusted_root: &Path) -> io::Result<()> {
+    require_real_directory(directory)?;
+    if directory != trusted_root {
+        let current_uid = unsafe { libc::geteuid() };
+        let mut current = directory.parent();
+        while let Some(ancestor) = current {
+            if ancestor == trusted_root {
+                break;
+            }
+            require_real_directory(ancestor)?;
+            let metadata = fs::metadata(ancestor)?;
+            if metadata.uid() != current_uid || metadata.mode() & 0o022 != 0 {
+                return Err(permission_denied(
+                    "user state directory owner or write permissions are insecure",
+                ));
+            }
+            current = ancestor.parent();
+        }
+        if current.is_none() {
+            return Err(permission_denied(
+                "manifest trusted root is not an ancestor",
+            ));
+        }
+    }
+    verify_user_trusted_root_chain(trusted_root)
+}
+
+fn verify_user_trusted_root_chain(path: &Path) -> io::Result<()> {
+    require_real_directory(path)?;
+    let current_uid = unsafe { libc::geteuid() };
+    let metadata = fs::metadata(path)?;
+    if metadata.uid() != current_uid || metadata.mode() & 0o022 != 0 {
+        return Err(permission_denied(
+            "user state root owner or write permissions are insecure",
+        ));
+    }
+    let mut child_uid = metadata.uid();
+    let mut reached_system_owner = false;
+    let mut current = path.parent();
+    while let Some(ancestor) = current {
+        require_real_directory(ancestor)?;
+        let metadata = fs::metadata(ancestor)?;
+        validate_user_ancestor_access(
+            metadata.uid(),
+            metadata.mode(),
+            child_uid,
+            current_uid,
+            &mut reached_system_owner,
+        )?;
+        child_uid = metadata.uid();
+        current = ancestor.parent();
+    }
+    Ok(())
+}
+
+fn validate_user_ancestor_access(
+    uid: u32,
+    mode: u32,
+    child_uid: u32,
+    current_uid: u32,
+    reached_system_owner: &mut bool,
+) -> io::Result<()> {
+    if uid == 0 {
+        *reached_system_owner = true;
+    } else if uid != current_uid || *reached_system_owner {
+        return Err(permission_denied(
+            "user state ancestor has an unrelated or invalid owner transition",
+        ));
+    }
+    if mode & 0o022 != 0 {
+        let trusted_owner = uid == 0 || uid == current_uid;
+        let sticky_protects_user_child =
+            mode & 0o1000 != 0 && child_uid == current_uid && trusted_owner;
+        if !sticky_protects_user_child {
+            return Err(permission_denied(
+                "user state ancestor grants unrelated replacement access",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn verify_ancestor_chain(
     start: &Path,
     mut child_uid: u32,
@@ -267,6 +415,7 @@ fn verify_ancestor_chain(
 fn worker_uid(owner: ManifestOwner, worker: &str) -> io::Result<Option<u32>> {
     match owner {
         ManifestOwner::System => Ok(Some(lookup_worker_uid(worker)?)),
+        ManifestOwner::User => Ok(None),
         #[cfg(test)]
         ManifestOwner::CurrentProcess => Ok(None),
         #[cfg(test)]
@@ -346,9 +495,32 @@ fn validate_manifest_inspection(inspection: &UnixManifestInspection) -> io::Resu
     Ok(())
 }
 
+fn validate_store_inspection(
+    owner: ManifestOwner,
+    inspection: &UnixManifestInspection,
+) -> io::Result<()> {
+    if !matches!(owner, ManifestOwner::User) {
+        return validate_manifest_inspection(inspection);
+    }
+    if inspection.file_uid != inspection.expected_uid
+        || inspection.directory_uid != inspection.expected_uid
+    {
+        return Err(permission_denied(
+            "user state file and directory owner mismatch",
+        ));
+    }
+    if inspection.file_mode != 0o600 || inspection.directory_mode != 0o700 {
+        return Err(permission_denied(
+            "user state requires file mode 0600 and directory mode 0700",
+        ));
+    }
+    Ok(())
+}
+
 fn apply_owner(path: &Path, owner: ManifestOwner) -> io::Result<()> {
     match owner {
         ManifestOwner::System => std::os::unix::fs::chown(path, Some(0), Some(0)),
+        ManifestOwner::User => Ok(()),
         #[cfg(test)]
         ManifestOwner::CurrentProcess | ManifestOwner::CurrentProcessWorker => Ok(()),
     }
@@ -358,8 +530,15 @@ fn verify_directory(path: &Path, owner: ManifestOwner) -> io::Result<()> {
     require_real_directory(path)?;
     let metadata = fs::metadata(path)?;
     verify_owner(&metadata, owner, "manifest directory")?;
-    if metadata.mode() & 0o777 != 0o755 {
-        return Err(permission_denied("manifest directory mode must be 0755"));
+    let expected_mode = if matches!(owner, ManifestOwner::User) {
+        0o700
+    } else {
+        0o755
+    };
+    if metadata.mode() & 0o777 != expected_mode {
+        return Err(permission_denied(&format!(
+            "manifest directory mode must be {expected_mode:04o}"
+        )));
     }
     Ok(())
 }
@@ -380,6 +559,7 @@ fn verify_file(path: &Path, owner: ManifestOwner, mode: u32, label: &str) -> io:
 fn verify_owner(metadata: &fs::Metadata, owner: ManifestOwner, label: &str) -> io::Result<()> {
     let expected = match owner {
         ManifestOwner::System => 0,
+        ManifestOwner::User => unsafe { libc::geteuid() },
         #[cfg(test)]
         ManifestOwner::CurrentProcess | ManifestOwner::CurrentProcessWorker => metadata.uid(),
     };
@@ -461,5 +641,26 @@ mod tests {
     #[test]
     fn worker_owned_read_only_ancestor_is_still_rejected() {
         assert!(validate_ancestor_access(41, 0o555, Some(41), true).is_err());
+    }
+
+    #[test]
+    fn user_ancestor_policy_accepts_sticky_protection_and_rejects_takeover_authority() {
+        let mut reached_system_owner = false;
+        assert!(
+            validate_user_ancestor_access(0, 0o1777, 41, 41, &mut reached_system_owner,).is_ok()
+        );
+        assert!(reached_system_owner);
+
+        let mut user_owned_chain = false;
+        assert!(validate_user_ancestor_access(41, 0o0777, 41, 41, &mut user_owned_chain,).is_err());
+        let mut unrelated_owner_chain = false;
+        assert!(
+            validate_user_ancestor_access(42, 0o0755, 41, 41, &mut unrelated_owner_chain,).is_err()
+        );
+        let mut invalid_reverse_transition = true;
+        assert!(
+            validate_user_ancestor_access(41, 0o0755, 0, 41, &mut invalid_reverse_transition,)
+                .is_err()
+        );
     }
 }

@@ -13,6 +13,8 @@ use std::path::PathBuf;
 #[derive(Clone, Copy, Debug)]
 pub(crate) enum ManifestOwner {
     System,
+    #[allow(dead_code)] // Source-including manifest fixtures omit the user receipt store.
+    User,
     #[cfg(test)]
     CurrentProcess,
     #[cfg(test)]
@@ -26,6 +28,20 @@ pub(crate) enum ManifestOwner {
 /// publishing a separately created or worker-authorized directory.
 pub(crate) struct PrivateManifestStagingDirectory {
     path: PathBuf,
+}
+
+/// Stable identity captured while enumerating a private transaction file.
+/// The subsequent no-follow open must verify the same object before reading.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct PrivateFileIdentity {
+    first: u64,
+    second: u64,
+}
+
+impl PrivateFileIdentity {
+    fn new(first: u64, second: u64) -> Self {
+        Self { first, second }
+    }
 }
 
 impl PrivateManifestStagingDirectory {
@@ -80,6 +96,20 @@ pub(crate) fn create_private_file(
     owner: ManifestOwner,
 ) -> std::io::Result<std::fs::File> {
     platform_impl::create_private_file(path, owner)
+}
+
+#[allow(dead_code)] // Source-including manifest tests omit receipt recovery.
+pub(crate) fn private_file_identity(path: &Path) -> std::io::Result<PrivateFileIdentity> {
+    platform_impl::private_file_identity(path)
+}
+
+#[allow(dead_code)] // Source-including manifest tests omit receipt recovery.
+pub(crate) fn open_verified_private_file_for_read(
+    path: &Path,
+    owner: ManifestOwner,
+    expected_identity: PrivateFileIdentity,
+) -> std::io::Result<std::fs::File> {
+    platform_impl::open_verified_private_file_for_read(path, owner, expected_identity)
 }
 
 pub(crate) fn verify_manifest_security(
