@@ -5090,13 +5090,15 @@ Symbols: `+` create/install, `~` reconfigure, `✓` already satisfied, `!` needs
 
 ### 15.6.1 The receipt
 
-JSON, schema-versioned, one entry per applied action — write-ahead where possible, finalized after; modeled on `/nix/receipt.json` [verified: S1]. Locations (matching Styrn's existing directory casing, deviating deliberately from the brief's lowercase suggestion): `/var/lib/styrn/receipt.json` (Linux), `/Library/Application Support/Styrn/receipt.json` (macOS), `C:\ProgramData\Styrn\receipt.json` (Windows). Owned by root/Administrators, like the manifest (Part 4.5). Per entry:
+JSON, schema-versioned, one entry per applied action, modeled on `/nix/receipt.json` [verified: S1]. Locations (matching Styrn's existing directory casing, deviating deliberately from the brief's lowercase suggestion): `/var/lib/styrn/receipt.json` (Linux), `/Library/Application Support/Styrn/receipt.json` (macOS), `C:\ProgramData\Styrn\receipt.json` (Windows). Owned by root/Administrators, like the manifest (Part 4.5). Per entry:
 
 - action type + parameters, timestamp, privilege used;
 - files created (paths + hashes); files modified (path + before-hash + backup location);
 - services, accounts, registry keys, firewall rules created;
 - download provenance (URL, version, SHA-256);
 - status: `applied | pending | adopted` (adopted = applied by a generated script and reconciled later; 15.11.2).
+
+**Durable apply protocol (rev. G):** the private transaction intent is not a receipt entry and conveys no ownership. Before dispatch it is fsynced as `prepared` with the closed action and expected effect. After `apply` returns success and the finalized effect exactly matches, the intent is atomically/fsync transitioned to `succeeded`; only then may the applied receipt entry be appended. Recovery may finalize a `succeeded` intent after revalidation. A `prepared` intent whose probe remains `Todo` may retry; a `prepared` intent whose probe is already `Done`, `NeedsHuman`, or inconsistent is an explicit `setup.receipt_conflict`, never automatic ownership or adoption.
 
 ### 15.6.2 `--uninstall`
 
@@ -5106,7 +5108,9 @@ JSON, schema-versioned, one entry per applied action — write-ahead where possi
 
 ### 15.6.3 Failure policy — resumable-forward (adopted, with the brief's argument)
 
-Partial failure is the norm: network blips, a locked MSI, a missing FDA grant. Rollback-on-failure is the wrong default for a *setup* tool — half-configured-but-progressing beats repeatedly-reverted, and some actions (OS capability installs) are slow to redo. nix-installer attempts best-effort reversion on failed installs [verified: S1]; Styrn steals the *receipt* that makes reversal possible, **not** that behavior [judgment; adopted]. On action failure: stop (or continue independent siblings with `--keep-going`), report exactly which action failed and why (exit 13, `setup.apply_failed`, failing action named in `errors[].details`), leave the receipt accurate, and make the fix path "run `styrn setup` again" — which converges because of the `check()` gate. Reversal happens only via explicit `--uninstall`. This is the same resumable-forward stance as rev. C's 15.1 atomicity addendum, now mechanized.
+Partial failure is the norm: network blips, a locked MSI, a missing FDA grant. Rollback-on-failure is the wrong default for a *setup* tool — half-configured-but-progressing beats repeatedly-reverted, and some actions (OS capability installs) are slow to redo. nix-installer attempts best-effort reversion on failed installs [verified: S1]; Styrn steals the *receipt* that makes reversal possible, **not** that behavior [judgment; adopted]. On action failure: stop (or continue independent siblings with `--keep-going`), report exactly which action failed and why (exit 13, `setup.apply_failed`, failing action named in `errors[].details`), leave the receipt accurate, and make the fix path "run `styrn setup` again" — which normally converges because of the `check()` gate. Reversal happens only via explicit `--uninstall`.
+
+There is an unavoidable crash window between an external OS mutation and durably recording `succeeded`; those operations cannot be one filesystem transaction. If recovery sees the resource `Done` with only a `prepared` intent, it cannot distinguish Styrn's interrupted mutation from an external actor completing the same state. Because the receipt is uninstall authority, false ownership is worse than automatic recovery: stop with `setup.receipt_conflict`, retain diagnostic evidence, and require later explicit adoption/reconciliation. Never infer ownership from observed convergence alone. This is the honest boundary of the resumable-forward policy.
 
 ## 15.7 Per-OS mechanics (new in rev. D; evidence tags preserved)
 

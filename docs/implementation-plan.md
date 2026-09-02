@@ -111,7 +111,7 @@ passing negative test.
 - [ ] **T0.11** — Receipt journal (15.6)
       Append-only record of every applied action with provenance (url, version, digest) per the 15.7.6 supply-chain bar.
   - [ ] + positive: a completed run produces a receipt listing every action, and a second run reads it and prints "nothing to do".
-  - [ ] − negative: a run interrupted mid-apply leaves a receipt describing exactly the actions that completed — no entry for the action that failed, and no entry for actions never attempted.
+  - [ ] − negative: a run interrupted mid-apply leaves a receipt describing exactly the durably acknowledged actions — no entry for the action that failed or was only prepared. `succeeded`-before-append recovers automatically; `prepared` plus already-`Done` refuses with `setup.receipt_conflict` rather than guessing ownership.
 
 - [ ] **T0.12** — Elevation strategy (15.5)
       Per the decided model; never demand admin for actions that do not need it.
