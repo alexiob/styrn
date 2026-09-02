@@ -106,7 +106,7 @@ The worker—not the controller or coding agent—makes the final admission deci
 - **Persistent by design:** worker-owned job supervisors outlive controller connections; where Herdr is registered, agent sessions do too.
 - **Generic, not abstract:** provide durable fleet primitives while leaving Cargo or other build-system knowledge in the project profile.
 - **Automation is a contract:** finite commands have a versioned JSON envelope, documented error codes, and stable exit semantics.
-- **Security boundaries are explicit:** untrusted work runs without fleet credentials as the dedicated `styrn` user; MCP profiles improve least-privilege ergonomics but are not treated as containment from a process that already has controller shell access.
+- **Security boundaries are explicit:** current-user mode is the frictionless default and creates no account; optional dedicated mode adds OS-account isolation under any configured valid name. MCP profiles improve least-privilege ergonomics but are not treated as containment from a process that already has controller shell access.
 - **Secrets stay out of manifests:** machine manifests, job records, logs, and command payloads must not contain private keys, auth keys, API keys, tokens, or passwords.
 
 ## Planned integrations
@@ -178,7 +178,7 @@ Styrn release. There is no supported installation path yet.
 
 ## Naming
 
-The canonical names are: project **Styrn**, command and repository `styrn`, project file `.styrn.toml`, environment-variable prefix `STYRN_`, and service user `styrn`.
+The canonical names are: project **Styrn**, command and repository `styrn`, project file `.styrn.toml`, and environment-variable prefix `STYRN_`. There is no required service-user name; `styrn` is only the suggested name for optional dedicated-account mode.
 
 ## License
 

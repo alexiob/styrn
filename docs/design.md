@@ -79,7 +79,10 @@ The operator's requirement, verbatim and binding:
 This is a first-class design tenet, and it is the **tiebreaker** used throughout this document: when two designs are equally correct, the one requiring less setup, fewer flags, fewer manual steps, and fewer permission prompts wins. Concretely:
 
 - **Sensible defaults over required configuration.** Every knob has a working default; configuration expresses *deviation*, never table stakes.
-- **Autodetection over declaration.** Styrn never asks a developer for information it could discover itself (transport user, port, project, revision, key material, repo state on a worker).
+- **Autodetection over declaration.** Styrn never asks a developer to invent
+  information it can discover itself (project, revision, key material, repo
+  state on a worker). Setup resolves the transport user and emits it explicitly
+  in the enrollment card; the controller does not guess an account default.
 - **One command over a documented sequence.** If the docs say "first run X, then Y", Y should run X implicitly when it is safe to.
 - **Opt-in hardening rather than opt-out friction.** Security postures that add ceremony (profile pinning, deploy keys, keychain storage) exist and are one config block away — they are never the default a developer must dismantle to get started.
 - **Powerful stays possible, never mandatory.** Nothing in the frictionless path forecloses the advanced path.
@@ -101,8 +104,8 @@ Applied in this revision at: 4.3.1 (lazy key generation), 6.1 (transport default
 
 1. **Part 15 replaced wholesale** by the `styrn setup` subsystem: one probe→diff→plan→apply engine with typed, reversible, journaled Actions; `doctor` and `setup` are two frontends of one probe layer (15.2, amending 6.5). The operator's CLI surface — `--install …/--role …`, `--config …`, `--interactive` — is adopted verbatim, plus `--dry-run`, `--emit-script`, `--uninstall`, `--adopt` (15.4, 15.13). Bare `styrn setup` provisions a worker with **two human decisions** (one Enter, one Tailscale browser login); zero with `--yes --auth-key`.
 2. **D-3 originally decided hardened mode as the Windows default** (15.8); rev. G supersedes only that default. The transient-logon path remains available as optional dedicated-account hardening, while current-user now requires no account creation.
-3. **`styrnd` worker service** (S-34): the maintenance executor Part 6.8 lacked, and the Windows supervisor-spawn broker 7.8 needed — per-worker, unprivileged, local-only, explicitly reconciled with orig. §63's no-central-daemon rule (15.9).
-4. **Enrollment ergonomics resolved** (S-36): enrollment stays controller-initiated; setup ends with an **enrollment card** (name + address + host-key fingerprint) making a worker enrollable in one pasted line; `styrn bootstrap-script --os <os>` emits a customized stage-zero script with the controller key baked in (15.10, 15.11.4).
+3. **`styrnd` worker service** (S-34): the maintenance executor Part 6.8 lacked, and the Windows supervisor-spawn broker 7.8 needed — per-worker and local-only, with selected-principal maintenance separated from the narrow credential-free Windows broker, explicitly reconciled with orig. §63's no-central-daemon rule (15.9).
+4. **Enrollment ergonomics resolved** (S-36): enrollment stays controller-initiated; setup ends with an **enrollment card** (name/address + explicit transport user + host-key fingerprint) making a worker enrollable in one pasted line; `styrn bootstrap-script --os <os>` emits a customized stage-zero script with the controller key baked in (15.10, 15.11.4).
 5. **Script generation** specified as a third renderer of the same Action plan (`render_posix`/`render_powershell`), with the four hard breaks handled: runtime secrets via `Secret<T>`, embedded guard checks against state drift, interactive auth passthrough, and `--adopt` receipt reconciliation (15.11).
 6. **winget demoted** (S-35): unusable from SYSTEM/service/SSH-non-interactive contexts — the rev. A Windows script was built on it; direct MSI/EXE is the dependable Windows channel (15.7.6).
 7. Exit code 13 and the `setup.*` error-code family added (10.3, 10.4, 15.13); reference scripts demoted with S-10/S-17/S-18/S-27 supersession recorded (15.12); Appendix A remapped for orig. §42–§49, §60, §111–§114.
@@ -379,7 +382,9 @@ This is preferable to creating a custom TCP service in v1 because it gives you:
 - easy auditing;
 - easy manual debugging;
 - Tailscale isolation;
-- no privileged worker daemon.
+- no general-purpose privileged worker daemon. The sole exception is the narrow,
+  local Windows admission/spawn broker in Part 15.9; it accepts no arbitrary
+  executable, arguments, network input, or unadmitted job.
 
 **Clarification (new in rev. B, resolves part of S-01):** the SSH/stdio RPC session is a *control channel*, not an *execution container*. Long-running jobs submitted through it are handed off to a detached worker-side supervisor (Part 7.8) and survive the channel. Only the interactive stream (`styrn shell`, `styrn agent attach`) is inherently tied to the SSH session's lifetime.
 
@@ -922,7 +927,14 @@ headless = true
 kind = "ssh"
 host = "win-mini"
 port = 22
-user = "styrn"
+user = "alex"
+
+[worker_identity]
+mode = "current-user"
+principal_kind = "windows-sid"
+principal_id = "S-1-5-21-111111111-222222222-333333333-1001"
+name = "alex"
+isolation = "shared-user"
 
 [paths]
 root = "C:\\Styrn"
@@ -1007,6 +1019,16 @@ Revision A's canonical manifest requires `machine_id`, but none of the reference
 
 ### 2.4.2 Manifest field constraints (new in rev. B; resolves part of S-18)
 
+- A manifest with the `worker` role requires `[transport].user` and a
+  `[worker_identity]` record. `mode` is `current-user | dedicated`,
+  `principal_kind` is `unix-uid | windows-sid`, `principal_id` is the stable
+  numeric uid or SID, `name` is the resolved login name, and `isolation` is
+  `shared-user | dedicated-account`. `transport.user` must equal
+  `worker_identity.name`. Renaming or deleting that uid/SID is identity drift;
+  Styrn refuses worker operation rather than silently selecting another
+  account. In this greenfield v1, a worker manifest missing the record is
+  invalid and the remediation is to rerun setup; there is no ambiguous
+  name-only migration.
 - Exactly one of `reserved_disk_bytes` or `reserved_disk_percent` may be present in `[resources.policy]`. Both present is a validation error (`project.profile_invalid` analog for manifests: `machine.manifest_invalid`). `reserved_disk_percent` is evaluated against the *total size* of the filesystem containing `[paths].root`, computed at admission time.
 - All `*_bytes` fields are non-negative integers (bytes). All `max_*` counts are positive integers.
 - `[pending_actions]` (Part 15.2.4) is a list of tables and may be present in the manifest after bootstrap; `styrn host doctor` reports unresolved entries.
@@ -1085,7 +1107,7 @@ manifest_cache = "manifests/linux-macpro.toml"
 [hosts.transport]
 kind = "ssh"
 host = "linux-macpro"
-user = "styrn"
+user = "buildbot"
 port = 22
 identity = "~/.ssh/styrn_ed25519"
 
@@ -1097,7 +1119,7 @@ manifest_cache = "manifests/win-mini.toml"
 [hosts.transport]
 kind = "ssh"
 host = "win-mini"
-user = "styrn"
+user = "alex"
 port = 22
 identity = "~/.ssh/styrn_ed25519"
 ```
@@ -1125,7 +1147,14 @@ headless = true
 kind = "ssh"
 host = "win-mini"
 port = 22
-user = "styrn"
+user = "alex"
+
+[worker_identity]
+mode = "current-user"
+principal_kind = "windows-sid"
+principal_id = "S-1-5-21-111111111-222222222-333333333-1001"
+name = "alex"
+isolation = "shared-user"
 
 [resources.policy]
 reserved_memory_bytes = 5368709120
@@ -1366,12 +1395,18 @@ Why not standardize on Tailscale SSH? Because native Windows is an important tar
 For all workers, prefer:
 
 - public-key authentication;
-- a dedicated worker account;
+- the invoking account for the frictionless default, or an explicitly chosen
+  dedicated account when OS-account isolation is wanted;
 - no public router port forwarding;
 - Tailscale-only network reachability;
 - no shared personal SSH private keys stored on workers.
 
-**Hardening addendum (new in rev. B):** bootstrap should additionally set, on workers, `PasswordAuthentication no` (or the Windows sshd_config equivalent) once key auth is verified working, and restrict `AllowUsers styrn` where the machine is a dedicated worker. Revision A implied but never stated either.
+**Hardening addendum (new in rev. B; amended rev. G):** bootstrap should
+additionally set, on workers, `PasswordAuthentication no` (or the Windows
+sshd_config equivalent) once key auth is verified working. On a dedicated
+worker it may restrict `AllowUsers` to the safely rendered selected principal,
+while preserving unrelated sshd configuration and existing users. It never
+writes a literal username or narrows a shared current-user machine globally.
 
 ## 3.4 Remote GUI / headless control (orig. §17)
 
@@ -1450,7 +1485,7 @@ Also, modern macOS does not allow fully reliable command-line enablement of Scre
 [[pending_actions]]
 id = "macos-screen-sharing"
 severity = "info"
-message = "Enable Screen Sharing for the styrn user in System Settings > General > Sharing."
+message = "Enable Screen Sharing for the selected worker user in System Settings > General > Sharing."
 ```
 
 ## 3.5 Hard recovery for headless systems (orig. §18)
@@ -1589,10 +1624,17 @@ Enable sandboxing where it is compatible with the project.
 
 Revision A distributed one key (`styrn_ed25519`) in every bootstrap example and never discussed rotation or revocation. Adopted policy:
 
-1. **One keypair per controller machine, generated lazily (rev. C; S-30, tenet §0.6).** The first Styrn command that needs to connect and finds no configured identity generates `~/.ssh/styrn_<controller-name>_ed25519` automatically (equivalent to `ssh-keygen -t ed25519 -C styrn-<controller-name>`), prints the public key, and says exactly how to authorize it (`styrn setup --authorized-keys` on the worker, or `styrn host authorize-key` from an already-authorized controller). No separate init ceremony is required; `styrn controller init` exists only as an explicit way to pre-generate. The public half is what bootstrap installs into each worker's `authorized_keys`.
-2. **Keys are authorized per worker, per controller.** The resolved worker identity's `authorized_keys` contains one line per authorized controller, each with a recognizable comment (`styrn-mbp-main`, `styrn-win-hp`). Options `restrict,pty` may be added later; v1 keeps plain entries because `styrn shell` and Herdr attach need a PTY and command flexibility.
-3. **Authorizing a new controller** is an administrative action performed either during setup (`[ssh] authorized_keys` in setup-config, or `--authorized-keys`; Part 15.10) or later via an existing controller: `styrn host authorize-key <host> --public-key <path>` (new command; appends to the worker's `authorized_keys` over the existing transport, idempotently).
-4. **Revocation:** `styrn host revoke-key <host> --controller <name>` removes the matching `authorized_keys` line. When a controller machine is lost or compromised, run this against every worker from any surviving controller; because keys are per-controller, no other controller is disturbed. Tailscale device removal for the lost machine is the complementary first step (it cuts network reachability even before key cleanup).
+1. **One keypair per controller machine, generated lazily (rev. C; S-30, tenet §0.6).** The first Styrn command that needs to connect and finds no configured identity generates `~/.ssh/styrn_<controller-name>_ed25519` automatically (equivalent to `ssh-keygen -t ed25519 -C styrn-<controller-name>`), prints the public key, and says exactly how to authorize it (`styrn setup --authorized-keys` on the worker, or `styrn host authorize-key` from an already-authorized controller). No separate init ceremony is required; `styrn controller init` exists only as an explicit way to pre-generate. The public half is what bootstrap installs into each worker's protected account-specific authorized-key file.
+2. **Keys are authorized per worker, per controller, in protected state.**
+   Styrn configures an account-specific `AuthorizedKeysFile` outside the selected
+   identity's writable profile. Root/Administrators owns it; the selected
+   identity may read but not modify it. It contains one recognizable line per
+   controller (`styrn-mbp-main`, `styrn-win-hp`). This prevents an admitted job
+   running as that same identity from silently installing a persistence key.
+   Options `restrict,pty` may be added later; v1 keeps plain entries because
+   `styrn shell` and Herdr attach need a PTY and command flexibility.
+3. **Authorizing a new controller** is an administrative action performed either during setup (`[ssh] authorized_keys` in setup-config, or `--authorized-keys`; Part 15.10) or later via an existing controller: `styrn host authorize-key <host> --public-key <path>` (new command; updates the protected worker key file over the existing transport, idempotently).
+4. **Revocation:** `styrn host revoke-key <host> --controller <name>` removes the matching line from the protected worker key file. When a controller machine is lost or compromised, run this against every worker from any surviving controller; because keys are per-controller, no other controller is disturbed. Tailscale device removal for the lost machine is the complementary first step (it cuts network reachability even before key cleanup).
 5. **Rotation** is revoke + authorize with a fresh keypair; no shared-secret ceremony exists to coordinate.
 6. Private keys should be held in the OS keychain/agent where practical (`ssh-agent` on all three platforms; macOS keychain integration; Windows OpenSSH agent service). Styrn never reads private key files itself in v1 — it delegates to `ssh`.
 
@@ -1778,7 +1820,7 @@ The remote Styrn process subscribes to its own job registry unconditionally, and
 Bootstrap a worker. Then, from any controller:
 
 ```text
-styrn host enroll win-mini
+styrn host enroll win-mini --user alex
 ```
 
 Implementation (revised order; host-key and identity steps new in rev. B — resolves S-05):
@@ -1815,19 +1857,27 @@ Pending:
 Machine output:
 
 ```text
-styrn host enroll win-mini --json
+styrn host enroll win-mini --user alex --json
 ```
 
 returns one stable JSON object (standard envelope).
 
-**Friction note (rev. C, tenet §0.6):** enrollment needs exactly one operator-supplied fact — the hostname — plus a fingerprint confirmation. Transport defaults (`user = "styrn"`, `port = 22`) are assumed and recorded in inventory only when they differ; the manifest, `machine_id`, capabilities, and versions are discovered, never asked for. If no controller identity exists yet, enrollment triggers lazy key generation (4.3.1) instead of failing. As of rev. D, the worker side of enrollment is one step: `styrn setup` ends by printing the enrollment card (name, address, host-key fingerprint) that makes the `styrn host enroll <name> --fingerprint ...` line a paste, not a procedure — see Part 15.10. Enrollment itself remains controller-initiated (S-36).
+**Friction note (rev. C, tenet §0.6; amended rev. G):** enrollment has no
+implicit SSH username. The operator supplies the hostname and selected
+transport user, plus a fingerprint confirmation; `port = 22` remains the only
+transport default. Setup discovers the user and prints all three facts in the
+enrollment card, so normal enrollment is still one paste rather than a memory
+test. The returned manifest must bind `transport.user` to the same stable
+`worker_identity`; a mismatch aborts before inventory is written. If no
+controller identity exists yet, enrollment triggers lazy key generation
+(4.3.1) instead of failing. Enrollment remains controller-initiated (S-36).
 
 ## 6.2 `styrn host remove` semantics (new in rev. B; part of S-05)
 
 Revision A listed the command (orig. §25) without semantics. Defined:
 
 - `styrn host remove <host>` removes the host from **this controller's inventory and caches only**. It does not touch the worker, does not revoke keys, and does not affect running jobs. Output states this explicitly.
-- `styrn host remove <host> --revoke` additionally connects first and removes *this controller's* key line from the worker's `authorized_keys` (self-deauthorization). Refused if there are jobs on that worker owned/submitted by this controller unless `--force`.
+- `styrn host remove <host> --revoke` additionally connects first and removes *this controller's* key line from the worker's protected authorized-key file (self-deauthorization). Refused if there are jobs on that worker owned/submitted by this controller unless `--force`.
 - Removing a **lost or compromised** machine is the reverse direction and is documented procedure, not a single command: remove the device from the tailnet, then `styrn host revoke-key <worker> --controller <lost>` on each worker (Part 4.3.4).
 - Running jobs on a removed host keep running (the worker owns them); they simply stop being visible from this controller until re-enrollment.
 
@@ -3000,7 +3050,7 @@ styrn controller init [--json]                        (optional keypair pre-gene
 styrn host list [--json]
 styrn host show <host> [--json]
 styrn host status [<host>] [--json]
-styrn host enroll <host> [--fingerprint SHA256] [--json]
+styrn host enroll <host> --user <user> [--fingerprint SHA256] [--json]
 styrn host remove <host> [--revoke] [--json]          (semantics: Part 6.2)
 styrn host doctor [<host>] [--json]
 styrn host refresh [<host>] [--json]
@@ -3859,7 +3909,7 @@ Claude Code now runs natively on Windows and can use PowerShell. No WSL is requi
 
 > Claude Code's sandboxing supports macOS, Linux and WSL2; native Windows sandboxing is not currently supported.
 
-Therefore the Windows security boundary should be:
+Therefore an operator who needs OS-account separation should opt into:
 
 ```text
 dedicated Windows account
@@ -3869,6 +3919,11 @@ dedicated Windows account
 + Claude permission rules
 + isolated job directory
 ```
+
+This is optional hardening, not a prerequisite for Styrn. In default
+current-user mode the boundary instead includes that user's ambient access and
+must be reported honestly; admission, quotas, job directories, Tailscale,
+Firewall, and harness permissions still apply.
 
 If using PowerShell as the primary Claude shell, configure it intentionally. (The concrete `settings.json` keys the Windows bootstrap script writes for this — `CLAUDE_CODE_USE_POWERSHELL_TOOL`, `defaultShell` — are **unverified inventions of the rev. A script**; confirm the real configuration surface against current Claude Code docs before shipping the bootstrap. Registered as part of S-18.)
 
@@ -4952,7 +5007,7 @@ The rev. A bootstrap principles are not dropped; they are what the engine *is*:
 | Orig. §42 principle | Where the engine delivers it |
 |---|---|
 | idempotent / safe to rerun | `check()`-before-`apply()` gate (15.2.3); resumable-forward (15.6.3) |
-| explicit about privilege | `privilege()` per action; badges in the plan display (15.4.4); split phases (15.5) |
+| explicit about privilege | `privilege()` per action; badges in the plan display (15.4.4); one protected publisher that delegates `None` effects to the original principal (15.5) |
 | native to the OS; WSL-free | per-OS action implementations (15.7); WSL never appears |
 | generates the machine manifest | manifest is setup *output* (15.3.2) |
 | reports incomplete interactive steps | `NeedsHuman` (15.2.4) |
@@ -5018,6 +5073,11 @@ Layering, lowest → highest: **built-in defaults < config file < environment va
 
 Setup **generates the manifest** (and re-generates it on every run, preserving `machine_id` per Part 2.4.1). The manifest is never desired state; a hand-edit to `machine.toml` that contradicts probing is reported by doctor as drift, not silently honored. `[resources.policy]` values (Part 7.4) are seeded by setup from detected hardware using the Part 7.4 tables and are the one manifest region setup will *not* overwrite on re-run once an operator has edited it (policy is operator-owned; identity and detection are setup-owned).
 
+For a worker role, setup writes `[worker_identity]` from the resolved stable
+uid/SID and makes `[transport].user` the same validated login name. Both fields
+are setup-owned. A later name-to-id mismatch is reported as drift; neither
+setup nor RPC falls back to the current process user.
+
 ### 15.3.3 Roles and component sets (absorbs orig. §43's profiles)
 
 Orig. §43's bootstrap profiles map onto role defaults plus `--install`:
@@ -5081,10 +5141,29 @@ Symbols: `+` create/install, `~` reconfigure, `✓` already satisfied, `!` needs
 ## 15.5 Elevation strategy (decided)
 
 - **Probe always runs unprivileged** (15.2.1).
-- Elevation is requested **once, at apply time, only if the confirmed plan contains privileged actions** [judgment; adopted].
-- **Unix:** if the plan contains `Root` actions and euid != 0, self-re-exec `sudo <current argv> --resume <plan-file>` after confirmation — one password prompt, whole plan runs elevated. `--no-elevate` prints the sudo command instead of running it. Per-step sudo (N prompts) and blanket "run me as root" (over-privilege for a plan that may need nothing) are both rejected.
-- **Windows:** UAC self-relaunch (`ShellExecuteEx`/`runas`) spawns a new console and detaches stdout/stderr — hostile for a CLI. Instead: detect token elevation; if the plan needs admin and the shell is not elevated, print the plan plus one exact instruction ("open an elevated PowerShell and re-run: `styrn setup ...`") and exit 13 / `setup.elevation_required`. Where the inbox `sudo` command exists and is enabled (Windows 11 24H2+, inline mode keeps the console), use it [well-established; implementer confirm behavior per Windows build].
-- **Never gate unprivileged actions behind elevation**: the plan is split into privileged and unprivileged phases, so a no-admin run still does everything it can (directory tree, user-level tool installs, manifest write) and reports the rest as a re-run-elevated remainder [judgment].
+- A confirmed plan that would mutate anything is coordinated by one protected
+  root/Administrator publisher. This is required even when every external
+  action is `Privilege::None`, because the private intent journal, public
+  receipt, and generated manifest are protected state and are the uninstall
+  ownership authority. A true no-op, probe, and dry run need no elevation.
+- **Unix:** if a mutating plan starts with euid != 0, self-re-exec
+  `sudo <current argv> --resume <plan-file>` after confirmation — one password
+  prompt. The coordinator verifies the sealed plan, opens the protected journal
+  session, and runs each `Privilege::None` action as the captured original uid;
+  it never turns a user-level installer into a root-level installer.
+- **Windows:** UAC self-relaunch (`ShellExecuteEx`/`runas`) spawns a new console
+  and detaches stdout/stderr — hostile for a CLI. Detect token elevation; for a
+  mutating plan without an elevated publisher, print the plan plus one exact
+  instruction ("open an elevated PowerShell and re-run: `styrn setup ...`")
+  and exit 13 / `setup.elevation_required`. Where the inbox `sudo` command is
+  enabled and its inline behavior is natively verified, it may preserve the
+  console. The publisher delegates `Privilege::None` work through the captured
+  original token, never as Administrator/SYSTEM.
+- `--no-elevate` is all-or-nothing for mutation: it prints the exact resume
+  command and exits 13 before dispatching any action. This avoids both
+  half-applied plans and a worker-writable ownership journal. The plan names
+  the protected-state publisher separately from actions whose OS effect itself
+  requires root/Administrator.
 
 ## 15.6 Receipts, idempotency, `--uninstall`, and the failure policy
 
@@ -5121,7 +5200,19 @@ There is an unavoidable crash window between an external OS mutation and durably
 - **Service:** `Start-Service sshd; Set-Service -Name sshd -StartupType 'Automatic'`.
 - **Firewall:** verify rule `OpenSSH-Server-In-TCP`; create if absent (`New-NetFirewallRule ... -LocalPort 22`).
 - **Config:** `%programdata%\ssh\sshd_config`; sshd regenerates a default if missing; restart the service after edits. `StrictModes`, `AuthorizedKeysCommand`, `PermitRootLogin` and others are NOT supported in the inbox build [verified: S3] — setup must not write unsupported directives.
-- **The ACL trap:** for a selected identity in the Administrators group, keys are read from `%programdata%\ssh\administrators_authorized_keys` (not its profile's `.ssh\authorized_keys`), and that file must carry ONLY SYSTEM and Administrators ACEs or key auth *silently fails* [verified: S3]. A non-admin identity uses its resolved profile's `.ssh\authorized_keys` with tight owner + SYSTEM ACLs. Setup probes group membership and selects the correct path; it never infers the path from an assumed username. The conformance test (16.6 item 8) exercises both branches with real key login.
+- **The ACL trap and the safe resolution:** the inbox default sends members of
+  Administrators to `%programdata%\ssh\administrators_authorized_keys`, whose
+  ACL must contain only SYSTEM and Administrators or key auth silently fails
+  [verified: S3]. That shared file would authorize the Styrn controller key for
+  every administrator, so Styrn does not use it. Setup writes an account-specific
+  protected key file under `%ProgramData%\Styrn\ssh\`, ACL'd to SYSTEM,
+  Administrators, and read-only access for the selected SID, and installs a
+  safely escaped `Match User <selected-name>` override pointing to it. Native
+  conformance proves both administrator-member and ordinary-user key login. If
+  the installed OpenSSH build cannot express or honor that account-specific
+  override, setup returns `NeedsHuman` and refuses worker eligibility; it never
+  broadens access through `administrators_authorized_keys`. Unix uses the same
+  protected, account-specific model under Styrn's root-owned state directory.
 - **DefaultShell (decided):** registry `HKLM:\SOFTWARE\OpenSSH`, string value `DefaultShell`; initial default is `cmd.exe` [verified: S3]. Setup sets it to PowerShell (`pwsh.exe` when present, else Windows PowerShell) via `New-ItemProperty ... -Force`. Rationale: every string that *does* traverse the login shell — `styrn shell`, the Herdr attach command (11.13), and git's `git-receive-pack '<path>'` invocation during controller-push (8.2) — gets one known set of quoting semantics instead of cmd.exe's. This does not change Part 7.10's convention: workflow commands and `styrn exec` never use the login shell at all; the fixed `styrn rpc serve --stdio` literal is quote-safe under any of the three shells (5.1). **Git-push interop through the chosen default shell is exercised by `styrn fleet selftest` (16.6 item 6), which pushes on every run — treat any residual quoting interaction between OpenSSH-Windows, the shell, and `git-receive-pack` as implementer-confirm rather than assumed.**
 
 ### 15.7.2 Tailscale, per OS
@@ -5150,7 +5241,7 @@ The design degrades gracefully if item 2 is dead on current macOS: the chain sim
 |---|---|---|
 | Linux | write `/etc/systemd/system/styrnd.service`; `systemctl daemon-reload && systemctl enable --now styrnd` | root [well-established: S28] |
 | macOS | write `/Library/LaunchDaemons/dev.styrn.styrnd.plist`; `launchctl bootstrap system <plist>` (legacy: `load -w`). LaunchDaemons run at boot with `UserName` set to the resolved worker principal and survive logout; LaunchAgents are per-login-session — a daemon is required | root [well-established: S29] |
-| Windows | real SCM service (binary implements service entry points via the `windows-service` crate [well-established: S30]) in dedicated mode; current-user mode does not capture or persist the user's password and therefore uses the documented service-less degraded path unless the operator later opts into dedicated mode | Administrator |
+| Windows | a credential-free LocalSystem SCM service implements only the narrow admission/spawn broker; maintenance runs as the selected identity when a safe logon mechanism exists and otherwise uses the documented opportunistic path. Current-user mode never captures a login password | Administrator |
 
 **Normative content is the unit/plist/service definitions themselves** — they are files, written directly by Styrn and recorded in the receipt. The `service-manager` crate (v0.10; wraps sc.exe/launchd/systemd/OpenRC with install/uninstall/start/stop [verified: S17]) may be *evaluated* as an implementation backend, but its fitness is **[unverified — API verified from README only; prototype before committing]**; worst case Styrn vendors its own three small templates, which also keeps them receipt-visible [judgment].
 
@@ -5158,7 +5249,7 @@ The design degrades gracefully if item 2 is dead on current macOS: the chain sim
 
 ### 15.7.5 Worker identity modes, per OS (amended rev. G)
 
-**Current-user mode (default):** resolve the invoking non-elevated OS principal once, record its stable platform identifier plus display name, and reuse it after elevation. Setup neither creates an account nor changes ownership anywhere outside Styrn-owned paths. Per-user tools, SSH keys, PATH changes, and job processes use that principal's existing profile. If setup was launched through elevation, the elevated identity must not accidentally replace the original worker identity. A Unix root launch with no trustworthy original caller and a Windows elevated launch with no recoverable unelevated token refuse current-user mode with `NeedsHuman`; Styrn never runs jobs as root/SYSTEM merely because setup began there.
+**Current-user mode (default):** resolve the invoking non-elevated OS principal once, record its stable platform identifier plus display name, and reuse it after elevation. Setup neither creates an account nor changes ownership anywhere outside Styrn-owned paths. Per-user tools, PATH changes, harness configuration, and job processes use that principal's existing profile; controller authorization keys use the protected account-specific location from 4.3. If setup was launched through elevation, the elevated identity must not accidentally replace the original worker identity. A Unix root launch with no trustworthy original caller and a Windows elevated launch with no recoverable unelevated token refuse current-user mode with `NeedsHuman`; Styrn never runs jobs as root/SYSTEM merely because setup began there.
 
 **Dedicated mode (optional):** create or adopt the configured, non-administrator local account. The suggested name is `styrn`, but no platform adapter or test may assume it. Linux uses an ordinary local user with a real shell and home because workers accept SSH and may run lingering user services. macOS uses the validated native account mechanism selected by T0.14; its account-creation path remains an honest native gate until proven end to end. Windows uses native local-account APIs, generates a 32+-byte password in memory, and keeps the transient-logon and SCM behavior in 15.8. Re-running must adopt the exact configured principal without recursively taking ownership of pre-existing files.
 
@@ -5197,22 +5288,51 @@ Orig. §111's ordering rule — integrations only after the tools and their user
 
 Orig. §112's diagnosis stands: Herdr, Codex, and native Claude installers are per-user, so an elevated phase must never install them into the elevating administrator's profile by accident.
 
-**Current-user mode is the default.** Setup captures the original invoking principal before any Administrator re-execution. The unprivileged user phase runs before elevation or through the typed resume channel under that same principal; the privileged phase performs only machine-wide actions. No account or password is created, requested, logged, or persisted. If Windows cannot return to the captured principal safely, setup records `NeedsHuman` with a user-phase command instead of writing into a different profile.
+**Current-user mode is the default.** Setup captures the original invoking principal before any Administrator re-execution. The protected coordinator delegates the unprivileged user phase through that captured token; it performs machine-wide and journal-publication work itself. No account or password is created, requested, logged, or persisted. If Windows cannot return to the captured principal safely, setup records `NeedsHuman` with a user-phase command instead of writing into a different profile.
 
-**Dedicated mode remains the hardened option.** Setup creates or adopts the configured non-administrator principal and generates a password in memory. Within that run it uses `CreateProcessWithLogonW` with profile loading to materialize and execute `styrn setup user-phase` under the selected identity. The password is zeroized after the user phase and, when `styrnd` is enabled, after handing the service credential to SCM; that OS-held LSA persistence remains disclosed. No argument, output, config, receipt, manifest, or Styrn-owned file contains it.
+**Dedicated mode remains the hardened option.** Setup creates or adopts the configured non-administrator principal and generates a password in memory. Within that run it uses `CreateProcessWithLogonW` with profile loading to materialize and execute `styrn setup user-phase` under the selected identity. The password is zeroized after the user phase; it is never handed to the broker or SCM. No argument, output, config, receipt, manifest, Styrn-owned file, or service credential contains it.
 
-The user phase installs per-user tools, writes the selected profile's SSH and harness configuration, and journals through the shared receipt session. All paths derive from the resolved profile; neither `C:\Users\styrn` nor any other literal profile is assumed. Transient-logon failure produces a `NeedsHuman` fragment naming the configured account and doctor continues to report the incomplete probes.
+The user phase installs per-user tools and writes selected-profile harness configuration while journaling through the protected coordinator. Controller authorization keys remain in the protected account-specific location from Part 4.3, not the writable profile. All user-owned paths derive from the resolved profile; neither `C:\Users\styrn` nor any other literal profile is assumed. Transient-logon failure produces a `NeedsHuman` fragment naming the configured account and doctor continues to report the incomplete probes.
 
 ## 15.9 `styrnd`: the worker service (resolves S-34; reconciles orig. §58/Part 6.8 with orig. §63)
 
 **The gap:** Part 6.8 (orig. §58) specifies daily and weekly maintenance but never says what *runs* it; workers are headless, controllers are closable, and orig. §63 rejects a central daemon. Separately, 7.8 needed a concrete home for the Windows supervisor-spawn fallback ("a pre-created scheduled task" was a placeholder). One small local service answers both.
 
-**`styrnd`** — installed by `styrn setup` on workers and running as the resolved worker principal (mechanics: 15.7.4). It is default-on on Unix in either identity mode and on Windows dedicated mode. Windows current-user mode defaults it off because Styrn will not capture or persist the user's login password merely to register an SCM service; maintenance then uses the already-specified opportunistic path and supervisor spawning uses the direct-breakaway path. Setup and doctor disclose that degraded mode, and opting into a configured dedicated identity enables the service. It executes `styrn daemon run` and does exactly two jobs:
+**`styrnd`** — one binary with two deliberately separate execution contexts
+(mechanics: 15.7.4). On Unix it runs as the resolved worker principal and
+executes maintenance. On Windows, its SCM entry runs as LocalSystem without any
+selected-user credential and exposes only the narrow spawn-broker state machine;
+it cannot perform maintenance, access the network, or accept arbitrary process
+requests. Maintenance runs as the selected principal when a safe native
+mechanism is available and otherwise uses the opportunistic path. Thus current-
+user mode retains durable Windows job ownership without account creation or a
+stored password.
 
 1. **Maintenance executor (all OSes):** an internal tick runs Part 6.8's daily and weekly task lists (`styrn clean run --local`, cache trim, log rotation, disk-floor check, git maintenance, health snapshots) under the same registry lock as admission (6.8's locus rule, unchanged), journaling each run to the worker audit log (14.3).
-2. **Spawn broker (Windows only):** a local named pipe `\\.\pipe\styrnd`, ACL'd to the resolved worker SID and SYSTEM, over which the RPC process (running under sshd) requests supervisor spawns when `CREATE_BREAKAWAY_FROM_JOB` is denied in its context (7.8). The broker — outside any sshd Job Object by construction — spawns `styrn job supervise <id>` detached and returns the pid. On Linux/macOS, double-fork/setsid needs no broker and styrnd plays no part in job execution.
+2. **Spawn broker (Windows only):** a local named pipe `\\.\pipe\styrnd`, ACL'd
+   to the resolved worker SID and SYSTEM. The ACL is necessary but not an
+   authorization decision because hostile jobs share that SID. Admission first
+   creates a private, one-use pending-spawn record containing the job id,
+   submission id, expected installed-binary identity, and requesting RPC
+   process. The LocalSystem broker owns and atomically consumes that record. It
+   validates the named-pipe client PID/token, selected SID, installed executable
+   identity, sshd ancestry, expected Job-Object condition, and exact admitted
+   job before constructing the fixed argv `styrn job supervise <id>` itself.
+   It rejects replay, malformed ids, arbitrary executables/argv, unadmitted jobs,
+   and same-SID callers without the pending record. It has no network access and
+   cannot serve as a general privileged executor. On Linux/macOS,
+   double-fork/setsid needs no broker and styrnd plays no part in job execution.
 
-**Reconciliation with orig. §63 (explicit, so the contradiction is only apparent):** §63 rejected a *central* server — a coordination point whose availability the fleet depends on, with TLS, a database, and upgrade coupling. `styrnd` is none of those: per-worker, local-only, **no listening network socket** (the Windows pipe is local IPC restricted to one account), no shared state, no cross-machine protocol, and no fleet-availability dependency — if styrnd is stopped, maintenance degrades to opportunistic execution (a due maintenance tick is also checked and run, briefly, at job admission and by `doctor`), and Windows spawn falls back to the direct breakaway attempt. It is also consistent with Part 1.4's "no privileged worker daemon": styrnd is unprivileged. §63's "design the protocol so it can be proxied later, but do not build it now" is untouched — styrnd speaks no protocol.
+**Reconciliation with orig. §63 (explicit, so the contradiction is only
+apparent):** §63 rejected a *central* server — a fleet coordination point with
+TLS, a database, and upgrade coupling. `styrnd` is per-worker and local-only,
+with no listening network socket, cross-machine protocol, or fleet-availability
+dependency. Maintenance degrades to opportunistic execution when its executor
+is absent. Windows tries direct breakaway first, but when the OS denies it the
+narrow credential-free broker is required for the accepted job-durability
+contract; doctor therefore marks a Windows worker ineligible if that broker is
+unavailable and breakaway is denied. Part 1.4's rule now explicitly excludes
+this capability-limited broker from its ban on privileged worker daemons.
 
 ## 15.10 Enrollment in one step (resolves the pass-1 deferral in 6.1; S-36; absorbs orig. §60)
 
@@ -5224,12 +5344,19 @@ The user phase installs per-user tools, writes the selected profile's SSH and ha
 ```text
 Ready to enroll. From any controller, run:
 
-  styrn host enroll win-mini --fingerprint sha256:Yk3…hostkey…Q0=
+  styrn host enroll win-mini --user alex --fingerprint sha256:Yk3…hostkey…Q0=
 
   (tailscale: win-mini.tail1234.ts.net · 100.101.102.103)
 ```
 
-   The card carries exactly what Part 6.1's flow needs: the name, the reachable address, and the out-of-band host-key fingerprint that makes `--fingerprint` enrollment non-interactive and TOFU-honest (4.4). This replaces rev. B's "the reference scripts should be extended to print the fingerprint" with a guarantee. The card is **integrity-sensitive** (the fingerprint is the enrollment trust anchor): read it off the worker's own console or a session you initiated; do not relay it through channels you would not trust with host-key pinning (rev. E; review D §6.2).
+   The card carries exactly what Part 6.1's flow needs: name/address, the
+   validated transport user, and the out-of-band host-key fingerprint that
+   makes enrollment non-interactive and TOFU-honest (4.4). There is no implicit
+   account. This replaces rev. B's "the reference scripts should be extended to
+   print the fingerprint" with a guarantee. The card is **integrity-sensitive**
+   (the fingerprint is the enrollment trust anchor): read it off the worker's
+   own console or a session you initiated; do not relay it through channels you
+   would not trust with host-key pinning (rev. E; review D §6.2).
 3. On the controller, that one pasted line completes enrollment (manifest fetch, machine_id record, pin, inventory add — 6.1 unchanged).
 
 **The fleet walkthrough (orig. §60, rewritten for rev. D).** Setting up the initial fleet is now:
@@ -5258,7 +5385,7 @@ The plan already has two renderers — dry-run text and `apply()`. Script emissi
 ### 15.11.2 The four hard breaks (specified, not hand-waved)
 
 1. **Runtime-only secrets.** The Windows account password must be generated *at script run time*, inside the script (PowerShell crypto RNG inline), never embedded at generation time. Rule: `render_*` may reference secrets only as generate-here code or environment lookups (`$env:TS_AUTHKEY`), never as literals — **enforced structurally**: secret-bearing Action parameters are typed `Secret<T>`, and `Secret<T>` deliberately implements no renderer-visible stringification [judgment].
-2. **State drift between generation and execution.** The plan was computed from a probe that may be stale when a human finally runs the script — or was never run at all (`--target-os`). Fix: every rendered fragment embeds its own guard — the script form of `Action::check()` (`Get-WindowsCapability`, `systemctl is-active`, `id styrn`, …) — so each step is skip-if-satisfied. Alembic documents the same offline limitation and makes the operator supply the starting state [verified: S39]; Styrn is luckier — shell *can* re-probe cheaply, so rendered guards recover most of what a live probe gives [judgment].
+2. **State drift between generation and execution.** The plan was computed from a probe that may be stale when a human finally runs the script — or was never run at all (`--target-os`). Fix: every rendered fragment embeds its own guard — the script form of `Action::check()` (`Get-WindowsCapability`, `systemctl is-active`, a safely quoted lookup of the configured principal, …) — so each step is skip-if-satisfied. Alembic documents the same offline limitation and makes the operator supply the starting state [verified: S39]; Styrn is luckier — shell *can* re-probe cheaply, so rendered guards recover most of what a live probe gives [judgment].
 3. **Interactive auth.** Unproblematic: the script does what setup would — honor `TS_AUTHKEY` if set, else run `tailscale up` and let it print its login URL and wait [verified: S8].
 4. **The receipt.** A script cannot faithfully write Styrn's journal. Rule: every generated script's final step installs (if absent) and invokes `styrn` to re-probe and reconcile — `styrn setup --adopt` — recording receipt entries with `provenance: "script"`, status `adopted`, so `--uninstall` knows those resources are Styrn-owned by adoption. **No prior art exists for this exact loop — it needs a design spike before implementation** [judgment; flagged honestly]. A plain re-run of `styrn setup` also converges (the `check()` gate) but records nothing as Styrn-owned; `--adopt` is what claims ownership.
 
@@ -5305,7 +5432,8 @@ Their open defect registers are **superseded, not silently dropped**:
 ```text
 styrn setup [--role controller|worker|both] [--install <c1,c2,...>]
             [--config PATH] [--interactive]
-            [--name NAME] [--account current-user] [--authorized-keys K...]
+            [--name NAME] [--account current-user|dedicated[:NAME]]
+            [--authorized-keys K...]
             [--auth-key TSKEY] [--yes] [--dry-run] [--no-elevate] [--keep-going]
             [--emit-script[=PATH]] [--target-os linux|macos|windows]
             [--uninstall [--force]] [--adopt] [--rotate-account]
@@ -5707,7 +5835,7 @@ A product whose entire value is cross-platform correctness cannot rely on "works
 5. **Platform CI matrix** — GitHub Actions (or equivalent) on `ubuntu-latest`, `macos-latest`, `windows-latest` running layers 1–4, plus Windows-specific tests: Job-Object tree-kill actually reaps grandchildren, long-path job root, argv round-trip through `CreateProcess` for adversarial arguments (spaces, quotes, `%VAR%`, trailing backslashes).
 6. **End-to-end smoke on the real fleet** — a `styrn fleet selftest` command (new): trivially small project profile (`echo`-level workflows) run as a real matrix across all enrolled machines; used after every upgrade, doubling as the acceptance test for enrollment, push, admission, supervision, and artifact retrieval. This is also the dogfooding loop: Styrn's own repository gets a `.styrn.toml` so the fleet validates Styrn. Selftest passes unchanged on a Herdr-less fleet: the enrollment, push, admission, supervision and artifact legs run on every host, and the agent/parity leg reports `skipped (substrate: none)` per host rather than failing — item 7's conformance runs only where the substrate is `active`, as it already says.
 7. **Herdr parity conformance (rev. C; S-33)** — on every OS where Herdr is present in the test environment: start the same harness (or a stand-in binary with the harness's process signature) twice in Herdr panes — once manually, once via `styrn harness run` — and assert Herdr reports identical detection and an identical lifecycle-transition sequence for both, and that the wrapped child's environment is a superset of the manual one's (no `HERDR_*` variable lost or altered). Runs in CI where Herdr can be installed, and always as part of `styrn fleet selftest` (item 6). This is the check that keeps the 12.9.1 invariant from rotting.
-8. **Setup and rendered-script conformance (rev. D; Part 15)** — on the three-OS VM matrix: fresh-machine `styrn setup --yes` converges (second run prints "nothing to do"); `--uninstall` leaves no styrn-owned residue while sparing pre-existing tools (receipt-ownership test); the Windows transient-logon user phase produces a working `styrn` profile with SSH key login; and for each OS, the emitted `--emit-script` output run on an identical fresh VM converges to the **same probe results** as direct `apply` — the drift check that makes the third renderer trustworthy (15.11).
+8. **Setup and rendered-script conformance (rev. D; amended rev. G; Part 15)** — on the three-OS VM matrix: fresh-machine `styrn setup --yes` in current-user mode creates no account and converges (second run prints "nothing to do"); `--uninstall` leaves no Styrn-owned residue while sparing pre-existing tools (receipt-ownership test); an environmental dedicated-mode run uses an explicitly selected disposable account whose name is not `styrn`; Windows proves both identity modes with real SSH key login and proves that a same-SID hostile process cannot use the spawn broker; and for each OS, emitted `--emit-script` output on an identical fresh VM converges to the **same probe results** as direct `apply` — the drift check that makes the third renderer trustworthy (15.11).
 
 Mocked-SSH transport tests (orig. §2.5) fall out of layer 3 for free: the `Transport` trait's test implementation is "spawn local child," and the ssh implementation is thin enough to be covered by layer 6.
 
@@ -5753,7 +5881,7 @@ You can close the controller. **Herdr owns the persistent agent sessions, and ea
 Later, from a different controller:
 
 ```text
-styrn host enroll ...
+styrn host enroll <host> --user <user>
 styrn agent list --all
 styrn job list
 ```
@@ -6139,7 +6267,7 @@ Every issue cites the original section(s) it derives from; resolutions name the 
 **S-34 · major · orig. §58/§63, rev. B Parts 6.8 and 7.8 (raised in rev. D)**
 **Problem:** Part 6.8 specifies daily and weekly maintenance but never says what *runs* it — workers are headless, controllers are closable, and orig. §63 rejects a central daemon; separately, 7.8's Windows spawn fallback was a placeholder ("a pre-created scheduled task") with no owner. An apparent contradiction (needs a resident executor vs. "no daemon") was left standing.
 **Impact:** retention, cache quotas, log rotation, and disk-floor protection silently never run; Windows supervisors have no spawn path when sshd denies Job-Object breakaway.
-**Resolution:** `styrnd` — a per-worker, unprivileged, local-only service (no network listener) installed by setup, executing the 6.8 tick lists and brokering Windows supervisor spawns over an ACL'd named pipe; explicitly reconciled with §63 (it is not the central coordination daemon §63 rejected, and its absence degrades gracefully to opportunistic maintenance). Part 15.9.
+**Resolution:** `styrnd` — per-worker and local-only (no network listener), with selected-principal maintenance executing the 6.8 tick lists and a separate credential-free, capability-limited LocalSystem Windows broker admitting fixed supervisor spawns through private one-use records; explicitly reconciled with §63 because it is not a fleet coordination daemon. Maintenance degrades opportunistically; Windows worker eligibility does not pretend durable spawn when both direct breakaway and the broker are unavailable. Part 15.9.
 
 **S-35 · major · orig. §48 + `bootstrap-windows.ps1` (raised in rev. D)**
 **Problem:** the entire rev. A Windows bootstrap rests on a winget helper, but winget is per-user MSIX and is not resolvable/runnable under SYSTEM/service contexts and commonly fails in non-interactive SSH sessions [verified: S13, S14] — precisely the contexts in which Styrn provisions Windows workers.
@@ -6148,7 +6276,7 @@ Every issue cites the original section(s) it derives from; resolutions name the 
 
 **S-36 · minor · rev. C Parts 6.1/15 seam (raised in rev. D)**
 **Problem:** enrollment ergonomics straddled two Parts — pass 1 left 6.1 "light" pending the setup redesign, with no decision on whether a worker becomes enrollable in one step or how, given that no credential may live on the worker.
-**Resolution:** enrollment stays controller-initiated (trust flows from the credential holder); `styrn setup` closes the loop by installing controller keys up front and ending with the **enrollment card** (name + address + host-key fingerprint), making enrollment one pasted line per direction — script out, card back. Parts 15.10, 6.1.
+**Resolution:** enrollment stays controller-initiated (trust flows from the credential holder); `styrn setup` closes the loop by installing controller keys up front and ending with the **enrollment card** (name/address + explicit transport user + host-key fingerprint), making enrollment one pasted line per direction — script out, card back. Parts 15.10, 6.1.
 
 **S-37 · major · rev. D Parts 2.8/6.6/16.6 (raised by review D §6.2 item 1; resolved via a new operator requirement)**
 **Problem:** the document engineered *around* mixed versions — the 2.8 compatibility window, `fleet versions` drift reporting, `fleet selftest` "after every upgrade" — while specifying **no mechanism that upgrades the `styrn` binary on any machine**. Ad-hoc replacement would interact undefined with running jobs, styrnd, and the window.

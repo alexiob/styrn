@@ -77,9 +77,9 @@ passing negative test.
 ## 0.B Manifest
 
 - [ ] **T0.5** — Machine manifest: schema, parse, validate, `machine_id` minting (2.4)
-      TOML canonical, JSON renderable via `styrn machine manifest --json`. Mint a UUID at first write (this was S-25: no bootstrap script ever minted one).
-  - [ ] + positive: a manifest round-trips TOML→struct→JSON and validates against `schemas/machine-v1.schema.json`; `machine_id` is stable across re-runs.
-  - [ ] − negative: a manifest missing `machine_id` or `schema_version` is rejected with a schema error (exit 8), not silently defaulted. A second `setup` run does **not** mint a new id.
+      TOML canonical, JSON renderable via `styrn machine manifest --json`. Mint a UUID at first write (this was S-25: no bootstrap script ever minted one). Worker manifests bind transport to a schema-backed stable worker identity: mode, uid/SID, login name, and disclosed isolation posture.
+  - [ ] + positive: a manifest round-trips TOML→struct→JSON and validates against `schemas/machine-v1.schema.json`; `machine_id` and `worker_identity.principal_id` are stable across re-runs, while current-user mode accepts any valid invoking principal.
+  - [ ] − negative: a manifest missing `machine_id`, `schema_version`, or the required worker-identity record is rejected with a schema error (exit 8), not silently defaulted. A transport-user/name mismatch or renamed/deleted uid/SID is drift, never permission to switch accounts. A second `setup` run does **not** mint a new id.
 
 - [ ] **T0.6** — Manifest secret rejection (2.4, 4.2)
       No private key, API key, auth key, token, or password may be serialized into a manifest.
@@ -114,9 +114,9 @@ passing negative test.
   - [ ] − negative: a run interrupted mid-apply leaves a receipt describing exactly the durably acknowledged actions — no entry for the action that failed or was only prepared. `succeeded`-before-append recovers automatically; `prepared` plus already-`Done` refuses with `setup.receipt_conflict` rather than guessing ownership.
 
 - [ ] **T0.12** — Elevation strategy (15.5)
-      Per the decided model; never demand admin for actions that do not need it.
-  - [ ] + positive: unprivileged probing runs without elevation; only privileged actions trigger it.
-  - [ ] − negative: running without the needed privilege produces a clear plan showing which actions require elevation and exits 13 — it does not half-apply and abort mid-tree.
+      Per the decided protected-state coordinator model. Probe/dry-run/no-op are unprivileged; any mutation uses one root/Administrator publisher for the private intent journal, public receipt, and manifest, while `Privilege::None` actions execute as the captured original uid/token.
+  - [ ] + positive: unprivileged probing and no-op runs need no elevation; a mutating run elevates once, journals protected state, and demonstrably executes user-level installers as the original principal rather than root/Administrator.
+  - [ ] − negative: `--no-elevate` on any mutating plan produces a clear plan and exact resume command, exits 13, and dispatches no action. An unprivileged process cannot forge the journal or manifest, and an elevated launch with no trustworthy original principal refuses current-user mode.
 
 - [ ] **T0.13** — `NeedsHuman` pending actions (15.2.4, 3.4)
       Non-automatable residue (macOS Sharing toggle, Tailscale login, Codex/Claude first login) reported as structured pending actions, never as false success.
@@ -131,9 +131,9 @@ passing negative test.
   - [ ] − negative: no implementation or native test requires a literal username. Dedicated mode cannot read controller key material or write outside `paths.root`; current-user mode reports that it provides no such OS-account isolation. Re-running never recursively resets ownership of pre-existing files.
 
 - [ ] **T0.15** — sshd component (15.7)
-      Windows: `Add-WindowsCapability` + service automatic + `administrators_authorized_keys` ACL correctness + DefaultShell registry key. Linux/macOS: `openssh-server` / Remote Login.
-  - [ ] + positive: key-based login as the resolved worker identity succeeds from a controller on every OS.
-  - [ ] − negative: the Windows ACL trap is asserted directly — a wrongly-ACL'd `authorized_keys` must be **detected and corrected** by the action, since the failure mode is silent auth rejection. Password auth must be refused.
+      Windows: `Add-WindowsCapability` + service automatic + account-specific protected `AuthorizedKeysFile` + DefaultShell registry key. Linux/macOS: `openssh-server` / Remote Login with the same protected-key ownership rule.
+  - [ ] + positive: key-based login as the resolved worker identity succeeds from a controller on every OS, including a current Windows user who belongs to Administrators, without authorizing any other account.
+  - [ ] − negative: the Windows ACL trap is asserted directly — Styrn never places its key in shared `administrators_authorized_keys`; a wrongly ACL'd or unsupported account-specific override yields correction or `NeedsHuman`, not broadened access. A same-identity job cannot modify its protected key file. Password auth must be refused.
 
 - [ ] **T0.16** — Tailscale component (15.7)
       Per-OS unattended operation; interactive browser flow vs. `--auth-key`/`TS_AUTHKEY` chosen by interactivity.
@@ -158,8 +158,8 @@ passing negative test.
   - [ ] − negative: an unknown key or type error in the config fails fast with exit 2 naming the offending key and line; no partial apply.
 
 - [ ] **T0.20** — Three invocation modes and the zero-argument path (15.4, 15.4.1)
-      `--install a,b --role both`, `--config <toml>`, `--interactive`, and bare `styrn setup`. Zero-arg = probe → plan → one confirmation → apply.
-  - [ ] + positive: bare `styrn setup` on a fresh machine reaches an enrollable worker with the specified minimum human decisions.
+      `--install a,b --role both`, `--account current-user|dedicated[:NAME]`, `--config <toml>`, `--interactive`, and bare `styrn setup`. Zero-arg = probe → plan → one confirmation → apply, with current-user as the cross-platform default.
+  - [ ] + positive: bare `styrn setup` on a fresh machine creates no account and reaches an enrollable worker as the invoking non-elevated principal; the dedicated flag accepts a non-literal configured name.
   - [ ] − negative: with no TTY and no `--yes`, it prints the plan and exits 13 rather than guessing consent. `--install` naming an unknown component exits 2 listing valid components.
 
 - [ ] **T0.21** — `--interactive` wizard (15.4.2)
@@ -168,8 +168,8 @@ passing negative test.
   - [ ] − negative: with stdin not a TTY, the wizard fails fast with a flag hint rather than hanging or consuming EOF as a default answer.
 
 - [ ] **T0.22** — Enrollment card (15.10)
-      Emits name, address, host-key fingerprint for the controller-side paste.
-  - [ ] + positive: the card contains everything `host enroll` needs; the fingerprint matches the machine's actual host key.
+      Emits name/address, resolved transport user, and host-key fingerprint for the controller-side paste.
+  - [ ] + positive: the card contains an explicit `--user` and everything else `host enroll` needs; the fingerprint matches the machine's actual host key.
   - [ ] − negative: the card contains no private key material and no auth key.
 
 - [ ] **T0.23** — Stage-zero shims and release substrate (15.11.4, 15.14.1)
@@ -229,9 +229,9 @@ passing negative test.
   - [ ] − negative: an existing key is never overwritten or regenerated silently.
 
 - [ ] **T1.10** — `host enroll` with host-key pinning (6.1, 4.4)
-      Pin at enrollment; TOFU is bounded to that moment.
-  - [ ] + positive: enroll validates protocol, fetches and schema-checks the manifest, runs doctor, writes the inventory entry and manifest cache.
-  - [ ] − negative: a changed host key on a later connection is refused (exit 4), not re-pinned. An incompatible protocol aborts enrollment (exit 8) leaving no inventory entry.
+      Require `--user`, pin the host key at enrollment, and bound TOFU to that moment. The setup card supplies the complete paste.
+  - [ ] + positive: enroll connects as the explicit transport user, validates protocol, fetches and schema-checks a matching stable worker identity, runs doctor, and writes the inventory entry and manifest cache.
+  - [ ] − negative: a missing user, transport/identity mismatch, changed host key, or incompatible protocol aborts without an inventory entry. A later key change is refused (exit 4), never re-pinned.
 
 - [ ] **T1.11** — Inventory storage (2.6)
       `~/.config/styrn/inventory.toml`; `%APPDATA%\Styrn\inventory.toml` on Windows.
@@ -314,8 +314,8 @@ passing negative test.
 
 - [ ] **T2.8** — Windows process ownership (7.8, 7.10)
       Job Object, `CREATE_BREAKAWAY_FROM_JOB`, and the styrnd broker path when breakaway is denied.
-  - [ ] + positive: tree-kill reaps grandchildren (16.6 layer 5); long-path job roots work.
-  - [ ] − negative: when breakaway is denied under sshd's Job Object, the broker path is taken and the job still survives session close — the fallback is exercised in CI, not assumed.
+  - [ ] + positive: tree-kill reaps grandchildren (16.6 layer 5); long-path job roots work; current-user mode survives session close without storing that user's password.
+  - [ ] − negative: when breakaway is denied under sshd's Job Object, the credential-free broker path is taken and the job still survives session close — the fallback is exercised in CI, not assumed. If direct breakaway and the broker are both unavailable, doctor marks the worker ineligible rather than accepting a job it cannot own durably.
 
 ## 2.C Limits and lifecycle
 
@@ -421,14 +421,14 @@ passing negative test.
   - [ ] − negative: on a Herdr-less fleet selftest **passes**, with the agent leg reported `skipped (substrate: none)` per host. Absence is never a selftest failure (16.6 item 6).
 
 - [ ] **T3.12** — `styrnd`: service install and maintenance executor (15.9)
-      Per-worker, unprivileged, no listening network socket. Runs the Part 6.8 daily/weekly ticks under the registry lock.
-  - [ ] + positive: installed per OS (systemd / launchd / Windows service); ticks execute and journal to the audit log.
-  - [ ] − negative: with styrnd stopped, maintenance degrades to opportunistic execution at admission and doctor — the documented degraded mode is tested, not assumed. Assert styrnd opens no network listener.
+      Per-worker, no listening network socket. Unix maintenance runs as the selected principal. Windows keeps maintenance distinct from the credential-free LocalSystem spawn broker and uses a selected-principal mechanism when safe, otherwise the opportunistic path.
+  - [ ] + positive: installed per OS where the selected-principal mechanism is safe; ticks execute under that principal and journal to the audit log. No current-user password is captured or stored.
+  - [ ] − negative: with the maintenance executor stopped or unavailable, maintenance degrades to opportunistic execution at admission and doctor — the documented degraded mode is tested, not assumed. Assert every context opens no network listener and the Windows broker cannot execute maintenance.
 
 - [ ] **T3.13** — `styrnd`: Windows spawn broker (15.9)
-      Named pipe ACL'd to the resolved worker SID and SYSTEM; no literal account lookup.
-  - [ ] + positive: brokered spawn produces a detached supervisor outside any sshd Job Object.
-  - [ ] − negative: an unauthorized local account cannot use the pipe; a broker request for a malformed job id is rejected without spawning anything.
+      Credential-free LocalSystem broker with a named pipe ACL'd to the resolved worker SID and SYSTEM, plus private one-use pending-spawn admission; no literal account lookup and no general privileged execution.
+  - [ ] + positive: the broker validates client PID/token, installed-binary identity, sshd ancestry, Job-Object condition, and one-use admitted job before constructing a fixed `styrn job supervise <id>` spawn outside sshd's Job Object.
+  - [ ] − negative: an unauthorized account and a hostile process running under the *same* worker SID cannot spawn without the private pending record. Replay, malformed ids, arbitrary executable/argv, and unadmitted job requests are rejected without spawning anything.
 
 - [ ] **T3.14** — Maintenance commands: `clean plan/run`, `cache status/trim` (10.5, 6.8)
   - [ ] + positive: plan lists exactly what run will delete; trim honours the cache quota.
