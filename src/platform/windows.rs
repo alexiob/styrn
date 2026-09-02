@@ -4,7 +4,9 @@ pub(crate) fn platform_name() -> &'static str {
 }
 
 use super::{
-    ManifestOwner, PrincipalKind, PrivateFileIdentity, SetupExecutionContext, WorkerPrincipal,
+    select_windows_user_token, windows_token_posture_from_native, ManifestOwner, PrincipalKind,
+    PrivateFileIdentity, SetupExecutionContext, SetupHostPrivilege, WindowsTokenElevationType,
+    WindowsTokenPosture, WindowsUserTokenChoice, WorkerPrincipal,
 };
 use std::ffi::c_void;
 use std::io;
@@ -18,7 +20,15 @@ const SE_DACL_PROTECTED: u16 = 0x1000;
 const SE_FILE_OBJECT: u32 = 1;
 const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
 const TOKEN_QUERY: u32 = 0x0008;
+const TOKEN_ASSIGN_PRIMARY: u32 = 0x0001;
+const TOKEN_DUPLICATE: u32 = 0x0002;
 const TOKEN_USER_CLASS: u32 = 1;
+const TOKEN_GROUPS_CLASS: u32 = 2;
+const TOKEN_ELEVATION_TYPE_CLASS: u32 = 18;
+const TOKEN_LINKED_TOKEN_CLASS: u32 = 19;
+const TOKEN_INTEGRITY_LEVEL_CLASS: u32 = 25;
+const SECURITY_IMPERSONATION: u32 = 2;
+const TOKEN_PRIMARY: u32 = 1;
 const SID_TYPE_USER: i32 = 1;
 const WIN_LOCAL_SYSTEM_SID: i32 = 22;
 const WIN_BUILTIN_ADMINISTRATORS_SID: i32 = 26;
@@ -132,6 +142,25 @@ struct TokenUser {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
+struct TokenGroups {
+    group_count: u32,
+    groups: [SidAndAttributes; 1],
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct TokenMandatoryLabel {
+    label: SidAndAttributes,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct TokenLinkedToken {
+    linked_token: *mut c_void,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
 struct FileTime {
     low_date_time: u32,
     high_date_time: u32,
@@ -233,6 +262,16 @@ unsafe extern "system" {
     ) -> i32;
     fn GetLengthSid(sid: *const c_void) -> u32;
     fn CopySid(destination_length: u32, destination: *mut c_void, source: *const c_void) -> i32;
+    fn GetSidSubAuthorityCount(sid: *const c_void) -> *mut u8;
+    fn GetSidSubAuthority(sid: *const c_void, sub_authority: u32) -> *mut u32;
+    fn DuplicateTokenEx(
+        existing_token: *mut c_void,
+        desired_access: u32,
+        token_attributes: *const SecurityAttributes,
+        impersonation_level: u32,
+        token_type: u32,
+        new_token: *mut *mut c_void,
+    ) -> i32;
     #[cfg(test)]
     fn LogonUserW(
         username: *const u16,
@@ -253,12 +292,11 @@ pub(super) fn resolve_current_worker_principal() -> io::Result<WorkerPrincipal> 
     principal_for_sid(&sid)
 }
 
-/// Placeholder opaque token type for the cfg-safe setup boundary.
-///
-/// Native capture must populate this only after validating elevation type,
-/// integrity, Administrators group attributes, and any linked limited token.
 #[allow(dead_code)]
-pub(super) struct UserExecutionToken(OwnedHandle);
+pub(super) struct UserExecutionToken {
+    handle: OwnedHandle,
+    principal: WorkerPrincipal,
+}
 
 #[cfg(test)]
 pub(super) fn test_user_execution_token(_principal: &WorkerPrincipal) -> UserExecutionToken {
@@ -268,14 +306,60 @@ pub(super) fn test_user_execution_token(_principal: &WorkerPrincipal) -> UserExe
         0,
         "the current Windows process token must be available to tests"
     );
-    UserExecutionToken(OwnedHandle(token))
+    UserExecutionToken {
+        handle: OwnedHandle(token),
+        principal: resolve_current_worker_principal().unwrap(),
+    }
 }
 
 pub(super) fn capture_setup_execution_context() -> io::Result<SetupExecutionContext> {
-    Err(io::Error::new(
-        io::ErrorKind::Unsupported,
-        "native Windows setup token capture requires the Windows elevated-token gate",
-    ))
+    let current = open_current_process_token()?;
+    let current_posture = inspect_token_posture(&current)?;
+    let linked = match current_posture.elevation_type {
+        WindowsTokenElevationType::Default => None,
+        WindowsTokenElevationType::Full | WindowsTokenElevationType::Limited => {
+            Some(linked_token(&current)?)
+        }
+    };
+    let linked_posture = linked.as_ref().map(inspect_token_posture).transpose()?;
+    let choice = select_windows_user_token(current_posture, linked_posture)?;
+    let source = match choice {
+        WindowsUserTokenChoice::Current => &current,
+        WindowsUserTokenChoice::LinkedLimited => linked.as_ref().ok_or_else(|| {
+            permission_denied("Windows elevated token has no linked limited user token")
+        })?,
+    };
+
+    let expected_posture = match choice {
+        WindowsUserTokenChoice::Current => current_posture,
+        WindowsUserTokenChoice::LinkedLimited => linked_posture.ok_or_else(|| {
+            permission_denied("Windows elevated token has no linked limited user posture")
+        })?,
+    };
+    let primary = duplicate_primary_token(source)?;
+    if inspect_token_posture(&primary)? != expected_posture {
+        return Err(permission_denied(
+            "Windows user token posture changed while it was captured",
+        ));
+    }
+    let current_sid = token_user_sid(&current)?;
+    let user_sid = token_user_sid(&primary)?;
+    if unsafe { EqualSid(current_sid.as_ptr().cast(), user_sid.as_ptr().cast()) } == 0 {
+        return Err(permission_denied(
+            "Windows linked token belongs to a different user",
+        ));
+    }
+    let principal = principal_for_sid(&user_sid)?;
+    let token = UserExecutionToken {
+        handle: primary,
+        principal: principal.clone(),
+    };
+    let privilege = if choice == WindowsUserTokenChoice::LinkedLimited {
+        SetupHostPrivilege::Administrator
+    } else {
+        SetupHostPrivilege::Ordinary
+    };
+    Ok(SetupExecutionContext::new(privilege, principal, token))
 }
 
 pub(super) fn invoke_setup_authorization(
@@ -307,7 +391,7 @@ pub(super) fn verify_setup_authorization_executable(
 }
 
 pub(super) fn run_user_phase(
-    _token: &UserExecutionToken,
+    token: &UserExecutionToken,
     request: &[u8],
 ) -> io::Result<std::process::ExitStatus> {
     if request.len() > 64 * 1024 {
@@ -315,8 +399,203 @@ pub(super) fn run_user_phase(
     }
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
-        "native Windows user execution requires a validated limited primary token",
+        format!(
+            "native Windows user execution for {} is not implemented",
+            token.principal.name()
+        ),
     ))
+}
+
+fn open_current_process_token() -> io::Result<OwnedHandle> {
+    let mut token = std::ptr::null_mut();
+    if unsafe {
+        OpenProcessToken(
+            GetCurrentProcess(),
+            TOKEN_QUERY | TOKEN_DUPLICATE,
+            &mut token,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(OwnedHandle(token))
+}
+
+fn duplicate_primary_token(source: &OwnedHandle) -> io::Result<OwnedHandle> {
+    let mut token = std::ptr::null_mut();
+    if unsafe {
+        DuplicateTokenEx(
+            source.0,
+            TOKEN_ASSIGN_PRIMARY | TOKEN_DUPLICATE | TOKEN_QUERY,
+            std::ptr::null(),
+            SECURITY_IMPERSONATION,
+            TOKEN_PRIMARY,
+            &mut token,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(OwnedHandle(token))
+}
+
+fn linked_token(token: &OwnedHandle) -> io::Result<OwnedHandle> {
+    let information = token_information(token, TOKEN_LINKED_TOKEN_CLASS)?;
+    if information.byte_len < std::mem::size_of::<TokenLinkedToken>() {
+        return Err(invalid_data(
+            "Windows linked-token information is truncated",
+        ));
+    }
+    let linked = unsafe { *information.as_ptr().cast::<TokenLinkedToken>() };
+    if linked.linked_token.is_null() {
+        return Err(permission_denied(
+            "Windows token has no usable linked user token",
+        ));
+    }
+    Ok(OwnedHandle(linked.linked_token))
+}
+
+fn inspect_token_posture(token: &OwnedHandle) -> io::Result<WindowsTokenPosture> {
+    let elevation = token_information(token, TOKEN_ELEVATION_TYPE_CLASS)?;
+    if elevation.byte_len < std::mem::size_of::<u32>() {
+        return Err(invalid_data(
+            "Windows token elevation information is truncated",
+        ));
+    }
+    let elevation_type = unsafe { *elevation.as_ptr().cast::<u32>() };
+
+    let integrity = token_information(token, TOKEN_INTEGRITY_LEVEL_CLASS)?;
+    if integrity.byte_len < std::mem::size_of::<TokenMandatoryLabel>() {
+        return Err(invalid_data(
+            "Windows token integrity information is truncated",
+        ));
+    }
+    let label = unsafe { *integrity.as_ptr().cast::<TokenMandatoryLabel>() };
+    let integrity_rid = sid_last_sub_authority(label.label.sid)?;
+
+    let administrators = well_known_sid(WIN_BUILTIN_ADMINISTRATORS_SID)?;
+    let groups = token_information(token, TOKEN_GROUPS_CLASS)?;
+    if groups.byte_len < std::mem::size_of::<TokenGroups>() {
+        return Err(invalid_data("Windows token group information is truncated"));
+    }
+    let groups_ptr = groups.as_ptr().cast::<TokenGroups>();
+    let count = unsafe { (*groups_ptr).group_count as usize };
+    let groups_offset = std::mem::offset_of!(TokenGroups, groups);
+    let available =
+        groups.byte_len.saturating_sub(groups_offset) / std::mem::size_of::<SidAndAttributes>();
+    if count > available {
+        return Err(invalid_data("Windows token group count exceeds its buffer"));
+    }
+    let first = unsafe { std::ptr::addr_of!((*groups_ptr).groups).cast::<SidAndAttributes>() };
+    let mut admin_attributes = None;
+    for index in 0..count {
+        let group = unsafe { *first.add(index) };
+        if group.sid.is_null() {
+            return Err(invalid_data("Windows token contains a null group SID"));
+        }
+        if unsafe { EqualSid(group.sid, administrators.as_ptr().cast()) } != 0
+            && admin_attributes.replace(group.attributes).is_some()
+        {
+            return Err(invalid_data(
+                "Windows token repeats the Administrators group SID",
+            ));
+        }
+    }
+    windows_token_posture_from_native(elevation_type, integrity_rid, admin_attributes)
+}
+
+fn sid_last_sub_authority(sid: *const c_void) -> io::Result<u32> {
+    if sid.is_null() {
+        return Err(invalid_data("Windows token contains a null integrity SID"));
+    }
+    let count = unsafe { GetSidSubAuthorityCount(sid) };
+    if count.is_null() || unsafe { *count } == 0 {
+        return Err(invalid_data("Windows integrity SID has no sub-authority"));
+    }
+    let value = unsafe { GetSidSubAuthority(sid, u32::from(*count) - 1) };
+    if value.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(unsafe { *value })
+}
+
+struct TokenInformation {
+    words: Vec<usize>,
+    byte_len: usize,
+}
+
+impl TokenInformation {
+    fn as_ptr(&self) -> *const usize {
+        self.words.as_ptr()
+    }
+}
+
+fn token_information(token: &OwnedHandle, class: u32) -> io::Result<TokenInformation> {
+    let mut required = 0;
+    let result =
+        unsafe { GetTokenInformation(token.0, class, std::ptr::null_mut(), 0, &mut required) };
+    if result != 0 || required == 0 {
+        return Err(invalid_data(
+            "Windows returned an invalid token-information size",
+        ));
+    }
+    if io::Error::last_os_error().raw_os_error() != Some(ERROR_INSUFFICIENT_BUFFER as i32) {
+        return Err(io::Error::last_os_error());
+    }
+    let word_size = std::mem::size_of::<usize>();
+    let word_count = (required as usize).div_ceil(word_size);
+    let mut words = vec![0_usize; word_count];
+    let capacity = words.len() * word_size;
+    if unsafe {
+        GetTokenInformation(
+            token.0,
+            class,
+            words.as_mut_ptr().cast(),
+            capacity
+                .try_into()
+                .map_err(|_| invalid_data("Windows token information is too large"))?,
+            &mut required,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    if required as usize > capacity {
+        return Err(invalid_data(
+            "Windows token information grew while it was read",
+        ));
+    }
+    Ok(TokenInformation {
+        words,
+        byte_len: required as usize,
+    })
+}
+
+fn token_user_sid(token: &OwnedHandle) -> io::Result<Vec<u8>> {
+    let information = token_information(token, TOKEN_USER_CLASS)?;
+    if information.byte_len < std::mem::size_of::<TokenUser>() {
+        return Err(invalid_data("Windows token user information is truncated"));
+    }
+    let token_user = unsafe { *information.as_ptr().cast::<TokenUser>() };
+    if token_user.user.sid.is_null() {
+        return Err(invalid_data("Windows token contains a null user SID"));
+    }
+    let sid_length = unsafe { GetLengthSid(token_user.user.sid) };
+    if sid_length == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut sid = vec![0_u8; sid_length as usize];
+    if unsafe {
+        CopySid(
+            sid_length,
+            sid.as_mut_ptr().cast(),
+            token_user.user.sid.cast_const(),
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(sid)
 }
 
 #[allow(dead_code)] // Explicit system-account selection is exercised by environmental gates.

@@ -479,6 +479,42 @@ impl WindowsTokenPosture {
     }
 }
 
+#[allow(dead_code)] // Parsed by the native Windows token adapter.
+fn windows_token_posture_from_native(
+    elevation_type: u32,
+    integrity_rid: u32,
+    administrators_group_attributes: Option<u32>,
+) -> std::io::Result<WindowsTokenPosture> {
+    let elevation_type = match elevation_type {
+        1 => WindowsTokenElevationType::Default,
+        2 => WindowsTokenElevationType::Full,
+        3 => WindowsTokenElevationType::Limited,
+        _ => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Windows returned an unknown token elevation type",
+            ));
+        }
+    };
+    let integrity_level = match integrity_rid {
+        0x0000..=0x1fff => WindowsIntegrityLevel::Low,
+        0x2000..=0x2fff => WindowsIntegrityLevel::Medium,
+        0x3000..=0x3fff => WindowsIntegrityLevel::High,
+        0x4000..=0x4fff => WindowsIntegrityLevel::System,
+        _ => {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "Windows token has an unsupported integrity level",
+            ));
+        }
+    };
+    Ok(WindowsTokenPosture::new(
+        elevation_type,
+        integrity_level,
+        administrators_group_attributes,
+    ))
+}
+
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum WindowsUserTokenChoice {
@@ -929,6 +965,20 @@ mod setup_execution_tests {
         );
         assert!(select_windows_user_token(uac_off_admin, None).is_err());
         assert!(select_windows_user_token(full, None).is_err());
+    }
+
+    #[test]
+    fn windows_native_token_facts_are_parsed_fail_closed() {
+        assert_eq!(
+            windows_token_posture_from_native(3, 0x2100, Some(SE_GROUP_USE_FOR_DENY_ONLY)).unwrap(),
+            WindowsTokenPosture::new(
+                WindowsTokenElevationType::Limited,
+                WindowsIntegrityLevel::Medium,
+                Some(SE_GROUP_USE_FOR_DENY_ONLY),
+            )
+        );
+        assert!(windows_token_posture_from_native(0, 0x2000, None).is_err());
+        assert!(windows_token_posture_from_native(1, 0x5000, None).is_err());
     }
 
     #[test]
