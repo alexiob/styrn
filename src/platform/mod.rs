@@ -135,6 +135,20 @@ pub(crate) struct WorkerDirectoryCreation {
     lease: platform_impl::WorkerDirectoryLease,
 }
 
+#[allow(dead_code)] // Consumed by the deferred T0.14 receipt binding integration.
+pub(crate) struct VerifiedWorkerDirectoryBinding<'authority> {
+    nodes: &'authority [WorkerDirectoryNodeObservation; 6],
+    lease: &'authority platform_impl::WorkerDirectoryLease,
+}
+
+#[derive(Debug)]
+#[allow(dead_code)] // Consumed by the deferred T0.14 receipt binding integration.
+pub(crate) enum WorkerDirectoryBindingError<BindingError> {
+    Reverification(std::io::Error),
+    Binding(BindingError),
+    AuthorityRetirement(std::io::Error),
+}
+
 impl std::fmt::Debug for WorkerDirectoryCreation {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter
@@ -158,13 +172,34 @@ impl WorkerDirectoryCreation {
         }
     }
 
-    pub(crate) fn nodes(&self) -> &[WorkerDirectoryNodeObservation; 6] {
-        &self.nodes
+    pub(crate) fn bind_after_reverify<Value, BindingError>(
+        self,
+        bind: impl for<'authority> FnOnce(
+            VerifiedWorkerDirectoryBinding<'authority>,
+        ) -> Result<Value, BindingError>,
+    ) -> Result<Value, WorkerDirectoryBindingError<BindingError>> {
+        platform_impl::reverify_worker_directory_lease(&self.lease, &self.nodes)
+            .map_err(WorkerDirectoryBindingError::Reverification)?;
+        let value = bind(VerifiedWorkerDirectoryBinding {
+            nodes: &self.nodes,
+            lease: &self.lease,
+        })
+        .map_err(WorkerDirectoryBindingError::Binding)?;
+        platform_impl::retire_worker_directory_authority(&self.lease)
+            .map_err(WorkerDirectoryBindingError::AuthorityRetirement)?;
+        Ok(value)
+    }
+}
+
+#[allow(dead_code)] // Consumed by the deferred T0.14 receipt binding integration.
+impl VerifiedWorkerDirectoryBinding<'_> {
+    pub(crate) fn observations(&self) -> &[WorkerDirectoryNodeObservation; 6] {
+        self.nodes
     }
 
-    pub(crate) fn final_reverify(self) -> std::io::Result<[WorkerDirectoryNodeObservation; 6]> {
-        platform_impl::reverify_worker_directory_lease(&self.lease, &self.nodes)?;
-        Ok(self.nodes)
+    #[cfg(test)]
+    fn reverify_retained_authority_for_test(&self) -> std::io::Result<()> {
+        platform_impl::reverify_worker_directory_lease(self.lease, self.nodes)
     }
 }
 
@@ -1726,6 +1761,106 @@ mod setup_execution_tests {
 }
 
 #[cfg(test)]
+mod private_publication_tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn private_publication_refuses_a_displaced_temporary_without_removing_evidence() {
+        let parent = unique_private_publication_directory("displaced-temporary");
+        std::fs::create_dir(&parent).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let temporary = parent.join("intent.tmp");
+        let displaced = parent.join("created-by-styrn");
+        let destination = parent.join("intent.json");
+        let principal = resolve_current_worker_principal().unwrap();
+        let mut publication =
+            create_private_publication_file(&temporary, ManifestOwner::CurrentProcess, &principal)
+                .unwrap();
+        publication.write_all(b"complete intent\n").unwrap();
+        std::fs::rename(&temporary, &displaced).unwrap();
+        std::fs::write(&temporary, b"external evidence\n").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&temporary, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+
+        let error = publication
+            .complete_exact(b"complete intent\n")
+            .unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(std::fs::read(&temporary).unwrap(), b"external evidence\n");
+        assert_eq!(std::fs::read(&displaced).unwrap(), b"complete intent\n");
+        assert!(!destination.exists());
+        std::fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn complete_private_publication_is_no_replace_and_durable_before_return() {
+        let parent = unique_private_publication_directory("durable-no-replace");
+        std::fs::create_dir(&parent).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let principal = resolve_current_worker_principal().unwrap();
+        let temporary = parent.join("intent.tmp");
+        let destination = parent.join("intent.json");
+        let mut publication =
+            create_private_publication_file(&temporary, ManifestOwner::CurrentProcess, &principal)
+                .unwrap();
+        publication.write_all(b"complete intent\n").unwrap();
+        let complete = publication.complete_exact(b"complete intent\n").unwrap();
+
+        let published = complete.publish_no_replace(&destination).unwrap();
+
+        assert_eq!(published.path(), destination);
+        assert_eq!(std::fs::read(&destination).unwrap(), b"complete intent\n");
+        assert!(!temporary.exists());
+
+        let second_temporary = parent.join("second.tmp");
+        let mut second = create_private_publication_file(
+            &second_temporary,
+            ManifestOwner::CurrentProcess,
+            &principal,
+        )
+        .unwrap();
+        second.write_all(b"must not replace\n").unwrap();
+        let error = second
+            .complete_exact(b"must not replace\n")
+            .unwrap()
+            .publish_no_replace(&destination)
+            .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::AlreadyExists);
+        assert_eq!(std::fs::read(&destination).unwrap(), b"complete intent\n");
+        assert_eq!(
+            std::fs::read(&second_temporary).unwrap(),
+            b"must not replace\n"
+        );
+        std::fs::remove_dir_all(parent).unwrap();
+    }
+
+    fn unique_private_publication_directory(label: &str) -> PathBuf {
+        #[cfg(unix)]
+        let temporary = std::fs::canonicalize(std::env::temp_dir()).unwrap();
+        #[cfg(target_os = "windows")]
+        let temporary = std::env::temp_dir();
+        temporary.join(format!(
+            "styrn-private-publication-{label}-{}-{}",
+            std::process::id(),
+            uuid::Uuid::now_v7()
+        ))
+    }
+}
+
+#[cfg(test)]
 mod worker_directory_tests {
     use super::*;
     use std::collections::BTreeSet;
@@ -2044,7 +2179,10 @@ mod worker_directory_tests {
             resolve_worker_directory_layout(InstallationScope::System, &principal, Some(&root))
                 .unwrap();
 
-        create_worker_directory_layout(&layout).unwrap();
+        create_worker_directory_layout(&layout)
+            .unwrap()
+            .bind_after_reverify(|_| Ok::<_, ()>(()))
+            .unwrap();
 
         let parent_entries = directory_entry_names(&parent);
         assert_eq!(parent_entries, BTreeSet::from(["chosen-root".to_owned()]));
@@ -2080,11 +2218,39 @@ mod worker_directory_tests {
 
         let created = create_worker_directory_layout(&layout)
             .unwrap()
-            .final_reverify()
+            .bind_after_reverify(|binding| {
+                Ok::<_, ()>(
+                    binding
+                        .observations()
+                        .iter()
+                        .map(|node| {
+                            (
+                                node.path().to_path_buf(),
+                                node.disposition(),
+                                node.identity(),
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                )
+            })
             .unwrap();
         let existing = create_worker_directory_layout(&layout)
             .unwrap()
-            .final_reverify()
+            .bind_after_reverify(|binding| {
+                Ok::<_, ()>(
+                    binding
+                        .observations()
+                        .iter()
+                        .map(|node| {
+                            (
+                                node.path().to_path_buf(),
+                                node.disposition(),
+                                node.identity(),
+                            )
+                        })
+                        .collect::<Vec<_>>(),
+                )
+            })
             .unwrap();
 
         let expected_paths = std::iter::once(root.clone())
@@ -2099,17 +2265,11 @@ mod worker_directory_tests {
         for ((created, existing), expected_path) in
             created.iter().zip(&existing).zip(expected_paths)
         {
-            assert_eq!(created.path(), expected_path);
-            assert_eq!(
-                created.disposition(),
-                WorkerDirectoryNodeDisposition::Created
-            );
-            assert_eq!(existing.path(), created.path());
-            assert_eq!(
-                existing.disposition(),
-                WorkerDirectoryNodeDisposition::Existing
-            );
-            assert_eq!(existing.identity(), created.identity());
+            assert_eq!(created.0, expected_path);
+            assert_eq!(created.1, WorkerDirectoryNodeDisposition::Created);
+            assert_eq!(existing.0, created.0);
+            assert_eq!(existing.1, WorkerDirectoryNodeDisposition::Existing);
+            assert_eq!(existing.2, created.2);
         }
 
         std::fs::remove_dir_all(parent).unwrap();
@@ -2129,9 +2289,41 @@ mod worker_directory_tests {
         std::fs::rename(&root, &displaced).unwrap();
         std::fs::create_dir(&root).unwrap();
 
-        let error = creation.final_reverify().unwrap_err();
+        let error = creation
+            .bind_after_reverify(|_| Ok::<_, ()>(()))
+            .unwrap_err();
 
-        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(matches!(
+            error,
+            WorkerDirectoryBindingError::Reverification(error)
+                if error.kind() == std::io::ErrorKind::PermissionDenied
+        ));
+        std::fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn worker_directory_binding_retains_handles_and_preserves_binding_errors() {
+        let principal = resolve_current_worker_principal().unwrap();
+        let parent = unique_test_directory("retained-binding-authority");
+        std::fs::create_dir(&parent).unwrap();
+        let root = parent.join("chosen-root");
+        let layout =
+            resolve_worker_directory_layout(InstallationScope::System, &principal, Some(&root))
+                .unwrap();
+        let creation = create_worker_directory_layout(&layout).unwrap();
+
+        let error = creation
+            .bind_after_reverify(|binding| {
+                binding.reverify_retained_authority_for_test().unwrap();
+                assert_eq!(binding.observations().len(), 6);
+                Err::<(), _>("receipt binding failed")
+            })
+            .unwrap_err();
+
+        assert!(matches!(
+            error,
+            WorkerDirectoryBindingError::Binding("receipt binding failed")
+        ));
         std::fs::remove_dir_all(parent).unwrap();
     }
 
@@ -2144,7 +2336,10 @@ mod worker_directory_tests {
         let layout =
             resolve_worker_directory_layout(InstallationScope::System, &principal, Some(&root))
                 .unwrap();
-        create_worker_directory_layout(&layout).unwrap();
+        create_worker_directory_layout(&layout)
+            .unwrap()
+            .bind_after_reverify(|_| Ok::<_, ()>(()))
+            .unwrap();
         let repos = root.join("repos");
         let existing = repos.join("existing-project");
         std::fs::create_dir(&existing).unwrap();
@@ -2392,7 +2587,10 @@ mod worker_directory_tests {
             principal,
         );
 
-        create_worker_directory_layout(&layout).unwrap();
+        create_worker_directory_layout(&layout)
+            .unwrap()
+            .bind_after_reverify(|_| Ok::<_, ()>(()))
+            .unwrap();
 
         assert_eq!(
             directory_entry_names(&profile),
@@ -2748,6 +2946,141 @@ pub(crate) struct PrivateManifestStagingDirectory {
     path: PathBuf,
 }
 
+/// A private, same-directory publication temporary whose identity was captured
+/// from the handle returned by the exclusive create operation.
+#[allow(dead_code)] // Consumed by the T0.13 receipt durability follow-up.
+pub(crate) struct PrivatePublicationFile {
+    path: PathBuf,
+    file: std::fs::File,
+    identity: PrivateFileIdentity,
+    owner: ManifestOwner,
+    principal: WorkerPrincipal,
+}
+
+#[allow(dead_code)] // Consumed by the T0.13 receipt durability follow-up.
+pub(crate) struct CompletePrivatePublication(PrivatePublicationFile);
+
+#[derive(Debug)]
+#[allow(dead_code)] // Consumed by the T0.13 receipt durability follow-up.
+pub(crate) struct DurablePrivatePublication {
+    path: PathBuf,
+    identity: PrivateFileIdentity,
+}
+
+impl std::fmt::Debug for PrivatePublicationFile {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("PrivatePublicationFile")
+            .field("path", &self.path)
+            .field("identity", &self.identity)
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for CompletePrivatePublication {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_tuple("CompletePrivatePublication")
+            .field(&self.0)
+            .finish()
+    }
+}
+
+impl std::io::Write for PrivatePublicationFile {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        std::io::Write::write(&mut self.file, bytes)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        std::io::Write::flush(&mut self.file)
+    }
+}
+
+#[allow(dead_code)] // Consumed by the T0.13 receipt durability follow-up.
+impl PrivatePublicationFile {
+    pub(crate) fn complete_exact(
+        mut self,
+        expected_bytes: &[u8],
+    ) -> std::io::Result<CompletePrivatePublication> {
+        use std::io::{Read, Seek, Write};
+
+        self.flush()?;
+        self.file.sync_all()?;
+        platform_impl::verify_private_file_handle_security(
+            &self.file,
+            self.owner,
+            &self.principal,
+        )?;
+        if platform_impl::private_file_identity_from_handle(&self.file)? != self.identity {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "private publication handle identity changed",
+            ));
+        }
+        let named = open_verified_private_file_for_read(
+            &self.path,
+            self.owner,
+            &self.principal,
+            self.identity,
+        )?;
+        drop(named);
+        self.file.rewind()?;
+        let mut actual = Vec::new();
+        self.file.read_to_end(&mut actual)?;
+        if actual != expected_bytes {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "private publication bytes differ from the completed document",
+            ));
+        }
+        Ok(CompletePrivatePublication(self))
+    }
+}
+
+#[allow(dead_code)] // Consumed by the T0.13 receipt durability follow-up.
+impl CompletePrivatePublication {
+    pub(crate) fn publish_no_replace(
+        self,
+        destination: &Path,
+    ) -> std::io::Result<DurablePrivatePublication> {
+        let temporary_parent = self
+            .0
+            .path
+            .parent()
+            .ok_or_else(|| std::io::Error::other("private publication has no parent"))?;
+        if destination.parent() != Some(temporary_parent) || destination.file_name().is_none() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "private publication destination must be a same-directory leaf",
+            ));
+        }
+        platform_impl::publish_private_file_no_replace(
+            &self.0.file,
+            &self.0.path,
+            destination,
+            self.0.owner,
+            &self.0.principal,
+            self.0.identity,
+        )?;
+        Ok(DurablePrivatePublication {
+            path: destination.to_path_buf(),
+            identity: self.0.identity,
+        })
+    }
+}
+
+#[allow(dead_code)] // Consumed by the T0.13 receipt durability follow-up.
+impl DurablePrivatePublication {
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    #[allow(dead_code)] // Consumed by the T0.13 receipt integration follow-up.
+    pub(crate) fn identity(&self) -> PrivateFileIdentity {
+        self.identity
+    }
+}
+
 /// Stable identity captured while enumerating a private transaction file.
 /// The subsequent no-follow open must verify the same object before reading.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2818,6 +3151,30 @@ pub(crate) fn create_private_file(
     principal: &WorkerPrincipal,
 ) -> std::io::Result<std::fs::File> {
     platform_impl::create_private_file(path, owner, principal)
+}
+
+#[allow(dead_code)] // Consumed by the T0.13 receipt durability follow-up.
+pub(crate) fn create_private_publication_file(
+    path: &Path,
+    owner: ManifestOwner,
+    principal: &WorkerPrincipal,
+) -> std::io::Result<PrivatePublicationFile> {
+    if path.parent().is_none() || path.file_name().is_none() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "private publication temporary must have a parent and leaf name",
+        ));
+    }
+    let file = platform_impl::create_private_file(path, owner, principal)?;
+    let identity = platform_impl::private_file_identity_from_handle(&file)?;
+    platform_impl::verify_private_file_handle_security(&file, owner, principal)?;
+    Ok(PrivatePublicationFile {
+        path: path.to_path_buf(),
+        file,
+        identity,
+        owner,
+        principal: principal.clone(),
+    })
 }
 
 #[allow(dead_code)] // Source-including manifest tests omit receipt recovery.

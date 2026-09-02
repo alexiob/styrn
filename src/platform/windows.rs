@@ -15,6 +15,44 @@ use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PrivatePublicationPhase {
+    WriteThroughMove,
+    DestinationIdentityVerified,
+}
+
+#[cfg(test)]
+thread_local! {
+    static TRACE_PRIVATE_PUBLICATION: std::cell::Cell<bool> = const {
+        std::cell::Cell::new(false)
+    };
+    static PRIVATE_PUBLICATION_TRACE: std::cell::RefCell<Vec<PrivatePublicationPhase>> = const {
+        std::cell::RefCell::new(Vec::new())
+    };
+}
+
+#[cfg(test)]
+fn trace_private_publication_for_test(enabled: bool) {
+    TRACE_PRIVATE_PUBLICATION.with(|trace| trace.set(enabled));
+    PRIVATE_PUBLICATION_TRACE.with(|phases| phases.borrow_mut().clear());
+}
+
+#[cfg(test)]
+fn record_private_publication_phase(phase: PrivatePublicationPhase) {
+    TRACE_PRIVATE_PUBLICATION.with(|trace| {
+        if trace.get() {
+            PRIVATE_PUBLICATION_TRACE.with(|phases| phases.borrow_mut().push(phase));
+        }
+    });
+}
+
+#[cfg(test)]
+fn take_private_publication_trace_for_test() -> Vec<PrivatePublicationPhase> {
+    TRACE_PRIVATE_PUBLICATION.with(|trace| trace.set(false));
+    PRIVATE_PUBLICATION_TRACE.with(|phases| std::mem::take(&mut *phases.borrow_mut()))
+}
+
 const OWNER_SECURITY_INFORMATION: u32 = 0x0000_0001;
 const DACL_SECURITY_INFORMATION: u32 = 0x0000_0004;
 const PROTECTED_DACL_SECURITY_INFORMATION: u32 = 0x8000_0000;
@@ -827,6 +865,10 @@ pub(super) fn reverify_worker_directory_lease(
             ));
         }
     }
+    Ok(())
+}
+
+pub(super) fn retire_worker_directory_authority(_lease: &WorkerDirectoryLease) -> io::Result<()> {
     Ok(())
 }
 
@@ -2487,6 +2529,97 @@ pub(super) fn private_file_identity(path: &Path) -> io::Result<PrivateFileIdenti
     Ok(file_identity(&information))
 }
 
+#[allow(dead_code)] // Consumed through the deferred T0.13 publication adapter.
+pub(super) fn private_file_identity_from_handle(
+    file: &std::fs::File,
+) -> io::Result<PrivateFileIdentity> {
+    use std::os::windows::io::AsRawHandle;
+
+    let mut information = unsafe { std::mem::zeroed::<ByHandleFileInformation>() };
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut information) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if information.file_attributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY) != 0
+    {
+        return Err(permission_denied(
+            "private publication handle is not a regular non-reparse file",
+        ));
+    }
+    Ok(file_identity(&information))
+}
+
+#[allow(dead_code)] // Consumed through the deferred T0.13 publication adapter.
+pub(super) fn verify_private_file_handle_security(
+    file: &std::fs::File,
+    owner: ManifestOwner,
+    principal: &WorkerPrincipal,
+) -> io::Result<()> {
+    private_file_identity_from_handle(file)?;
+    if is_test_owner(owner) {
+        return Ok(());
+    }
+    match owner {
+        ManifestOwner::System => inspect_handle_private_acl(file, AclKind::Lock),
+        ManifestOwner::User => inspect_handle_user_acl(file, principal, AclKind::UserFile),
+        #[cfg(test)]
+        ManifestOwner::CurrentProcess | ManifestOwner::CurrentProcessWorker => unreachable!(),
+    }
+}
+
+#[allow(dead_code)] // Consumed through the deferred T0.13 publication adapter.
+pub(super) fn publish_private_file_no_replace(
+    file: &std::fs::File,
+    temporary: &Path,
+    destination: &Path,
+    owner: ManifestOwner,
+    principal: &WorkerPrincipal,
+    expected_identity: PrivateFileIdentity,
+) -> io::Result<()> {
+    const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
+
+    if private_file_identity_from_handle(file)? != expected_identity {
+        return Err(permission_denied(
+            "private publication handle identity changed",
+        ));
+    }
+    drop(open_verified_private_file_for_read(
+        temporary,
+        owner,
+        principal,
+        expected_identity,
+    )?);
+    let temporary_wide = wide_os(temporary);
+    let destination_wide = wide_os(destination);
+    if unsafe {
+        MoveFileExW(
+            temporary_wide.as_ptr(),
+            destination_wide.as_ptr(),
+            MOVEFILE_WRITE_THROUGH,
+        )
+    } == 0
+    {
+        let error = io::Error::last_os_error();
+        if std::fs::symlink_metadata(destination).is_ok() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "private publication destination already exists",
+            ));
+        }
+        return Err(error);
+    }
+    #[cfg(test)]
+    record_private_publication_phase(PrivatePublicationPhase::WriteThroughMove);
+    drop(open_verified_private_file_for_read(
+        destination,
+        owner,
+        principal,
+        expected_identity,
+    )?);
+    #[cfg(test)]
+    record_private_publication_phase(PrivatePublicationPhase::DestinationIdentityVerified);
+    Ok(())
+}
+
 pub(super) fn open_verified_private_file_for_read(
     path: &Path,
     owner: ManifestOwner,
@@ -4023,7 +4156,10 @@ mod tests {
             );
             panic!("dedicated worker creation failed: {error}");
         }
-        creation.unwrap().final_reverify().unwrap();
+        creation
+            .unwrap()
+            .bind_after_reverify(|_| Ok::<_, ()>(()))
+            .unwrap();
         for path in std::iter::once(root.as_path()).chain(
             crate::platform::WorkerDirectoryLayout::child_names()
                 .into_iter()
@@ -4486,6 +4622,46 @@ mod tests {
 
         assert_eq!(std::fs::read(&destination).unwrap(), b"complete");
         drop(file);
+        std::fs::remove_file(destination).unwrap();
+        std::fs::remove_dir(root).unwrap();
+    }
+
+    #[test]
+    fn native_private_publication_uses_write_through_before_identity_verification() {
+        use std::io::Write;
+
+        let root = std::env::temp_dir().join(format!(
+            "styrn-private-write-through-{}-{}",
+            std::process::id(),
+            uuid::Uuid::now_v7()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let temporary = root.join("temporary");
+        let destination = root.join("destination");
+        let principal = test_principal();
+        let mut file = super::super::create_private_publication_file(
+            &temporary,
+            ManifestOwner::CurrentProcess,
+            &principal,
+        )
+        .unwrap();
+        file.write_all(b"complete").unwrap();
+        trace_private_publication_for_test(true);
+
+        file.complete_exact(b"complete")
+            .unwrap()
+            .publish_no_replace(&destination)
+            .unwrap();
+
+        assert_eq!(
+            take_private_publication_trace_for_test(),
+            vec![
+                PrivatePublicationPhase::WriteThroughMove,
+                PrivatePublicationPhase::DestinationIdentityVerified,
+            ]
+        );
+        assert_eq!(std::fs::read(&destination).unwrap(), b"complete");
+        assert!(!temporary.exists());
         std::fs::remove_file(destination).unwrap();
         std::fs::remove_dir(root).unwrap();
     }

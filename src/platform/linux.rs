@@ -18,12 +18,21 @@ use sha2::{Digest, Sha256};
 #[cfg(test)]
 type PostWorkerMkdirHook = fn(i32, &std::ffi::CStr);
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum WorkerPublicationInterruption {
+    AfterProvenance,
+    AfterRootOwnership,
+}
+
 #[cfg(test)]
 thread_local! {
     static POST_WORKER_MKDIR_HOOK: std::cell::Cell<Option<PostWorkerMkdirHook>> = const {
         std::cell::Cell::new(None)
     };
     static WORKER_MKDIR_INTERRUPT_AFTER: std::cell::Cell<Option<usize>> = const {
+        std::cell::Cell::new(None)
+    };
+    static WORKER_PUBLICATION_INTERRUPT: std::cell::Cell<Option<WorkerPublicationInterruption>> = const {
         std::cell::Cell::new(None)
     };
 }
@@ -36,6 +45,11 @@ fn set_post_worker_mkdir_hook(hook: PostWorkerMkdirHook) {
 #[cfg(test)]
 fn set_worker_mkdir_interrupt_after(remaining: Option<usize>) {
     WORKER_MKDIR_INTERRUPT_AFTER.with(|slot| slot.set(remaining));
+}
+
+#[cfg(test)]
+fn set_worker_publication_interrupt(interruption: Option<WorkerPublicationInterruption>) {
+    WORKER_PUBLICATION_INTERRUPT.with(|slot| slot.set(interruption));
 }
 
 #[allow(dead_code)]
@@ -188,16 +202,25 @@ pub(super) fn create_worker_directory_layout(
     let verified_principal = revalidate_worker_root_principal(layout)?;
     let expected_uid = verified_principal.unix_uid()?;
     let mut root_parent = creation_lock.try_clone()?;
+    let mut creation_provenance = Vec::new();
+    let mut pending_ownership = Vec::new();
     for component in &root_components[first_creatable..root_components.len() - 1] {
-        root_parent = open_or_create_worker_directory_at(
+        let opened = open_or_create_worker_directory_at(
             &root_parent,
             &root_parent,
             component,
             true,
             expected_uid,
             false,
-        )?
-        .directory;
+            false,
+        )?;
+        if let Some(provenance) = opened.provenance {
+            creation_provenance.push(provenance);
+        }
+        if opened.disposition == super::WorkerDirectoryNodeDisposition::Created {
+            pending_ownership.push((root_parent.try_clone()?, opened.directory.try_clone()?));
+        }
+        root_parent = opened.directory;
     }
     let root_name = root_components
         .last()
@@ -205,6 +228,9 @@ pub(super) fn create_worker_directory_layout(
     let (root, staged_children) =
         create_or_open_complete_worker_root(&root_parent, root_name, expected_uid)?;
     let root_disposition = root.disposition;
+    if let Some(provenance) = root.provenance {
+        creation_provenance.push(provenance);
+    }
     let directory = root.directory;
     let root_identity = worker_directory_identity(&directory)?;
     let root_observation = super::WorkerDirectoryNodeObservation::new(
@@ -215,8 +241,20 @@ pub(super) fn create_worker_directory_layout(
 
     let children = match staged_children {
         Some(children) => children,
-        None => open_or_create_worker_children(&root_parent, &directory, expected_uid)?,
+        None => open_or_create_worker_children(&root_parent, &directory, expected_uid, false)?,
     };
+
+    for (parent, intermediate) in pending_ownership {
+        harden_new_worker_directory(&intermediate, expected_uid)?;
+        intermediate.sync_all()?;
+        parent.sync_all()?;
+    }
+    if root_disposition == super::WorkerDirectoryNodeDisposition::Created {
+        harden_new_worker_directory(&directory, expected_uid)?;
+        directory.sync_all()?;
+        root_parent.sync_all()?;
+        maybe_interrupt_worker_publication(true, WorkerPublicationInterruption::AfterRootOwnership);
+    }
 
     if worker_directory_identity(&directory)? != root_identity {
         return Err(permission_denied(
@@ -243,6 +281,9 @@ pub(super) fn create_worker_directory_layout(
             child.disposition,
             identity,
         ));
+        if let Some(provenance) = child.provenance {
+            creation_provenance.push(provenance);
+        }
         child_handles.push(child.directory);
     }
     let [repos, jobs, cache, artifacts, logs] = child_handles
@@ -252,6 +293,7 @@ pub(super) fn create_worker_directory_layout(
         _creation_lock: creation_lock,
         nodes: [directory, repos, jobs, cache, artifacts, logs],
         expected_uid,
+        creation_provenance,
     };
     Ok(super::WorkerDirectoryCreation::new(
         root_observation,
@@ -265,18 +307,33 @@ pub(super) fn create_worker_directory_layout(
 struct OpenedWorkerDirectory {
     directory: std::fs::File,
     disposition: super::WorkerDirectoryNodeDisposition,
+    provenance: Option<WorkerCreationProvenance>,
+}
+
+struct WorkerCreationProvenance {
+    parent: std::fs::File,
+    name: CString,
+    directory: std::fs::File,
+    directory_identity: super::WorkerDirectoryIdentity,
+    file: std::fs::File,
+    file_identity: PrivateFileIdentity,
+    expected_record: Vec<u8>,
 }
 
 pub(super) struct WorkerDirectoryLease {
     _creation_lock: std::fs::File,
     nodes: [std::fs::File; 6],
     expected_uid: u32,
+    creation_provenance: Vec<WorkerCreationProvenance>,
 }
 
 pub(super) fn reverify_worker_directory_lease(
     lease: &WorkerDirectoryLease,
     observations: &[super::WorkerDirectoryNodeObservation; 6],
 ) -> io::Result<()> {
+    for provenance in &lease.creation_provenance {
+        verify_worker_creation_provenance(provenance)?;
+    }
     for (directory, observation) in lease.nodes.iter().zip(observations) {
         verify_worker_directory_security(directory, lease.expected_uid)?;
         if worker_directory_identity(directory)? != observation.identity() {
@@ -292,6 +349,268 @@ pub(super) fn reverify_worker_directory_lease(
         }
     }
     Ok(())
+}
+
+pub(super) fn retire_worker_directory_authority(lease: &WorkerDirectoryLease) -> io::Result<()> {
+    for provenance in &lease.creation_provenance {
+        verify_worker_creation_provenance(provenance)?;
+    }
+    // Child evidence is retired before the root record, so a partial cleanup
+    // leaves the root transaction visibly incomplete rather than silently
+    // converting an unbound creation into an ordinary existing tree.
+    for provenance in lease.creation_provenance.iter().rev() {
+        if unsafe { libc::unlinkat(provenance.directory.as_raw_fd(), c"record".as_ptr(), 0) } == -1
+        {
+            return Err(io::Error::last_os_error());
+        }
+        provenance.directory.sync_all()?;
+        if unsafe {
+            libc::unlinkat(
+                provenance.parent.as_raw_fd(),
+                provenance.name.as_ptr(),
+                libc::AT_REMOVEDIR,
+            )
+        } == -1
+        {
+            return Err(io::Error::last_os_error());
+        }
+        provenance.parent.sync_all()?;
+    }
+    Ok(())
+}
+
+fn worker_creation_provenance_name(
+    destination_parent: &std::fs::File,
+    destination_name: &[u8],
+) -> io::Result<CString> {
+    use std::fmt::Write;
+
+    let identity = worker_directory_identity(destination_parent)?;
+    let mut digest = Sha256::new();
+    digest.update(b"styrn-worker-provenance-v1");
+    digest.update(identity.volume.to_le_bytes());
+    digest.update(identity.file_id);
+    digest.update(destination_name);
+    let digest = digest.finalize();
+    let mut name = String::from(".styrn-worker-provenance-");
+    for byte in &digest[..16] {
+        write!(&mut name, "{byte:02x}").expect("writing a provenance digest cannot fail");
+    }
+    CString::new(name).map_err(|_| invalid_data("worker provenance name contains a NUL byte"))
+}
+
+fn worker_creation_provenance_record(
+    staging_parent: &std::fs::File,
+    destination_parent: &std::fs::File,
+    destination_name: &[u8],
+    created_identity: super::WorkerDirectoryIdentity,
+) -> io::Result<Vec<u8>> {
+    let staging_parent = worker_directory_identity(staging_parent)?;
+    let destination_parent = worker_directory_identity(destination_parent)?;
+    let name_length = u32::try_from(destination_name.len())
+        .map_err(|_| invalid_data("worker directory component is too long"))?;
+    let mut record = Vec::with_capacity(96 + destination_name.len());
+    record.extend_from_slice(b"STYRN-WORKER-PROVENANCE-V1\0");
+    for identity in [staging_parent, destination_parent, created_identity] {
+        record.extend_from_slice(&identity.volume.to_le_bytes());
+        record.extend_from_slice(&identity.file_id);
+    }
+    record.extend_from_slice(&name_length.to_le_bytes());
+    record.extend_from_slice(destination_name);
+    Ok(record)
+}
+
+fn worker_provenance_file_identity(file: &std::fs::File) -> io::Result<PrivateFileIdentity> {
+    let mut status = unsafe { std::mem::zeroed::<libc::stat>() };
+    if unsafe { libc::fstat(file.as_raw_fd(), &mut status) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    if status.st_mode & libc::S_IFMT != libc::S_IFREG
+        || status.st_mode & 0o777 != 0o600
+        || status.st_uid != unsafe { libc::geteuid() }
+        || status.st_nlink != 1
+    {
+        return Err(permission_denied(
+            "worker creation provenance is not a private regular file",
+        ));
+    }
+    if posix_acl_present(file, c"system.posix_acl_access")? {
+        return Err(permission_denied(
+            "worker creation provenance has an access ACL",
+        ));
+    }
+    Ok(PrivateFileIdentity::new(status.st_dev, status.st_ino))
+}
+
+fn worker_provenance_identity_at(
+    parent: &std::fs::File,
+    name: &std::ffi::CStr,
+) -> io::Result<PrivateFileIdentity> {
+    let mut status = unsafe { std::mem::zeroed::<libc::stat>() };
+    if unsafe {
+        libc::fstatat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            &mut status,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } == -1
+    {
+        return Err(io::Error::last_os_error());
+    }
+    if status.st_mode & libc::S_IFMT != libc::S_IFREG {
+        return Err(permission_denied(
+            "worker creation provenance path is not a regular file",
+        ));
+    }
+    Ok(PrivateFileIdentity::new(status.st_dev, status.st_ino))
+}
+
+fn verify_worker_creation_provenance(provenance: &WorkerCreationProvenance) -> io::Result<()> {
+    use std::io::{Read, Seek};
+
+    verify_staged_worker_directory_security(
+        &provenance.directory,
+        unsafe { libc::geteuid() },
+        unsafe { libc::geteuid() },
+    )?;
+    if worker_directory_identity(&provenance.directory)? != provenance.directory_identity
+        || worker_directory_identity_at(&provenance.parent, &provenance.name)?
+            != provenance.directory_identity
+        || worker_provenance_file_identity(&provenance.file)? != provenance.file_identity
+        || worker_provenance_identity_at(&provenance.directory, c"record")?
+            != provenance.file_identity
+    {
+        return Err(permission_denied(
+            "worker creation provenance identity changed",
+        ));
+    }
+    let mut reader = provenance.file.try_clone()?;
+    reader.rewind()?;
+    let mut actual = Vec::new();
+    reader.read_to_end(&mut actual)?;
+    if actual != provenance.expected_record {
+        return Err(permission_denied(
+            "worker creation provenance content changed",
+        ));
+    }
+    Ok(())
+}
+
+fn create_worker_creation_provenance(
+    staging_parent: &std::fs::File,
+    destination_parent: &std::fs::File,
+    destination_name: &[u8],
+    created_identity: super::WorkerDirectoryIdentity,
+) -> io::Result<WorkerCreationProvenance> {
+    use std::io::Write;
+
+    let name = worker_creation_provenance_name(destination_parent, destination_name)?;
+    let entries_before = worker_parent_entry_snapshot(staging_parent)?;
+    if unsafe { libc::mkdirat(staging_parent.as_raw_fd(), name.as_ptr(), 0o700) } == -1 {
+        let error = io::Error::last_os_error();
+        return Err(if error.kind() == io::ErrorKind::AlreadyExists {
+            permission_denied("worker creation provenance already exists ambiguously")
+        } else {
+            error
+        });
+    }
+    let directory = open_worker_directory_at(staging_parent, name.to_bytes())?;
+    let directory_identity = worker_directory_identity(&directory)?;
+    let mut expected_entries = entries_before;
+    expected_entries.push((name.to_bytes().to_vec(), directory_identity));
+    expected_entries.sort_by(|left, right| left.0.cmp(&right.0));
+    if worker_parent_entry_snapshot(staging_parent)? != expected_entries {
+        return Err(permission_denied(
+            "worker creation provenance directory changed before its first retained handle",
+        ));
+    }
+    harden_new_worker_directory(&directory, unsafe { libc::geteuid() })?;
+    let descriptor = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            c"record".as_ptr(),
+            libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0o600,
+        )
+    };
+    if descriptor == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut file = unsafe { std::fs::File::from_raw_fd(descriptor) };
+    clear_posix_acl(&file, c"system.posix_acl_access")?;
+    if unsafe { libc::fchmod(file.as_raw_fd(), 0o600) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    let file_identity = worker_provenance_file_identity(&file)?;
+    let expected_record = worker_creation_provenance_record(
+        staging_parent,
+        destination_parent,
+        destination_name,
+        created_identity,
+    )?;
+    file.write_all(&expected_record)?;
+    file.sync_all()?;
+    directory.sync_all()?;
+    staging_parent.sync_all()?;
+    let provenance = WorkerCreationProvenance {
+        parent: staging_parent.try_clone()?,
+        name,
+        directory,
+        directory_identity,
+        file,
+        file_identity,
+        expected_record,
+    };
+    verify_worker_creation_provenance(&provenance)?;
+    Ok(provenance)
+}
+
+fn open_worker_creation_provenance(
+    staging_parent: &std::fs::File,
+    destination_parent: &std::fs::File,
+    destination_name: &[u8],
+    created_identity: super::WorkerDirectoryIdentity,
+) -> io::Result<Option<WorkerCreationProvenance>> {
+    let name = worker_creation_provenance_name(destination_parent, destination_name)?;
+    let directory = match open_worker_directory_at(staging_parent, name.to_bytes()) {
+        Ok(directory) => directory,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    verify_staged_worker_directory_security(&directory, unsafe { libc::geteuid() }, unsafe {
+        libc::geteuid()
+    })?;
+    let directory_identity = worker_directory_identity(&directory)?;
+    let descriptor = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            c"record".as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if descriptor == -1 {
+        return Err(worker_directory_open_error(io::Error::last_os_error()));
+    }
+    let file = unsafe { std::fs::File::from_raw_fd(descriptor) };
+    let expected_record = worker_creation_provenance_record(
+        staging_parent,
+        destination_parent,
+        destination_name,
+        created_identity,
+    )?;
+    let file_identity = worker_provenance_file_identity(&file)?;
+    let provenance = WorkerCreationProvenance {
+        parent: staging_parent.try_clone()?,
+        name,
+        directory,
+        directory_identity,
+        file,
+        file_identity,
+        expected_record,
+    };
+    verify_worker_creation_provenance(&provenance)?;
+    Ok(Some(provenance))
 }
 
 fn absolute_worker_components(path: &Path) -> io::Result<Vec<&[u8]>> {
@@ -348,13 +667,33 @@ fn open_or_create_worker_directory_at(
     may_create: bool,
     expected_uid: u32,
     existing_must_be_canonical: bool,
+    complete_root: bool,
 ) -> io::Result<OpenedWorkerDirectory> {
     match open_worker_directory_at(parent, name) {
         Ok(directory) => {
+            if let Some(provenance) = open_worker_creation_provenance(
+                staging_parent,
+                parent,
+                name,
+                worker_directory_identity(&directory)?,
+            )? {
+                verify_staged_or_published_worker_directory(&directory, expected_uid)?;
+                if existing_must_be_canonical && !complete_root {
+                    harden_new_worker_directory(&directory, expected_uid)?;
+                    directory.sync_all()?;
+                    parent.sync_all()?;
+                }
+                return Ok(OpenedWorkerDirectory {
+                    directory,
+                    disposition: super::WorkerDirectoryNodeDisposition::Created,
+                    provenance: Some(provenance),
+                });
+            }
             verify_existing_worker_directory(&directory, expected_uid, existing_must_be_canonical)?;
             return Ok(OpenedWorkerDirectory {
                 directory,
                 disposition: super::WorkerDirectoryNodeDisposition::Existing,
+                provenance: None,
             });
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound && may_create => {}
@@ -362,7 +701,6 @@ fn open_or_create_worker_directory_at(
     }
     let staged =
         create_unpublished_worker_directory(staging_parent, parent, name, expected_uid, false)?;
-    harden_new_worker_directory(&staged.directory, expected_uid)?;
     publish_staged_worker_directory(
         staging_parent,
         staged,
@@ -384,11 +722,30 @@ fn create_or_open_complete_worker_root(
 )> {
     match open_worker_directory_at(root_parent, root_name) {
         Ok(directory) => {
+            if let Some(provenance) = open_worker_creation_provenance(
+                root_parent,
+                root_parent,
+                root_name,
+                worker_directory_identity(&directory)?,
+            )? {
+                verify_staged_or_published_worker_directory(&directory, expected_uid)?;
+                let children =
+                    open_or_create_worker_children(root_parent, &directory, expected_uid, true)?;
+                return Ok((
+                    OpenedWorkerDirectory {
+                        directory,
+                        disposition: super::WorkerDirectoryNodeDisposition::Created,
+                        provenance: Some(provenance),
+                    },
+                    Some(children),
+                ));
+            }
             verify_worker_directory_security(&directory, expected_uid)?;
             return Ok((
                 OpenedWorkerDirectory {
                     directory,
                     disposition: super::WorkerDirectoryNodeDisposition::Existing,
+                    provenance: None,
                 },
                 None,
             ));
@@ -404,67 +761,26 @@ fn create_or_open_complete_worker_root(
         expected_uid,
         true,
     )?;
-    let children =
-        match open_or_create_worker_children(&staged.directory, &staged.directory, expected_uid) {
-            Ok(children) => children,
-            Err(error) => {
-                return fail_after_staged_tree_cleanup(error, root_parent, &staged);
-            }
-        };
-    if let Err(error) = harden_new_worker_directory(&staged.directory, expected_uid) {
-        return fail_after_staged_tree_cleanup(error, root_parent, &staged);
-    }
-    let destination_name = CString::new(root_name)
-        .map_err(|_| invalid_data("worker directory component contains a NUL byte"))?;
-    if unsafe {
-        libc::renameat2(
-            root_parent.as_raw_fd(),
-            staged.name.as_ptr(),
-            root_parent.as_raw_fd(),
-            destination_name.as_ptr(),
-            libc::RENAME_NOREPLACE,
-        )
-    } == 0
-    {
-        let reopened = open_worker_directory_at(root_parent, destination_name.to_bytes())?;
-        if worker_directory_identity(&reopened)? != staged.identity {
-            return Err(permission_denied(
-                "published worker root identity changed before verification",
-            ));
-        }
-        verify_worker_directory_security(&staged.directory, expected_uid)?;
-        let children = children
-            .into_iter()
-            .map(|child| {
-                child.map(|child| OpenedWorkerDirectory {
-                    directory: child.directory,
-                    disposition: super::WorkerDirectoryNodeDisposition::Created,
-                })
-            })
-            .collect();
-        return Ok((
-            OpenedWorkerDirectory {
-                directory: staged.directory,
-                disposition: super::WorkerDirectoryNodeDisposition::Created,
-            },
-            Some(children),
-        ));
-    }
-
-    let error = io::Error::last_os_error();
-    remove_known_staged_worker_tree(root_parent, &staged)?;
-    if error.kind() != io::ErrorKind::AlreadyExists {
-        return Err(error);
-    }
-    let directory = open_worker_directory_at(root_parent, destination_name.to_bytes())?;
-    verify_worker_directory_security(&directory, expected_uid)?;
-    Ok((
-        OpenedWorkerDirectory {
-            directory,
-            disposition: super::WorkerDirectoryNodeDisposition::Existing,
-        },
-        None,
-    ))
+    maybe_interrupt_worker_mkdir();
+    let children = match open_or_create_worker_children(
+        root_parent,
+        &staged.directory,
+        expected_uid,
+        !staged.created,
+    ) {
+        Ok(children) => children,
+        Err(error) => return fail_after_staged_tree_cleanup(error, root_parent, &staged),
+    };
+    let root = publish_staged_worker_directory(
+        root_parent,
+        staged,
+        root_parent,
+        root_name,
+        expected_uid,
+        expected_uid,
+        true,
+    )?;
+    Ok((root, Some(children)))
 }
 
 fn fail_after_staged_tree_cleanup<T>(
@@ -472,6 +788,13 @@ fn fail_after_staged_tree_cleanup<T>(
     parent: &std::fs::File,
     staged: &StagedWorkerDirectory,
 ) -> io::Result<T> {
+    if !staged.created
+        || worker_parent_entry_snapshot(parent)?
+            .iter()
+            .any(|(name, _)| name.starts_with(b".styrn-worker-provenance-"))
+    {
+        return Err(original);
+    }
     match remove_known_staged_worker_tree(parent, staged) {
         Ok(()) => Err(original),
         Err(cleanup) => Err(cleanup),
@@ -482,32 +805,27 @@ fn open_or_create_worker_children(
     staging_parent: &std::fs::File,
     root: &std::fs::File,
     expected_uid: u32,
+    require_provenance_for_existing: bool,
 ) -> io::Result<Vec<Option<OpenedWorkerDirectory>>> {
     let mut children = Vec::with_capacity(super::WorkerDirectoryLayout::child_names().len());
     for name in super::WorkerDirectoryLayout::child_names() {
-        match open_worker_directory_at(root, name.as_bytes()) {
-            Ok(child) => {
-                verify_worker_directory_security(&child, expected_uid)?;
-                children.push(Some(OpenedWorkerDirectory {
-                    directory: child,
-                    disposition: super::WorkerDirectoryNodeDisposition::Existing,
-                }));
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => children.push(None),
-            Err(error) => return Err(error),
+        let child = open_or_create_worker_directory_at(
+            staging_parent,
+            root,
+            name.as_bytes(),
+            true,
+            expected_uid,
+            true,
+            false,
+        )?;
+        if require_provenance_for_existing
+            && child.disposition == super::WorkerDirectoryNodeDisposition::Existing
+        {
+            return Err(permission_denied(
+                "interrupted worker staging child lacks exact creation provenance",
+            ));
         }
-    }
-    for (index, child) in children.iter_mut().enumerate() {
-        if child.is_none() {
-            *child = Some(open_or_create_worker_directory_at(
-                staging_parent,
-                root,
-                super::WorkerDirectoryLayout::child_names()[index].as_bytes(),
-                true,
-                expected_uid,
-                true,
-            )?);
-        }
+        children.push(Some(child));
     }
     Ok(children)
 }
@@ -551,6 +869,7 @@ struct StagedWorkerDirectory {
     name: CString,
     directory: std::fs::File,
     identity: super::WorkerDirectoryIdentity,
+    created: bool,
 }
 
 fn create_unpublished_worker_directory(
@@ -561,6 +880,7 @@ fn create_unpublished_worker_directory(
     allow_canonical_children: bool,
 ) -> io::Result<StagedWorkerDirectory> {
     let name = worker_staging_name(destination_parent, destination_name)?;
+    let entries_before = worker_parent_entry_snapshot(staging_parent)?;
     let created =
         if unsafe { libc::mkdirat(staging_parent.as_raw_fd(), name.as_ptr(), 0o700) } == -1 {
             let error = io::Error::last_os_error();
@@ -571,34 +891,25 @@ fn create_unpublished_worker_directory(
         } else {
             true
         };
-    let identity_before_open = if created {
-        let identity = worker_directory_identity_at(staging_parent, &name)?;
+    if created {
         #[cfg(test)]
         POST_WORKER_MKDIR_HOOK.with(|slot| {
             if let Some(hook) = slot.take() {
                 hook(staging_parent.as_raw_fd(), &name);
             }
         });
-        #[cfg(test)]
-        WORKER_MKDIR_INTERRUPT_AFTER.with(|slot| {
-            if let Some(remaining) = slot.get() {
-                if remaining == 0 {
-                    slot.set(None);
-                    panic!("injected worker staging interruption");
-                }
-                slot.set(Some(remaining - 1));
-            }
-        });
-        Some(identity)
-    } else {
-        None
-    };
+    }
     let directory = open_worker_directory_at(staging_parent, name.to_bytes())?;
     let identity = worker_directory_identity(&directory)?;
-    if identity_before_open.is_some_and(|expected| expected != identity) {
-        return Err(permission_denied(
-            "new worker staging directory was substituted before it was opened",
-        ));
+    if created {
+        let mut expected_entries = entries_before;
+        expected_entries.push((name.to_bytes().to_vec(), identity));
+        expected_entries.sort_by(|left, right| left.0.cmp(&right.0));
+        if worker_parent_entry_snapshot(staging_parent)? != expected_entries {
+            return Err(permission_denied(
+                "new worker staging directory ancestry changed before its first retained handle",
+            ));
+        }
     }
     let creator_uid = unsafe { libc::geteuid() };
     if created {
@@ -613,7 +924,85 @@ fn create_unpublished_worker_directory(
         name,
         directory,
         identity,
+        created,
     })
+}
+
+fn worker_parent_entry_snapshot(
+    parent: &std::fs::File,
+) -> io::Result<Vec<(Vec<u8>, super::WorkerDirectoryIdentity)>> {
+    let duplicate = unsafe { libc::fcntl(parent.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+    if duplicate == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    let stream = unsafe { libc::fdopendir(duplicate) };
+    if stream.is_null() {
+        unsafe { libc::close(duplicate) };
+        return Err(io::Error::last_os_error());
+    }
+    let stream = OwnedDirectoryStream(stream);
+    unsafe { libc::rewinddir(stream.0) };
+    let mut entries = Vec::new();
+    loop {
+        unsafe { *libc::__errno_location() = 0 };
+        let entry = unsafe { libc::readdir(stream.0) };
+        if entry.is_null() {
+            let error = unsafe { *libc::__errno_location() };
+            if error != 0 {
+                return Err(io::Error::from_raw_os_error(error));
+            }
+            break;
+        }
+        let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) };
+        if matches!(name.to_bytes(), b"." | b"..") {
+            continue;
+        }
+        let mut status = unsafe { std::mem::zeroed::<libc::stat>() };
+        if unsafe {
+            libc::fstatat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                &mut status,
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        } == -1
+        {
+            return Err(io::Error::last_os_error());
+        }
+        entries.push((
+            name.to_bytes().to_vec(),
+            super::WorkerDirectoryIdentity::from_unix(status.st_dev, status.st_ino),
+        ));
+    }
+    entries.sort_by(|left, right| left.0.cmp(&right.0));
+    Ok(entries)
+}
+
+fn maybe_interrupt_worker_mkdir() {
+    #[cfg(test)]
+    WORKER_MKDIR_INTERRUPT_AFTER.with(|slot| {
+        if let Some(remaining) = slot.get() {
+            if remaining == 0 {
+                slot.set(None);
+                panic!("injected worker staging interruption");
+            }
+            slot.set(Some(remaining - 1));
+        }
+    });
+}
+
+fn maybe_interrupt_worker_publication(complete_root: bool, phase: WorkerPublicationInterruption) {
+    #[cfg(test)]
+    if complete_root {
+        WORKER_PUBLICATION_INTERRUPT.with(|slot| {
+            if slot.get() == Some(phase) {
+                slot.set(None);
+                panic!("injected worker publication interruption");
+            }
+        });
+    }
+    #[cfg(not(test))]
+    let _ = (complete_root, phase);
 }
 
 fn worker_staging_name(
@@ -652,6 +1041,13 @@ fn verify_staged_worker_directory_security(
         posix_acl_present(directory, c"system.posix_acl_access")?,
         posix_acl_present(directory, c"system.posix_acl_default")?,
     )
+}
+
+fn verify_staged_or_published_worker_directory(
+    directory: &std::fs::File,
+    expected_uid: u32,
+) -> io::Result<()> {
+    verify_staged_worker_directory_security(directory, unsafe { libc::geteuid() }, expected_uid)
 }
 
 fn verify_staged_worker_directory_entries(
@@ -734,8 +1130,42 @@ fn publish_staged_worker_directory(
     existing_expected_uid: u32,
     existing_must_be_canonical: bool,
 ) -> io::Result<OpenedWorkerDirectory> {
+    let complete_root = existing_must_be_canonical
+        && worker_directory_identity(staging_parent)?
+            == worker_directory_identity(destination_parent)?;
     let destination_name = CString::new(destination_name)
         .map_err(|_| invalid_data("worker directory component contains a NUL byte"))?;
+    verify_staged_worker_directory_security(
+        &staged.directory,
+        unsafe { libc::geteuid() },
+        created_expected_uid,
+    )?;
+    let provenance = match open_worker_creation_provenance(
+        staging_parent,
+        destination_parent,
+        destination_name.to_bytes(),
+        staged.identity,
+    )? {
+        Some(provenance) => provenance,
+        None if staged.created => create_worker_creation_provenance(
+            staging_parent,
+            destination_parent,
+            destination_name.to_bytes(),
+            staged.identity,
+        )?,
+        None => {
+            return Err(permission_denied(
+                "interrupted worker staging directory lacks exact creation provenance",
+            ));
+        }
+    };
+    maybe_interrupt_worker_publication(
+        complete_root,
+        WorkerPublicationInterruption::AfterProvenance,
+    );
+    if complete_root {
+        maybe_interrupt_worker_mkdir();
+    }
     if unsafe {
         libc::renameat2(
             staging_parent.as_raw_fd(),
@@ -752,26 +1182,44 @@ fn publish_staged_worker_directory(
                 "published worker directory identity changed before verification",
             ));
         }
-        verify_worker_directory_security(&staged.directory, created_expected_uid)?;
+        destination_parent.sync_all()?;
+        if existing_must_be_canonical && !complete_root {
+            harden_new_worker_directory(&staged.directory, created_expected_uid)?;
+            staged.directory.sync_all()?;
+            destination_parent.sync_all()?;
+            verify_worker_directory_security(&staged.directory, created_expected_uid)?;
+        } else {
+            verify_staged_or_published_worker_directory(&staged.directory, created_expected_uid)?;
+        }
         return Ok(OpenedWorkerDirectory {
             directory: staged.directory,
             disposition: super::WorkerDirectoryNodeDisposition::Created,
+            provenance: Some(provenance),
         });
     }
     let error = io::Error::last_os_error();
     if error.kind() != io::ErrorKind::AlreadyExists {
         return Err(error);
     }
-    remove_exact_empty_staged_worker_directory(staging_parent, &staged)?;
     let directory = open_worker_directory_at(destination_parent, destination_name.to_bytes())?;
-    verify_existing_worker_directory(
-        &directory,
-        existing_expected_uid,
-        existing_must_be_canonical,
-    )?;
+    if worker_directory_identity(&directory)? != staged.identity {
+        return Err(permission_denied(
+            "worker publication conflict retains exact creation evidence",
+        ));
+    }
+    verify_staged_or_published_worker_directory(&directory, existing_expected_uid)?;
+    if existing_must_be_canonical && !complete_root {
+        harden_new_worker_directory(&directory, existing_expected_uid)?;
+        verify_existing_worker_directory(
+            &directory,
+            existing_expected_uid,
+            existing_must_be_canonical,
+        )?;
+    }
     Ok(OpenedWorkerDirectory {
         directory,
-        disposition: super::WorkerDirectoryNodeDisposition::Existing,
+        disposition: super::WorkerDirectoryNodeDisposition::Created,
+        provenance: Some(provenance),
     })
 }
 
@@ -900,12 +1348,14 @@ fn worker_directory_status(directory: &std::fs::File) -> io::Result<libc::stat> 
 
 fn verify_worker_creation_ancestor(directory: &std::fs::File, expected_uid: u32) -> io::Result<()> {
     let status = worker_directory_status(directory)?;
-    if (status.st_uid != 0 && status.st_uid != expected_uid)
+    let creator_uid = unsafe { libc::geteuid() };
+    if (expected_uid != creator_uid && status.st_uid == expected_uid)
+        || (status.st_uid != 0 && status.st_uid != expected_uid)
         || (status.st_mode & 0o022 != 0
             && !(status.st_uid == 0 && status.st_mode & libc::S_ISVTX != 0))
     {
         return Err(permission_denied(
-            "worker root ancestor is controlled by an untrusted principal",
+            "worker root ancestor does not preserve creator authority over unpublished staging",
         ));
     }
     if posix_acl_present(directory, c"system.posix_acl_access")? {
@@ -1358,12 +1808,17 @@ pub(super) fn create_private_file(
     _owner: ManifestOwner,
     _principal: &WorkerPrincipal,
 ) -> io::Result<fs::File> {
-    fs::OpenOptions::new()
+    let file = fs::OpenOptions::new()
         .read(true)
         .write(true)
         .create_new(true)
         .mode(0o600)
-        .open(path)
+        .open(path)?;
+    clear_posix_acl(&file, c"system.posix_acl_access")?;
+    if unsafe { libc::fchmod(file.as_raw_fd(), 0o600) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(file)
 }
 
 pub(super) fn private_file_identity(path: &Path) -> io::Result<PrivateFileIdentity> {
@@ -1374,6 +1829,87 @@ pub(super) fn private_file_identity(path: &Path) -> io::Result<PrivateFileIdenti
         ));
     }
     Ok(PrivateFileIdentity::new(metadata.dev(), metadata.ino()))
+}
+
+#[allow(dead_code)] // Consumed through the deferred T0.13 publication adapter.
+pub(super) fn private_file_identity_from_handle(
+    file: &std::fs::File,
+) -> io::Result<PrivateFileIdentity> {
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(permission_denied(
+            "private publication handle is not a regular file",
+        ));
+    }
+    Ok(PrivateFileIdentity::new(metadata.dev(), metadata.ino()))
+}
+
+#[allow(dead_code)] // Consumed through the deferred T0.13 publication adapter.
+pub(super) fn verify_private_file_handle_security(
+    file: &std::fs::File,
+    owner: ManifestOwner,
+    principal: &WorkerPrincipal,
+) -> io::Result<()> {
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(permission_denied(
+            "private publication handle is not a regular file",
+        ));
+    }
+    let expected_uid = match owner {
+        ManifestOwner::System => 0,
+        ManifestOwner::User => principal.unix_uid()?,
+        #[cfg(test)]
+        ManifestOwner::CurrentProcess | ManifestOwner::CurrentProcessWorker => metadata.uid(),
+    };
+    if metadata.uid() != expected_uid || metadata.mode() & 0o777 != 0o600 {
+        return Err(permission_denied(
+            "private publication handle ownership or mode is insecure",
+        ));
+    }
+    if posix_acl_present(file, c"system.posix_acl_access")? {
+        return Err(permission_denied(
+            "private publication handle has an access ACL",
+        ));
+    }
+    Ok(())
+}
+
+#[allow(dead_code)] // Consumed through the deferred T0.13 publication adapter.
+pub(super) fn publish_private_file_no_replace(
+    file: &std::fs::File,
+    temporary: &Path,
+    destination: &Path,
+    owner: ManifestOwner,
+    principal: &WorkerPrincipal,
+    expected_identity: PrivateFileIdentity,
+) -> io::Result<()> {
+    if private_file_identity_from_handle(file)? != expected_identity {
+        return Err(permission_denied(
+            "private publication handle identity changed",
+        ));
+    }
+    drop(open_verified_private_file_for_read(
+        temporary,
+        owner,
+        principal,
+        expected_identity,
+    )?);
+    std::fs::hard_link(temporary, destination)?;
+    let parent = destination
+        .parent()
+        .ok_or_else(|| invalid_data("private publication destination has no parent"))?;
+    std::fs::File::open(parent)?.sync_all()?;
+    drop(open_verified_private_file_for_read(
+        destination,
+        owner,
+        principal,
+        expected_identity,
+    )?);
+    let removal =
+        prepare_verified_private_file_removal(temporary, owner, principal, expected_identity)?;
+    consume_verified_private_file(removal)?;
+    std::fs::File::open(parent)?.sync_all()
 }
 
 pub(super) fn open_verified_private_file_for_read(
@@ -2099,10 +2635,14 @@ mod tests {
         assert!(!root.exists());
 
         let creation = create_worker_directory_layout(&layout).unwrap();
-        assert!(creation.nodes().iter().all(
-            |node| node.disposition() == super::super::WorkerDirectoryNodeDisposition::Created
-        ));
-        creation.final_reverify().unwrap();
+        creation
+            .bind_after_reverify(|binding| {
+                assert!(binding.observations().iter().all(|node| {
+                    node.disposition() == super::super::WorkerDirectoryNodeDisposition::Created
+                }));
+                Ok::<_, ()>(())
+            })
+            .unwrap();
         assert_eq!(
             fs::read_dir(&parent)
                 .unwrap()
@@ -2111,6 +2651,93 @@ mod tests {
             vec![std::ffi::OsString::from("root")]
         );
         assert_eq!(fs::read_dir(&root).unwrap().count(), 5);
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn interruption_after_ownership_preparation_recovers_only_exact_provenance() {
+        let principal = resolve_current_worker_principal().unwrap();
+        let parent = fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!(
+                "styrn-worker-provenance-recovery-{}-{}",
+                std::process::id(),
+                uuid::Uuid::now_v7()
+            ));
+        fs::create_dir(&parent).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+        let root = parent.join("root");
+        let layout = crate::platform::resolve_worker_directory_layout(
+            crate::platform::InstallationScope::System,
+            &principal,
+            Some(&root),
+        )
+        .unwrap();
+
+        set_worker_publication_interrupt(Some(WorkerPublicationInterruption::AfterProvenance));
+        let interrupted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            create_worker_directory_layout(&layout)
+        }));
+        set_worker_publication_interrupt(None);
+        assert!(interrupted.is_err());
+        assert!(!root.exists());
+
+        create_worker_directory_layout(&layout)
+            .unwrap()
+            .bind_after_reverify(|binding| {
+                assert!(binding.observations().iter().all(|node| {
+                    node.disposition() == super::super::WorkerDirectoryNodeDisposition::Created
+                }));
+                Ok::<_, ()>(())
+            })
+            .unwrap();
+        assert_eq!(
+            fs::read_dir(&parent)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<Vec<_>>(),
+            vec![std::ffi::OsString::from("root")]
+        );
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn worker_substituted_compliant_child_is_not_relabelled_created_during_recovery() {
+        let principal = resolve_current_worker_principal().unwrap();
+        let parent = fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!(
+                "styrn-worker-provenance-substitution-{}-{}",
+                std::process::id(),
+                uuid::Uuid::now_v7()
+            ));
+        fs::create_dir(&parent).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+        let root = parent.join("root");
+        let layout = crate::platform::resolve_worker_directory_layout(
+            crate::platform::InstallationScope::System,
+            &principal,
+            Some(&root),
+        )
+        .unwrap();
+
+        set_worker_publication_interrupt(Some(WorkerPublicationInterruption::AfterRootOwnership));
+        let interrupted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            create_worker_directory_layout(&layout)
+        }));
+        set_worker_publication_interrupt(None);
+        assert!(interrupted.is_err());
+        assert!(root.is_dir());
+        let displaced = root.join("repos-created-by-styrn");
+        fs::rename(root.join("repos"), &displaced).unwrap();
+        fs::create_dir(root.join("repos")).unwrap();
+        fs::set_permissions(root.join("repos"), fs::Permissions::from_mode(0o700)).unwrap();
+
+        let error = create_worker_directory_layout(&layout).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(root.join("repos").is_dir());
+        assert!(displaced.is_dir());
         fs::remove_dir_all(parent).unwrap();
     }
 
