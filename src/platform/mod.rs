@@ -135,6 +135,180 @@ pub(crate) struct WorkerDirectoryCreation {
     lease: platform_impl::WorkerDirectoryLease,
 }
 
+pub(crate) struct WorkerDirectoryCreationError {
+    inner: Box<WorkerDirectoryCreationErrorInner>,
+}
+
+enum WorkerDirectoryCreationErrorInner {
+    Native(std::io::Error),
+    #[cfg(target_os = "windows")]
+    RetainedWindowsEvidence {
+        primary: std::io::Error,
+        operation_error: Option<std::io::Error>,
+        privilege_cleanup_failed: bool,
+        evidence: platform_impl::WorkerDirectoryFailureEvidence,
+    },
+}
+
+#[cfg(target_os = "windows")]
+#[allow(dead_code)] // Consumed by the deferred T0.14 receipt binding integration.
+pub(crate) struct VerifiedWorkerDirectoryFailureBinding<'authority> {
+    nodes: &'authority [WorkerDirectoryNodeObservation],
+    _authority: &'authority platform_impl::WorkerDirectoryFailureEvidence,
+}
+
+#[cfg(target_os = "windows")]
+#[derive(Debug)]
+#[allow(dead_code)] // Consumed by the deferred T0.14 receipt binding integration.
+pub(crate) enum WorkerDirectoryFailureBindingError<BindingError> {
+    NoRetainedEvidence,
+    Reverification(std::io::Error),
+    Binding(BindingError),
+}
+
+#[allow(dead_code)] // Detailed evidence access is consumed by the deferred T0.14 receipt integration.
+impl WorkerDirectoryCreationError {
+    fn native(error: std::io::Error) -> Self {
+        Self {
+            inner: Box::new(WorkerDirectoryCreationErrorInner::Native(error)),
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    pub(in crate::platform) fn with_windows_retained_evidence(
+        primary: std::io::Error,
+        operation_error: Option<std::io::Error>,
+        privilege_cleanup_failed: bool,
+        evidence: platform_impl::WorkerDirectoryFailureEvidence,
+    ) -> Self {
+        Self {
+            inner: Box::new(WorkerDirectoryCreationErrorInner::RetainedWindowsEvidence {
+                primary,
+                operation_error,
+                privilege_cleanup_failed,
+                evidence,
+            }),
+        }
+    }
+
+    pub(crate) fn kind(&self) -> std::io::ErrorKind {
+        match self.inner.as_ref() {
+            WorkerDirectoryCreationErrorInner::Native(error) => error.kind(),
+            #[cfg(target_os = "windows")]
+            WorkerDirectoryCreationErrorInner::RetainedWindowsEvidence { primary, .. } => {
+                primary.kind()
+            }
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    pub(crate) fn is_windows_privilege_cleanup_failure(&self) -> bool {
+        matches!(
+            self.inner.as_ref(),
+            WorkerDirectoryCreationErrorInner::RetainedWindowsEvidence {
+                privilege_cleanup_failed: true,
+                ..
+            }
+        )
+    }
+
+    #[cfg(target_os = "windows")]
+    pub(crate) fn retained_creation_observation_count(&self) -> usize {
+        match self.inner.as_ref() {
+            WorkerDirectoryCreationErrorInner::RetainedWindowsEvidence { evidence, .. } => {
+                evidence.observations().len()
+            }
+            WorkerDirectoryCreationErrorInner::Native(_) => 0,
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    pub(crate) fn bind_retained_creation_evidence_after_reverify<Value, BindingError>(
+        &self,
+        bind: impl for<'authority> FnOnce(
+            VerifiedWorkerDirectoryFailureBinding<'authority>,
+        ) -> Result<Value, BindingError>,
+    ) -> Result<Value, WorkerDirectoryFailureBindingError<BindingError>> {
+        let WorkerDirectoryCreationErrorInner::RetainedWindowsEvidence { evidence, .. } =
+            self.inner.as_ref()
+        else {
+            return Err(WorkerDirectoryFailureBindingError::NoRetainedEvidence);
+        };
+        platform_impl::reverify_worker_directory_failure_evidence(evidence)
+            .map_err(WorkerDirectoryFailureBindingError::Reverification)?;
+        bind(VerifiedWorkerDirectoryFailureBinding {
+            nodes: evidence.observations(),
+            _authority: evidence,
+        })
+        .map_err(WorkerDirectoryFailureBindingError::Binding)
+    }
+}
+
+impl From<std::io::Error> for WorkerDirectoryCreationError {
+    fn from(error: std::io::Error) -> Self {
+        Self::native(error)
+    }
+}
+
+impl std::fmt::Debug for WorkerDirectoryCreationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.inner.as_ref() {
+            WorkerDirectoryCreationErrorInner::Native(error) => formatter
+                .debug_tuple("WorkerDirectoryCreationError")
+                .field(error)
+                .finish(),
+            #[cfg(target_os = "windows")]
+            WorkerDirectoryCreationErrorInner::RetainedWindowsEvidence {
+                primary,
+                operation_error,
+                privilege_cleanup_failed,
+                evidence,
+            } => formatter
+                .debug_struct("WorkerDirectoryCreationError")
+                .field("primary", primary)
+                .field("operation_error", operation_error)
+                .field("privilege_cleanup_failed", privilege_cleanup_failed)
+                .field("retained_observations", &evidence.observations())
+                .finish_non_exhaustive(),
+        }
+    }
+}
+
+impl std::fmt::Display for WorkerDirectoryCreationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.inner.as_ref() {
+            WorkerDirectoryCreationErrorInner::Native(error) => error.fmt(formatter),
+            #[cfg(target_os = "windows")]
+            WorkerDirectoryCreationErrorInner::RetainedWindowsEvidence {
+                primary,
+                operation_error: Some(operation_error),
+                ..
+            } => write!(
+                formatter,
+                "{primary}; worker directory mutation also failed: {operation_error}"
+            ),
+            #[cfg(target_os = "windows")]
+            WorkerDirectoryCreationErrorInner::RetainedWindowsEvidence {
+                primary,
+                operation_error: None,
+                ..
+            } => primary.fmt(formatter),
+        }
+    }
+}
+
+impl std::error::Error for WorkerDirectoryCreationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self.inner.as_ref() {
+            WorkerDirectoryCreationErrorInner::Native(error) => Some(error),
+            #[cfg(target_os = "windows")]
+            WorkerDirectoryCreationErrorInner::RetainedWindowsEvidence { primary, .. } => {
+                Some(primary)
+            }
+        }
+    }
+}
+
 #[allow(dead_code)] // Consumed by the deferred T0.14 receipt binding integration.
 pub(crate) struct VerifiedWorkerDirectoryBinding<'authority> {
     nodes: &'authority [WorkerDirectoryNodeObservation; 6],
@@ -200,6 +374,14 @@ impl VerifiedWorkerDirectoryBinding<'_> {
     #[cfg(test)]
     fn reverify_retained_authority_for_test(&self) -> std::io::Result<()> {
         platform_impl::reverify_worker_directory_lease(self.lease, self.nodes)
+    }
+}
+
+#[cfg(target_os = "windows")]
+#[allow(dead_code)] // Consumed by the deferred T0.14 receipt binding integration.
+impl VerifiedWorkerDirectoryFailureBinding<'_> {
+    pub(crate) fn observations(&self) -> &[WorkerDirectoryNodeObservation] {
+        self.nodes
     }
 }
 
@@ -337,6 +519,78 @@ fn validate_windows_restore_privilege_result(
     Ok(true)
 }
 
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+struct WindowsPrivilegedWorkerMutation<Evidence> {
+    operation_error: Option<std::io::Error>,
+    evidence: Evidence,
+}
+
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+enum WindowsPrivilegedWorkerMutationResolution<Evidence> {
+    Success(Evidence),
+    OperationFailure {
+        error: std::io::Error,
+        evidence: Evidence,
+    },
+    Failure {
+        operation_error: Option<std::io::Error>,
+        cleanup_error: std::io::Error,
+        evidence: Evidence,
+    },
+}
+
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn reconcile_windows_privileged_worker_mutation<Evidence>(
+    mutation: WindowsPrivilegedWorkerMutation<Evidence>,
+    cleanup: std::io::Result<()>,
+) -> WindowsPrivilegedWorkerMutationResolution<Evidence> {
+    match (mutation.operation_error, cleanup) {
+        (operation_error, Err(cleanup_error)) => {
+            WindowsPrivilegedWorkerMutationResolution::Failure {
+                operation_error,
+                cleanup_error,
+                evidence: mutation.evidence,
+            }
+        }
+        (Some(error), Ok(())) => WindowsPrivilegedWorkerMutationResolution::OperationFailure {
+            error,
+            evidence: mutation.evidence,
+        },
+        (None, Ok(())) => WindowsPrivilegedWorkerMutationResolution::Success(mutation.evidence),
+    }
+}
+
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+struct WindowsPrivilegeRestorer<State> {
+    previous: State,
+}
+
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+impl<State> WindowsPrivilegeRestorer<State> {
+    fn new(previous: State) -> Self {
+        Self { previous }
+    }
+
+    fn restore<Error>(self, restore: impl FnOnce(State) -> Result<(), Error>) -> Result<(), Error> {
+        restore(self.previous)
+    }
+}
+
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn validate_windows_worker_lock_anchor_identity(
+    expected: WorkerDirectoryIdentity,
+    actual: WorkerDirectoryIdentity,
+) -> std::io::Result<()> {
+    if actual == expected {
+        Ok(())
+    } else {
+        Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "Windows worker lock anchor identity changed before filesystem mutation",
+        ))
+    }
+}
+
 /// Creates the fixed worker layout without enumerating or rewriting descendants.
 ///
 /// Ownership assignment for a future dedicated principal is intentionally a
@@ -344,8 +598,15 @@ fn validate_windows_restore_privilege_result(
 #[allow(dead_code)] // Consumed by the T0.14 setup action integration follow-up.
 pub(crate) fn create_worker_directory_layout(
     layout: &WorkerDirectoryLayout,
-) -> std::io::Result<WorkerDirectoryCreation> {
-    platform_impl::create_worker_directory_layout(layout)
+) -> Result<WorkerDirectoryCreation, WorkerDirectoryCreationError> {
+    #[cfg(target_os = "windows")]
+    {
+        platform_impl::create_worker_directory_layout(layout)
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        platform_impl::create_worker_directory_layout(layout).map_err(Into::into)
+    }
 }
 
 #[allow(dead_code)] // Reached through the deferred T0.14 action integration.
@@ -1335,6 +1596,69 @@ mod principal_tests {
         let error = validate_windows_restore_privilege_result(false, true, 1300).unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
         assert!(validate_windows_restore_privilege_result(false, false, 5).is_err());
+    }
+
+    #[test]
+    fn windows_privilege_cleanup_failure_retains_zero_some_and_all_creation_evidence() {
+        for evidence in [vec![], vec![11_u8, 29, 47], vec![1_u8, 2, 3, 4, 5, 6]] {
+            let operation_error =
+                (evidence.len() < 6).then(|| std::io::Error::other("injected mutation failure"));
+            let resolution = reconcile_windows_privileged_worker_mutation(
+                WindowsPrivilegedWorkerMutation {
+                    operation_error,
+                    evidence: evidence.clone(),
+                },
+                Err(std::io::Error::other(
+                    "injected exact-state restoration failure",
+                )),
+            );
+
+            let WindowsPrivilegedWorkerMutationResolution::Failure {
+                operation_error,
+                cleanup_error,
+                evidence: retained,
+            } = resolution
+            else {
+                panic!("cleanup failure was reported as successful creation");
+            };
+            assert_eq!(retained, evidence);
+            assert_eq!(operation_error.is_some(), retained.len() < 6);
+            assert_eq!(cleanup_error.kind(), std::io::ErrorKind::Other);
+        }
+    }
+
+    #[test]
+    fn windows_privilege_restorer_supplies_the_exact_previous_state() {
+        let previous = [0x00_u8, 0x11, 0x80, 0xfe, 0x7a, 0x55, 0xaa, 0xff];
+        let mut restored = None;
+
+        WindowsPrivilegeRestorer::new(previous)
+            .restore(|state| {
+                restored = Some(state);
+                Ok::<_, std::convert::Infallible>(())
+            })
+            .unwrap();
+
+        assert_eq!(restored, Some(previous));
+    }
+
+    #[test]
+    fn windows_worker_mutex_anchor_requires_the_complete_file_identity() {
+        let expected = WorkerDirectoryIdentity {
+            volume: 0x1020_3040_5060_7080,
+            file_id: [
+                0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d,
+                0x0e, 0x0f,
+            ],
+        };
+        let mut substituted = expected;
+        substituted.file_id[15] ^= 0xff;
+
+        let error = validate_windows_worker_lock_anchor_identity(expected, substituted)
+            .expect_err("a high-byte FILE_ID_INFO substitution must be rejected");
+
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(validate_windows_worker_lock_anchor_identity(expected, expected).is_ok());
     }
 
     #[test]
