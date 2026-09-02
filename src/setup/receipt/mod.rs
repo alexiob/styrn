@@ -2,10 +2,11 @@
 
 use chrono::{DateTime, FixedOffset, SecondsFormat};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 #[cfg(test)]
 use std::collections::VecDeque;
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs,
     io::{Read, Write},
     path::{Component, Path, PathBuf},
@@ -44,6 +45,12 @@ impl ReceiptDocument {
     }
 
     fn from_json(input: &[u8]) -> Result<Self, ReceiptError> {
+        let document = Self::from_json_without_epoch_validation(input)?;
+        document.validate_pending_publication_epochs()?;
+        Ok(document)
+    }
+
+    fn from_json_without_epoch_validation(input: &[u8]) -> Result<Self, ReceiptError> {
         let wire = serde_json::from_slice::<ReceiptDocumentWire>(input).map_err(|error| {
             ReceiptError::Parse {
                 line: error.line(),
@@ -58,12 +65,24 @@ impl ReceiptDocument {
             entries: wire.entries,
             pending_publications: wire.pending_publications,
         };
-        document.validate()?;
+        document.validate_structure()?;
         Ok(document)
     }
 
     pub(crate) fn to_json(&self) -> Result<Vec<u8>, ReceiptError> {
         self.validate()?;
+        self.serialize_json()
+    }
+
+    fn to_json_with_pending_publication_intent(
+        &self,
+        intent: Option<&PendingPublicationIntentDocument>,
+    ) -> Result<Vec<u8>, ReceiptError> {
+        self.validate_with_pending_publication_intent(intent)?;
+        self.serialize_json()
+    }
+
+    fn serialize_json(&self) -> Result<Vec<u8>, ReceiptError> {
         let mut bytes = serde_json::to_vec_pretty(self).map_err(|_| ReceiptError::Serialize)?;
         bytes.push(b'\n');
         Ok(bytes)
@@ -90,6 +109,12 @@ impl ReceiptDocument {
     }
 
     fn validate(&self) -> Result<(), ReceiptError> {
+        self.validate_structure()?;
+        self.validate_pending_publication_epochs()?;
+        Ok(())
+    }
+
+    fn validate_structure(&self) -> Result<(), ReceiptError> {
         if self.schema_version != SCHEMA_VERSION {
             return Err(ReceiptError::UnknownSchemaVersion);
         }
@@ -119,6 +144,83 @@ impl ReceiptDocument {
             }
             if !publication_timestamps.insert(publication.timestamp.as_str()) {
                 return Err(ReceiptError::DuplicatePendingPublicationTimestamp);
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_with_pending_publication_intent(
+        &self,
+        intent: Option<&PendingPublicationIntentDocument>,
+    ) -> Result<(), ReceiptError> {
+        self.validate_structure()?;
+        let Some(intent) = intent else {
+            return self.validate_pending_publication_epochs();
+        };
+        let mut effective = self.clone();
+        if effective.pending_publications.len() == intent.pending_publication_count {
+            effective
+                .pending_publications
+                .push(intent.publication.clone());
+        }
+        effective.validate_pending_publication_epochs()
+    }
+
+    fn validate_pending_publication_epochs(&self) -> Result<(), ReceiptError> {
+        let mut current = HashMap::<String, ReceiptEntryId>::new();
+        let mut unpublished = HashMap::<String, ReceiptEntryId>::new();
+        let mut entry_cursor = 0;
+
+        for publication in &self.pending_publications {
+            for entry in &self.entries[entry_cursor..publication.receipt_entry_count] {
+                if entry.status != ReceiptStatus::Pending {
+                    continue;
+                }
+                let action_id = entry.action.action_id().to_owned();
+                if current.contains_key(&action_id)
+                    || unpublished
+                        .insert(action_id, entry.entry_id.clone())
+                        .is_some()
+                {
+                    return Err(ReceiptError::InvalidPendingPublicationOrder);
+                }
+            }
+
+            let mut next = HashMap::with_capacity(publication.pending.len());
+            for link in &publication.pending {
+                let action_id = link.action_id.0.as_str();
+                let entry_id = if let Some(current_entry_id) = current.get(action_id) {
+                    if current_entry_id != &link.entry_id {
+                        return Err(ReceiptError::InvalidPendingPublicationOrder);
+                    }
+                    current_entry_id.clone()
+                } else {
+                    match unpublished.remove(action_id) {
+                        Some(unpublished_entry_id) if unpublished_entry_id == link.entry_id => {
+                            unpublished_entry_id
+                        }
+                        _ => return Err(ReceiptError::InvalidPendingPublicationOrder),
+                    }
+                };
+                next.insert(action_id.to_owned(), entry_id);
+            }
+
+            unpublished.clear();
+            current = next;
+            entry_cursor = publication.receipt_entry_count;
+        }
+
+        for entry in &self.entries[entry_cursor..] {
+            if entry.status != ReceiptStatus::Pending {
+                continue;
+            }
+            let action_id = entry.action.action_id().to_owned();
+            if current.contains_key(&action_id)
+                || unpublished
+                    .insert(action_id, entry.entry_id.clone())
+                    .is_some()
+            {
+                return Err(ReceiptError::InvalidPendingPublicationOrder);
             }
         }
         Ok(())
@@ -216,8 +318,199 @@ impl PendingPublication {
     }
 }
 
-pub(in crate::setup) struct PreparedPendingPublication {
-    publication: Option<PendingPublication>,
+impl PendingPublicationIntentDocument {
+    fn validate_shape(&self) -> Result<(), ReceiptError> {
+        if self.schema_version != SCHEMA_VERSION {
+            return Err(ReceiptError::UnknownSchemaVersion);
+        }
+        if !is_normalized_absolute_path(&self.receipt_path)
+            || !is_normalized_absolute_path(&self.manifest_path)
+        {
+            return Err(ReceiptError::InvalidRecordedPath);
+        }
+        self.receipt_prefix_sha256.validate()?;
+        if let Some(digest) = &self.before_manifest_sha256 {
+            digest.validate()?;
+        }
+        self.after_manifest_sha256.validate()?;
+        self.machine_id.validate()?;
+        self.publication.publication_id.validate()?;
+        self.publication.timestamp.validate()?;
+        if self.publication.receipt_entry_count != self.receipt_entry_count {
+            return Err(ReceiptError::InvalidPendingPublicationLink);
+        }
+        let mut action_ids = HashSet::with_capacity(self.publication.pending.len());
+        let mut entry_ids = HashSet::with_capacity(self.publication.pending.len());
+        for link in &self.publication.pending {
+            link.action_id.validate()?;
+            link.entry_id.validate()?;
+            if !action_ids.insert(link.action_id.0.as_str())
+                || !entry_ids.insert(link.entry_id.as_str())
+            {
+                return Err(ReceiptError::DuplicatePendingPublicationLink);
+            }
+        }
+
+        #[cfg(not(any(action_core_fixture, action_compile_fixture)))]
+        {
+            let manifest = crate::manifest::MachineManifest::parse_toml(&self.candidate_manifest)
+                .map_err(|_| ReceiptError::InvalidPendingPublicationLink)?;
+            if manifest.to_toml().map_err(|_| ReceiptError::Serialize)? != self.candidate_manifest
+                || manifest.machine_id.to_string() != self.machine_id.as_str()
+                || manifest_digest(self.candidate_manifest.as_bytes()) != self.after_manifest_sha256
+            {
+                return Err(ReceiptError::InvalidPendingPublicationLink);
+            }
+            let manifest_pending = manifest.pending_actions.as_deref().unwrap_or(&[]);
+            if manifest_pending.len() != self.publication.pending.len()
+                || manifest_pending
+                    .iter()
+                    .zip(&self.publication.pending)
+                    .any(|(manifest_action, link)| manifest_action.id != link.action_id.0)
+            {
+                return Err(ReceiptError::InvalidPendingPublicationLink);
+            }
+        }
+        Ok(())
+    }
+
+    fn to_json(&self) -> Result<Vec<u8>, ReceiptError> {
+        self.validate_shape()?;
+        let mut bytes = serde_json::to_vec_pretty(self).map_err(|_| ReceiptError::Serialize)?;
+        bytes.push(b'\n');
+        Ok(bytes)
+    }
+
+    fn from_json(input: &[u8]) -> Result<Self, ReceiptError> {
+        let document =
+            serde_json::from_slice::<Self>(input).map_err(|error| ReceiptError::Parse {
+                line: error.line(),
+                column: error.column(),
+            })?;
+        document.validate_shape()?;
+        Ok(document)
+    }
+
+    fn validate_receipt_binding(
+        &self,
+        store: &ReceiptStore,
+        receipt: &ReceiptDocument,
+    ) -> Result<(), ReceiptStoreError> {
+        self.validate_shape()?;
+        if self.installation_scope != store.scope
+            || self.worker_principal != store.worker
+            || self.receipt_path != normalized_path_text(&store.path)?
+            || self.receipt_entry_count > receipt.entries.len()
+            || self.pending_publication_count > receipt.pending_publications.len()
+            || receipt.pending_publications.len() > self.pending_publication_count + 1
+        {
+            return Err(ReceiptStoreError::IntentConflict);
+        }
+        let prefix = receipt_prefix(
+            receipt,
+            self.receipt_entry_count,
+            self.pending_publication_count,
+        )?;
+        if receipt_document_digest(&prefix)? != self.receipt_prefix_sha256 {
+            return Err(ReceiptStoreError::IntentConflict);
+        }
+        // The target links are bounded by `receipt_entry_count`, while UUID
+        // collision checks must also cover entries appended after preparation.
+        self.publication.validate(&receipt.entries)?;
+        let mut candidate = prefix;
+        candidate
+            .pending_publications
+            .push(self.publication.clone());
+        validate_pending_publication_append_candidate(
+            &receipt_prefix(
+                receipt,
+                self.receipt_entry_count,
+                self.pending_publication_count,
+            )?,
+            &candidate,
+        )?;
+        if receipt.pending_publications.len() == self.pending_publication_count + 1
+            && receipt.pending_publications[self.pending_publication_count] != self.publication
+        {
+            return Err(ReceiptStoreError::IntentConflict);
+        }
+        Ok(())
+    }
+}
+
+fn receipt_prefix(
+    document: &ReceiptDocument,
+    entry_count: usize,
+    publication_count: usize,
+) -> Result<ReceiptDocument, ReceiptStoreError> {
+    if entry_count > document.entries.len()
+        || publication_count > document.pending_publications.len()
+    {
+        return Err(ReceiptStoreError::IntentConflict);
+    }
+    let mut prefix = document.clone();
+    prefix.entries.truncate(entry_count);
+    prefix.pending_publications.truncate(publication_count);
+    prefix.validate()?;
+    Ok(prefix)
+}
+
+fn receipt_document_digest(document: &ReceiptDocument) -> Result<Sha256Digest, ReceiptStoreError> {
+    Ok(manifest_digest(&document.to_json()?))
+}
+
+fn manifest_digest(bytes: &[u8]) -> Sha256Digest {
+    use std::fmt::Write as _;
+
+    let digest = Sha256::digest(bytes);
+    let mut hexadecimal = String::with_capacity(digest.len() * 2);
+    for byte in digest {
+        write!(&mut hexadecimal, "{byte:02x}").expect("writing to a string cannot fail");
+    }
+    Sha256Digest(hexadecimal)
+}
+
+fn normalized_path_text(path: &Path) -> Result<String, ReceiptStoreError> {
+    let value = path.to_str().ok_or(ReceiptStoreError::InvalidDestination)?;
+    if !is_normalized_absolute_path(value) {
+        return Err(ReceiptStoreError::InvalidDestination);
+    }
+    Ok(value.to_owned())
+}
+
+#[derive(Debug, Error)]
+pub(crate) enum PendingPublicationProtocolError {
+    #[error(transparent)]
+    Receipt(#[from] ReceiptStoreError),
+    #[cfg(not(any(action_core_fixture, action_compile_fixture)))]
+    #[error(transparent)]
+    Manifest(#[from] crate::manifest::ManifestError),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PendingPublicationIntentDocument {
+    schema_version: u32,
+    installation_scope: InstallationScope,
+    receipt_path: String,
+    worker_principal: WorkerPrincipal,
+    receipt_entry_count: usize,
+    pending_publication_count: usize,
+    receipt_prefix_sha256: Sha256Digest,
+    manifest_path: String,
+    manifest_scope: InstallationScope,
+    manifest_worker_principal: WorkerPrincipal,
+    machine_id: ReceiptEntryId,
+    before_manifest_sha256: Option<Sha256Digest>,
+    after_manifest_sha256: Sha256Digest,
+    publication: PendingPublication,
+    candidate_manifest: String,
+}
+
+struct PendingPublicationIntent {
+    document: PendingPublicationIntentDocument,
+    path: PathBuf,
+    identity: crate::platform::PrivateFileIdentity,
 }
 
 #[derive(Clone)]
@@ -485,6 +778,10 @@ impl ReceiptStore {
             Err(error) => return Err(ReceiptStoreError::Read(error)),
         }
         self.verify_directory(destination)?;
+        // Open the durable sidecar first. If a writer commits its checkpoint and
+        // removes the name while this lock-free read proceeds, the verified
+        // handle still binds the receipt prefix we may observe next.
+        let publication_intent = self.read_verified_pending_publication_intent()?;
         let mut receipt = match crate::platform::open_verified_manifest_file_for_read(
             &self.path,
             self.owner,
@@ -493,7 +790,11 @@ impl ReceiptStore {
         ) {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(ReceiptDocument::empty(self.scope));
+                return if publication_intent.is_some() {
+                    Err(ReceiptStoreError::IntentConflict)
+                } else {
+                    Ok(ReceiptDocument::empty(self.scope))
+                };
             }
             Err(error) => return Err(ReceiptStoreError::Security(error)),
         };
@@ -510,7 +811,7 @@ impl ReceiptStore {
         receipt
             .read_to_end(&mut input)
             .map_err(ReceiptStoreError::Read)?;
-        self.parse_for_scope(&input)
+        self.parse_for_scope_with_pending_publication_intent(&input, publication_intent.as_ref())
     }
 
     pub(in crate::setup) fn begin_apply<'a>(
@@ -620,10 +921,18 @@ impl ReceiptStore {
         lock.lock().map_err(ReceiptStoreError::Write)?;
 
         let existing = self.read_locked()?;
+        let publication_intent = self.read_pending_publication_intent(&existing)?;
         let mut candidate = existing.clone();
         candidate.entries.push(entry);
-        validate_append_candidate(&existing, &candidate)?;
-        self.write_document(&candidate)
+        validate_append_candidate(
+            &existing,
+            &candidate,
+            publication_intent.as_ref().map(|intent| &intent.document),
+        )?;
+        self.write_document(
+            &candidate,
+            publication_intent.as_ref().map(|intent| &intent.document),
+        )
     }
 
     fn read_locked(&self) -> Result<ReceiptDocument, ReceiptStoreError> {
@@ -642,7 +951,15 @@ impl ReceiptStore {
         let mut input = Vec::new();
         file.read_to_end(&mut input)
             .map_err(ReceiptStoreError::Read)?;
-        self.parse_for_scope(&input)
+        let document = ReceiptDocument::from_json_without_epoch_validation(&input)?;
+        if document.installation_scope != self.scope {
+            return Err(ReceiptStoreError::ScopeMismatch);
+        }
+        let publication_intent = self.read_pending_publication_intent(&document)?;
+        document.validate_with_pending_publication_intent(
+            publication_intent.as_ref().map(|intent| &intent.document),
+        )?;
+        Ok(document)
     }
 
     fn preflight_existing_receipt(&self) -> Result<bool, ReceiptStoreError> {
@@ -672,8 +989,12 @@ impl ReceiptStore {
         Ok(())
     }
 
-    fn write_document(&self, document: &ReceiptDocument) -> Result<(), ReceiptStoreError> {
-        let serialized = document.to_json()?;
+    fn write_document(
+        &self,
+        document: &ReceiptDocument,
+        publication_intent: Option<&PendingPublicationIntentDocument>,
+    ) -> Result<(), ReceiptStoreError> {
+        let serialized = document.to_json_with_pending_publication_intent(publication_intent)?;
         let destination = self
             .path
             .parent()
@@ -892,6 +1213,112 @@ impl ReceiptStore {
             .join(".receipt.json.lock")
     }
 
+    fn pending_publication_intent_path(&self) -> PathBuf {
+        self.path
+            .parent()
+            .unwrap_or_else(|| Path::new(""))
+            .join(".receipt.json.pending-publication.json")
+    }
+
+    fn read_pending_publication_intent(
+        &self,
+        receipt: &ReceiptDocument,
+    ) -> Result<Option<PendingPublicationIntent>, ReceiptStoreError> {
+        let intent = self.read_verified_pending_publication_intent()?;
+        if let Some(intent) = &intent {
+            intent.document.validate_receipt_binding(self, receipt)?;
+        }
+        Ok(intent)
+    }
+
+    fn read_verified_pending_publication_intent(
+        &self,
+    ) -> Result<Option<PendingPublicationIntent>, ReceiptStoreError> {
+        let path = self.pending_publication_intent_path();
+        let identity = match crate::platform::private_file_identity(&path) {
+            Ok(identity) => identity,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(ReceiptStoreError::Security(error)),
+        };
+        let mut file = crate::platform::open_verified_private_file_for_read(
+            &path,
+            self.owner,
+            &self.worker,
+            identity,
+        )
+        .map_err(ReceiptStoreError::Security)?;
+        let mut input = Vec::new();
+        file.read_to_end(&mut input)
+            .map_err(ReceiptStoreError::Read)?;
+        let document = PendingPublicationIntentDocument::from_json(&input)?;
+        Ok(Some(PendingPublicationIntent {
+            document,
+            path,
+            identity,
+        }))
+    }
+
+    fn write_pending_publication_intent(
+        &self,
+        document: PendingPublicationIntentDocument,
+    ) -> Result<PendingPublicationIntent, ReceiptStoreError> {
+        let serialized = document.to_json()?;
+        let path = self.pending_publication_intent_path();
+        let directory = path.parent().ok_or(ReceiptStoreError::InvalidDestination)?;
+        let result = (|| {
+            let mut file = crate::platform::create_private_file(&path, self.owner, &self.worker)
+                .map_err(|error| {
+                    if error.kind() == std::io::ErrorKind::AlreadyExists {
+                        ReceiptStoreError::IntentConflict
+                    } else {
+                        ReceiptStoreError::Write(error)
+                    }
+                })?;
+            file.write_all(&serialized)
+                .map_err(ReceiptStoreError::Write)?;
+            file.flush().map_err(ReceiptStoreError::Write)?;
+            file.sync_all().map_err(ReceiptStoreError::Write)?;
+            crate::platform::verify_private_file_security(&path, self.owner, &self.worker)
+                .map_err(ReceiptStoreError::Security)?;
+            crate::platform::sync_parent_directory(directory).map_err(ReceiptStoreError::Write)?;
+            crate::platform::private_file_identity(&path).map_err(ReceiptStoreError::Security)
+        })();
+        let identity = match result {
+            Ok(identity) => identity,
+            Err(error) => {
+                let _ = fs::remove_file(&path);
+                return Err(error);
+            }
+        };
+        Ok(PendingPublicationIntent {
+            document,
+            path,
+            identity,
+        })
+    }
+
+    fn remove_pending_publication_intent(
+        &self,
+        intent: PendingPublicationIntent,
+    ) -> Result<(), ReceiptStoreError> {
+        let removal = crate::platform::prepare_verified_private_file_removal(
+            &intent.path,
+            self.owner,
+            &self.worker,
+            intent.identity,
+        )
+        .map_err(ReceiptStoreError::Security)?;
+        crate::platform::consume_verified_private_file(removal)
+            .map_err(ReceiptStoreError::Write)?;
+        crate::platform::sync_parent_directory(
+            intent
+                .path
+                .parent()
+                .ok_or(ReceiptStoreError::InvalidDestination)?,
+        )
+        .map_err(ReceiptStoreError::Write)
+    }
+
     fn validate_destination_policy(&self) -> Result<&Path, ReceiptStoreError> {
         let destination = self
             .path
@@ -942,11 +1369,21 @@ impl ReceiptStore {
         Ok(())
     }
 
-    fn parse_for_scope(&self, input: &[u8]) -> Result<ReceiptDocument, ReceiptStoreError> {
-        let document = ReceiptDocument::from_json(input)?;
+    fn parse_for_scope_with_pending_publication_intent(
+        &self,
+        input: &[u8],
+        publication_intent: Option<&PendingPublicationIntent>,
+    ) -> Result<ReceiptDocument, ReceiptStoreError> {
+        let document = ReceiptDocument::from_json_without_epoch_validation(input)?;
         if document.installation_scope != self.scope {
             return Err(ReceiptStoreError::ScopeMismatch);
         }
+        if let Some(intent) = publication_intent {
+            intent.document.validate_receipt_binding(self, &document)?;
+        }
+        document.validate_with_pending_publication_intent(
+            publication_intent.map(|intent| &intent.document),
+        )?;
         Ok(document)
     }
 }
@@ -963,7 +1400,12 @@ impl ReceiptApplySession<'_> {
         _authority: &crate::setup::action::JournalAuthority,
     ) -> Result<bool, ReceiptStoreError> {
         let existing = self.store.read_locked()?;
-        if pending_entry_is_current_or_unpublished(&existing, action.as_str()) {
+        let publication_intent = self.store.read_pending_publication_intent(&existing)?;
+        if pending_entry_is_current_or_unpublished(
+            &existing,
+            action.as_str(),
+            publication_intent.as_ref().map(|intent| &intent.document),
+        ) {
             return Ok(false);
         }
 
@@ -971,8 +1413,15 @@ impl ReceiptApplySession<'_> {
         candidate
             .entries
             .push(ReceiptEntry::pending(action, metadata.next()?)?);
-        validate_pending_append_candidate(&existing, &candidate)?;
-        self.store.write_document(&candidate)?;
+        validate_pending_append_candidate(
+            &existing,
+            &candidate,
+            publication_intent.as_ref().map(|intent| &intent.document),
+        )?;
+        self.store.write_document(
+            &candidate,
+            publication_intent.as_ref().map(|intent| &intent.document),
+        )?;
         Ok(true)
     }
 
@@ -1111,10 +1560,18 @@ impl ReceiptApplySession<'_> {
                 return Err(ReceiptStoreError::IntentConflict);
             }
         } else {
+            let publication_intent = self.store.read_pending_publication_intent(&existing)?;
             let mut candidate = existing.clone();
             candidate.entries.push(intent.entry.clone());
-            validate_append_candidate(&existing, &candidate)?;
-            self.store.write_document(&candidate)?;
+            validate_append_candidate(
+                &existing,
+                &candidate,
+                publication_intent.as_ref().map(|intent| &intent.document),
+            )?;
+            self.store.write_document(
+                &candidate,
+                publication_intent.as_ref().map(|intent| &intent.document),
+            )?;
         }
         fs::remove_file(&intent.path).map_err(ReceiptStoreError::Write)?;
         crate::platform::sync_parent_directory(
@@ -1282,18 +1739,31 @@ impl ReceiptApplySession<'_> {
 
 #[cfg(not(any(action_core_fixture, action_compile_fixture)))]
 impl ReceiptPendingPublicationSession<'_> {
-    pub(in crate::setup) fn prepare(
+    pub(in crate::setup) fn publish_manifest(
         &self,
+        manifest_store: &crate::manifest::MachineManifestStore,
+        draft: &crate::manifest::MachineManifestDraft,
         pending: &[crate::setup::action::PendingAction],
         metadata: &mut ReceiptMetadataSource,
         _authority: &crate::setup::pending::PendingPublicationAuthority,
-    ) -> Result<PreparedPendingPublication, ReceiptStoreError> {
+    ) -> Result<uuid::Uuid, PendingPublicationProtocolError> {
+        self.recover_pending_publication(manifest_store)?;
+
+        let manifest_session = manifest_store.begin_pending_publication()?;
+        let manifest_candidate = manifest_session.candidate(draft)?;
         let existing = self.store.read_locked()?;
+        if self
+            .store
+            .read_pending_publication_intent(&existing)?
+            .is_some()
+        {
+            return Err(ReceiptStoreError::IntentConflict.into());
+        }
         let mut action_ids = HashSet::with_capacity(pending.len());
         let mut links = Vec::with_capacity(pending.len());
         for action in pending {
             if !action_ids.insert(action.id().as_str()) {
-                return Err(ReceiptStoreError::PrefixConflict);
+                return Err(ReceiptStoreError::PrefixConflict.into());
             }
             let entry = existing
                 .entries
@@ -1315,36 +1785,113 @@ impl ReceiptPendingPublicationSession<'_> {
             .last()
             .is_some_and(|publication| publication.pending == links)
         {
-            return Ok(PreparedPendingPublication { publication: None });
+            if manifest_session
+                .current_canonical()
+                .map(|canonical| manifest_digest(canonical.as_bytes()))
+                != Some(manifest_digest(manifest_candidate.canonical().as_bytes()))
+            {
+                manifest_session.publish(&manifest_candidate)?;
+            }
+            return Ok(manifest_candidate.machine_id());
         }
 
-        let metadata = metadata.next()?;
+        let metadata = metadata.next().map_err(ReceiptStoreError::from)?;
         let publication = PendingPublication {
             publication_id: metadata.entry_id,
             timestamp: metadata.timestamp,
             receipt_entry_count: existing.entries.len(),
             pending: links,
         };
-        publication.validate(&existing.entries)?;
-        Ok(PreparedPendingPublication {
-            publication: Some(publication),
-        })
+        publication
+            .validate(&existing.entries)
+            .map_err(ReceiptStoreError::from)?;
+        let receipt_prefix_sha256 = receipt_document_digest(&existing)?;
+        let before_manifest_sha256 = manifest_session
+            .current_canonical()
+            .map(|canonical| manifest_digest(canonical.as_bytes()));
+        let after_manifest_sha256 = manifest_digest(manifest_candidate.canonical().as_bytes());
+        let intent =
+            self.store
+                .write_pending_publication_intent(PendingPublicationIntentDocument {
+                    schema_version: SCHEMA_VERSION,
+                    installation_scope: self.store.scope,
+                    receipt_path: normalized_path_text(&self.store.path)?,
+                    worker_principal: self.store.worker.clone(),
+                    receipt_entry_count: existing.entries.len(),
+                    pending_publication_count: existing.pending_publications.len(),
+                    receipt_prefix_sha256,
+                    manifest_path: normalized_path_text(manifest_session.path())?,
+                    manifest_scope: manifest_session.installation_scope(),
+                    manifest_worker_principal: manifest_session.worker_principal().clone(),
+                    machine_id: ReceiptEntryId(manifest_candidate.machine_id().to_string()),
+                    before_manifest_sha256: before_manifest_sha256.clone(),
+                    after_manifest_sha256: after_manifest_sha256.clone(),
+                    publication,
+                    candidate_manifest: manifest_candidate.canonical().to_owned(),
+                })?;
+
+        if before_manifest_sha256 != Some(after_manifest_sha256) {
+            manifest_session.publish(&manifest_candidate)?;
+        }
+        self.finalize_pending_publication(intent)?;
+        Ok(manifest_candidate.machine_id())
     }
 
-    pub(in crate::setup) fn commit(
+    fn recover_pending_publication(
         &self,
-        prepared: PreparedPendingPublication,
-        _authority: &crate::setup::pending::PendingPublicationAuthority,
-    ) -> Result<bool, ReceiptStoreError> {
-        let Some(publication) = prepared.publication else {
-            return Ok(false);
-        };
+        manifest_store: &crate::manifest::MachineManifestStore,
+    ) -> Result<(), PendingPublicationProtocolError> {
         let existing = self.store.read_locked()?;
-        let mut candidate = existing.clone();
-        candidate.pending_publications.push(publication);
-        validate_pending_publication_append_candidate(&existing, &candidate)?;
-        self.store.write_document(&candidate)?;
-        Ok(true)
+        let Some(intent) = self.store.read_pending_publication_intent(&existing)? else {
+            return Ok(());
+        };
+        let manifest_session = manifest_store.begin_pending_publication()?;
+        let document = &intent.document;
+        if document.manifest_path != normalized_path_text(manifest_session.path())?
+            || document.manifest_scope != manifest_session.installation_scope()
+            || document.manifest_worker_principal != *manifest_session.worker_principal()
+        {
+            return Err(ReceiptStoreError::IntentConflict.into());
+        }
+        let current_digest = manifest_session
+            .current_canonical()
+            .map(|canonical| manifest_digest(canonical.as_bytes()));
+        if current_digest == Some(document.after_manifest_sha256.clone()) {
+            // The candidate is already durable. Never rewrite it during
+            // recovery; only finish the receipt checkpoint.
+        } else if current_digest == document.before_manifest_sha256 {
+            let candidate = manifest_session.stored_candidate(&document.candidate_manifest)?;
+            if candidate.machine_id().to_string() != document.machine_id.as_str()
+                || manifest_digest(candidate.canonical().as_bytes())
+                    != document.after_manifest_sha256
+            {
+                return Err(ReceiptStoreError::IntentConflict.into());
+            }
+            manifest_session.publish(&candidate)?;
+        } else {
+            return Err(ReceiptStoreError::IntentConflict.into());
+        }
+        self.finalize_pending_publication(intent)?;
+        Ok(())
+    }
+
+    fn finalize_pending_publication(
+        &self,
+        intent: PendingPublicationIntent,
+    ) -> Result<(), ReceiptStoreError> {
+        let existing = self.store.read_locked()?;
+        intent
+            .document
+            .validate_receipt_binding(self.store, &existing)?;
+        if existing.pending_publications.len() == intent.document.pending_publication_count {
+            let mut candidate = existing.clone();
+            candidate
+                .pending_publications
+                .push(intent.document.publication.clone());
+            validate_pending_publication_append_candidate(&existing, &candidate)?;
+            self.store.write_document(&candidate, None)?;
+        }
+        self.store.remove_pending_publication_intent(intent)
     }
 }
 
@@ -1413,11 +1960,14 @@ struct ReceiptMetadata {
 fn validate_append_candidate(
     existing: &ReceiptDocument,
     candidate: &ReceiptDocument,
+    publication_intent: Option<&PendingPublicationIntentDocument>,
 ) -> Result<(), ReceiptStoreError> {
-    candidate.validate()?;
+    candidate.validate_with_pending_publication_intent(publication_intent)?;
+    validate_pending_intent_prefix(existing, candidate, publication_intent)?;
     if candidate.entries.len() != existing.entries.len() + 1
         || candidate.installation_scope != existing.installation_scope
         || !candidate.entries.starts_with(&existing.entries)
+        || candidate.pending_publications != existing.pending_publications
         || candidate.entries.last().map(|entry| entry.status) != Some(ReceiptStatus::Applied)
     {
         return Err(ReceiptStoreError::PrefixConflict);
@@ -1428,15 +1978,22 @@ fn validate_append_candidate(
 fn validate_pending_append_candidate(
     existing: &ReceiptDocument,
     candidate: &ReceiptDocument,
+    publication_intent: Option<&PendingPublicationIntentDocument>,
 ) -> Result<(), ReceiptStoreError> {
-    candidate.validate()?;
+    candidate.validate_with_pending_publication_intent(publication_intent)?;
+    validate_pending_intent_prefix(existing, candidate, publication_intent)?;
     let appended = candidate.entries.last();
     if candidate.entries.len() != existing.entries.len() + 1
         || candidate.installation_scope != existing.installation_scope
         || !candidate.entries.starts_with(&existing.entries)
+        || candidate.pending_publications != existing.pending_publications
         || appended.map(|entry| entry.status) != Some(ReceiptStatus::Pending)
         || appended.is_some_and(|entry| {
-            pending_entry_is_current_or_unpublished(existing, entry.action.action_id())
+            pending_entry_is_current_or_unpublished(
+                existing,
+                entry.action.action_id(),
+                publication_intent,
+            )
         })
     {
         return Err(ReceiptStoreError::PrefixConflict);
@@ -1444,8 +2001,42 @@ fn validate_pending_append_candidate(
     Ok(())
 }
 
-fn pending_entry_is_current_or_unpublished(document: &ReceiptDocument, action_id: &str) -> bool {
-    let Some(latest) = document.pending_publications.last() else {
+fn validate_pending_intent_prefix(
+    existing: &ReceiptDocument,
+    candidate: &ReceiptDocument,
+    publication_intent: Option<&PendingPublicationIntentDocument>,
+) -> Result<(), ReceiptStoreError> {
+    if let Some(intent) = publication_intent {
+        intent.publication.validate(&candidate.entries)?;
+        let store_prefix = receipt_prefix(
+            existing,
+            intent.receipt_entry_count,
+            intent.pending_publication_count,
+        )?;
+        if receipt_document_digest(&store_prefix)? != intent.receipt_prefix_sha256 {
+            return Err(ReceiptStoreError::PrefixConflict);
+        }
+        let candidate_prefix = receipt_prefix(
+            candidate,
+            intent.receipt_entry_count,
+            intent.pending_publication_count,
+        )?;
+        if receipt_document_digest(&candidate_prefix)? != intent.receipt_prefix_sha256 {
+            return Err(ReceiptStoreError::PrefixConflict);
+        }
+    }
+    Ok(())
+}
+
+fn pending_entry_is_current_or_unpublished(
+    document: &ReceiptDocument,
+    action_id: &str,
+    publication_intent: Option<&PendingPublicationIntentDocument>,
+) -> bool {
+    let latest = publication_intent
+        .map(|intent| &intent.publication)
+        .or_else(|| document.pending_publications.last());
+    let Some(latest) = latest else {
         return document.entries.iter().any(|entry| {
             entry.status == ReceiptStatus::Pending && entry.action.action_id() == action_id
         });

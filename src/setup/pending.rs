@@ -136,11 +136,10 @@ pub(crate) fn publish_manifest(
     validate_unique_pending(pending)?;
     let authority = PendingPublicationAuthority(());
     let session = receipt_store.begin_pending_publication(&authority)?;
-    let prepared = session.prepare(pending, metadata, &authority)?;
     let mut candidate = draft.clone();
     project_manifest(&mut candidate, pending)?;
-    let machine_id = manifest_store.write_generated(&candidate)?;
-    session.commit(prepared, &authority)?;
+    let machine_id =
+        session.publish_manifest(manifest_store, &candidate, pending, metadata, &authority)?;
     *draft = candidate;
     Ok(machine_id)
 }
@@ -215,9 +214,9 @@ pub(crate) enum PendingError {
     #[error(transparent)]
     Output(#[from] output::OutputError),
     #[error(transparent)]
-    Manifest(#[from] manifest::ManifestError),
-    #[error(transparent)]
     Receipt(#[from] super::receipt::ReceiptStoreError),
+    #[error(transparent)]
+    Publication(#[from] super::receipt::PendingPublicationProtocolError),
     #[error("could not render pending actions")]
     Render(#[from] std::io::Error),
 }
@@ -227,9 +226,12 @@ impl PendingError {
         match self {
             Self::DuplicateId => output::ErrorCode::SetupPlanInvalid.as_str(),
             Self::Receipt(error) => error.error_code(),
-            Self::Output(_) | Self::Manifest(_) | Self::Render(_) => {
-                output::ErrorCode::SetupApplyFailed.as_str()
+            Self::Publication(super::receipt::PendingPublicationProtocolError::Receipt(error)) => {
+                error.error_code()
             }
+            Self::Output(_)
+            | Self::Publication(super::receipt::PendingPublicationProtocolError::Manifest(_))
+            | Self::Render(_) => output::ErrorCode::SetupApplyFailed.as_str(),
         }
     }
 

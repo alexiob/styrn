@@ -601,6 +601,83 @@ fn pending_publications_are_optional_but_strictly_linked_append_only_epochs() {
         ReceiptDocument::from_json(&serde_json::to_vec(&decreasing_count).unwrap()).unwrap_err(),
         ReceiptError::InvalidPendingPublicationOrder
     );
+
+    let mut reused_resolved_entry = valid.clone();
+    reused_resolved_entry["pending_publications"]
+        .as_array_mut()
+        .unwrap()
+        .extend([
+            serde_json::json!({
+                "publication_id": "019cafd0-5c00-7000-8000-000000000003",
+                "timestamp": "2026-09-02T10:00:02Z",
+                "receipt_entry_count": 1,
+                "pending": []
+            }),
+            serde_json::json!({
+                "publication_id": "019cafd0-5c00-7000-8000-000000000004",
+                "timestamp": "2026-09-02T10:00:03Z",
+                "receipt_entry_count": 1,
+                "pending": [{
+                    "action_id": "test.first",
+                    "entry_id": "019cafd0-5c00-7000-8000-000000000001"
+                }]
+            }),
+        ]);
+    assert_eq!(
+        ReceiptDocument::from_json(&serde_json::to_vec(&reused_resolved_entry).unwrap())
+            .unwrap_err(),
+        ReceiptError::InvalidPendingPublicationOrder
+    );
+
+    let mut duplicate_legacy_occurrence = pending_receipt_value();
+    let mut duplicate = duplicate_legacy_occurrence["entries"][0].clone();
+    duplicate["entry_id"] = serde_json::json!("019cafd0-5c00-7000-8000-000000000002");
+    duplicate["timestamp"] = serde_json::json!("2026-09-02T10:00:01Z");
+    duplicate_legacy_occurrence["entries"]
+        .as_array_mut()
+        .unwrap()
+        .push(duplicate);
+    assert_eq!(
+        ReceiptDocument::from_json(&serde_json::to_vec(&duplicate_legacy_occurrence).unwrap())
+            .unwrap_err(),
+        ReceiptError::InvalidPendingPublicationOrder
+    );
+
+    let mut valid_recurrence = pending_receipt_value();
+    let mut recurrence = valid_recurrence["entries"][0].clone();
+    recurrence["entry_id"] = serde_json::json!("019cafd0-5c00-7000-8000-000000000003");
+    recurrence["timestamp"] = serde_json::json!("2026-09-02T10:00:02Z");
+    valid_recurrence["entries"]
+        .as_array_mut()
+        .unwrap()
+        .push(recurrence);
+    valid_recurrence["pending_publications"] = serde_json::json!([
+        {
+            "publication_id": "019cafd0-5c00-7000-8000-000000000002",
+            "timestamp": "2026-09-02T10:00:01Z",
+            "receipt_entry_count": 1,
+            "pending": [{
+                "action_id": "test.first",
+                "entry_id": "019cafd0-5c00-7000-8000-000000000001"
+            }]
+        },
+        {
+            "publication_id": "019cafd0-5c00-7000-8000-000000000004",
+            "timestamp": "2026-09-02T10:00:03Z",
+            "receipt_entry_count": 1,
+            "pending": []
+        },
+        {
+            "publication_id": "019cafd0-5c00-7000-8000-000000000005",
+            "timestamp": "2026-09-02T10:00:04Z",
+            "receipt_entry_count": 2,
+            "pending": [{
+                "action_id": "test.first",
+                "entry_id": "019cafd0-5c00-7000-8000-000000000003"
+            }]
+        }
+    ]);
+    ReceiptDocument::from_json(&serde_json::to_vec(&valid_recurrence).unwrap()).unwrap();
 }
 
 #[test]
@@ -645,20 +722,38 @@ fn pending_publication_append_cannot_modify_entry_or_checkpoint_prefixes() {
 
 #[test]
 fn append_candidate_cannot_delete_reorder_modify_or_publish_non_applied_entries() {
-    let mut existing = ReceiptDocument::from_json(COMPLETE_RECEIPT.as_bytes()).unwrap();
+    let mut checkpointed = pending_receipt_value();
+    checkpointed["pending_publications"] = serde_json::json!([{
+        "publication_id": "019cafd0-5c00-7000-8000-000000000002",
+        "timestamp": "2026-09-02T10:00:01Z",
+        "receipt_entry_count": 1,
+        "pending": [{
+            "action_id": "test.first",
+            "entry_id": "019cafd0-5c00-7000-8000-000000000001"
+        }]
+    }]);
+    let mut existing =
+        ReceiptDocument::from_json(&serde_json::to_vec(&checkpointed).unwrap()).unwrap();
     existing
         .entries
-        .push(entry_with_id("019cafd0-5c00-7000-8000-000000000002"));
-    let third = entry_with_id("019cafd0-5c00-7000-8000-000000000003");
+        .push(entry_with_id("019cafd0-5c00-7000-8000-000000000003"));
+    let third = entry_with_id("019cafd0-5c00-7000-8000-000000000004");
 
     let mut deleted = existing.clone();
     deleted.entries.pop();
     let mut reordered = existing.clone();
-    reordered.entries.swap(0, 1);
     reordered.entries.push(third.clone());
+    reordered.entries.swap(1, 2);
     let mut modified = existing.clone();
-    modified.entries[0].privilege_used = ReceiptPrivilege::None;
+    modified.entries[0].timestamp = ReceiptTimestamp("2026-09-02T10:00:08Z".to_owned());
     modified.entries.push(third.clone());
+    let mut removed_checkpoint = existing.clone();
+    removed_checkpoint.entries.push(third.clone());
+    removed_checkpoint.pending_publications.clear();
+    let mut modified_checkpoint = existing.clone();
+    modified_checkpoint.entries.push(third.clone());
+    modified_checkpoint.pending_publications[0].timestamp =
+        ReceiptTimestamp("2026-09-02T10:00:09Z".to_owned());
     let mut non_applied = existing.clone();
     let mut pending = third;
     pending.privilege_used = ReceiptPrivilege::None;
@@ -670,14 +765,67 @@ fn append_candidate_cannot_delete_reorder_modify_or_publish_non_applied_entries(
     pending.firewall_rules.clear();
     pending.download_provenance = DownloadProvenanceSlot(None);
     pending.status = ReceiptStatus::Pending;
+    pending.action = ReceiptAction::Foundation(FoundationActionParameters {
+        action_id: ActionIdentifier("test.second".to_owned()),
+    });
     non_applied.entries.push(pending);
 
-    for candidate in [deleted, reordered, modified, non_applied] {
+    for candidate in [
+        deleted,
+        reordered,
+        modified,
+        removed_checkpoint,
+        modified_checkpoint,
+        non_applied,
+    ] {
         assert!(matches!(
-            validate_append_candidate(&existing, &candidate),
+            validate_append_candidate(&existing, &candidate, None),
             Err(ReceiptStoreError::PrefixConflict)
         ));
     }
+}
+
+#[test]
+fn pending_append_candidate_preserves_the_publication_checkpoint_prefix() {
+    let mut checkpointed = pending_receipt_value();
+    checkpointed["pending_publications"] = serde_json::json!([{
+        "publication_id": "019cafd0-5c00-7000-8000-000000000002",
+        "timestamp": "2026-09-02T10:00:01Z",
+        "receipt_entry_count": 1,
+        "pending": [{
+            "action_id": "test.first",
+            "entry_id": "019cafd0-5c00-7000-8000-000000000001"
+        }]
+    }]);
+    let existing = ReceiptDocument::from_json(&serde_json::to_vec(&checkpointed).unwrap()).unwrap();
+    let mut next_value = pending_receipt_value();
+    next_value["entries"][0]["entry_id"] =
+        serde_json::json!("019cafd0-5c00-7000-8000-000000000003");
+    next_value["entries"][0]["timestamp"] = serde_json::json!("2026-09-02T10:00:02Z");
+    next_value["entries"][0]["action"]["parameters"]["action_id"] =
+        serde_json::json!("test.second");
+    let next = ReceiptDocument::from_json(&serde_json::to_vec(&next_value).unwrap())
+        .unwrap()
+        .entries[0]
+        .clone();
+    let mut valid = existing.clone();
+    valid.entries.push(next);
+    validate_pending_append_candidate(&existing, &valid, None).unwrap();
+
+    let mut removed = valid.clone();
+    removed.pending_publications.clear();
+    assert!(matches!(
+        validate_pending_append_candidate(&existing, &removed, None),
+        Err(ReceiptStoreError::PrefixConflict)
+    ));
+
+    let mut modified = valid;
+    modified.pending_publications[0].timestamp =
+        ReceiptTimestamp("2026-09-02T10:00:09Z".to_owned());
+    assert!(matches!(
+        validate_pending_append_candidate(&existing, &modified, None),
+        Err(ReceiptStoreError::PrefixConflict)
+    ));
 }
 
 #[test]

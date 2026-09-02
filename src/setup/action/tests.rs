@@ -705,7 +705,9 @@ fn needs_human_journals_each_current_occurrence_once_and_recurrence_after_witnes
         "2026-09-02T10:00:05Z",
     )]);
     let publication_error = crate::setup::pending::publish_manifest(
-        &crate::manifest::MachineManifestStore::new_with_failing_hardening(&manifest_path),
+        &crate::manifest::MachineManifestStore::new_with_failing_publication_replace(
+            &manifest_path,
+        ),
         &store,
         &mut draft,
         recurrence.pending(),
@@ -811,7 +813,9 @@ fn failed_manifest_publication_repairs_on_rerun_without_duplicate_pending_histor
     let mut draft = pending_manifest_draft();
 
     let error = crate::setup::pending::publish_manifest(
-        &crate::manifest::MachineManifestStore::new_with_failing_hardening(&manifest_path),
+        &crate::manifest::MachineManifestStore::new_with_failing_publication_replace(
+            &manifest_path,
+        ),
         &receipt_store,
         &mut draft,
         report.pending(),
@@ -826,14 +830,12 @@ fn failed_manifest_publication_repairs_on_rerun_without_duplicate_pending_histor
     assert_eq!(error.exit_code().as_i32(), 13);
     assert!(draft.pending_actions.is_none());
     assert!(!manifest_path.exists());
+    assert!(fixture.pending_publication_intent_path().exists());
     assert_eq!(metrics.mutation_calls(), 0);
 
     let mut no_metadata = ReceiptMetadataSource::for_test([]);
     let rerun = apply_plan_with_journal(&mut plan, &receipt_store, &mut no_metadata).unwrap();
-    let mut repair_metadata = ReceiptMetadataSource::for_test([(
-        "019cafd0-5c00-7000-8000-000000000014",
-        "2026-09-02T10:02:01Z",
-    )]);
+    let mut repair_metadata = ReceiptMetadataSource::for_test([]);
     crate::setup::pending::publish_manifest(
         &crate::manifest::MachineManifestStore::new_for_test(&manifest_path),
         &receipt_store,
@@ -842,6 +844,7 @@ fn failed_manifest_publication_repairs_on_rerun_without_duplicate_pending_histor
         &mut repair_metadata,
     )
     .unwrap();
+    assert!(!fixture.pending_publication_intent_path().exists());
     let repaired_receipt = receipt_store.read_snapshot().unwrap().to_json().unwrap();
     assert_eq!(
         serde_json::from_slice::<serde_json::Value>(&repaired_receipt).unwrap()["entries"],
@@ -917,21 +920,22 @@ fn failed_receipt_checkpoint_leaves_a_valid_manifest_and_repairs_without_duplica
         serde_json::from_slice(&receipt_store.read_snapshot().unwrap().to_json().unwrap()).unwrap();
     assert_eq!(after_failure["entries"].as_array().unwrap().len(), 1);
     assert!(after_failure["pending_publications"].is_null());
+    assert!(fixture.pending_publication_intent_path().exists());
 
     let mut no_entry_metadata = ReceiptMetadataSource::for_test([]);
     let rerun = apply_plan_with_journal(&mut plan, &receipt_store, &mut no_entry_metadata).unwrap();
-    let mut repair_metadata = ReceiptMetadataSource::for_test([(
-        "019cafd0-5c00-7000-8000-000000000022",
-        "2026-09-02T10:04:01Z",
-    )]);
+    let mut repair_metadata = ReceiptMetadataSource::for_test([]);
     crate::setup::pending::publish_manifest(
-        &manifest_store,
+        &crate::manifest::MachineManifestStore::new_with_failing_publication_replace(
+            &manifest_path,
+        ),
         &receipt_store,
         &mut draft,
         rerun.pending(),
         &mut repair_metadata,
     )
     .unwrap();
+    assert!(!fixture.pending_publication_intent_path().exists());
     let repaired: serde_json::Value =
         serde_json::from_slice(&receipt_store.read_snapshot().unwrap().to_json().unwrap()).unwrap();
     assert_eq!(repaired["entries"].as_array().unwrap().len(), 1);
@@ -943,6 +947,270 @@ fn failed_receipt_checkpoint_leaves_a_valid_manifest_and_repairs_without_duplica
         repaired["pending_publications"][0]["pending"][0]["entry_id"],
         "019cafd0-5c00-7000-8000-000000000021"
     );
+}
+
+#[test]
+fn resolved_publication_intent_prevents_immediate_recurrence_suppression() {
+    let fixture = JournalFixture::new("pending-resolution-intent-recurrence");
+    let receipt_path = fixture.receipt_path().to_path_buf();
+    let receipt_store = ReceiptStore::new_for_test(&receipt_path);
+    let manifest_path = fixture.root.join("machine.toml");
+    let manifest_store = crate::manifest::MachineManifestStore::new_for_test(&manifest_path);
+    let needs_human = NeedsHuman::new(
+        HumanInstructions::new("Complete the local approval, then rerun setup.").unwrap(),
+        None,
+    );
+    let mut initial_plan = vec![
+        Action::test_named_needs_human(
+            "test.local-approval",
+            Privilege::None,
+            Arc::new(Mutex::new(Vec::new())),
+            needs_human.clone(),
+        )
+        .0,
+    ];
+    let mut initial_metadata = ReceiptMetadataSource::for_test([(
+        "019cafd0-5c00-7000-8000-000000000041",
+        "2026-09-02T10:06:00Z",
+    )]);
+    let initial =
+        apply_plan_with_journal(&mut initial_plan, &receipt_store, &mut initial_metadata).unwrap();
+    let mut draft = pending_manifest_draft();
+    crate::setup::pending::publish_manifest(
+        &manifest_store,
+        &receipt_store,
+        &mut draft,
+        initial.pending(),
+        &mut ReceiptMetadataSource::for_test([(
+            "019cafd0-5c00-7000-8000-000000000042",
+            "2026-09-02T10:06:01Z",
+        )]),
+    )
+    .unwrap();
+
+    let mut resolved_plan = Vec::new();
+    let resolved = apply_plan_with_journal(
+        &mut resolved_plan,
+        &receipt_store,
+        &mut ReceiptMetadataSource::for_test([]),
+    )
+    .unwrap();
+    let error = crate::setup::pending::publish_manifest(
+        &manifest_store,
+        &ReceiptStore::new_for_test_failing_before_replace(receipt_path),
+        &mut draft,
+        resolved.pending(),
+        &mut ReceiptMetadataSource::for_test([(
+            "019cafd0-5c00-7000-8000-000000000043",
+            "2026-09-02T10:06:02Z",
+        )]),
+    )
+    .unwrap_err();
+
+    assert_eq!(error.error_code(), "setup.receipt_conflict");
+    assert!(fixture.pending_publication_intent_path().exists());
+    assert!(manifest_store
+        .read()
+        .unwrap()
+        .manifest
+        .pending_actions
+        .is_none());
+
+    let mut recurrence_plan = vec![
+        Action::test_named_needs_human(
+            "test.local-approval",
+            Privilege::None,
+            Arc::new(Mutex::new(Vec::new())),
+            needs_human,
+        )
+        .0,
+    ];
+    let recurrence = apply_plan_with_journal(
+        &mut recurrence_plan,
+        &receipt_store,
+        &mut ReceiptMetadataSource::for_test([(
+            "019cafd0-5c00-7000-8000-000000000044",
+            "2026-09-02T10:06:03Z",
+        )]),
+    )
+    .unwrap();
+    assert_eq!(receipt_store.read_snapshot().unwrap().entry_count(), 2);
+
+    crate::setup::pending::publish_manifest(
+        &manifest_store,
+        &receipt_store,
+        &mut draft,
+        recurrence.pending(),
+        &mut ReceiptMetadataSource::for_test([(
+            "019cafd0-5c00-7000-8000-000000000045",
+            "2026-09-02T10:06:04Z",
+        )]),
+    )
+    .unwrap();
+
+    let receipt: serde_json::Value =
+        serde_json::from_slice(&receipt_store.read_snapshot().unwrap().to_json().unwrap()).unwrap();
+    assert_eq!(receipt["pending_publications"].as_array().unwrap().len(), 3);
+    assert_eq!(
+        receipt["pending_publications"][0]["pending"][0]["entry_id"],
+        "019cafd0-5c00-7000-8000-000000000041"
+    );
+    assert_eq!(
+        receipt["pending_publications"][1]["pending"],
+        serde_json::json!([])
+    );
+    assert_eq!(
+        receipt["pending_publications"][2]["pending"][0]["entry_id"],
+        "019cafd0-5c00-7000-8000-000000000044"
+    );
+    assert!(!fixture.pending_publication_intent_path().exists());
+}
+
+#[test]
+fn publication_recovery_rejects_a_third_manifest_digest_and_retains_evidence() {
+    let fixture = JournalFixture::new("pending-publication-third-digest");
+    let receipt_store = ReceiptStore::new_for_test(fixture.receipt_path());
+    let manifest_path = fixture.root.join("machine.toml");
+    let manifest_store = crate::manifest::MachineManifestStore::new_for_test(&manifest_path);
+    let mut draft = pending_manifest_draft();
+    manifest_store.write_generated(&draft).unwrap();
+    let mut plan = vec![
+        Action::test_named_needs_human(
+            "test.local-approval",
+            Privilege::None,
+            Arc::new(Mutex::new(Vec::new())),
+            NeedsHuman::new(
+                HumanInstructions::new("Complete the local approval, then rerun setup.").unwrap(),
+                None,
+            ),
+        )
+        .0,
+    ];
+    let report = apply_plan_with_journal(
+        &mut plan,
+        &receipt_store,
+        &mut ReceiptMetadataSource::for_test([(
+            "019cafd0-5c00-7000-8000-000000000051",
+            "2026-09-02T10:07:00Z",
+        )]),
+    )
+    .unwrap();
+
+    crate::setup::pending::publish_manifest(
+        &crate::manifest::MachineManifestStore::new_with_failing_publication_replace(
+            &manifest_path,
+        ),
+        &receipt_store,
+        &mut draft,
+        report.pending(),
+        &mut ReceiptMetadataSource::for_test([(
+            "019cafd0-5c00-7000-8000-000000000052",
+            "2026-09-02T10:07:01Z",
+        )]),
+    )
+    .unwrap_err();
+    assert!(fixture.pending_publication_intent_path().exists());
+
+    let mut third = draft.clone();
+    third.name = "third-valid-manifest-state".to_owned();
+    manifest_store.write_generated(&third).unwrap();
+    let third_bytes = fs::read(&manifest_path).unwrap();
+    let receipt_before = receipt_store.read_snapshot().unwrap().to_json().unwrap();
+
+    let error = crate::setup::pending::publish_manifest(
+        &manifest_store,
+        &receipt_store,
+        &mut draft,
+        report.pending(),
+        &mut ReceiptMetadataSource::for_test([]),
+    )
+    .unwrap_err();
+
+    assert_eq!(error.error_code(), "setup.receipt_conflict");
+    assert_eq!(error.exit_code().as_i32(), 13);
+    assert_eq!(fs::read(&manifest_path).unwrap(), third_bytes);
+    assert_eq!(
+        receipt_store.read_snapshot().unwrap().to_json().unwrap(),
+        receipt_before
+    );
+    assert!(fixture.pending_publication_intent_path().exists());
+}
+
+#[test]
+fn applied_append_preserves_a_prepared_publication_prefix_until_recovery() {
+    let fixture = JournalFixture::new("pending-publication-applied-append");
+    let receipt_store = ReceiptStore::new_for_test(fixture.receipt_path());
+    let manifest_path = fixture.root.join("machine.toml");
+    let manifest_store = crate::manifest::MachineManifestStore::new_for_test(&manifest_path);
+    let mut draft = pending_manifest_draft();
+    manifest_store.write_generated(&draft).unwrap();
+    let mut pending_plan = vec![
+        Action::test_named_needs_human(
+            "test.local-approval",
+            Privilege::None,
+            Arc::new(Mutex::new(Vec::new())),
+            NeedsHuman::new(
+                HumanInstructions::new("Complete the local approval, then rerun setup.").unwrap(),
+                None,
+            ),
+        )
+        .0,
+    ];
+    let pending = apply_plan_with_journal(
+        &mut pending_plan,
+        &receipt_store,
+        &mut ReceiptMetadataSource::for_test([(
+            "019cafd0-5c00-7000-8000-000000000061",
+            "2026-09-02T10:08:00Z",
+        )]),
+    )
+    .unwrap();
+    crate::setup::pending::publish_manifest(
+        &crate::manifest::MachineManifestStore::new_with_failing_publication_replace(
+            &manifest_path,
+        ),
+        &receipt_store,
+        &mut draft,
+        pending.pending(),
+        &mut ReceiptMetadataSource::for_test([(
+            "019cafd0-5c00-7000-8000-000000000062",
+            "2026-09-02T10:08:01Z",
+        )]),
+    )
+    .unwrap_err();
+    assert!(fixture.pending_publication_intent_path().exists());
+
+    let state = Arc::new(Mutex::new(Vec::new()));
+    let mut applied_plan = vec![
+        Action::test_journaled_state("test.applied", 1, Privilege::None, Arc::clone(&state)).0,
+    ];
+    apply_plan_with_journal(
+        &mut applied_plan,
+        &receipt_store,
+        &mut ReceiptMetadataSource::for_test([(
+            "019cafd0-5c00-7000-8000-000000000063",
+            "2026-09-02T10:08:02Z",
+        )]),
+    )
+    .unwrap();
+
+    crate::setup::pending::publish_manifest(
+        &manifest_store,
+        &receipt_store,
+        &mut draft,
+        pending.pending(),
+        &mut ReceiptMetadataSource::for_test([]),
+    )
+    .unwrap();
+
+    let receipt: serde_json::Value =
+        serde_json::from_slice(&receipt_store.read_snapshot().unwrap().to_json().unwrap()).unwrap();
+    assert_eq!(receipt["entries"].as_array().unwrap().len(), 2);
+    assert_eq!(receipt["entries"][1]["status"], "applied");
+    assert_eq!(receipt["pending_publications"].as_array().unwrap().len(), 1);
+    assert_eq!(receipt["pending_publications"][0]["receipt_entry_count"], 1);
+    assert_eq!(*state.lock().unwrap(), vec![1]);
+    assert!(!fixture.pending_publication_intent_path().exists());
 }
 
 #[test]
@@ -2244,6 +2512,13 @@ impl JournalFixture {
             .collect::<Vec<_>>();
         assert_eq!(paths.len(), 1);
         paths.into_iter().next().unwrap()
+    }
+
+    fn pending_publication_intent_path(&self) -> PathBuf {
+        self.receipt
+            .parent()
+            .unwrap()
+            .join(".receipt.json.pending-publication.json")
     }
 }
 

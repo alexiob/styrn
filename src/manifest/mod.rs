@@ -5,8 +5,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
-use std::io::Write;
-use std::path::PathBuf;
+use std::io::{Read, Write};
+use std::path::{Path, PathBuf};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -563,6 +563,20 @@ pub(crate) struct MachineManifestStore {
     destination_origin: DestinationOrigin,
 }
 
+#[allow(dead_code)] // Source-including manifest tests omit receipt publication recovery.
+pub(crate) struct PendingManifestPublicationSession<'a> {
+    store: &'a MachineManifestStore,
+    _lock: fs::File,
+    current: Option<MachineManifest>,
+    current_canonical: Option<String>,
+}
+
+#[allow(dead_code)] // Source-including manifest tests omit receipt publication recovery.
+pub(crate) struct PendingManifestCandidate {
+    manifest: MachineManifest,
+    canonical: String,
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DestinationOrigin {
     Canonical,
@@ -581,6 +595,8 @@ enum ManifestSecurity {
     FailBeforeReplace,
     #[cfg(test)]
     FailAfterReplace,
+    #[cfg(test)]
+    FailPendingBeforeReplace,
     #[cfg(test)]
     DirectoryPublicationRace,
     #[cfg(test)]
@@ -828,6 +844,24 @@ impl MachineManifestStore {
 
     #[cfg(test)]
     #[allow(dead_code)]
+    pub(crate) fn new_with_failing_publication_replace(path: impl Into<PathBuf>) -> Self {
+        let path = path.into();
+        let trusted_root = path
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_default();
+        Self {
+            scope: platform::InstallationScope::System,
+            principal: fixture_worker_principal(),
+            path,
+            trusted_root,
+            security: ManifestSecurity::FailPendingBeforeReplace,
+            destination_origin: DestinationOrigin::Test,
+        }
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) fn new_override_with_failing_hardening(path: impl Into<PathBuf>) -> Self {
         let path = path.into();
         let trusted_root = path
@@ -980,6 +1014,21 @@ impl MachineManifestStore {
         })
     }
 
+    #[allow(dead_code)] // Source-including manifest tests omit receipt publication recovery.
+    pub(crate) fn begin_pending_publication(
+        &self,
+    ) -> Result<PendingManifestPublicationSession<'_>, ManifestError> {
+        let lock = self.acquire_mutation_lock()?;
+        let current = self.read_existing_manifest_locked()?;
+        let current_canonical = current.as_ref().map(MachineManifest::to_toml).transpose()?;
+        Ok(PendingManifestPublicationSession {
+            store: self,
+            _lock: lock,
+            current,
+            current_canonical,
+        })
+    }
+
     fn existing_machine_id_for_generated(&self) -> Result<Option<Uuid>, ManifestError> {
         match fs::symlink_metadata(&self.path) {
             Ok(_) => {
@@ -1006,6 +1055,11 @@ impl MachineManifestStore {
         &self,
         operation: impl FnOnce() -> Result<T, ManifestError>,
     ) -> Result<T, ManifestError> {
+        let _lock = self.acquire_mutation_lock()?;
+        operation()
+    }
+
+    fn acquire_mutation_lock(&self) -> Result<fs::File, ManifestError> {
         let destination_dir = self.validate_destination_policy()?;
         self.verify_bound_principal()?;
         self.prepare_destination(destination_dir)?;
@@ -1019,7 +1073,27 @@ impl MachineManifestStore {
         let lock = platform::open_manifest_lock(&lock_path, self.platform_owner(), &self.principal)
             .map_err(ManifestError::Write)?;
         lock.lock().map_err(ManifestError::Write)?;
-        operation()
+        Ok(lock)
+    }
+
+    #[allow(dead_code)] // Source-including manifest tests omit receipt publication recovery.
+    fn read_existing_manifest_locked(&self) -> Result<Option<MachineManifest>, ManifestError> {
+        let mut file = match platform::open_verified_manifest_file_for_read(
+            &self.path,
+            self.platform_owner(),
+            &self.principal,
+            &self.trusted_root,
+        ) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(ManifestError::Security(error)),
+        };
+        let mut input = String::new();
+        file.read_to_string(&mut input)
+            .map_err(ManifestError::Read)?;
+        let manifest = MachineManifest::parse_toml(&input)?;
+        self.validate_manifest_binding(&manifest)?;
+        Ok(Some(manifest))
     }
 
     fn prepare_destination(&self, destination_dir: &std::path::Path) -> Result<(), ManifestError> {
@@ -1261,6 +1335,13 @@ impl MachineManifestStore {
             file.flush().map_err(ManifestError::Write)?;
             file.sync_all().map_err(ManifestError::Write)?;
             self.harden_temporary(&temporary)?;
+            #[cfg(test)]
+            if matches!(self.security, ManifestSecurity::FailPendingBeforeReplace) {
+                return Err(ManifestError::Write(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "injected manifest interruption before replacement",
+                )));
+            }
             platform::replace_file(&temporary, &self.path).map_err(ManifestError::Write)?;
             self.verify_security_after_replace()
         })();
@@ -1314,6 +1395,7 @@ impl MachineManifestStore {
             #[cfg(test)]
             ManifestSecurity::CurrentProcess
             | ManifestSecurity::FailBeforeReplace
+            | ManifestSecurity::FailPendingBeforeReplace
             | ManifestSecurity::DirectoryPublicationRace
             | ManifestSecurity::DirectoryPublicationAndCleanupFailure => {
                 platform::ManifestOwner::CurrentProcess
@@ -1414,6 +1496,77 @@ impl MachineManifestStore {
             )));
         }
         Ok(())
+    }
+}
+
+#[allow(dead_code)] // Source-including manifest tests omit receipt publication recovery.
+impl PendingManifestPublicationSession<'_> {
+    pub(crate) fn path(&self) -> &Path {
+        &self.store.path
+    }
+
+    pub(crate) fn installation_scope(&self) -> platform::InstallationScope {
+        self.store.scope
+    }
+
+    pub(crate) fn worker_principal(&self) -> &platform::WorkerPrincipal {
+        &self.store.principal
+    }
+
+    pub(crate) fn current_canonical(&self) -> Option<&str> {
+        self.current_canonical.as_deref()
+    }
+
+    pub(crate) fn candidate(
+        &self,
+        draft: &MachineManifestDraft,
+    ) -> Result<PendingManifestCandidate, ManifestError> {
+        let machine_id = self
+            .current
+            .as_ref()
+            .map(|manifest| manifest.machine_id)
+            .unwrap_or_else(Uuid::now_v7);
+        let manifest = draft.with_machine_id(machine_id);
+        manifest.validate()?;
+        self.store.validate_manifest_binding(&manifest)?;
+        let canonical = manifest.to_toml()?;
+        Ok(PendingManifestCandidate {
+            manifest,
+            canonical,
+        })
+    }
+
+    pub(crate) fn stored_candidate(
+        &self,
+        canonical: &str,
+    ) -> Result<PendingManifestCandidate, ManifestError> {
+        let manifest = MachineManifest::parse_toml(canonical)?;
+        self.store.validate_manifest_binding(&manifest)?;
+        if manifest.to_toml()? != canonical {
+            return invalid("prepared manifest candidate is not canonical");
+        }
+        Ok(PendingManifestCandidate {
+            manifest,
+            canonical: canonical.to_owned(),
+        })
+    }
+
+    pub(crate) fn publish(
+        &self,
+        candidate: &PendingManifestCandidate,
+    ) -> Result<(), ManifestError> {
+        self.store.write_manifest(&candidate.manifest)
+    }
+}
+
+#[allow(dead_code)] // Source-including manifest tests omit receipt publication recovery.
+impl PendingManifestCandidate {
+    pub(crate) fn machine_id(&self) -> Uuid {
+        self.manifest.machine_id
+    }
+
+    pub(crate) fn canonical(&self) -> &str {
+        &self.canonical
     }
 }
 

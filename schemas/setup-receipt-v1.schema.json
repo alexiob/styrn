@@ -16,7 +16,7 @@
     },
     "pending_publications": {
       "type": "array",
-      "description": "Append-only witnessed-current pending epochs. The runtime additionally requires unique publication IDs and timestamps, no publication ID collision with a receipt entry, unique action and entry IDs within each epoch, monotonic receipt entry counts, immutable publication prefixes, and links to the latest earlier pending entry with the same action ID.",
+      "description": "Append-only witnessed-current pending epochs. The runtime additionally requires unique publication IDs and timestamps, no publication ID collision with a receipt entry, unique action and entry IDs within each epoch, monotonic receipt entry counts, immutable publication prefixes, links to the latest earlier pending entry with the same action ID, a new pending receipt entry before an action can reappear after omission, and no duplicate legacy pending occurrence outside that epoch history.",
       "uniqueItems": true,
       "items": { "$ref": "#/$defs/pendingPublication" }
     }
