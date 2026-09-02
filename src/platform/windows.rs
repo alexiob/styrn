@@ -308,8 +308,11 @@ pub(super) fn verify_setup_authorization_executable(
 
 pub(super) fn run_user_phase(
     _token: &UserExecutionToken,
-    _request: &[u8],
+    request: &[u8],
 ) -> io::Result<std::process::ExitStatus> {
+    if request.len() > 64 * 1024 {
+        return Err(invalid_data("setup user-phase request is too large"));
+    }
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "native Windows user execution requires a validated limited primary token",

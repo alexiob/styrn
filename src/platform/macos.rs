@@ -2,13 +2,15 @@ use super::{
     ManifestOwner, PrincipalKind, PrivateFileIdentity, SetupExecutionContext, SetupHostPrivilege,
     UnixCallerIds, WorkerPrincipal,
 };
-use std::ffi::CString;
+use std::ffi::{CString, OsString};
 use std::fs;
 use std::io;
 use std::os::fd::AsRawFd;
 use std::os::unix::ffi::OsStrExt;
+use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::process::CommandExt;
 use std::path::Path;
 
 type Acl = *mut std::ffi::c_void;
@@ -67,14 +69,22 @@ pub(super) fn resolve_current_worker_principal() -> io::Result<WorkerPrincipal> 
 pub(super) struct UserExecutionToken {
     uid: u32,
     gid: u32,
+    supplementary_groups: Vec<libc::gid_t>,
+    home: OsString,
+    name: String,
+    requires_drop: bool,
 }
 
 #[cfg(test)]
 pub(super) fn test_user_execution_token(principal: &WorkerPrincipal) -> UserExecutionToken {
-    let (_, gid) = account_for_uid(principal.unix_uid().unwrap()).unwrap();
+    let account = account_details_for_uid(principal.unix_uid().unwrap()).unwrap();
     UserExecutionToken {
         uid: principal.unix_uid().unwrap(),
-        gid,
+        gid: account.gid,
+        supplementary_groups: supplementary_groups(principal.name(), account.gid).unwrap(),
+        home: account.home,
+        name: principal.name().to_owned(),
+        requires_drop: false,
     }
 }
 
@@ -91,10 +101,10 @@ pub(super) fn capture_setup_execution_context() -> io::Result<SetupExecutionCont
         original_name = Some(name);
         Ok(identity)
     })?;
-    let (principal, primary_gid) = account_for_uid(selected.uid)?;
-    if primary_gid != selected.gid
+    let account = account_details_for_uid(selected.uid)?;
+    if account.gid != selected.gid
         || (selected.privilege == SetupHostPrivilege::Root
-            && original_name.as_deref() != Some(principal.name()))
+            && original_name.as_deref() != Some(account.principal.name()))
     {
         return Err(permission_denied(
             "sudo original uid, gid, and account name do not identify one native user",
@@ -102,10 +112,14 @@ pub(super) fn capture_setup_execution_context() -> io::Result<SetupExecutionCont
     }
     Ok(SetupExecutionContext::new(
         selected.privilege,
-        principal,
+        account.principal.clone(),
         UserExecutionToken {
             uid: selected.uid,
             gid: selected.gid,
+            supplementary_groups: supplementary_groups(account.principal.name(), account.gid)?,
+            home: account.home,
+            name: account.principal.name().to_owned(),
+            requires_drop: selected.privilege == SetupHostPrivilege::Root,
         },
     ))
 }
@@ -136,13 +150,32 @@ pub(super) fn verify_setup_authorization_path_security(path: &Path) -> io::Resul
 }
 
 pub(super) fn run_user_phase(
-    _token: &UserExecutionToken,
-    _request: &[u8],
+    token: &UserExecutionToken,
+    request: &[u8],
 ) -> io::Result<std::process::ExitStatus> {
+    if request.len() > 64 * 1024 {
+        return Err(invalid_data("setup user-phase request is too large"));
+    }
+    validate_user_execution_token(token)?;
+    let mut command = std::process::Command::new(std::env::current_exe()?);
+    command.args(["setup", "user-phase"]);
+    configure_original_user_command(token, &mut command)?;
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
-        "native Unix user execution requires safe uid, gid, and supplementary-group restoration",
+        "native Unix user-phase protocol execution is unavailable in this build",
     ))
+}
+
+#[cfg(test)]
+pub(super) fn run_test_program_as_original(
+    token: &UserExecutionToken,
+    program: &Path,
+    arguments: &[&str],
+) -> io::Result<std::process::Output> {
+    let mut command = std::process::Command::new(program);
+    command.args(arguments);
+    configure_original_user_command(token, &mut command)?;
+    command.output()
 }
 
 #[allow(dead_code)] // Explicit system-account selection is exercised by environmental gates.
@@ -173,6 +206,17 @@ fn principal_for_uid(uid: u32) -> io::Result<WorkerPrincipal> {
 }
 
 fn account_for_uid(uid: u32) -> io::Result<(WorkerPrincipal, u32)> {
+    let account = account_details_for_uid(uid)?;
+    Ok((account.principal, account.gid))
+}
+
+struct UnixAccountDetails {
+    principal: WorkerPrincipal,
+    gid: u32,
+    home: OsString,
+}
+
+fn account_details_for_uid(uid: u32) -> io::Result<UnixAccountDetails> {
     if uid == 0 {
         return Err(permission_denied("root cannot be a worker principal"));
     }
@@ -191,7 +235,7 @@ fn account_for_uid(uid: u32) -> io::Result<(WorkerPrincipal, u32)> {
     if status != 0 {
         return Err(io::Error::from_raw_os_error(status));
     }
-    if result.is_null() || entry.pw_name.is_null() {
+    if result.is_null() || entry.pw_name.is_null() || entry.pw_dir.is_null() {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
             "worker uid has no native account mapping",
@@ -200,10 +244,124 @@ fn account_for_uid(uid: u32) -> io::Result<(WorkerPrincipal, u32)> {
     let name = unsafe { std::ffi::CStr::from_ptr(entry.pw_name) }
         .to_str()
         .map_err(|_| invalid_data("worker account name is not UTF-8"))?;
-    Ok((
-        WorkerPrincipal::new(PrincipalKind::UnixUid, uid.to_string(), name)?,
-        entry.pw_gid,
-    ))
+    let home = OsString::from_vec(
+        unsafe { std::ffi::CStr::from_ptr(entry.pw_dir) }
+            .to_bytes()
+            .to_vec(),
+    );
+    if !Path::new(&home).is_absolute() {
+        return Err(invalid_data("worker home directory is not absolute"));
+    }
+    Ok(UnixAccountDetails {
+        principal: WorkerPrincipal::new(PrincipalKind::UnixUid, uid.to_string(), name)?,
+        gid: entry.pw_gid,
+        home,
+    })
+}
+
+fn supplementary_groups(name: &str, primary_gid: u32) -> io::Result<Vec<libc::gid_t>> {
+    let name = CString::new(name).map_err(|_| invalid_data("worker account name contains NUL"))?;
+    let primary_group = i32::try_from(primary_gid)
+        .map_err(|_| invalid_data("worker primary group is out of range"))?;
+    let mut count = 16;
+    let mut native_groups = vec![0_i32; count as usize];
+    if unsafe {
+        libc::getgrouplist(
+            name.as_ptr(),
+            primary_group,
+            native_groups.as_mut_ptr(),
+            &mut count,
+        )
+    } == -1
+    {
+        if !(17..=1024).contains(&count) {
+            return Err(permission_denied(
+                "worker supplementary group set is invalid",
+            ));
+        }
+        native_groups.resize(count as usize, 0);
+        if unsafe {
+            libc::getgrouplist(
+                name.as_ptr(),
+                primary_group,
+                native_groups.as_mut_ptr(),
+                &mut count,
+            )
+        } == -1
+        {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    if !(1..=1024).contains(&count) {
+        return Err(permission_denied(
+            "worker supplementary group set is invalid",
+        ));
+    }
+    native_groups.truncate(count as usize);
+    let mut groups = native_groups
+        .into_iter()
+        .map(|group| {
+            libc::gid_t::try_from(group)
+                .map_err(|_| invalid_data("worker supplementary group is out of range"))
+        })
+        .collect::<io::Result<Vec<_>>>()?;
+    groups.sort_unstable();
+    groups.dedup();
+    if !groups.contains(&primary_gid) {
+        groups.push(primary_gid);
+        groups.sort_unstable();
+    }
+    Ok(groups)
+}
+
+fn validate_user_execution_token(token: &UserExecutionToken) -> io::Result<()> {
+    if token.uid == 0
+        || token.name.is_empty()
+        || !Path::new(&token.home).is_absolute()
+        || token.supplementary_groups.is_empty()
+        || !token.supplementary_groups.contains(&token.gid)
+    {
+        return Err(permission_denied(
+            "original-user execution token is invalid",
+        ));
+    }
+    Ok(())
+}
+
+fn configure_original_user_command(
+    token: &UserExecutionToken,
+    command: &mut std::process::Command,
+) -> io::Result<()> {
+    validate_user_execution_token(token)?;
+    command.env_clear();
+    command.env("HOME", &token.home);
+    command.env("USER", &token.name);
+    command.env("LOGNAME", &token.name);
+    command.env("PATH", "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin");
+    command.current_dir(&token.home);
+    if token.requires_drop {
+        let uid = token.uid;
+        let gid = token.gid;
+        let groups = token.supplementary_groups.clone();
+        unsafe {
+            command.pre_exec(move || {
+                if libc::setgroups(groups.len() as i32, groups.as_ptr()) != 0
+                    || libc::setgid(gid) != 0
+                    || libc::setuid(uid) != 0
+                    || libc::getuid() != uid
+                    || libc::geteuid() != uid
+                    || libc::getgid() != gid
+                    || libc::getegid() != gid
+                    || libc::setegid(0) == 0
+                    || libc::seteuid(0) == 0
+                {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
+    Ok(())
 }
 
 pub(super) fn create_private_manifest_staging_directory(

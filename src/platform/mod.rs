@@ -1029,10 +1029,62 @@ mod setup_execution_tests {
 
     #[cfg(unix)]
     #[test]
-    fn fixed_user_phase_seam_fails_closed_until_native_identity_restoration_exists() {
+    fn fixed_user_phase_seam_fails_closed_until_typed_protocol_execution_exists() {
         let context = SetupExecutionContext::capture().unwrap();
         let error = context.user_token().run_user_phase(b"{}").unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ordinary_original_user_command_keeps_the_exact_native_uid() {
+        let context = SetupExecutionContext::capture().unwrap();
+        assert_eq!(context.host_privilege(), SetupHostPrivilege::Ordinary);
+        let output = platform_impl::run_test_program_as_original(
+            &context.user_token().0,
+            Path::new("/usr/bin/id"),
+            &["-u"],
+        )
+        .unwrap();
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap().trim(),
+            context.original_principal().principal_id()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn original_user_command_receives_only_the_sanitized_profile_environment() {
+        let context = SetupExecutionContext::capture().unwrap();
+        let output = platform_impl::run_test_program_as_original(
+            &context.user_token().0,
+            Path::new("/usr/bin/env"),
+            &[],
+        )
+        .unwrap();
+        assert!(output.status.success());
+        let output = String::from_utf8(output.stdout).unwrap();
+        let environment = output
+            .lines()
+            .filter_map(|line| line.split_once('='))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        assert_eq!(environment.len(), 4);
+        assert_eq!(
+            environment.get("USER"),
+            Some(&context.original_principal().name())
+        );
+        assert_eq!(
+            environment.get("LOGNAME"),
+            Some(&context.original_principal().name())
+        );
+        assert!(environment
+            .get("HOME")
+            .is_some_and(|home| Path::new(home).is_absolute()));
+        assert_eq!(
+            environment.get("PATH"),
+            Some(&"/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin")
+        );
     }
 
     #[cfg(unix)]
@@ -1041,7 +1093,23 @@ mod setup_execution_tests {
     fn native_sudo_launch_recovers_the_original_nonroot_principal() {
         let context = SetupExecutionContext::capture().unwrap();
         assert_eq!(context.host_privilege(), SetupHostPrivilege::Root);
-        assert_ne!(context.original_principal().unix_uid().unwrap(), 0);
+        let original_uid = context.original_principal().unix_uid().unwrap();
+        assert_ne!(original_uid, 0);
+        let destination = std::env::temp_dir().join(format!(
+            "styrn-original-user-{}-{}",
+            std::process::id(),
+            uuid::Uuid::now_v7()
+        ));
+        let output = platform_impl::run_test_program_as_original(
+            &context.user_token().0,
+            Path::new("/usr/bin/touch"),
+            &[destination.to_str().unwrap()],
+        )
+        .unwrap();
+        assert!(output.status.success());
+        use std::os::unix::fs::MetadataExt;
+        assert_eq!(std::fs::metadata(&destination).unwrap().uid(), original_uid);
+        std::fs::remove_file(destination).unwrap();
     }
 }
 
