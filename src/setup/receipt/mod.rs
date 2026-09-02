@@ -215,6 +215,19 @@ impl ReceiptStore {
         &self.worker
     }
 
+    pub(in crate::setup) fn binds_user_authorization_request(
+        &self,
+        request_path: &Path,
+        worker: &WorkerPrincipal,
+    ) -> bool {
+        self.scope == InstallationScope::User
+            && &self.worker == worker
+            && self
+                .path
+                .parent()
+                .is_some_and(|parent| parent.join("authorization-request.json") == request_path)
+    }
+
     fn new_system(
         path: impl Into<PathBuf>,
         worker: WorkerPrincipal,

@@ -846,6 +846,71 @@ fn authorization_context_rejects_secret_shaped_request_parent_without_echo() {
     assert!(!error.to_string().contains("do-not-echo"));
 }
 
+#[test]
+fn authorization_is_bound_to_exact_user_and_system_receipt_stores() {
+    let fixture = AuthorizationFixture::new("store-binding");
+    let other = AuthorizationFixture::new("other-store-binding");
+    let state = Arc::new(Mutex::new(Vec::new()));
+    let (ordinary, ordinary_metrics) =
+        Action::test_journaled_state("test.user-action", 1, Privilege::None, Arc::clone(&state));
+    let mut ordinary_plan = vec![ordinary];
+    let wrong_user_store = ReceiptStore::new_user_for_test(other.user_receipt());
+    let mut metadata = receipt_metadata(&[]);
+    let mut invoker = SpyInvoker::default();
+
+    let parent_result = execute_with_authorization(
+        &mut ordinary_plan,
+        &wrong_user_store,
+        &mut metadata,
+        &fixture.context(),
+        AuthorizationOptions::interactive_decline(),
+        &mut invoker,
+    );
+    let parent_error = match parent_result {
+        Ok(_) => panic!("mismatched user store unexpectedly authorized execution"),
+        Err(error) => error,
+    };
+    assert_eq!(parent_error.error_code(), "setup.plan_invalid");
+    assert_eq!(ordinary_metrics.mutation_calls(), 0);
+    assert!(state.lock().unwrap().is_empty());
+    assert!(!other.user_receipt().exists());
+
+    let displayed = vec![
+        Action::test_journaled_state(
+            "test.system-action",
+            2,
+            host_privilege(),
+            Arc::clone(&state),
+        )
+        .0,
+    ];
+    let context = fixture.context();
+    let digest = write_request(&displayed, &context).unwrap();
+    let (privileged, privileged_metrics) = Action::test_journaled_state(
+        "test.system-action",
+        2,
+        host_privilege(),
+        Arc::clone(&state),
+    );
+    let mut privileged_plan = vec![privileged];
+    let wrong_system_store = ReceiptStore::new_user_for_test(fixture.user_receipt());
+    let mut metadata = receipt_metadata(&[]);
+
+    let child_error = run_privileged_request(
+        &context,
+        &digest,
+        &mut privileged_plan,
+        &wrong_system_store,
+        &mut metadata,
+    )
+    .unwrap_err();
+    assert_eq!(child_error.error_code(), "setup.plan_invalid");
+    assert_eq!(privileged_metrics.mutation_calls(), 0);
+    assert!(state.lock().unwrap().is_empty());
+    assert!(fixture.request_path().exists());
+    assert!(!fixture.user_receipt().exists());
+}
+
 #[cfg(unix)]
 #[test]
 fn runner_rejects_symlink_fifo_directory_and_insecure_request_nodes() {

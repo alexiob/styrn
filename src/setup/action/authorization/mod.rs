@@ -7,14 +7,11 @@
 use super::{execution::ApplyReport, Action, ActionCheck, PlanOperation, Privilege};
 #[cfg(test)]
 use super::{execution::PreparedActionRunner, ActionEffect, ActionError};
+#[cfg(test)]
+use crate::platform::{SetupExecutionContext, SetupHostPrivilege};
 use crate::{
     platform::{ManifestOwner, WorkerPrincipal},
-    setup::receipt::{ReceiptMetadataSource, ReceiptStore},
-};
-#[cfg(test)]
-use crate::{
-    platform::{SetupExecutionContext, SetupHostPrivilege},
-    setup::receipt::InstallationScope,
+    setup::receipt::{InstallationScope, ReceiptMetadataSource, ReceiptStore},
 };
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
@@ -345,6 +342,9 @@ pub(super) fn execute_with_authorization<I: AuthorizationInvoker>(
     invoker: &mut I,
 ) -> Result<AuthorizedExecutionReport, AuthorizationError> {
     context.validate()?;
+    if !ordinary_store.binds_user_authorization_request(&context.request_path, &context.principal) {
+        return Err(AuthorizationError::RequestInvalid);
+    }
     validate_plan(plan, context.privilege_class)?;
 
     let mut ordinary = Vec::new();
@@ -550,6 +550,12 @@ pub(super) fn run_privileged_request(
     crate::platform::verify_setup_authorization_executable(&context.executable)
         .map_err(|_| AuthorizationError::RequestInvalid)?;
     context.validate()?;
+    if system_store.installation_scope() != InstallationScope::System {
+        return Err(AuthorizationError::RequestInvalid);
+    }
+    if system_store.worker_principal() != &context.principal {
+        return Err(AuthorizationError::PrincipalInvalid);
+    }
     validate_plan(recomputed_plan, context.privilege_class)?;
     if recomputed_plan
         .iter()
