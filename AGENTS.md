@@ -10,7 +10,7 @@ project-build-system dependency to the core design.
 Work from the most specific applicable source, in this order:
 
 1. The user's request and security constraints.
-2. [`docs/design.md`](docs/design.md), revision F: the canonical, binding
+2. [`docs/design.md`](docs/design.md), revision G: the canonical, binding
    architecture and protocol specification. Cite its Part numbers in design
    discussions. If it conflicts with the plan, the design wins.
 3. [`docs/implementation-plan.md`](docs/implementation-plan.md): ordered work,
@@ -61,7 +61,11 @@ project workflows; project-specific build knowledge belongs in `.styrn.toml`.
   a private key, auth/API key, token, password, or secret-shaped value. Secret
   rejection must occur before a write and must not echo the secret in an error.
 - Machine manifests are root/Administrator-owned and readable but not writable
-  by the unprivileged `styrn` worker. Untrusted job code is confined by
+  by the resolved worker principal. Never hardcode or require an account named
+  `styrn`: current-user is the frictionless default; an optionally dedicated,
+  configurable non-administrator account is the stronger isolation mode.
+  Current-user mode must state that it cannot isolate jobs from that user's
+  ambient files or credentials. Untrusted job code is otherwise confined by
   convention and filesystem permissions to its job-scoped workspace/output
   reach. The worker control plane may write registry, locks, audit,
   maintenance, cache, repos, and artifacts under its designated Styrn-owned

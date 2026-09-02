@@ -1,6 +1,6 @@
 # Styrn implementation plan
 
-Derived from `docs/design.md` revision F (Part 16.3 phases, Part 16.6 testing strategy, Part 16.1 layout).
+Derived from `docs/design.md` revision G (Part 16.3 phases, Part 16.6 testing strategy, Part 16.1 layout).
 Every task cites the design Part that specifies it. If a task and the design disagree, **the design wins** — fix the plan.
 
 ## How to use this document
@@ -87,9 +87,9 @@ passing negative test.
   - [ ] − negative: attempting to write a manifest containing a field from the forbidden set fails at serialization time (a deny-list test over key names plus a heuristic scan for PEM/JWT-shaped values), rather than being caught by review.
 
 - [ ] **T0.7** — Manifest ownership and permissions (4.5)
-      Root-owned, read-only to the worker account, so a job cannot rewrite its own policy.
+      Root/Administrator-owned and read-only to the resolved worker principal, so a job cannot rewrite its own policy. No literal account name is assumed.
   - [ ] + positive: after setup, the manifest is root/Administrator-owned with the specified mode/ACL on each OS.
-  - [ ] − negative: a process running as the `styrn` account cannot modify the manifest; the attempt fails with a permission error.
+  - [ ] − negative: a process running as an explicitly selected real worker principal cannot modify the manifest; the attempt fails with a permission error.
 
 ## 0.C Setup engine
 
@@ -125,14 +125,14 @@ passing negative test.
 
 ## 0.D Component actions
 
-- [ ] **T0.14** — Directory tree and worker account (15.7, 4.1)
-      `repos/ jobs/ cache/ artifacts/ logs/` under the per-OS root; unprivileged `styrn` account.
-  - [ ] + positive: tree exists with correct ownership on each OS; account exists and can write only its own tree.
-  - [ ] − negative: the account cannot read the controller's key material or write outside `paths.root`; re-running does not reset ownership of pre-existing files.
+- [ ] **T0.14** — Directory tree and worker identity (15.7, 4.1)
+      `repos/ jobs/ cache/ artifacts/ logs/` under the per-OS root. Current-user mode is the no-account-creation default; optional dedicated mode accepts a configurable non-administrator account name (suggested `styrn`, never required).
+  - [ ] + positive: the tree exists with correct ownership on each OS in current-user mode without creating an account; dedicated mode creates or adopts the configured account and owns only the intended tree.
+  - [ ] − negative: no implementation or native test requires a literal username. Dedicated mode cannot read controller key material or write outside `paths.root`; current-user mode reports that it provides no such OS-account isolation. Re-running never recursively resets ownership of pre-existing files.
 
 - [ ] **T0.15** — sshd component (15.7)
       Windows: `Add-WindowsCapability` + service automatic + `administrators_authorized_keys` ACL correctness + DefaultShell registry key. Linux/macOS: `openssh-server` / Remote Login.
-  - [ ] + positive: key-based login as the `styrn` account succeeds from a controller on every OS.
+  - [ ] + positive: key-based login as the resolved worker identity succeeds from a controller on every OS.
   - [ ] − negative: the Windows ACL trap is asserted directly — a wrongly-ACL'd `authorized_keys` must be **detected and corrected** by the action, since the failure mode is silent auth rejection. Password auth must be refused.
 
 - [ ] **T0.16** — Tailscale component (15.7)
@@ -145,9 +145,9 @@ passing negative test.
   - [ ] + positive: components install and report `Done` on re-run.
   - [ ] − negative: a worker configured to sleep is flagged by doctor with the remediation command for that OS — the failure mode this prevents is a worker that is "unreachable" only because it is asleep.
 
-- [ ] **T0.18** — Windows hardened account: transient logon + fallback (15.8, D-3)
-      Password generated in memory, used for the profile-materializing user phase via `CreateProcessWithLogonW`, then discarded. `--account current-user` is the documented simple mode.
-  - [ ] + positive: per-user tools land in the `styrn` profile, not the administrator's (this was S-10); SSH key login as `styrn` works afterwards.
+- [ ] **T0.18** — Windows worker identity modes: current-user + hardened transient logon (15.8, rev. G)
+      Current-user is the no-account-creation default. Optional dedicated mode accepts a configurable account, generates its password in memory, uses it for the profile-materializing user phase via `CreateProcessWithLogonW`, then discards it.
+  - [ ] + positive: per-user tools land in the resolved worker profile, never an incidental elevating administrator's profile (this was S-10); SSH key login as that identity works afterwards in both modes.
   - [ ] − negative: the generated password appears in no log, no receipt, no manifest, and no process argument list. If the transient logon fails, the run degrades to the specified `NeedsHuman` fallback rather than leaving a half-created account.
 
 ## 0.E Invocation surface
@@ -426,7 +426,7 @@ passing negative test.
   - [ ] − negative: with styrnd stopped, maintenance degrades to opportunistic execution at admission and doctor — the documented degraded mode is tested, not assumed. Assert styrnd opens no network listener.
 
 - [ ] **T3.13** — `styrnd`: Windows spawn broker (15.9)
-      Named pipe ACL'd to the `styrn` account and SYSTEM.
+      Named pipe ACL'd to the resolved worker SID and SYSTEM; no literal account lookup.
   - [ ] + positive: brokered spawn produces a detached supervisor outside any sshd Job Object.
   - [ ] − negative: an unauthorized local account cannot use the pipe; a broker request for a malformed job id is rejected without spawning anything.
 

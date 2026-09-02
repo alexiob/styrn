@@ -1,8 +1,8 @@
 # Styrn: Cross-Platform Agent and Development Machine Control Plane — Consolidated Design
 
 **Status:** Specification. Nothing described here is implemented. There is no source code, no `Cargo.toml`, and no release. Every statement about behavior is a design decision to be implemented, not a description of an existing system.
-**Revision:** F (consolidated; independent-review correctness fixes; packaging/upgrade, phase plan, and watch TUI specified; the session substrate made optional)
-**Date:** 2026-09-01
+**Revision:** G (consolidated; configurable worker identity with a frictionless current-user default)
+**Date:** 2026-09-02
 **Primary use case:** centrally control heterogeneous macOS, Linux, and native Windows development machines and persistent coding-agent harnesses from any enrolled controller machine.
 **Initial project profile:** FriCOS / Rust development.
 **Project name:** `Styrn`
@@ -16,7 +16,7 @@
 
 This document **supersedes** the original design, revision A (`styrn-complete-design.md`), together with its companion example files and the five bootstrap/install scripts. Those files were **removed from the repository as obsolete** after rev. E; this document is now the sole design of record, and nothing in the repository depends on them. The `(orig. §N)` annotations throughout, and Appendix A, are retained as **provenance** — they record where each decision originated and that no original material was dropped — but they no longer point at a file in this repository. Where this document and any recovered copy of the original disagree, this document wins. The original's bootstrap scripts are superseded outright by the `styrn setup` subsystem (Part 15, esp. 15.12).
 
-This revision was produced by an adversarial architecture review of revision A. The review found five blocker-level defects (jobs die when the controller's SSH session drops; workers cannot fetch private repositories under the stated credential policy; resource admission has no atomicity story; the RPC protocol has no framing or negotiation specification; and the security claims made for MCP and project-declared workflows do not hold against the stated threat model). All are resolved inline in the relevant sections and cross-referenced from the consolidated **issues register** (Part 18). The pass-1 follow-up (rev. C) raised one further blocker — S-33, Herdr launcher parity — likewise resolved inline (12.9.1, 12.10). Questions that revision B left open have since been decided and are recorded in the **decision log** (Part 19); the last of them, D-3 (Windows hardened service-account mode), was resolved by the rev. D setup redesign — hardened is now the Windows default (15.8).
+This revision was produced by an adversarial architecture review of revision A. The review found five blocker-level defects (jobs die when the controller's SSH session drops; workers cannot fetch private repositories under the stated credential policy; resource admission has no atomicity story; the RPC protocol has no framing or negotiation specification; and the security claims made for MCP and project-declared workflows do not hold against the stated threat model). All are resolved inline in the relevant sections and cross-referenced from the consolidated **issues register** (Part 18). The pass-1 follow-up (rev. C) raised one further blocker — S-33, Herdr launcher parity — likewise resolved inline (12.9.1, 12.10). Questions that revision B left open have since been decided and are recorded in the **decision log** (Part 19). D-3's rev. D hardened-account default is superseded by rev. G's cross-platform worker-identity decision (0.11, 15.8): current-user is the default and a dedicated account is optional hardening.
 
 ### 0.2 Traceability conventions
 
@@ -36,7 +36,7 @@ CLI           styrn
 Repository    styrn
 Project file  .styrn.toml
 Config env    STYRN_*
-Service user  styrn
+Suggested dedicated worker user  styrn
 ```
 
 A Styrn machine may have either or both roles: `controller`, `worker`, or `controller + worker`. **There is no permanent master node.**
@@ -84,7 +84,7 @@ This is a first-class design tenet, and it is the **tiebreaker** used throughout
 - **Opt-in hardening rather than opt-out friction.** Security postures that add ceremony (profile pinning, deploy keys, keychain storage) exist and are one config block away — they are never the default a developer must dismantle to get started.
 - **Powerful stays possible, never mandatory.** Nothing in the frictionless path forecloses the advanced path.
 
-The tenet has one deliberate boundary: it never overrides *correctness of results* (a dirty worktree still refuses to masquerade as a clean commit — the fix is a crystal-clear one-flag remedy in the refusal message, not silent guessing) and it never silently weakens the security boundaries of Part 4.5.
+The tenet has one deliberate boundary: it never overrides *correctness of results* (a dirty worktree still refuses to masquerade as a clean commit — the fix is a crystal-clear one-flag remedy in the refusal message, not silent guessing). When an operator selects a lower-friction security posture, Styrn states the resulting boundary honestly rather than silently claiming the stronger posture from Part 4.5.
 
 Applied in this revision at: 4.3.1 (lazy key generation), 6.1 (transport defaults), 7.6 (TTY-aware queueing), 8.2 (implicit repo bootstrap), 9.1 (starter-profile on-ramp), 12.9–12.10 (Herdr parity — a Styrn-launched agent must never be worse than a manually launched one), and every decision in Part 19.
 
@@ -100,7 +100,7 @@ Applied in this revision at: 4.3.1 (lazy key generation), 6.1 (transport default
 ### 0.8 Revision D changelog (pass 2 — the setup redesign) (new in rev. D)
 
 1. **Part 15 replaced wholesale** by the `styrn setup` subsystem: one probe→diff→plan→apply engine with typed, reversible, journaled Actions; `doctor` and `setup` are two frontends of one probe layer (15.2, amending 6.5). The operator's CLI surface — `--install …/--role …`, `--config …`, `--interactive` — is adopted verbatim, plus `--dry-run`, `--emit-script`, `--uninstall`, `--adopt` (15.4, 15.13). Bare `styrn setup` provisions a worker with **two human decisions** (one Enter, one Tailscale browser login); zero with `--yes --auth-key`.
-2. **D-3 decided: hardened mode is the Windows default** (15.8). The in-memory-credential transient-logon user phase removes hardened mode's cost; simple mode survives as `--account current-user`.
+2. **D-3 originally decided hardened mode as the Windows default** (15.8); rev. G supersedes only that default. The transient-logon path remains available as optional dedicated-account hardening, while current-user now requires no account creation.
 3. **`styrnd` worker service** (S-34): the maintenance executor Part 6.8 lacked, and the Windows supervisor-spawn broker 7.8 needed — per-worker, unprivileged, local-only, explicitly reconciled with orig. §63's no-central-daemon rule (15.9).
 4. **Enrollment ergonomics resolved** (S-36): enrollment stays controller-initiated; setup ends with an **enrollment card** (name + address + host-key fingerprint) making a worker enrollable in one pasted line; `styrn bootstrap-script --os <os>` emits a customized stage-zero script with the controller key baked in (15.10, 15.11.4).
 5. **Script generation** specified as a third renderer of the same Action plan (`render_posix`/`render_powershell`), with the four hard breaks handled: runtime secrets via `Secret<T>`, embedded guard checks against state drift, interactive auth passthrough, and `--adopt` receipt reconciliation (15.11).
@@ -133,6 +133,19 @@ Raised by a new operator requirement, verbatim and binding:
 7. **`styrn herdr status|attach` added to the canonical surface** (10.5) — they had appeared in 10.7 and the Phase-4 listings but were never in 10.5, a latent violation of the design's own rule that every command is in 10.5. They stay vendor-named (D-9).
 8. **Dependency framing corrected** throughout Parts 1, 11, and 16.9; `[herdr].enabled` added to the manifest (2.4, 2.4.2) and to `schemas/machine-v1.schema.json`; ephemeral `substrate` added to `machine.status` (2.5).
 9. **Register grows to 40 issues** (6 blocker / 17 major / 17 minor); decision log grows to D-9.
+
+### 0.11 Revision G changelog (pass 5 — worker identity is configurable) (new in rev. G)
+
+Raised by a new operator requirement, verbatim and binding:
+
+> "I do not think we should enforce a specific account for styrn to work: that is a friction we do not need"
+
+1. **No named account is a prerequisite.** Every OS-facing permission, ownership, service, SSH, receipt, and manifest operation receives a resolved `WorkerPrincipal`; implementation code must never look up a literal account name as hidden global state.
+2. **Current user is the frictionless default.** `[account] mode = "current-user"` requires no account creation and is the default on Linux, macOS, and Windows. Bare `styrn setup` works under that identity. The selected principal is recorded in generated machine state so later commands resolve the same identity deterministically.
+3. **Dedicated identity is optional hardening.** `[account] mode = "dedicated"` creates or adopts the configured unprivileged local account. `name = "styrn"` is only the suggested default for this opt-in mode; any valid, non-administrator local account name is supported. `--account dedicated[:<name>]` selects it explicitly.
+4. **Security claims are posture-dependent.** Current-user mode does not claim OS-account separation from the operator's files or credentials. Setup, doctor, and the manifest surface that caveat. Dedicated mode retains the stronger Part 4.5 filesystem and credential-placement boundary and its native acceptance tests.
+5. **Tests select a principal explicitly.** Native permission tests may use any explicitly supplied real unprivileged account; they must not require an account literally named `styrn`. Tests that prove dedicated-account isolation remain environmental where root/Administrator and a second account are required.
+6. **D-3 is superseded.** Windows still supports the transient-logon hardened path, but it is opt-in and parameterized by the selected account. The default does not create an account or manufacture a password.
 
 ---
 
@@ -1476,13 +1489,14 @@ Do not put smart-plug credentials into the public machine manifest. Decided (D-4
 
 # Part 4 — Security and trust model
 
-## 4.1 Dedicated worker account (orig. §10)
+## 4.1 Worker identity and filesystem root (orig. §10; amended rev. G)
 
-A dedicated unprivileged account is strongly recommended. Suggested account:
-
-```text
-styrn
-```
+Styrn resolves one explicit worker identity per machine. The default is the
+current user and requires no account creation. A dedicated unprivileged account
+is optional hardening for machines that execute untrusted jobs; its suggested,
+not required, name is `styrn`. A configured dedicated identity must not be an
+administrator/root account. The resolved principal, rather than a literal user
+name, is passed to every native ownership and ACL operation.
 
 Linux filesystem:
 
@@ -1517,7 +1531,11 @@ macOS:
 └── logs/
 ```
 
-The agent account should not normally have administrator/root privileges. System provisioning is an administrator operation. Agent execution is not.
+The worker identity should not normally have administrator/root privileges.
+System provisioning is an administrator operation; agent execution is not.
+Current-user mode may use an administrator-capable interactive user, but jobs do
+not elevate and Styrn reports that this mode provides no OS-account separation
+from that user's files or credentials.
 
 ## 4.2 What may be stored where (orig. §41)
 
@@ -1532,7 +1550,7 @@ Do not store:
 - administrator credentials;
 - Tailscale reusable auth keys.
 
-**Clarified (new in rev. B; resolves S-02's policy half):** the default posture is *zero git-remote credentials on workers* — source arrives by controller push (Part 8.2). Where a project explicitly opts in (`[source.auth] mode = "deploy-key"`, Part 8.2.3), a worker may hold a **project-scoped, read-only deploy key** stored under the `styrn` account. Such a key is not a "personal" credential and does not violate this list; it must never be an account-wide personal token.
+**Clarified (new in rev. B; resolves S-02's policy half):** the default posture is *zero git-remote credentials on workers* — source arrives by controller push (Part 8.2). Where a project explicitly opts in (`[source.auth] mode = "deploy-key"`, Part 8.2.3), a worker may hold a **project-scoped, read-only deploy key** under the resolved worker profile. Such a key is not a "personal" credential and does not violate this list; it must never be an account-wide personal token.
 
 ### Controller
 
@@ -1553,7 +1571,7 @@ project cache
 explicit project dependencies
 ```
 
-**Honesty note (new in rev. B):** on Linux/macOS/Windows without additional sandboxing, this restriction is enforced by convention (per-job directories + the `styrn` account's filesystem permissions), not by a kernel mechanism. A hostile job command can read anything the `styrn` account can read. This is exactly why the worker account holds no credentials and no personal data. See 4.5.
+**Honesty note (new in rev. B; amended rev. G):** on Linux/macOS/Windows without additional sandboxing, this restriction is enforced by convention (per-job directories plus the selected identity's permissions), not by a kernel mechanism. A hostile job can read anything that identity can read. Dedicated mode is therefore intended to hold no personal credentials or data; current-user mode explicitly gives up that separation. See 4.5.
 
 ### Native Windows Claude (orig. §41)
 
@@ -1572,7 +1590,7 @@ Enable sandboxing where it is compatible with the project.
 Revision A distributed one key (`styrn_ed25519`) in every bootstrap example and never discussed rotation or revocation. Adopted policy:
 
 1. **One keypair per controller machine, generated lazily (rev. C; S-30, tenet §0.6).** The first Styrn command that needs to connect and finds no configured identity generates `~/.ssh/styrn_<controller-name>_ed25519` automatically (equivalent to `ssh-keygen -t ed25519 -C styrn-<controller-name>`), prints the public key, and says exactly how to authorize it (`styrn setup --authorized-keys` on the worker, or `styrn host authorize-key` from an already-authorized controller). No separate init ceremony is required; `styrn controller init` exists only as an explicit way to pre-generate. The public half is what bootstrap installs into each worker's `authorized_keys`.
-2. **Keys are authorized per worker, per controller.** A worker's `authorized_keys` for the `styrn` account contains one line per authorized controller, each with a recognizable comment (`styrn-mbp-main`, `styrn-win-hp`). Options `restrict,pty` may be added later; v1 keeps plain entries because `styrn shell` and Herdr attach need a PTY and command flexibility.
+2. **Keys are authorized per worker, per controller.** The resolved worker identity's `authorized_keys` contains one line per authorized controller, each with a recognizable comment (`styrn-mbp-main`, `styrn-win-hp`). Options `restrict,pty` may be added later; v1 keeps plain entries because `styrn shell` and Herdr attach need a PTY and command flexibility.
 3. **Authorizing a new controller** is an administrative action performed either during setup (`[ssh] authorized_keys` in setup-config, or `--authorized-keys`; Part 15.10) or later via an existing controller: `styrn host authorize-key <host> --public-key <path>` (new command; appends to the worker's `authorized_keys` over the existing transport, idempotently).
 4. **Revocation:** `styrn host revoke-key <host> --controller <name>` removes the matching `authorized_keys` line. When a controller machine is lost or compromised, run this against every worker from any surviving controller; because keys are per-controller, no other controller is disturbed. Tailscale device removal for the lost machine is the complementary first step (it cuts network reachability even before key cleanup).
 5. **Rotation** is revoke + authorize with a fresh keypair; no shared-secret ceremony exists to coordinate.
@@ -1601,9 +1619,9 @@ Only when the harness has no other capabilities. A coding agent with shell acces
 
 ```text
 1. Tailscale reachability            who can open a TCP connection at all
-2. SSH key possession                which machines can authenticate as styrn@worker
-3. OS account separation             what styrn@worker can read/write/damage
-4. Credential placement              what secrets exist on each machine (workers: none by default)
+2. SSH key possession                which machines can authenticate as the selected worker
+3. OS account separation             what a dedicated worker can read/write/damage
+4. Credential placement              dedicated workers hold none; current-user inherits its user
 5. Harness sandbox (where available) what a local agent process can touch
 6. Worker-side enforcement           quotas, timeouts, admission — bounds resource damage
 7. MCP surface + approvals           least-privilege vocabulary for honest agents
@@ -1612,9 +1630,10 @@ Only when the harness has no other capabilities. A coding agent with shell acces
 
 **Design consequences adopted:**
 
-- A job on a worker is treated as **untrusted code running as the `styrn` account**. Everything that must survive a hostile job — controller credentials, other projects' secrets, the machine's manifest integrity — must be outside that account's write reach or absent from the machine. Worker manifests at `/etc/styrn` / `C:\ProgramData\Styrn` / `/Library/Application Support/Styrn` are therefore owned by root/Administrators and read-only to `styrn` (bootstrap must set this; the current scripts already write them as root, but must also not grant `styrn` write access).
-- The worker-side Styrn RPC endpoint runs *as* `styrn`, so a hostile job could tamper with job state files of other jobs owned by the same account. v1 accepts this within a single worker account (single-tenant fleet, one human operator); it is recorded as a known limitation rather than papered over. A later hardening step is per-job OS users on Linux/macOS, which the job-directory layout already permits.
-- Machines where credentialed controllers run agents locally (the MacBook) rely on layers 5 and 7 plus operator review. If that is unacceptable for a given workflow, run the agent on a worker instead — workers hold nothing worth stealing by default.
+- A job on a worker is treated as **untrusted code running as the selected worker identity**. Machine manifests at `/etc/styrn` / `C:\ProgramData\Styrn` / `/Library/Application Support/Styrn` are owned by root/Administrators and readable but not writable by that identity. In dedicated mode, controller credentials and personal data must be outside its read reach or absent from the machine.
+- In current-user mode, a hostile job has that user's ambient filesystem and credential access. Styrn must state this limitation in the setup plan, manifest security posture, and doctor output; it must never describe current-user mode as credential isolation. Harness sandboxes, admission, quotas, and timeouts still apply.
+- The worker-side Styrn RPC endpoint and jobs use the same selected identity, so a hostile job could tamper with job state files of other jobs owned by that identity. v1 accepts this within a single worker identity (single-tenant fleet, one human operator); a later hardening step is per-job OS users on Linux/macOS.
+- Machines where credentialed controllers run agents under current-user mode (the MacBook is the obvious case) rely on harness sandboxing, worker-side enforcement, and operator review. If that is unacceptable, use a dedicated worker identity on that host or dispatch to a dedicated-identity worker.
 - Optional hardening for the workflow-tampering vector (controller-pinned profile hashes or a controller-side workflow allowlist) is specified as an opt-in in Part 9.5 and is default-off (decided in D-5).
 
 ## 4.6 Secrets storage summary (new in rev. B; part of S-19)
@@ -1625,7 +1644,7 @@ Only when the harness has no other capabilities. A coding agent with shell acces
 | Worker host-key pins | controller `~/.config/styrn/known_hosts` | shareable, not secret (public keys) |
 | Tailscale node identity | managed by Tailscale itself | never a reusable auth key on workers |
 | `TS_AUTHKEY` for setup | operator's shell env at setup time only | one-shot pre-approved keys preferred; never persisted (15.7.2) |
-| Optional deploy keys (opt-in) | worker `~styrn/.ssh`, per project | read-only scope, revocable at the forge |
+| Optional deploy keys (opt-in) | selected worker profile `.ssh`, per project | read-only scope, revocable at the forge |
 | Power-provider credentials | controller-only `power.toml`, mode 0600 (D-4) | never in machine manifest (orig. §18) |
 | Agent-harness logins (Codex/Claude) | per-user harness config on each machine | interactive first-login; surfaced as pending_actions |
 
@@ -1639,7 +1658,7 @@ Revision A committed to "a versioned JSON protocol over stdin/stdout" (orig. §3
 
 ## 5.1 Transport and framing
 
-- The controller runs `ssh <host> styrn rpc serve --stdio`. That literal command line is the *only* string that ever crosses the remote login shell; it contains no user data and is quoting-safe on sh, PowerShell, and cmd. Everything else travels inside the protocol. (This is the keystone of the Windows quoting answer — see Part 7.10.)
+- The controller runs `ssh <worker-user>@<host> styrn rpc serve --stdio`, with the enrolled worker user supplied as a separate SSH destination field rather than interpolated into a shell command. The fixed `styrn rpc serve --stdio` remote command is the *only* command string that crosses the login shell; it contains no user data and is quoting-safe on sh, PowerShell, and cmd. Everything else travels inside the protocol. (This is the keystone of the Windows quoting answer — see Part 7.10.)
 - The protocol is **newline-delimited JSON (NDJSON)**: one JSON object per line, UTF-8, `\n` terminated, no pretty-printing. A frame may not exceed **4 MiB** serialized; larger payloads must be chunked (5.6).
 - stdin of `styrn rpc serve` carries controller→worker frames; stdout carries worker→controller frames; **stderr of the RPC process is reserved for human-readable diagnostics and is never parsed**.
 - Every frame has:
@@ -1924,7 +1943,7 @@ Additions in rev. B:
 
 ```text
 machine_id present in manifest (self-heal if missing)         [S-25]
-manifest not writable by the styrn account                    [4.5]
+manifest not writable by the resolved worker principal         [4.5]
 clock skew vs controller under 30s                            [2.5]
 manifest cache age / version drift                            [2.8.6]
 Windows: long paths enabled (registry + git core.longpaths)   [7.10]
@@ -2345,7 +2364,7 @@ Revision A required native-Windows correctness throughout but never specified ho
    - the program must be a real executable on `PATH` or an absolute path; `.bat`/`.cmd` files are **not supported** as workflow commands (they would require `cmd.exe` semantics and its unquotable metacharacters — a project needing one wraps it in a real executable or a PowerShell file invoked as `["pwsh", "-File", "script.ps1"]`);
    - no environment-variable expansion, globbing, or redirection happens in `command` on any OS — uniformity beats convenience.
 2. **`styrn exec` is the one shell-full path.** `styrn exec <host> -- <command...>` sends an argv array; the remote side executes it directly (no shell) by default, with `--shell` opting into the account's shell for humans who want pipes. Documented accordingly; agents get no exec at all (Part 13).
-3. **Process-tree termination** is the Job Object (`KILL_ON_JOB_CLOSE` + explicit `TerminateJobObject`), covering grandchildren; the known escape (a child that itself requests breakaway) requires a privilege the `styrn` account is not granted.
+3. **Process-tree termination** is the Job Object (`KILL_ON_JOB_CLOSE` + explicit `TerminateJobObject`), covering grandchildren; the known escape (a child that itself requests breakaway) requires a privilege Styrn does not grant to a dedicated worker identity. In current-user mode, setup/doctor report if the selected account already holds privileges that weaken this boundary.
 4. **Paths.** Variable expansion (Part 9.3) renders path-valued variables with native separators (`C:\Styrn\jobs\<id>\target` on Windows) before they reach environment variables, even though profile authors write `${job.root}/target` with forward slashes. Windows APIs largely accept forward slashes, but child tooling (MSVC, some build scripts) does not reliably, so Styrn normalizes.
 5. **Long paths.** Deep Cargo target trees can exceed the legacy 260-character `MAX_PATH`. Bootstrap must set `HKLM\SYSTEM\CurrentControlSet\Control\FileSystem\LongPathsEnabled = 1` and `git config --system core.longpaths true`; job roots stay short (`C:\Styrn\jobs\<uuid>`); doctor checks both (6.5).
 6. **Encoding.** The RPC and log pipeline is UTF-8 end to end; the supervisor sets the child's console code page expectations by env (`PYTHONUTF8`-style tricks are per-tool and out of scope) and stores raw bytes in log files, converting lossily only for `log` frames (5.4).
@@ -2475,7 +2494,7 @@ mode = "deploy-key"           # "push" (default) | "deploy-key"
 remote = "git@github.com:iob-dev/fricos.git"
 ```
 
-In `deploy-key` mode, a per-project, read-only deploy key is provisioned under the worker's `styrn` account (`~styrn/.ssh/deploy_<project>_ed25519` plus an SSH config alias), revocable at the forge independently of everything else. This is compatible with Part 4.2 as clarified there: project-scoped read-only ≠ personal credential. The default is decided in D-1: controller-push for every project unless that project explicitly opts into `deploy-key`.
+In `deploy-key` mode, a per-project, read-only deploy key is provisioned under the resolved worker profile (`.ssh/deploy_<project>_ed25519` plus an SSH config alias), revocable at the forge independently of everything else. This is compatible with Part 4.2 as clarified there: project-scoped read-only ≠ personal credential. The default is decided in D-1: controller-push for every project unless that project explicitly opts into `deploy-key`.
 
 ## 8.3 Agent job versus validation job (orig. §36)
 
@@ -2765,7 +2784,7 @@ Avoid compiling FriCOS-specific subcommands into Styrn. Alias lookup happens onl
 
 Consequence of Part 4.5, stated as policy:
 
-- **Default posture:** workflow commands are untrusted input executed as constrained jobs on workers. The safety property Styrn *does* guarantee is: "anything submitted through Styrn runs as the unprivileged `styrn` account, inside a disposable worktree, under admission, quota, and timeout enforcement, on a machine that holds no credentials." The vocabulary restriction ("only declared workflows") is an *ergonomic and review* aid, not a guarantee about what code runs.
+- **Default posture:** workflow commands are untrusted input executed as the selected worker identity, inside a disposable worktree, under admission, quota, and timeout enforcement. Dedicated mode additionally provides a credential-free OS identity; current-user mode does not and must not advertise that guarantee. The vocabulary restriction ("only declared workflows") is an *ergonomic and review* aid, not a guarantee about what code runs.
 - **Optional hardening (default off per D-5):**
 
 ```toml
@@ -4395,7 +4414,7 @@ ssh_exec(host, arbitrary_command)
 
 Keep arbitrary remote execution a **human/controller CLI capability**, not a default agent tool.
 
-**Reframing (rev. B; resolves S-06):** the narrow vocabulary is what a *cooperating* agent uses, and it is genuinely valuable — less context, fewer footguns, reviewable approvals. It is **not containment** of a hostile agent on a machine where the same user account can run `styrn`/`ssh` directly, and it does not survive `.styrn.toml` tampering (Part 4.5, 9.5). Both residual vectors terminate at the worker-side posture: unprivileged account, no credentials, quotas, timeouts. State the guarantee in those terms and no further.
+**Reframing (rev. B; amended rev. G; resolves S-06):** the narrow vocabulary is what a *cooperating* agent uses, and it is genuinely valuable — less context, fewer footguns, reviewable approvals. It is **not containment** of a hostile agent on a machine where the same user account can run `styrn`/`ssh` directly, and it does not survive `.styrn.toml` tampering (Part 4.5, 9.5). Both residual vectors terminate at the selected posture: admission, quotas, and timeouts in both modes, plus unprivileged credential-free account separation only in dedicated mode. State the guarantee in those terms and no further.
 
 ## 13.3 MCP profiles (orig. §83; tool names normalized per §0.4)
 
@@ -4973,8 +4992,8 @@ rdp = false                            # Windows only; optional GUI access (Part
 cockpit = false                        # Linux only; optional web admin (Part 3.4)
 
 [account]
-name = "styrn"                         # naming contract; see 15.7.5 for the macOS note
-mode = "dedicated"                     # "dedicated" | "current-user"  (15.8)
+mode = "current-user"                  # default; "current-user" | "dedicated"
+# name = "styrn"                       # dedicated mode only; suggested, never required
 
 [dirs]
 root = ""                              # empty = OS default (Part 4.1 layout)
@@ -5007,8 +5026,8 @@ Orig. §43's bootstrap profiles map onto role defaults plus `--install`:
 |---|---|
 | `core` | the baseline set every role gets: tailscale, ssh (server for workers, client check for controllers), git, styrn binary, dirs, manifest |
 | `developer` | `--install rust,sccache,herdr,codex,claude` (the dev-tool extras) |
-| `controller` | `--role controller` (adds config dir, lazy keypair per 4.3.1; no worker account, no styrnd) |
-| `worker` | `--role worker` (adds account, dir tree, styrnd, enrollment card) |
+| `controller` | `--role controller` (adds config dir and lazy keypair per 4.3.1; no worker runtime or styrnd) |
+| `worker` | `--role worker` (selects a worker identity, adds the dir tree, styrnd, and enrollment card) |
 | `both` | `--role both` |
 
 For the initial fleet, the rev. A guidance "use `developer + worker`" becomes: `styrn setup --role worker --install rust,sccache,herdr,codex,claude`.
@@ -5028,17 +5047,17 @@ Shared tail for all modes: print plan → confirm (skipped by `--yes`) → eleva
 Bare `styrn setup` on a fresh machine [judgment; adopted]:
 
 1. Probe everything (unprivileged, seconds), render current state.
-2. DesiredState from pure defaults: **role = `worker`** — a controller is a deliberate act; promote later with `styrn setup --role both`. Components = the worker baseline; dev-tool extras appear in the plan as `skipped (enable with --install rust,sccache,herdr,codex,claude)`.
+2. DesiredState from pure defaults: **role = `worker`, account mode = `current-user`** — a controller and a dedicated worker identity are deliberate acts; promote later with `styrn setup --role both` or harden with `--account dedicated[:<name>]`. Components = the worker baseline; dev-tool extras appear in the plan as `skipped (enable with --install rust,sccache,herdr,codex,claude)`.
 3. Print the plan with privilege badges and pending-human items.
 4. **Human decision 1:** one Enter to confirm (also authorizes the single sudo prompt on Unix).
 5. Apply. **Human decision 2:** the Tailscale browser login, when interactive (skipped entirely when `--auth-key`/`TS_AUTHKEY` is provided).
 6. Finish: manifest written, machine's Tailscale name/IP, the **enrollment card** (15.10), the copy-pasteable line to bootstrap the *next* machine, and any pending actions.
 
-That is **two human decisions** on interactive Linux/macOS; **zero** with `--yes --auth-key ...` (fully unattended); on Windows, plus one "re-run elevated" bounce when launched unelevated (15.5). No TTY and no `--yes` → print the plan, exit non-zero (exit 13, `setup.elevation_required` or `setup.confirmation_required` as applicable), hint `--yes`/`--auth-key`. Everything else — account name, dirs, shell, versions — is defaulted and overridable later. Defaults are how §0.6 is honored without hiding power.
+That is **two human decisions** on interactive Linux/macOS; **zero** with `--yes --auth-key ...` (fully unattended); on Windows, plus one "re-run elevated" bounce when launched unelevated (15.5). No TTY and no `--yes` → print the plan, exit non-zero (exit 13, `setup.elevation_required` or `setup.confirmation_required` as applicable), hint `--yes`/`--auth-key`. Identity, dirs, shell, and versions have working defaults and remain overridable. Selecting dedicated mode may add platform-specific account provisioning, which is why it is explicit.
 
 ### 15.4.2 `--interactive` wizard — `inquire`-style prompts, not a ratatui TUI (decided)
 
-Adopted [judgment; libraries well-established: S26, S27]: the wizard is a **prompt sequence** (`inquire` — or `dialoguer`; inquire preferred for richer built-in select/multiselect/validation), *not* a full-screen `ratatui` application. A ratatui wizard is the wrong weight: higher maintenance, worse over-SSH/dumb-terminal behavior, no accessibility win — and it would duplicate effort with the later `styrn watch` TUI (specified in Part 14.5), which is where ratatui genuinely belongs. The user's phrase "TUI based configuration" is satisfied by a terminal-interactive wizard; the reconciliation is explicit: **prompts for setup, ratatui for `watch`.** Prompts degrade gracefully when stdin is not a TTY (fail fast with a flag hint). Wizard scope, five questions maximum: role → components (multiselect with sensible pre-checks) → account name (default `styrn`) → Tailscale auth method → confirm.
+Adopted [judgment; libraries well-established: S26, S27]: the wizard is a **prompt sequence** (`inquire` — or `dialoguer`; inquire preferred for richer built-in select/multiselect/validation), *not* a full-screen `ratatui` application. A ratatui wizard is the wrong weight: higher maintenance, worse over-SSH/dumb-terminal behavior, no accessibility win — and it would duplicate effort with the later `styrn watch` TUI (specified in Part 14.5), which is where ratatui genuinely belongs. The user's phrase "TUI based configuration" is satisfied by a terminal-interactive wizard; the reconciliation is explicit: **prompts for setup, ratatui for `watch`.** Prompts degrade gracefully when stdin is not a TTY (fail fast with a flag hint). Wizard scope, five questions maximum: role → components (multiselect with sensible pre-checks) → identity mode (current user preselected; ask for a name only if dedicated) → Tailscale auth method → confirm.
 
 ### 15.4.3 Superseded UX (orig. §46, §113 — recorded, not silently dropped)
 
@@ -5053,7 +5072,7 @@ tailscale     + install 1.86.2 (msi, 28 MB, pkgs.tailscale.com)      [admin]
               ~ set unattended mode: always                          [admin]
               ! authenticate: browser login (or pass --auth-key)
 sshd          ✓ installed, running, key auth ok — nothing to do
-account styrn + create unprivileged service account                  [admin]
+identity      ✓ current user alex (dedicated isolation disabled)
 rust          . skipped (enable with --install rust)
 ```
 
@@ -5098,7 +5117,7 @@ Partial failure is the norm: network blips, a locked MSI, a missing FDA grant. R
 - **Service:** `Start-Service sshd; Set-Service -Name sshd -StartupType 'Automatic'`.
 - **Firewall:** verify rule `OpenSSH-Server-In-TCP`; create if absent (`New-NetFirewallRule ... -LocalPort 22`).
 - **Config:** `%programdata%\ssh\sshd_config`; sshd regenerates a default if missing; restart the service after edits. `StrictModes`, `AuthorizedKeysCommand`, `PermitRootLogin` and others are NOT supported in the inbox build [verified: S3] — setup must not write unsupported directives.
-- **The ACL trap:** for users in the Administrators group, keys are read from `%programdata%\ssh\administrators_authorized_keys` (not `~/.ssh/authorized_keys`), and that file must carry ONLY SYSTEM and Administrators ACEs or key auth *silently fails* [verified: S3]. **Because the `styrn` account is unprivileged, it uses the normal per-user `C:\Users\styrn\.ssh\authorized_keys`** — a strong extra reason (on top of Part 4.1) to keep the service account out of Administrators. Setup still writes the per-user file with tight ACLs (owner + SYSTEM); the exact required ACEs for non-admin users are [well-established in outline; implementer confirm empirically] and the conformance test (16.6 item 8) exercises a real key login.
+- **The ACL trap:** for a selected identity in the Administrators group, keys are read from `%programdata%\ssh\administrators_authorized_keys` (not its profile's `.ssh\authorized_keys`), and that file must carry ONLY SYSTEM and Administrators ACEs or key auth *silently fails* [verified: S3]. A non-admin identity uses its resolved profile's `.ssh\authorized_keys` with tight owner + SYSTEM ACLs. Setup probes group membership and selects the correct path; it never infers the path from an assumed username. The conformance test (16.6 item 8) exercises both branches with real key login.
 - **DefaultShell (decided):** registry `HKLM:\SOFTWARE\OpenSSH`, string value `DefaultShell`; initial default is `cmd.exe` [verified: S3]. Setup sets it to PowerShell (`pwsh.exe` when present, else Windows PowerShell) via `New-ItemProperty ... -Force`. Rationale: every string that *does* traverse the login shell — `styrn shell`, the Herdr attach command (11.13), and git's `git-receive-pack '<path>'` invocation during controller-push (8.2) — gets one known set of quoting semantics instead of cmd.exe's. This does not change Part 7.10's convention: workflow commands and `styrn exec` never use the login shell at all; the fixed `styrn rpc serve --stdio` literal is quote-safe under any of the three shells (5.1). **Git-push interop through the chosen default shell is exercised by `styrn fleet selftest` (16.6 item 6), which pushes on every run — treat any residual quoting interaction between OpenSSH-Windows, the shell, and `git-receive-pack` as implementer-confirm rather than assumed.**
 
 ### 15.7.2 Tailscale, per OS
@@ -5126,18 +5145,20 @@ The design degrades gracefully if item 2 is dead on current macOS: the chain sim
 | OS | Mechanism | Privilege |
 |---|---|---|
 | Linux | write `/etc/systemd/system/styrnd.service`; `systemctl daemon-reload && systemctl enable --now styrnd` | root [well-established: S28] |
-| macOS | write `/Library/LaunchDaemons/dev.styrn.styrnd.plist`; `launchctl bootstrap system <plist>` (legacy: `load -w`). LaunchDaemons run at boot (with a `UserName` key for the styrn account) and survive logout; LaunchAgents are per-login-session — a daemon is required | root [well-established: S29] |
-| Windows | real SCM service (binary implements service entry points via the `windows-service` crate [well-established: S30]); scheduled tasks rejected for the primary path (second-class: no SCM recovery/restart policies, and running one *as* `styrn` needs stored credentials) | Administrator |
+| macOS | write `/Library/LaunchDaemons/dev.styrn.styrnd.plist`; `launchctl bootstrap system <plist>` (legacy: `load -w`). LaunchDaemons run at boot with `UserName` set to the resolved worker principal and survive logout; LaunchAgents are per-login-session — a daemon is required | root [well-established: S29] |
+| Windows | real SCM service (binary implements service entry points via the `windows-service` crate [well-established: S30]) in dedicated mode; current-user mode does not capture or persist the user's password and therefore uses the documented service-less degraded path unless the operator later opts into dedicated mode | Administrator |
 
 **Normative content is the unit/plist/service definitions themselves** — they are files, written directly by Styrn and recorded in the receipt. The `service-manager` crate (v0.10; wraps sc.exe/launchd/systemd/OpenRC with install/uninstall/start/stop [verified: S17]) may be *evaluated* as an implementation backend, but its fitness is **[unverified — API verified from README only; prototype before committing]**; worst case Styrn vendors its own three small templates, which also keeps them receipt-visible [judgment].
 
-**Herdr autostart carried forward:** the rev. B Linux mechanism — a systemd *user* service (`styrn-herdr.service`, `Environment=HERDR_SESSION=fleet`, `ExecStart=<herdr> server`) plus `loginctl enable-linger styrn` — is retained as the `herdr` component's Linux autostart action (`[herdr] autostart = "systemd-user"`); macOS/Windows remain `on-demand`/`on-demand-ssh` as in Part 2.4.
+**Herdr autostart carried forward:** the rev. B Linux mechanism — a systemd *user* service (`styrn-herdr.service`, `Environment=HERDR_SESSION=fleet`, `ExecStart=<herdr> server`) plus `loginctl enable-linger <worker-principal>` — is retained as the `herdr` component's Linux autostart action (`[herdr] autostart = "systemd-user"`); macOS/Windows remain `on-demand`/`on-demand-ssh` as in Part 2.4.
 
-### 15.7.5 The unprivileged `styrn` account, per OS
+### 15.7.5 Worker identity modes, per OS (amended rev. G)
 
-- **Linux:** ordinary local user with a real shell and home — `useradd --create-home --shell /bin/bash styrn` — because workers execute jobs and Herdr sessions over SSH (not `nologin`). The brief's `--system`-account variant [S31] is **deliberately not adopted**: system-UID accounts with interactive SSH logins and lingering user services fight distro conventions for no gain here [judgment]. Reverse: `userdel -r styrn`.
-- **macOS:** there is no supported one-shot CLI for hidden role accounts. The community-standard `dscl` sequence (create user, `UniqueID` in a free range, `PrimaryGroupID`, `UserShell`, `NFSHomeDirectory`, `IsHidden 1`, `createhomedir`) is **community-sourced and [unverified end-to-end]** [S18]; `sysadminctl -addUser` with a `-roleAccount` flag (UID 200–400, `_`-prefixed) is likewise **[unverified — check `sysadminctl -h` on the target macOS]**. **Naming-contract decision [judgment]:** the account is named `styrn`, not `_styrn` — the naming contract (§0.3) is binding ("Service user styrn"), so the default is a plain **hidden standard user** `styrn` (`IsHidden 1`); the `_`-prefixed role-account variant would require both successful prototyping *and* a naming-contract amendment, and is recorded only as a possible future refinement. SSH-login and TCC behaviors of whichever variant ships must be tested end-to-end (rev. B's S-27 Secure-Token/FDA caveats fold in here).
-- **Windows:** create with `New-LocalUser` (inbox Microsoft.PowerShell.LocalAccounts / the equivalent Win32 APIs from Rust) with `-PasswordNeverExpires`, member of **no privileged groups** [well-established: S32]. **The password is never persisted by Styrn's own hand — with one OS-mediated exception, stated plainly** (rev. E; review D §4.2): generate 32+ cryptographically random bytes in memory, set, use transiently within the same setup run (15.8), zeroize, discard — never written to receipt, config, console, or script output, enforced structurally by the `Secret<T>` parameter type (15.11.2). The exception: registering the styrnd SCM service (15.9) hands the credential to Windows, which stores it in LSA as it does for every service account. LSA secrets are Administrator-extractable — acceptable within the 4.5 threat model (a hostile job runs as `styrn`, not Administrator), but it is a real persistence and any "goes nowhere" phrasing would over-claim. The account is otherwise used only via SSH public-key auth; rotation = generate-and-set a new one (`styrn setup --rotate-account`, which also refreshes that service credential). Alternatives assessed: virtual service accounts (`NT SERVICE\<name>`, passwordless) are ideal for pure service-execution identity [verified: S19] but cannot accept SSH logins as a normal user, so the SSH-facing account remains a real local user; gMSA requires Active Directory — inapplicable to standalone dev boxes [verified: S20].
+**Current-user mode (default):** resolve the invoking non-elevated OS principal once, record its stable platform identifier plus display name, and reuse it after elevation. Setup neither creates an account nor changes ownership anywhere outside Styrn-owned paths. Per-user tools, SSH keys, PATH changes, and job processes use that principal's existing profile. If setup was launched through elevation, the elevated identity must not accidentally replace the original worker identity. A Unix root launch with no trustworthy original caller and a Windows elevated launch with no recoverable unelevated token refuse current-user mode with `NeedsHuman`; Styrn never runs jobs as root/SYSTEM merely because setup began there.
+
+**Dedicated mode (optional):** create or adopt the configured, non-administrator local account. The suggested name is `styrn`, but no platform adapter or test may assume it. Linux uses an ordinary local user with a real shell and home because workers accept SSH and may run lingering user services. macOS uses the validated native account mechanism selected by T0.14; its account-creation path remains an honest native gate until proven end to end. Windows uses native local-account APIs, generates a 32+-byte password in memory, and keeps the transient-logon and SCM behavior in 15.8. Re-running must adopt the exact configured principal without recursively taking ownership of pre-existing files.
+
+In either mode, the worker principal is a typed value validated before native calls. Names containing NULs, separators, ambiguous domain syntax, or platform-invalid forms are rejected. Security-sensitive records prefer stable uid/SID identity and retain the display name for diagnostics. Deleting or renaming a configured OS account is drift, not a reason to silently switch users.
 
 ### 15.7.6 Package substrates and component channels
 
@@ -5162,33 +5183,30 @@ The design degrades gracefully if item 2 is dead on current macOS: the chain sim
 - **cockpit** (Linux only, default off; the orig. §47 mechanics as an Action): `apt-get install -y cockpit` + `systemctl enable --now cockpit.socket` `[sudo]`; updates `[admin]` in the manifest (Part 2.7) and reminds about the optional tailnet grant (Part 3.1).
 - **sleep-policy** (workers, default on; rev. E — resolves S-38, review D §6.2): a machine that accepts jobs must not suspend while unattended. Windows: `powercfg /change standby-timeout-ac 0` plus lid-close-on-AC action "do nothing" `[admin]`; Linux: mask `sleep.target suspend.target hibernate.target hybrid-sleep.target` `[sudo]`; macOS: `pmset -c sleep 0` [well-established in outline; exact per-OS incantations implementer-confirm]. Laptop workers (win-hp, mbp-main) are exactly why this exists: "heavy Windows validation" otherwise silently depends on an unstated the-lid-is-open assumption. Remote *wake* stays out of scope (power providers, 3.5/D-4, are recovery, not wake); doctor warns when a manifest says `accept_jobs = true` but the OS sleep policy would suspend the machine.
 
-**PATH strategy [judgment; adopted]:** silently editing rc files across bash/zsh/fish/PowerShell is the classic tarpit (rustup maintains env files; starship instead has the user add one line [verified: S23]). Styrn uses one bin dir (`~styrn/.local/bin`; `C:\Users\styrn\.local\bin`), adds it to PATH **for the styrn account only** (its own shell profile + the styrn user's Windows registry PATH), and provides `styrn env` printing shell-appropriate export lines for humans who want the tools on their own accounts.
+**PATH strategy [judgment; adopted]:** silently editing rc files across bash/zsh/fish/PowerShell is the classic tarpit (rustup maintains env files; starship instead has the user add one line [verified: S23]). Styrn uses `.local/bin` under the resolved worker profile, changes PATH only for that identity, and provides `styrn env` printing shell-appropriate export lines for other users.
 
 ### 15.7.7 Install ordering (absorbs orig. §111)
 
 Orig. §111's ordering rule — integrations only after the tools and their user config dirs exist — becomes a **dependency edge in the plan**, not documentation: `integrate-herdr-codex` depends on `herdr` and `codex` actions (and on the user-phase context on Windows, 15.8); `integrate-claude` likewise; the Styrn Herdr plugin and MCP registrations depend on their hosts. The planner orders by dependencies; a failed prerequisite skips its dependents with an explicit `skipped: dependency failed` plan-result line. The orig. §111 sequence (install Herdr → Codex → Claude → init config dirs → Herdr integrations → Styrn plugin → MCP registrations → integration doctor) is exactly the topological order the graph produces.
 
-## 15.8 Windows account strategy: hardened mode is now the default (resolves D-3; absorbs orig. §112)
+## 15.8 Windows worker identity strategy (D-3 superseded by rev. G; absorbs orig. §112)
 
-Orig. §112's diagnosis stands: Herdr, Codex, and native Claude installers are **per-user** on Windows, so an elevated bootstrap that installs them from the admin context configures the wrong profile, and rev. B/C could only choose between an honest "simple mode" (current user = worker identity) and an unimplemented hardened mode. **D-3 deferred that choice to this pass. It is now decided: hardened mode — the dedicated `styrn` account — is the Windows default,** because the Rust engine dissolves the two obstacles that made it expensive:
+Orig. §112's diagnosis stands: Herdr, Codex, and native Claude installers are per-user, so an elevated phase must never install them into the elevating administrator's profile by accident.
 
-1. **The credential moment.** Setup generates the account password in memory (15.7.5) and — *within the same run, before discarding it* — uses it to execute the user phase as `styrn` via a transient logon (`CreateProcessWithLogonW` with profile loading, the `runas` mechanism) [account/logon mechanics well-established; **implementer confirm profile materialization behavior end-to-end**]. No prompt, no stored credential, no scheduled-task registration. This simultaneously fixes rev. B's profile-directory-before-first-logon defect (S-10): the transient logon *creates* the profile before anything writes into `C:\Users\styrn`.
-2. **The user phase.** The transient process is simply `styrn setup user-phase` (internal plumbing subcommand): it installs the per-user tools (Herdr, Codex, Claude, rustup), writes `~\.ssh\authorized_keys` with correct ACLs (15.7.1), writes the Codex/Claude per-user config (the rev. A settings keys remain flagged unverified per Part 12.3), and runs the integration actions (15.7.7) — all as the right user, journaled into the same receipt.
+**Current-user mode is the default.** Setup captures the original invoking principal before any Administrator re-execution. The unprivileged user phase runs before elevation or through the typed resume channel under that same principal; the privileged phase performs only machine-wide actions. No account or password is created, requested, logged, or persisted. If Windows cannot return to the captured principal safely, setup records `NeedsHuman` with a user-phase command instead of writing into a different profile.
 
-**Friction check (§0.6):** hardened-by-default costs *zero additional human decisions* versus simple mode — the password ceremony is invisible — and yields the credential separation Part 4.5 wants. That is why the default flips: rev. C's simple-mode-first sequencing was a judgment about a broken shell script, not about the design, and it is superseded.
+**Dedicated mode remains the hardened option.** Setup creates or adopts the configured non-administrator principal and generates a password in memory. Within that run it uses `CreateProcessWithLogonW` with profile loading to materialize and execute `styrn setup user-phase` under the selected identity. The password is zeroized after the user phase and, when `styrnd` is enabled, after handing the service credential to SCM; that OS-held LSA persistence remains disclosed. No argument, output, config, receipt, manifest, or Styrn-owned file contains it.
 
-**Simple mode survives** as `[account] mode = "current-user"` / `--account current-user`: the current Windows user is the worker identity — appropriate for a box like `win-hp` if it doubles as an interactive dev machine under the same identity, with Part 4.5's credential-separation caveat recorded in the manifest.
-
-**Fallback (refusal over degradation, mirroring 12.9.1):** if the transient-logon user phase fails (local security policy, EDR interference), setup does not fake it from the admin context (the original sin of `bootstrap-windows.ps1`). It records `NeedsHuman` with an emitted user-phase script fragment (15.11) to be run once as `styrn`, and doctor nags until the user-phase probes pass.
+The user phase installs per-user tools, writes the selected profile's SSH and harness configuration, and journals through the shared receipt session. All paths derive from the resolved profile; neither `C:\Users\styrn` nor any other literal profile is assumed. Transient-logon failure produces a `NeedsHuman` fragment naming the configured account and doctor continues to report the incomplete probes.
 
 ## 15.9 `styrnd`: the worker service (resolves S-34; reconciles orig. §58/Part 6.8 with orig. §63)
 
 **The gap:** Part 6.8 (orig. §58) specifies daily and weekly maintenance but never says what *runs* it; workers are headless, controllers are closable, and orig. §63 rejects a central daemon. Separately, 7.8 needed a concrete home for the Windows supervisor-spawn fallback ("a pre-created scheduled task" was a placeholder). One small local service answers both.
 
-**`styrnd`** — installed by `styrn setup` on workers (component `styrnd`, default on for `--role worker`/`both`, absent for pure controllers), running **as the unprivileged `styrn` account** on all three OSes (mechanics: 15.7.4; on Windows the SCM service credential is set from the in-memory password during setup and stored by Windows in LSA — an OS-held persistence acknowledged explicitly in 15.7.5 (rev. E); `--rotate-account` refreshes both) [service-credential trade-off: judgment; alternatives — SYSTEM + S4U token acquisition — assessed as over-engineering for a personal fleet, virtual accounts rejected because they cannot own the styrn file tree without ACL surgery]. It executes `styrn daemon run` and does exactly two jobs:
+**`styrnd`** — installed by `styrn setup` on workers and running as the resolved worker principal (mechanics: 15.7.4). It is default-on on Unix in either identity mode and on Windows dedicated mode. Windows current-user mode defaults it off because Styrn will not capture or persist the user's login password merely to register an SCM service; maintenance then uses the already-specified opportunistic path and supervisor spawning uses the direct-breakaway path. Setup and doctor disclose that degraded mode, and opting into a configured dedicated identity enables the service. It executes `styrn daemon run` and does exactly two jobs:
 
 1. **Maintenance executor (all OSes):** an internal tick runs Part 6.8's daily and weekly task lists (`styrn clean run --local`, cache trim, log rotation, disk-floor check, git maintenance, health snapshots) under the same registry lock as admission (6.8's locus rule, unchanged), journaling each run to the worker audit log (14.3).
-2. **Spawn broker (Windows only):** a local named pipe `\\.\pipe\styrnd`, ACL'd to the `styrn` account and SYSTEM, over which the RPC process (running under sshd) requests supervisor spawns when `CREATE_BREAKAWAY_FROM_JOB` is denied in its context (7.8). The broker — outside any sshd Job Object by construction — spawns `styrn job supervise <id>` detached and returns the pid. On Linux/macOS, double-fork/setsid needs no broker and styrnd plays no part in job execution.
+2. **Spawn broker (Windows only):** a local named pipe `\\.\pipe\styrnd`, ACL'd to the resolved worker SID and SYSTEM, over which the RPC process (running under sshd) requests supervisor spawns when `CREATE_BREAKAWAY_FROM_JOB` is denied in its context (7.8). The broker — outside any sshd Job Object by construction — spawns `styrn job supervise <id>` detached and returns the pid. On Linux/macOS, double-fork/setsid needs no broker and styrnd plays no part in job execution.
 
 **Reconciliation with orig. §63 (explicit, so the contradiction is only apparent):** §63 rejected a *central* server — a coordination point whose availability the fleet depends on, with TLS, a database, and upgrade coupling. `styrnd` is none of those: per-worker, local-only, **no listening network socket** (the Windows pipe is local IPC restricted to one account), no shared state, no cross-machine protocol, and no fleet-availability dependency — if styrnd is stopped, maintenance degrades to opportunistic execution (a due maintenance tick is also checked and run, briefly, at job admission and by `doctor`), and Windows spawn falls back to the direct breakaway attempt. It is also consistent with Part 1.4's "no privileged worker daemon": styrnd is unprivileged. §63's "design the protocol so it can be proxied later, but do not build it now" is untouched — styrnd speaks no protocol.
 
@@ -5987,7 +6005,7 @@ Every issue cites the original section(s) it derives from; resolutions name the 
 **S-06 · blocker · orig. §26, §81–§87, §93**
 **Problem:** two implied security properties do not hold: (a) workflow commands come from `.styrn.toml` in the repo the agent edits, so "agents can only run declared workflows" is defeated by editing the profile on the agent's own branch; (b) MCP tool narrowing does not contain an agent that has shell access on a machine holding controller credentials — it can invoke `styrn`/`ssh` directly.
 **Impact:** the design's security story overstated what it delivers; readers would provision credentials and trust boundaries based on false assumptions.
-**Resolution:** honest boundary model (Part 4.5): jobs are untrusted code as the credential-free `styrn` account; MCP is least-privilege ergonomics; server-side profile ceiling (`max_profile`) so client config cannot widen; optional controller-side profile pinning/allowlist (Part 9.5, default off per D-5); manifest made root-owned/read-only to the worker account. Parts 4.5, 9.5, 13.2, 13.3.
+**Resolution:** honest boundary model (Part 4.5): jobs are untrusted code as the resolved worker identity; dedicated mode can be credential-free while current-user mode explicitly cannot promise account separation; MCP is least-privilege ergonomics; server-side profile ceiling (`max_profile`) so client config cannot widen; optional controller-side profile pinning/allowlist (Part 9.5, default off per D-5); manifest made root-owned/read-only to the selected principal. Parts 4.5, 9.5, 13.2, 13.3.
 
 **S-07 · major · orig. §27, §28, §32**
 **Problem:** the admission formula conflates intra-job parallelism with job-count admission; `available_memory` is a point sample, so concurrent admissions (or admitted-but-not-yet-allocating jobs) double-count the same free memory; linker/sccache peak spikes exceed the per-job constant; no accounting of already-committed budgets.
@@ -6168,10 +6186,10 @@ Every question revision B left open is now decided. D-n preserves the former OQ-
 *Rationale:* §0.6 — day-one interchangeability ceremony buys little when promoting any machine to a working controller is one `styrn host enroll` per worker plus key authorization. Safety is by construction; convenience is on demand.
 *Reversal:* adopt the 6.7 fleet-config repo whenever wanted; no design change.
 
-**D-3 (was OQ-3) — Windows hardened service-account mode: DECIDED (rev. D) — hardened is the default.**
-*Decision:* `styrn setup` on Windows creates and provisions the dedicated `styrn` account by default (Part 15.8); the current-user identity survives as `--account current-user`.
-*Rationale:* the deferral existed because the shell-script era made hardened mode a broken pretense (S-10). The Rust engine removes its cost entirely — the generated password is used transiently in-memory for the profile-materializing user phase, so hardened-by-default adds **zero** human decisions (§0.6) while delivering Part 4.5's credential separation. When correctness and friction stop trading off, the safer default wins.
-*Reversal:* pass `--account current-user` (or set `[account] mode` in setup-config) per machine.
+**D-3 (was OQ-3) — Windows worker identity: REVISED (rev. G) — current-user is the default.**
+*Decision:* `styrn setup` defaults to the invoking non-elevated identity and creates no account. `--account dedicated[:<name>]` opts into the transient-logon hardened path from Part 15.8; `styrn` is only its suggested name.
+*Rationale:* requiring a dedicated account is setup friction and is not necessary for Styrn's core job, transport, receipt, or admission behavior. The optional path remains valuable when the operator wants Part 4.5's OS-account separation. Current-user mode discloses that it has the user's ambient access rather than pretending otherwise.
+*Reversal:* select dedicated mode per machine; no other subsystem changes because all consume the resolved `WorkerPrincipal`.
 
 **D-4 (was OQ-4) — Power control: local-API hardware; credentials in a 0600 file.**
 *Decision:* select power hardware by criterion, not brand: any smart plug or PDU controllable via a **local-network API with no cloud round-trip** (Tasmota-class firmware or a lab PDU with a local REST endpoint are the archetypes). Configuration and credentials live in a controller-only file — `~/.config/styrn/power.toml`, mode 0600 (`%APPDATA%\Styrn\power.toml` on Windows) — one `[[power]]` entry per worker:
