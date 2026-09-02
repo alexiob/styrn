@@ -7,8 +7,9 @@
 #   macOS    /Library/Application Support/Styrn/machine.toml
 #
 # This file MUST NOT contain private SSH keys, API keys, Tailscale auth keys,
-# agent tokens, or passwords (Part 2.4, 4.2). It is root-owned and read-only to
-# the `styrn` worker account so a job cannot rewrite its own policy (Part 4.5).
+# agent tokens, or passwords (Part 2.4, 4.2). It is Administrator-owned and
+# read-only to the resolved worker principal so a job cannot rewrite policy
+# (Part 4.5). This example happens to use opt-in dedicated identity `styrn`.
 
 schema_version = 1
 machine_id = "01991f5d-d72f-7b5e-a43d-9fcb61bd3265"   # UUIDv7, minted once (2.4.1)
@@ -26,7 +27,7 @@ headless = true
 kind = "ssh"
 host = "win-mini"          # Tailscale MagicDNS name, not a mutable LAN IP (3.1)
 port = 22
-user = "styrn"
+user = "styrn"             # selected dedicated identity in this example
 
 [paths]
 root = "C:\\Styrn"
