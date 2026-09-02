@@ -566,7 +566,7 @@ fn held_verified_reader_observes_one_complete_prefix_and_does_not_block_replacem
     let mut reader = crate::platform::open_verified_manifest_file_for_read(
         fixture.receipt_path(),
         crate::platform::ManifestOwner::CurrentProcess,
-        "fixture-worker",
+        &fixture_worker_principal(),
         fixture.receipt_path().parent().unwrap(),
     )
     .unwrap();
@@ -737,6 +737,10 @@ fn recorded_windows_paths_reject_ads_embedded_drives_and_device_namespaces() {
         r"\\.\PIPE\styrn",
         r"C:\safe\file.",
         "C:\\safe\\file ",
+        r"C:\safe\bad?name",
+        r#"C:\safe\bad"name"#,
+        r"C:\safe\COM¹.txt",
+        r"C:\safe\LPT³",
     ] {
         assert!(!is_normalized_windows_path(path), "accepted {path:?}");
     }
@@ -875,23 +879,46 @@ fn canonical_receipt_location_matches_the_native_platform_contract() {
 
 #[test]
 fn canonical_store_requires_an_explicit_valid_worker_principal() {
-    for principal in ["", "worker\0name", "worker\nname"] {
-        assert!(matches!(
-            ReceiptStore::new_system(
-                canonical_receipt_path(InstallationScope::System).unwrap(),
-                principal
-            ),
-            Err(ReceiptStoreError::InvalidWorkerPrincipal)
-        ));
+    for name in ["", "worker\0name", "worker\nname"] {
+        assert!(crate::platform::WorkerPrincipal::new(
+            crate::platform::PrincipalKind::UnixUid,
+            "501",
+            name,
+        )
+        .is_err());
     }
 
-    let store = configured_system_receipt_store("build-agent").unwrap();
-    assert_eq!(store.worker.as_ref().unwrap().as_str(), "build-agent");
+    let principal = fixture_worker_principal();
+    let store = configured_system_receipt_store(principal.clone()).unwrap();
+    assert_eq!(store.worker, principal);
     assert_eq!(store.scope, InstallationScope::System);
 
     let user = configured_receipt_store().unwrap();
-    assert!(user.worker.is_none());
+    assert_eq!(user.worker, fixture_worker_principal());
     assert_eq!(user.scope, InstallationScope::User);
+}
+
+#[test]
+fn user_store_rejects_a_different_principal_before_filesystem_mutation() {
+    let fixture = MissingDestinationFixture::new("different-user-principal");
+    let current = fixture_worker_principal();
+    let different_name = if current.name() == "mismatched-native-name" {
+        "another-mismatched-native-name"
+    } else {
+        "mismatched-native-name"
+    };
+    let different = crate::platform::WorkerPrincipal::new(
+        current.principal_kind(),
+        current.principal_id(),
+        different_name,
+    )
+    .unwrap();
+
+    let error = ReceiptStore::new_user(fixture.receipt_path(), different).unwrap_err();
+
+    assert!(matches!(error, ReceiptStoreError::InvalidPrincipal(_)));
+    assert!(!fixture.receipt_path().parent().unwrap().exists());
+    assert_eq!(fs::read_dir(&fixture.root).unwrap().count(), 0);
 }
 
 #[test]
@@ -1042,7 +1069,7 @@ fn selected_store_scope_rejects_a_document_from_the_other_scope_without_rewrite(
     crate::platform::harden_manifest_directory(
         fixture.receipt_path().parent().unwrap(),
         crate::platform::ManifestOwner::User,
-        "",
+        &fixture_worker_principal(),
     )
     .unwrap();
     let bytes = COMPLETE_RECEIPT.as_bytes();
@@ -1050,7 +1077,7 @@ fn selected_store_scope_rejects_a_document_from_the_other_scope_without_rewrite(
     crate::platform::harden_manifest_file(
         fixture.receipt_path(),
         crate::platform::ManifestOwner::User,
-        "",
+        &fixture_worker_principal(),
     )
     .unwrap();
     let lock = fixture
@@ -1059,7 +1086,12 @@ fn selected_store_scope_rejects_a_document_from_the_other_scope_without_rewrite(
         .unwrap()
         .join(".receipt.json.lock");
     drop(
-        crate::platform::create_private_file(&lock, crate::platform::ManifestOwner::User).unwrap(),
+        crate::platform::create_private_file(
+            &lock,
+            crate::platform::ManifestOwner::User,
+            &fixture_worker_principal(),
+        )
+        .unwrap(),
     );
     let store = ReceiptStore::new_user_for_test(fixture.receipt_path());
 
@@ -1246,7 +1278,8 @@ fn real_selected_worker_can_read_but_cannot_mutate_replace_or_take_over_receipt(
         "/Library/Application Support/Styrn Receipt Test {nonce}"
     ));
     let receipt = directory.join("receipt.json");
-    let store = ReceiptStore::new_system(&receipt, &worker).unwrap();
+    let principal = crate::platform::resolve_named_worker_principal(&worker).unwrap();
+    let store = ReceiptStore::new_system(&receipt, principal.clone()).unwrap();
     store
         .append_entry(entry_with_id("019cafd0-5c00-7000-8000-000000000001"))
         .unwrap();
@@ -1263,6 +1296,7 @@ fn real_selected_worker_can_read_but_cannot_mutate_replace_or_take_over_receipt(
         crate::platform::create_private_file(
             &private_intent,
             crate::platform::ManifestOwner::System,
+            &principal,
         )
         .unwrap(),
     );

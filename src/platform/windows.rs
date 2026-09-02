@@ -3,7 +3,7 @@ pub(crate) fn platform_name() -> &'static str {
     "windows"
 }
 
-use super::{ManifestOwner, PrivateFileIdentity};
+use super::{ManifestOwner, PrincipalKind, PrivateFileIdentity, WorkerPrincipal};
 use std::ffi::c_void;
 use std::io;
 use std::os::windows::ffi::OsStrExt;
@@ -17,6 +17,7 @@ const SE_FILE_OBJECT: u32 = 1;
 const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
 const TOKEN_QUERY: u32 = 0x0008;
 const TOKEN_USER_CLASS: u32 = 1;
+const SID_TYPE_USER: i32 = 1;
 const WIN_LOCAL_SYSTEM_SID: i32 = 22;
 const WIN_BUILTIN_ADMINISTRATORS_SID: i32 = 26;
 const FILE_READ: u32 = 0x0012_0089;
@@ -169,6 +170,16 @@ unsafe extern "system" {
         sid_name_use: *mut i32,
     ) -> i32;
     fn ConvertSidToStringSidW(sid: *const c_void, string_sid: *mut *mut u16) -> i32;
+    fn ConvertStringSidToSidW(string_sid: *const u16, sid: *mut *mut c_void) -> i32;
+    fn LookupAccountSidW(
+        system_name: *const u16,
+        sid: *const c_void,
+        name: *mut u16,
+        name_size: *mut u32,
+        domain: *mut u16,
+        domain_size: *mut u32,
+        sid_name_use: *mut i32,
+    ) -> i32;
     fn GetNamedSecurityInfoW(
         object_name: *mut u16,
         object_type: u32,
@@ -227,6 +238,115 @@ unsafe extern "system" {
     fn RevertToSelf() -> i32;
 }
 
+pub(super) fn resolve_current_worker_principal() -> io::Result<WorkerPrincipal> {
+    let sid = current_user_sid()?;
+    principal_for_sid(&sid)
+}
+
+#[allow(dead_code)] // Explicit system-account selection is exercised by environmental gates.
+pub(super) fn resolve_named_worker_principal(name: &str) -> io::Result<WorkerPrincipal> {
+    // This is an explicit setup/test selection, never an authorization lookup.
+    let sid = lookup_account_sid(name)?;
+    let principal = principal_for_sid(&sid)?;
+    if principal.name() != name {
+        return Err(permission_denied(
+            "worker account name does not match its native SID",
+        ));
+    }
+    Ok(principal)
+}
+
+pub(super) fn verify_worker_principal(principal: &WorkerPrincipal) -> io::Result<()> {
+    if principal.principal_kind() != PrincipalKind::WindowsSid {
+        return Err(invalid_data("worker principal kind does not match Windows"));
+    }
+    let sid = principal_sid(principal)?;
+    let current = principal_for_sid(&sid)?;
+    if &current != principal {
+        return Err(permission_denied("worker SID/name identity drift detected"));
+    }
+    Ok(())
+}
+
+fn principal_for_sid(sid: &[u8]) -> io::Result<WorkerPrincipal> {
+    let id = sid_to_string(sid.as_ptr().cast())?;
+    let name = account_name_for_sid(sid)?;
+    WorkerPrincipal::new(PrincipalKind::WindowsSid, id, name)
+}
+
+fn principal_sid(principal: &WorkerPrincipal) -> io::Result<Vec<u8>> {
+    if principal.principal_kind() != PrincipalKind::WindowsSid {
+        return Err(invalid_data("worker principal kind does not match Windows"));
+    }
+    let input = wide(principal.principal_id());
+    let mut sid = std::ptr::null_mut();
+    if unsafe { ConvertStringSidToSidW(input.as_ptr(), &mut sid) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let sid = LocalAllocation(sid);
+    let length = unsafe { GetLengthSid(sid.0) };
+    if length == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut result = vec![0_u8; length as usize];
+    if unsafe { CopySid(length, result.as_mut_ptr().cast(), sid.0) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(result)
+}
+
+fn account_name_for_sid(sid: &[u8]) -> io::Result<String> {
+    let mut name_size = 0;
+    let mut domain_size = 0;
+    let mut sid_use = 0;
+    unsafe {
+        LookupAccountSidW(
+            std::ptr::null(),
+            sid.as_ptr().cast(),
+            std::ptr::null_mut(),
+            &mut name_size,
+            std::ptr::null_mut(),
+            &mut domain_size,
+            &mut sid_use,
+        );
+    }
+    if io::Error::last_os_error().raw_os_error() != Some(ERROR_INSUFFICIENT_BUFFER as i32) {
+        return Err(io::Error::last_os_error());
+    }
+    let mut name = vec![0_u16; name_size as usize];
+    let mut domain = vec![0_u16; domain_size as usize];
+    if unsafe {
+        LookupAccountSidW(
+            std::ptr::null(),
+            sid.as_ptr().cast(),
+            name.as_mut_ptr(),
+            &mut name_size,
+            domain.as_mut_ptr(),
+            &mut domain_size,
+            &mut sid_use,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    validate_worker_sid_name_use(sid_use)?;
+    let length = name
+        .iter()
+        .position(|unit| *unit == 0)
+        .unwrap_or(name.len());
+    String::from_utf16(&name[..length])
+        .map_err(|_| invalid_data("Windows returned a non-UTF-16 account name"))
+}
+
+fn validate_worker_sid_name_use(sid_name_use: i32) -> io::Result<()> {
+    if sid_name_use != SID_TYPE_USER {
+        return Err(permission_denied(
+            "worker SID must resolve to an individual user account",
+        ));
+    }
+    Ok(())
+}
+
 #[link(name = "kernel32")]
 unsafe extern "system" {
     fn LocalFree(memory: *mut c_void) -> *mut c_void;
@@ -256,6 +376,7 @@ unsafe extern "system" {
 pub(super) fn create_private_manifest_staging_directory(
     path: &Path,
     owner: ManifestOwner,
+    principal: &WorkerPrincipal,
 ) -> io::Result<()> {
     if is_test_owner(owner) {
         return std::fs::create_dir(path);
@@ -263,10 +384,7 @@ pub(super) fn create_private_manifest_staging_directory(
 
     let (principal, kind) = match owner {
         ManifestOwner::System => ("unused".to_owned(), AclKind::Staging),
-        ManifestOwner::User => (
-            sid_to_string(current_user_sid()?.as_ptr().cast())?,
-            AclKind::UserDirectory,
-        ),
+        ManifestOwner::User => (principal.principal_id().to_owned(), AclKind::UserDirectory),
         #[cfg(test)]
         ManifestOwner::CurrentProcess | ManifestOwner::CurrentProcessWorker => unreachable!(),
     };
@@ -355,7 +473,7 @@ pub(super) fn publish_manifest_directory(staging: &Path, destination: &Path) -> 
 pub(super) fn harden_manifest_directory(
     path: &Path,
     owner: ManifestOwner,
-    worker: &str,
+    worker: &WorkerPrincipal,
 ) -> io::Result<()> {
     require_kind(path, true)?;
     if is_test_owner(owner) {
@@ -367,8 +485,8 @@ pub(super) fn harden_manifest_directory(
             inspect_acl(path, worker, AclKind::Directory)
         }
         ManifestOwner::User => {
-            apply_user_acl(path, AclKind::UserDirectory)?;
-            inspect_user_acl(path, AclKind::UserDirectory)
+            apply_user_acl(path, worker, AclKind::UserDirectory)?;
+            inspect_user_acl(path, worker, AclKind::UserDirectory)
         }
         #[cfg(test)]
         ManifestOwner::CurrentProcess | ManifestOwner::CurrentProcessWorker => unreachable!(),
@@ -378,7 +496,7 @@ pub(super) fn harden_manifest_directory(
 pub(super) fn harden_manifest_file(
     path: &Path,
     owner: ManifestOwner,
-    worker: &str,
+    worker: &WorkerPrincipal,
 ) -> io::Result<()> {
     require_kind(path, false)?;
     if is_test_owner(owner) {
@@ -390,24 +508,29 @@ pub(super) fn harden_manifest_file(
             inspect_acl(path, worker, AclKind::Manifest)
         }
         ManifestOwner::User => {
-            apply_user_acl(path, AclKind::UserFile)?;
-            inspect_user_acl(path, AclKind::UserFile)
+            apply_user_acl(path, worker, AclKind::UserFile)?;
+            inspect_user_acl(path, worker, AclKind::UserFile)
         }
         #[cfg(test)]
         ManifestOwner::CurrentProcess | ManifestOwner::CurrentProcessWorker => unreachable!(),
     }
 }
 
-pub(super) fn open_manifest_lock(path: &Path, owner: ManifestOwner) -> io::Result<std::fs::File> {
+pub(super) fn open_manifest_lock(
+    path: &Path,
+    owner: ManifestOwner,
+    principal: &WorkerPrincipal,
+) -> io::Result<std::fs::File> {
     let created = create_private_file_with_sharing(
         path,
         owner,
+        principal,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
     );
     let file = match created {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-            verify_private_file_security(path, owner)?;
+            verify_private_file_security(path, owner, principal)?;
             std::fs::OpenOptions::new()
                 .read(true)
                 .write(true)
@@ -415,27 +538,36 @@ pub(super) fn open_manifest_lock(path: &Path, owner: ManifestOwner) -> io::Resul
         }
         Err(error) => return Err(error),
     };
-    verify_private_file_security(path, owner)?;
+    verify_private_file_security(path, owner, principal)?;
     Ok(file)
 }
 
-pub(super) fn verify_private_file_security(path: &Path, owner: ManifestOwner) -> io::Result<()> {
+pub(super) fn verify_private_file_security(
+    path: &Path,
+    owner: ManifestOwner,
+    principal: &WorkerPrincipal,
+) -> io::Result<()> {
     require_kind(path, false)?;
     if is_test_owner(owner) {
         return Ok(());
     }
     match owner {
         ManifestOwner::System => inspect_private_acl(path, AclKind::Lock),
-        ManifestOwner::User => inspect_user_acl(path, AclKind::UserFile),
+        ManifestOwner::User => inspect_user_acl(path, principal, AclKind::UserFile),
         #[cfg(test)]
         ManifestOwner::CurrentProcess | ManifestOwner::CurrentProcessWorker => unreachable!(),
     }
 }
 
-pub(super) fn create_private_file(path: &Path, owner: ManifestOwner) -> io::Result<std::fs::File> {
+pub(super) fn create_private_file(
+    path: &Path,
+    owner: ManifestOwner,
+    principal: &WorkerPrincipal,
+) -> io::Result<std::fs::File> {
     create_private_file_with_sharing(
         path,
         owner,
+        principal,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
     )
 }
@@ -448,6 +580,7 @@ pub(super) fn private_file_identity(path: &Path) -> io::Result<PrivateFileIdenti
 pub(super) fn open_verified_private_file_for_read(
     path: &Path,
     owner: ManifestOwner,
+    principal: &WorkerPrincipal,
     expected_identity: PrivateFileIdentity,
 ) -> io::Result<std::fs::File> {
     let (file, information) = open_private_file_handle(path)?;
@@ -457,7 +590,7 @@ pub(super) fn open_verified_private_file_for_read(
     if !is_test_owner(owner) {
         match owner {
             ManifestOwner::System => inspect_handle_private_acl(&file, AclKind::Lock)?,
-            ManifestOwner::User => inspect_handle_user_acl(&file, AclKind::UserFile)?,
+            ManifestOwner::User => inspect_handle_user_acl(&file, principal, AclKind::UserFile)?,
             #[cfg(test)]
             ManifestOwner::CurrentProcess | ManifestOwner::CurrentProcessWorker => unreachable!(),
         }
@@ -507,6 +640,7 @@ fn file_identity(information: &ByHandleFileInformation) -> PrivateFileIdentity {
 fn create_private_file_with_sharing(
     path: &Path,
     owner: ManifestOwner,
+    principal: &WorkerPrincipal,
     share_mode: u32,
 ) -> io::Result<std::fs::File> {
     if is_test_owner(owner) {
@@ -521,10 +655,7 @@ fn create_private_file_with_sharing(
 
     let (principal, kind) = match owner {
         ManifestOwner::System => ("unused".to_owned(), AclKind::Lock),
-        ManifestOwner::User => (
-            sid_to_string(current_user_sid()?.as_ptr().cast())?,
-            AclKind::UserFile,
-        ),
+        ManifestOwner::User => (principal.principal_id().to_owned(), AclKind::UserFile),
         #[cfg(test)]
         ManifestOwner::CurrentProcess | ManifestOwner::CurrentProcessWorker => unreachable!(),
     };
@@ -569,7 +700,7 @@ fn create_private_file_with_sharing(
 pub(super) fn verify_manifest_security(
     path: &Path,
     owner: ManifestOwner,
-    worker: &str,
+    worker: &WorkerPrincipal,
     trusted_root: &Path,
 ) -> io::Result<()> {
     require_kind(path, false)?;
@@ -587,8 +718,8 @@ pub(super) fn verify_manifest_security(
             inspect_acl(path, worker, AclKind::Manifest)
         }
         ManifestOwner::User => {
-            inspect_user_acl(parent, AclKind::UserDirectory)?;
-            inspect_user_acl(path, AclKind::UserFile)
+            inspect_user_acl(parent, worker, AclKind::UserDirectory)?;
+            inspect_user_acl(path, worker, AclKind::UserFile)
         }
         #[cfg(test)]
         ManifestOwner::CurrentProcess | ManifestOwner::CurrentProcessWorker => unreachable!(),
@@ -598,7 +729,7 @@ pub(super) fn verify_manifest_security(
 pub(super) fn open_verified_manifest_file_for_read(
     path: &Path,
     owner: ManifestOwner,
-    worker: &str,
+    worker: &WorkerPrincipal,
     trusted_root: &Path,
 ) -> io::Result<std::fs::File> {
     use std::os::windows::io::{AsRawHandle, FromRawHandle};
@@ -611,7 +742,7 @@ pub(super) fn open_verified_manifest_file_for_read(
     if !is_test_owner(owner) {
         match owner {
             ManifestOwner::System => inspect_acl(parent, worker, AclKind::Directory)?,
-            ManifestOwner::User => inspect_user_acl(parent, AclKind::UserDirectory)?,
+            ManifestOwner::User => inspect_user_acl(parent, worker, AclKind::UserDirectory)?,
             #[cfg(test)]
             ManifestOwner::CurrentProcess | ManifestOwner::CurrentProcessWorker => unreachable!(),
         }
@@ -643,14 +774,14 @@ pub(super) fn open_verified_manifest_file_for_read(
     if !is_test_owner(owner) {
         match owner {
             ManifestOwner::System => inspect_handle_acl(&file, worker, AclKind::Manifest)?,
-            ManifestOwner::User => inspect_handle_user_acl(&file, AclKind::UserFile)?,
+            ManifestOwner::User => inspect_handle_user_acl(&file, worker, AclKind::UserFile)?,
             #[cfg(test)]
             ManifestOwner::CurrentProcess | ManifestOwner::CurrentProcessWorker => unreachable!(),
         }
         verify_manifest_ancestors(parent, owner, worker, trusted_root)?;
         match owner {
             ManifestOwner::System => inspect_acl(parent, worker, AclKind::Directory)?,
-            ManifestOwner::User => inspect_user_acl(parent, AclKind::UserDirectory)?,
+            ManifestOwner::User => inspect_user_acl(parent, worker, AclKind::UserDirectory)?,
             #[cfg(test)]
             ManifestOwner::CurrentProcess | ManifestOwner::CurrentProcessWorker => unreachable!(),
         }
@@ -665,7 +796,7 @@ pub(super) fn verify_manifest_file_target(path: &Path) -> io::Result<()> {
 pub(super) fn verify_manifest_directory_security(
     directory: &Path,
     owner: ManifestOwner,
-    worker: &str,
+    worker: &WorkerPrincipal,
 ) -> io::Result<()> {
     require_kind(directory, true)?;
     if is_test_owner(owner) {
@@ -673,7 +804,7 @@ pub(super) fn verify_manifest_directory_security(
     }
     match owner {
         ManifestOwner::System => inspect_acl(directory, worker, AclKind::Directory),
-        ManifestOwner::User => inspect_user_acl(directory, AclKind::UserDirectory),
+        ManifestOwner::User => inspect_user_acl(directory, worker, AclKind::UserDirectory),
         #[cfg(test)]
         ManifestOwner::CurrentProcess | ManifestOwner::CurrentProcessWorker => unreachable!(),
     }
@@ -682,10 +813,10 @@ pub(super) fn verify_manifest_directory_security(
 pub(super) fn verify_manifest_parent_chain(
     parent: &Path,
     owner: ManifestOwner,
-    worker: &str,
+    worker: &WorkerPrincipal,
 ) -> io::Result<()> {
     if matches!(owner, ManifestOwner::User) {
-        return verify_user_manifest_ancestors(parent, parent);
+        return verify_user_manifest_ancestors(parent, parent, worker);
     }
     let mut current = Some(parent);
     while let Some(ancestor) = current {
@@ -708,7 +839,7 @@ pub(super) fn verify_manifest_parent_chain(
 pub(super) fn verify_manifest_ancestors(
     directory: &Path,
     owner: ManifestOwner,
-    worker: &str,
+    worker: &WorkerPrincipal,
     trusted_root: &Path,
 ) -> io::Result<()> {
     let system_owner = matches!(owner, ManifestOwner::System);
@@ -723,7 +854,7 @@ pub(super) fn verify_manifest_ancestors(
         return require_kind(directory, true);
     }
     if matches!(owner, ManifestOwner::User) {
-        return verify_user_manifest_ancestors(directory, trusted_root);
+        return verify_user_manifest_ancestors(directory, trusted_root, worker);
     }
     require_kind(directory, true)?;
     let mut current = directory.parent();
@@ -749,7 +880,11 @@ pub(super) fn verify_manifest_ancestors(
     }
 }
 
-fn verify_user_manifest_ancestors(directory: &Path, trusted_root: &Path) -> io::Result<()> {
+fn verify_user_manifest_ancestors(
+    directory: &Path,
+    trusted_root: &Path,
+    worker: &WorkerPrincipal,
+) -> io::Result<()> {
     require_kind(directory, true)?;
     if directory != trusted_root {
         let mut current = directory.parent();
@@ -758,7 +893,7 @@ fn verify_user_manifest_ancestors(directory: &Path, trusted_root: &Path) -> io::
                 break;
             }
             require_kind(ancestor, true)?;
-            if inspect_user_ancestor_acl(ancestor)? != UserAncestorOwner::User {
+            if inspect_user_ancestor_acl(ancestor, worker)? != UserAncestorOwner::User {
                 return Err(permission_denied(
                     "user state directory is not owned by the current user",
                 ));
@@ -773,7 +908,7 @@ fn verify_user_manifest_ancestors(directory: &Path, trusted_root: &Path) -> io::
     }
 
     require_kind(trusted_root, true)?;
-    if inspect_user_ancestor_acl(trusted_root)? != UserAncestorOwner::User {
+    if inspect_user_ancestor_acl(trusted_root, worker)? != UserAncestorOwner::User {
         return Err(permission_denied(
             "user state root is not owned by the current user",
         ));
@@ -784,7 +919,7 @@ fn verify_user_manifest_ancestors(directory: &Path, trusted_root: &Path) -> io::
     while let Some(ancestor) = current {
         require_kind(ancestor, true)?;
         validate_user_ancestor_owner_transition(
-            inspect_user_ancestor_acl(ancestor)?,
+            inspect_user_ancestor_acl(ancestor, worker)?,
             &mut reached_system_owner,
         )?;
         current = ancestor.parent();
@@ -816,17 +951,13 @@ fn is_test_owner(owner: ManifestOwner) -> bool {
     }
 }
 
-fn apply_acl(path: &Path, worker: &str, kind: AclKind) -> io::Result<()> {
-    let worker_sid = lookup_account_sid(worker)?;
-    let worker_sid_string = sid_to_string(worker_sid.as_ptr().cast())?;
-    let sddl = acl_sddl(&worker_sid_string, kind);
+fn apply_acl(path: &Path, worker: &WorkerPrincipal, kind: AclKind) -> io::Result<()> {
+    let sddl = acl_sddl(worker.principal_id(), kind);
     apply_sddl(path, &sddl)
 }
 
-fn apply_user_acl(path: &Path, kind: AclKind) -> io::Result<()> {
-    let user = current_user_sid()?;
-    let user = sid_to_string(user.as_ptr().cast())?;
-    apply_sddl(path, &acl_sddl(&user, kind))
+fn apply_user_acl(path: &Path, worker: &WorkerPrincipal, kind: AclKind) -> io::Result<()> {
+    apply_sddl(path, &acl_sddl(worker.principal_id(), kind))
 }
 
 fn apply_sddl(path: &Path, sddl: &str) -> io::Result<()> {
@@ -878,13 +1009,13 @@ fn acl_sddl(worker_sid: &str, kind: AclKind) -> String {
     }
 }
 
-fn inspect_acl(path: &Path, worker: &str, kind: AclKind) -> io::Result<()> {
-    let worker = lookup_account_sid(worker)?;
+fn inspect_acl(path: &Path, worker: &WorkerPrincipal, kind: AclKind) -> io::Result<()> {
+    let worker = principal_sid(worker)?;
     inspect_acl_with_worker(path, &worker, kind)
 }
 
-fn inspect_user_acl(path: &Path, kind: AclKind) -> io::Result<()> {
-    let user = current_user_sid()?;
+fn inspect_user_acl(path: &Path, worker: &WorkerPrincipal, kind: AclKind) -> io::Result<()> {
+    let user = principal_sid(worker)?;
     inspect_acl_with_worker(path, &user, kind)
 }
 
@@ -919,13 +1050,21 @@ fn inspect_acl_with_worker(path: &Path, worker: &[u8], kind: AclKind) -> io::Res
     inspect_security_descriptor(owner, dacl, descriptor.0, worker, kind)
 }
 
-fn inspect_handle_acl(file: &std::fs::File, worker: &str, kind: AclKind) -> io::Result<()> {
-    let worker = lookup_account_sid(worker)?;
+fn inspect_handle_acl(
+    file: &std::fs::File,
+    worker: &WorkerPrincipal,
+    kind: AclKind,
+) -> io::Result<()> {
+    let worker = principal_sid(worker)?;
     inspect_handle_acl_with_principal(file, &worker, kind)
 }
 
-fn inspect_handle_user_acl(file: &std::fs::File, kind: AclKind) -> io::Result<()> {
-    let user = current_user_sid()?;
+fn inspect_handle_user_acl(
+    file: &std::fs::File,
+    worker: &WorkerPrincipal,
+    kind: AclKind,
+) -> io::Result<()> {
+    let user = principal_sid(worker)?;
     inspect_handle_acl_with_principal(file, &user, kind)
 }
 
@@ -995,7 +1134,7 @@ fn inspect_security_descriptor(
     validate_acl_contract(&inspection, kind)
 }
 
-fn inspect_ancestor_acl(path: &Path, worker: &str) -> io::Result<()> {
+fn inspect_ancestor_acl(path: &Path, worker: &WorkerPrincipal) -> io::Result<()> {
     let mut path = wide_os(path);
     let mut owner = std::ptr::null_mut();
     let mut dacl = std::ptr::null_mut();
@@ -1024,14 +1163,17 @@ fn inspect_ancestor_acl(path: &Path, worker: &str) -> io::Result<()> {
     let administrators = well_known_sid(WIN_BUILTIN_ADMINISTRATORS_SID)?;
     let system = well_known_sid(WIN_LOCAL_SYSTEM_SID)?;
     let trusted_installer = lookup_account_sid("NT SERVICE\\TrustedInstaller")?;
-    let worker = lookup_account_sid(worker)?;
+    let worker = principal_sid(worker)?;
     validate_ancestor_entries(
         unsafe { EqualSid(owner, worker.as_ptr().cast()) } != 0,
         &inspect_aces(dacl, &system, &administrators, &trusted_installer, &worker)?,
     )
 }
 
-fn inspect_user_ancestor_acl(path: &Path) -> io::Result<UserAncestorOwner> {
+fn inspect_user_ancestor_acl(
+    path: &Path,
+    worker: &WorkerPrincipal,
+) -> io::Result<UserAncestorOwner> {
     let mut path = wide_os(path);
     let mut owner = std::ptr::null_mut();
     let mut dacl = std::ptr::null_mut();
@@ -1060,7 +1202,7 @@ fn inspect_user_ancestor_acl(path: &Path) -> io::Result<UserAncestorOwner> {
     let administrators = well_known_sid(WIN_BUILTIN_ADMINISTRATORS_SID)?;
     let system = well_known_sid(WIN_LOCAL_SYSTEM_SID)?;
     let trusted_installer = lookup_account_sid("NT SERVICE\\TrustedInstaller")?;
-    let user = current_user_sid()?;
+    let user = principal_sid(worker)?;
     let owner = if unsafe { EqualSid(owner, user.as_ptr().cast()) } != 0 {
         UserAncestorOwner::User
     } else if unsafe { EqualSid(owner, system.as_ptr().cast()) } != 0
@@ -1440,6 +1582,10 @@ impl Drop for OwnedHandle {
 mod tests {
     use super::*;
 
+    fn test_principal() -> WorkerPrincipal {
+        resolve_current_worker_principal().unwrap()
+    }
+
     #[test]
     fn constructed_acl_is_protected_and_grants_only_the_documented_principals() {
         assert_eq!(
@@ -1466,6 +1612,52 @@ mod tests {
             acl_sddl("S-1-5-21-1-2-3-1001", AclKind::UserDirectory),
             "O:S-1-5-21-1-2-3-1001D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;S-1-5-21-1-2-3-1001)"
         );
+    }
+
+    #[test]
+    fn worker_acl_authorization_follows_stable_sid_not_account_name() {
+        let first = WorkerPrincipal::new(
+            PrincipalKind::WindowsSid,
+            "S-1-5-21-1-2-3-1001",
+            "build-agent",
+        )
+        .unwrap();
+        let renamed = WorkerPrincipal::new(
+            PrincipalKind::WindowsSid,
+            "S-1-5-21-1-2-3-1001",
+            "renamed-agent",
+        )
+        .unwrap();
+        let replacement = WorkerPrincipal::new(
+            PrincipalKind::WindowsSid,
+            "S-1-5-21-1-2-3-1002",
+            "build-agent",
+        )
+        .unwrap();
+
+        assert_eq!(
+            acl_sddl(first.principal_id(), AclKind::Manifest),
+            acl_sddl(renamed.principal_id(), AclKind::Manifest)
+        );
+        assert_ne!(
+            acl_sddl(first.principal_id(), AclKind::Manifest),
+            acl_sddl(replacement.principal_id(), AclKind::Manifest)
+        );
+        assert_eq!(
+            acl_sddl(first.principal_id(), AclKind::Lock),
+            acl_sddl(replacement.principal_id(), AclKind::Lock)
+        );
+    }
+
+    #[test]
+    fn worker_sid_must_resolve_to_an_individual_user_account() {
+        assert!(validate_worker_sid_name_use(SID_TYPE_USER).is_ok());
+        for non_user in [2, 3, 4, 5, 6, 7, 8, 9] {
+            assert!(
+                validate_worker_sid_name_use(non_user).is_err(),
+                "SID_NAME_USE {non_user} must not authorize a worker"
+            );
+        }
     }
 
     #[test]
@@ -1673,7 +1865,9 @@ mod tests {
         std::fs::create_dir(&root).unwrap();
         let temporary = root.join("temporary");
         let destination = root.join("destination");
-        let mut file = create_private_file(&temporary, ManifestOwner::CurrentProcess).unwrap();
+        let mut file =
+            create_private_file(&temporary, ManifestOwner::CurrentProcess, &test_principal())
+                .unwrap();
         std::io::Write::write_all(&mut file, b"complete").unwrap();
         file.sync_all().unwrap();
 
@@ -1713,6 +1907,7 @@ mod tests {
     fn real_windows_worker_can_read_but_cannot_mutate_or_take_over_manifest_and_receipt() {
         let worker = std::env::var("STYRN_WINDOWS_TEST_WORKER")
             .expect("STYRN_WINDOWS_TEST_WORKER must select a real unprivileged account");
+        let worker_principal = resolve_named_worker_principal(&worker).unwrap();
         let password = std::env::var("STYRN_WINDOWS_TEST_PASSWORD")
             .expect("STYRN_WINDOWS_TEST_PASSWORD is required for worker impersonation");
         let public = std::path::PathBuf::from(
@@ -1727,17 +1922,29 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir(&directory).unwrap();
-        harden_manifest_directory(&directory, ManifestOwner::System, &worker).unwrap();
+        harden_manifest_directory(&directory, ManifestOwner::System, &worker_principal).unwrap();
         let manifest = directory.join("machine.toml");
         std::fs::write(&manifest, "schema_version = 1\n").unwrap();
-        harden_manifest_file(&manifest, ManifestOwner::System, &worker).unwrap();
-        verify_manifest_security(&manifest, ManifestOwner::System, &worker, &directory).unwrap();
+        harden_manifest_file(&manifest, ManifestOwner::System, &worker_principal).unwrap();
+        verify_manifest_security(
+            &manifest,
+            ManifestOwner::System,
+            &worker_principal,
+            &directory,
+        )
+        .unwrap();
         let receipt = directory.join("receipt.json");
         std::fs::write(&receipt, "{\"schema_version\":1,\"entries\":[]}\n").unwrap();
-        harden_manifest_file(&receipt, ManifestOwner::System, &worker).unwrap();
-        verify_manifest_security(&receipt, ManifestOwner::System, &worker, &directory).unwrap();
+        harden_manifest_file(&receipt, ManifestOwner::System, &worker_principal).unwrap();
+        verify_manifest_security(
+            &receipt,
+            ManifestOwner::System,
+            &worker_principal,
+            &directory,
+        )
+        .unwrap();
         let receipt_lock = directory.join(".receipt.json.lock");
-        drop(create_private_file(&receipt_lock, ManifestOwner::System).unwrap());
+        drop(create_private_file(&receipt_lock, ManifestOwner::System, &worker_principal).unwrap());
         inspect_private_acl(&receipt_lock, AclKind::Lock).unwrap();
 
         let replacement_directory = public.join(format!(
@@ -1801,7 +2008,7 @@ mod tests {
         let mut held_receipt = open_verified_manifest_file_for_read(
             &receipt,
             ManifestOwner::System,
-            &worker,
+            &worker_principal,
             &directory,
         )
         .unwrap();
@@ -1830,12 +2037,21 @@ mod tests {
 
         drop(impersonation);
         let controller_replacement = directory.join("controller-replacement.json");
-        let mut controller_file =
-            create_private_file(&controller_replacement, ManifestOwner::System).unwrap();
+        let mut controller_file = create_private_file(
+            &controller_replacement,
+            ManifestOwner::System,
+            &worker_principal,
+        )
+        .unwrap();
         std::io::Write::write_all(&mut controller_file, b"complete replacement\n").unwrap();
         controller_file.sync_all().unwrap();
         drop(controller_file);
-        harden_manifest_file(&controller_replacement, ManifestOwner::System, &worker).unwrap();
+        harden_manifest_file(
+            &controller_replacement,
+            ManifestOwner::System,
+            &worker_principal,
+        )
+        .unwrap();
         replace_file(&controller_replacement, &receipt)
             .expect("a worker-held read-only receipt handle must share atomic replacement");
         use std::io::{Read, Seek};
@@ -1858,6 +2074,7 @@ mod tests {
     fn real_windows_worker_cannot_access_private_staging_or_files_before_publication() {
         let worker = std::env::var("STYRN_WINDOWS_TEST_WORKER")
             .expect("STYRN_WINDOWS_TEST_WORKER must select a real unprivileged account");
+        let worker_principal = resolve_named_worker_principal(&worker).unwrap();
         let password = std::env::var("STYRN_WINDOWS_TEST_PASSWORD")
             .expect("STYRN_WINDOWS_TEST_PASSWORD is required for worker impersonation");
         let public = std::path::PathBuf::from(
@@ -1873,14 +2090,20 @@ mod tests {
         );
         let parent = public.join(format!("styrn-staging-parent-{nonce}"));
         std::fs::create_dir(&parent).unwrap();
-        harden_manifest_directory(&parent, ManifestOwner::System, &worker).unwrap();
+        harden_manifest_directory(&parent, ManifestOwner::System, &worker_principal).unwrap();
 
         let staging = parent.join("staging");
-        create_private_manifest_staging_directory(&staging, ManifestOwner::System).unwrap();
+        create_private_manifest_staging_directory(
+            &staging,
+            ManifestOwner::System,
+            &worker_principal,
+        )
+        .unwrap();
         inspect_private_acl(&staging, AclKind::Staging).unwrap();
         assert_eq!(std::fs::read_dir(&staging).unwrap().count(), 0);
         let private_file = parent.join("receipt-intent.json");
-        let mut private = create_private_file(&private_file, ManifestOwner::System).unwrap();
+        let mut private =
+            create_private_file(&private_file, ManifestOwner::System, &worker_principal).unwrap();
         std::io::Write::write_all(&mut private, b"private receipt intent").unwrap();
         private.sync_all().unwrap();
         drop(private);

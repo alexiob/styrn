@@ -9,13 +9,24 @@
 # This file MUST NOT contain private SSH keys, API keys, Tailscale auth keys,
 # agent tokens, or passwords (Part 2.4, 4.2). It is Administrator-owned and
 # read-only to the resolved worker principal so a job cannot rewrite policy
-# (Part 4.5). This example happens to use opt-in dedicated identity `styrn`.
+# (Part 4.5). This example uses an arbitrary opt-in dedicated identity to make
+# clear that no account name is reserved or required by Styrn.
 
 schema_version = 1
 machine_id = "01991f5d-d72f-7b5e-a43d-9fcb61bd3265"   # UUIDv7, minted once (2.4.1)
 name = "win-mini"
 
 roles = ["worker"]
+
+[installation]
+scope = "system"
+
+[worker_identity]
+mode = "dedicated"
+principal_kind = "windows-sid"
+principal_id = "S-1-5-21-111111111-222222222-333333333-1001"
+name = "build-agent"
+isolation = "dedicated-account"
 
 [platform]
 os = "windows"
@@ -27,7 +38,7 @@ headless = true
 kind = "ssh"
 host = "win-mini"          # Tailscale MagicDNS name, not a mutable LAN IP (3.1)
 port = 22
-user = "styrn"             # selected dedicated identity in this example
+user = "build-agent"       # selected dedicated identity in this example
 
 [paths]
 root = "C:\\Styrn"
@@ -111,4 +122,4 @@ enabled = true
 # [[pending_actions]]
 # id = "codex-first-login"
 # severity = "info"
-# message = "Run `codex` once as the styrn user to complete first-time login."
+# message = "Run `codex` once as the selected worker user to complete first-time login."

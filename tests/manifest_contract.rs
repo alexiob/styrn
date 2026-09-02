@@ -15,6 +15,79 @@ use uuid::Uuid;
 #[cfg(unix)]
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
+fn current_worker_principal() -> platform::WorkerPrincipal {
+    platform::resolve_current_worker_principal()
+        .expect("manifest contract tests require a real non-privileged caller")
+}
+
+fn current_user_manifest() -> MachineManifest {
+    let principal = current_worker_principal();
+    let mut input = fs::read_to_string("examples/machine.controller-worker.toml").unwrap();
+    input = input.replace(
+        "principal_id = \"501\"",
+        &format!("principal_id = \"{}\"", principal.principal_id()),
+    );
+    input = input.replace(
+        "name = \"alex-dev\"",
+        &format!("name = \"{}\"", principal.name()),
+    );
+    input = input.replace(
+        "user = \"alex-dev\"",
+        &format!("user = \"{}\"", principal.name()),
+    );
+    #[cfg(target_os = "linux")]
+    {
+        input = input.replace("os = \"macos\"", "os = \"linux\"").replace(
+            "/Users/alex-dev/Library/Application Support/Styrn",
+            &format!("/home/{}/.local/share/styrn", principal.name()),
+        );
+    }
+    #[cfg(target_os = "windows")]
+    {
+        input = input
+            .replace("os = \"macos\"", "os = \"windows\"")
+            .replace(
+                "principal_kind = \"unix-uid\"",
+                "principal_kind = \"windows-sid\"",
+            )
+            .replace(
+                "/Users/alex-dev/Library/Application Support/Styrn",
+                &format!(
+                    "C:\\\\Users\\\\{}\\\\AppData\\\\Local\\\\Styrn",
+                    principal.name()
+                ),
+            );
+    }
+    MachineManifest::parse_toml(&input).unwrap()
+}
+
+#[cfg(unix)]
+fn system_manifest_for(principal: &platform::WorkerPrincipal) -> MachineManifest {
+    let mut manifest = MachineManifest::parse_toml(
+        &fs::read_to_string("examples/machine.controller-worker.toml").unwrap(),
+    )
+    .unwrap();
+    manifest.installation.as_mut().unwrap().scope = platform::InstallationScope::System;
+    let identity = manifest.worker_identity.as_mut().unwrap();
+    identity.mode = manifest::WorkerIdentityMode::Dedicated;
+    identity.principal_kind = principal.principal_kind();
+    identity.principal_id = principal.principal_id().to_owned();
+    identity.name = principal.name().to_owned();
+    identity.isolation = manifest::WorkerIsolation::DedicatedAccount;
+    manifest.transport.as_mut().unwrap().user = Some(principal.name().to_owned());
+    #[cfg(target_os = "linux")]
+    {
+        manifest.platform.os = manifest::OperatingSystem::Linux;
+        set_manifest_paths_root(&mut manifest, "/srv/styrn", '/');
+    }
+    #[cfg(target_os = "macos")]
+    {
+        set_manifest_paths_root(&mut manifest, "/Users/Shared/Styrn", '/');
+    }
+    manifest.validate().unwrap();
+    manifest
+}
+
 fn schema_validator() -> Validator {
     let schema: Value = serde_json::from_str(
         &fs::read_to_string(concat!(
@@ -41,6 +114,13 @@ fn assert_schema_valid(value: &Value) {
     }
 }
 
+fn assert_schema_invalid(value: &Value) {
+    assert!(
+        !schema_validator().is_valid(value),
+        "machine JSON unexpectedly validated against the checked-in schema"
+    );
+}
+
 #[test]
 fn checked_in_examples_parse_validate_and_round_trip_without_losing_fields() {
     for example in [
@@ -56,6 +136,297 @@ fn checked_in_examples_parse_validate_and_round_trip_without_losing_fields() {
         let reparsed = MachineManifest::parse_toml(&manifest.to_toml().unwrap()).unwrap();
         assert_eq!(reparsed.to_json_value().unwrap(), json, "{example}");
     }
+}
+
+#[test]
+fn worker_manifest_requires_installation_and_worker_identity() {
+    let input = fs::read_to_string("examples/machine.toml")
+        .unwrap()
+        .replace("[installation]\nscope = \"system\"\n\n", "")
+        .replace(
+            "[worker_identity]\nmode = \"dedicated\"\nprincipal_kind = \"windows-sid\"\nprincipal_id = \"S-1-5-21-111111111-222222222-333333333-1001\"\nname = \"build-agent\"\nisolation = \"dedicated-account\"\n\n",
+            "",
+        );
+
+    let error = MachineManifest::parse_toml(&input)
+        .expect_err("worker manifests without scope and identity must be rejected");
+
+    assert_eq!(
+        error.to_string(),
+        "invalid machine manifest: installation is required"
+    );
+}
+
+#[test]
+fn worker_identity_contract_rejects_missing_transport_user_kind_id_and_policy_mismatches() {
+    let unix = fs::read_to_string("examples/machine.controller-worker.toml").unwrap();
+    let cases = [
+        remove_toml_table(&unix, "worker_identity"),
+        remove_line(&unix, "user ="),
+        unix.replacen("principal_id = \"501\"", "principal_id = \"0501\"", 1),
+        unix.replacen(
+            "principal_kind = \"unix-uid\"",
+            "principal_kind = \"windows-sid\"",
+            1,
+        ),
+        unix.replacen(
+            "isolation = \"shared-user\"",
+            "isolation = \"dedicated-account\"",
+            1,
+        ),
+        unix.replacen("mode = \"current-user\"", "mode = \"dedicated\"", 1),
+        unix.replacen("user = \"alex-dev\"", "user = \"somebody-else\"", 1),
+        unix.replacen("scope = \"user\"", "scope = \"unknown\"", 1),
+        unix.replacen(
+            "mode = \"current-user\"",
+            "mode = \"current-user\"\nunexpected = true",
+            1,
+        ),
+    ];
+    for input in cases {
+        assert!(MachineManifest::parse_toml(&input).is_err(), "{input}");
+    }
+
+    let valid = MachineManifest::parse_toml(&unix)
+        .unwrap()
+        .to_json_value()
+        .unwrap();
+    let mut missing_user = valid.clone();
+    missing_user["transport"]
+        .as_object_mut()
+        .unwrap()
+        .remove("user");
+    assert_schema_invalid(&missing_user);
+    let mut wrong_kind = valid.clone();
+    wrong_kind["worker_identity"]["principal_kind"] = Value::String("windows-sid".to_owned());
+    assert_schema_invalid(&wrong_kind);
+    let mut wrong_id = valid.clone();
+    wrong_id["worker_identity"]["principal_id"] = Value::String("S-1-5-21-1".to_owned());
+    assert_schema_invalid(&wrong_id);
+
+    for invalid_name in [" leading", "trailing "] {
+        let mut value = valid.clone();
+        value["worker_identity"]["name"] = Value::String(invalid_name.to_owned());
+        value["transport"]["user"] = Value::String(invalid_name.to_owned());
+        assert_schema_invalid(&value);
+    }
+    let mut maximum_uid = valid.clone();
+    maximum_uid["worker_identity"]["principal_id"] = Value::String(u32::MAX.to_string());
+    assert_schema_valid(&maximum_uid);
+    let mut oversized_uid = valid.clone();
+    oversized_uid["worker_identity"]["principal_id"] =
+        Value::String((u64::from(u32::MAX) + 1).to_string());
+    assert_schema_invalid(&oversized_uid);
+
+    let mut windows = valid;
+    windows["platform"]["os"] = Value::String("windows".to_owned());
+    windows["worker_identity"]["principal_kind"] = Value::String("windows-sid".to_owned());
+    windows["worker_identity"]["principal_id"] =
+        Value::String("S-1-281474976710655-4294967295".to_owned());
+    set_json_paths_root(&mut windows, r"C:\Users\alex-dev\AppData\Local\Styrn", '\\');
+    assert_schema_valid(&windows);
+    for invalid_sid in ["S-1-281474976710656-1", "S-1-5-4294967296"] {
+        let mut value = windows.clone();
+        value["worker_identity"]["principal_id"] = Value::String(invalid_sid.to_owned());
+        assert_schema_invalid(&value);
+    }
+}
+
+#[test]
+fn manifest_paths_are_platform_native_scope_bound_and_root_relative() {
+    let mac = fs::read_to_string("examples/machine.controller-worker.toml").unwrap();
+
+    let linux_with_macos_paths = mac.replace("os = \"macos\"", "os = \"linux\"");
+    assert!(MachineManifest::parse_toml(&linux_with_macos_paths).is_err());
+
+    let user_with_system_root = mac.replace(
+        "/Users/alex-dev/Library/Application Support/Styrn",
+        "/Users/Shared/Styrn",
+    );
+    assert!(MachineManifest::parse_toml(&user_with_system_root).is_err());
+    let user_with_nested_system_root = mac.replace(
+        "/Users/alex-dev/Library/Application Support/Styrn",
+        "/Users/Shared/Styrn/nested",
+    );
+    assert!(MachineManifest::parse_toml(&user_with_nested_system_root).is_err());
+
+    let child_outside_root = mac.replacen(
+        "jobs = \"/Users/alex-dev/Library/Application Support/Styrn/jobs\"",
+        "jobs = \"/tmp/unrelated-jobs\"",
+        1,
+    );
+    assert!(MachineManifest::parse_toml(&child_outside_root).is_err());
+
+    let traversal = mac.replace(
+        "root = \"/Users/alex-dev/Library/Application Support/Styrn\"",
+        "root = \"/Users/alex-dev/Library/../Application Support/Styrn\"",
+    );
+    assert!(MachineManifest::parse_toml(&traversal).is_err());
+
+    let valid_json = MachineManifest::parse_toml(&mac)
+        .unwrap()
+        .to_json_value()
+        .unwrap();
+    let mut schema_platform_mismatch = valid_json.clone();
+    schema_platform_mismatch["platform"]["os"] = Value::String("windows".to_owned());
+    schema_platform_mismatch["worker_identity"]["principal_kind"] =
+        Value::String("windows-sid".to_owned());
+    schema_platform_mismatch["worker_identity"]["principal_id"] =
+        Value::String("S-1-5-21-1-2-3-1001".to_owned());
+    assert_schema_invalid(&schema_platform_mismatch);
+
+    let mut schema_traversal = valid_json.clone();
+    set_json_paths_root(&mut schema_traversal, "/Users/alex-dev/../Styrn", '/');
+    assert_schema_invalid(&schema_traversal);
+
+    let mut schema_trailing_separator = valid_json.clone();
+    schema_trailing_separator["paths"]["root"] = Value::String("/tmp/styrn/".to_owned());
+    assert_schema_invalid(&schema_trailing_separator);
+
+    let mut schema_detached_jobs = valid_json.clone();
+    schema_detached_jobs["paths"]["jobs"] = Value::String("/tmp/unrelated-jobs".to_owned());
+    assert_schema_invalid(&schema_detached_jobs);
+
+    let mut schema_macos_system_user_root = valid_json.clone();
+    make_json_system_scope(&mut schema_macos_system_user_root);
+    assert_schema_invalid(&schema_macos_system_user_root);
+
+    let mut schema_linux_system_user_root = valid_json.clone();
+    schema_linux_system_user_root["platform"]["os"] = Value::String("linux".to_owned());
+    make_json_system_scope(&mut schema_linux_system_user_root);
+    set_json_paths_root(
+        &mut schema_linux_system_user_root,
+        "/home/alex-dev/.local/share/styrn",
+        '/',
+    );
+    assert_schema_invalid(&schema_linux_system_user_root);
+
+    let mut schema_windows_user_system_root = valid_json.clone();
+    make_json_windows(&mut schema_windows_user_system_root);
+    set_json_paths_root(
+        &mut schema_windows_user_system_root,
+        r"C:\ProgramData\Styrn",
+        '\\',
+    );
+    assert_schema_invalid(&schema_windows_user_system_root);
+
+    let mut schema_windows_system_user_root = valid_json.clone();
+    make_json_windows(&mut schema_windows_system_user_root);
+    make_json_system_scope(&mut schema_windows_system_user_root);
+    set_json_paths_root(
+        &mut schema_windows_system_user_root,
+        r"C:\Users\alex-dev\AppData\Local\Styrn",
+        '\\',
+    );
+    assert_schema_invalid(&schema_windows_system_user_root);
+
+    let mut schema_scope_mismatch = valid_json;
+    schema_scope_mismatch["paths"]["root"] = Value::String("/Users/Shared/Styrn".to_owned());
+    assert_schema_invalid(&schema_scope_mismatch);
+
+    let base = MachineManifest::parse_toml(&mac).unwrap();
+    for (os, scope, root) in [
+        (
+            manifest::OperatingSystem::Linux,
+            platform::InstallationScope::User,
+            "/srv/styrn/nested",
+        ),
+        (
+            manifest::OperatingSystem::Linux,
+            platform::InstallationScope::System,
+            "/home",
+        ),
+        (
+            manifest::OperatingSystem::Macos,
+            platform::InstallationScope::System,
+            "/Users",
+        ),
+    ] {
+        let mut invalid = base.clone();
+        invalid.platform.os = os;
+        invalid.installation.as_mut().unwrap().scope = scope;
+        if scope == platform::InstallationScope::System {
+            let identity = invalid.worker_identity.as_mut().unwrap();
+            identity.mode = manifest::WorkerIdentityMode::Dedicated;
+            identity.isolation = manifest::WorkerIsolation::DedicatedAccount;
+        }
+        set_manifest_paths_root(&mut invalid, root, '/');
+        assert!(invalid.validate().is_err(), "accepted {root}");
+    }
+}
+
+#[test]
+fn manifest_windows_paths_reject_device_and_normalization_aliases() {
+    let mut windows = MachineManifest::parse_toml(
+        &fs::read_to_string("examples/machine.controller-worker.toml").unwrap(),
+    )
+    .unwrap();
+    windows.platform.os = manifest::OperatingSystem::Windows;
+    let identity = windows.worker_identity.as_mut().unwrap();
+    identity.principal_kind = platform::PrincipalKind::WindowsSid;
+    identity.principal_id = "S-1-5-21-1-2-3-1001".to_owned();
+    set_manifest_paths_root(&mut windows, r"C:\Users\alex-dev\AppData\Local\Styrn", '\\');
+    windows.validate().unwrap();
+
+    for invalid_root in [
+        r"C:\NUL",
+        r"C:\safe\CON",
+        r"C:\safe\COM1.txt",
+        r"C:\safe\COM¹.txt",
+        r"C:\safe\LPT³",
+        r"C:\safe\name.",
+        r"C:\safe\name ",
+        r"C:\safe\bad?name",
+        r#"C:\safe\bad"name"#,
+    ] {
+        let mut invalid = windows.clone();
+        set_manifest_paths_root(&mut invalid, invalid_root, '\\');
+        assert!(invalid.validate().is_err(), "accepted {invalid_root}");
+
+        let mut json = windows.to_json_value().unwrap();
+        set_json_paths_root(&mut json, invalid_root, '\\');
+        assert_schema_invalid(&json);
+    }
+
+    for (scope, root) in [
+        (platform::InstallationScope::User, r"C:\Styrn\nested"),
+        (platform::InstallationScope::User, r"C:\ProgramData"),
+        (platform::InstallationScope::System, r"C:\Users"),
+    ] {
+        let mut invalid = windows.clone();
+        invalid.installation.as_mut().unwrap().scope = scope;
+        if scope == platform::InstallationScope::System {
+            let identity = invalid.worker_identity.as_mut().unwrap();
+            identity.mode = manifest::WorkerIdentityMode::Dedicated;
+            identity.isolation = manifest::WorkerIsolation::DedicatedAccount;
+        }
+        set_manifest_paths_root(&mut invalid, root, '\\');
+        assert!(invalid.validate().is_err(), "accepted {root}");
+
+        let mut json = windows.to_json_value().unwrap();
+        if scope == platform::InstallationScope::System {
+            make_json_system_scope(&mut json);
+        }
+        set_json_paths_root(&mut json, root, '\\');
+        assert_schema_invalid(&json);
+    }
+}
+
+#[test]
+fn controller_only_manifest_may_omit_transport_and_worker_identity() {
+    let input = fs::read_to_string("examples/machine.controller-worker.toml")
+        .unwrap()
+        .replace(
+            "roles = [\"controller\", \"worker\"]",
+            "roles = [\"controller\"]",
+        );
+    let input = remove_toml_table(&remove_toml_table(&input, "worker_identity"), "transport");
+
+    let manifest = MachineManifest::parse_toml(&input).unwrap();
+
+    assert!(manifest.worker_identity.is_none());
+    assert!(manifest.transport.is_none());
+    assert_schema_valid(&manifest.to_json_value().unwrap());
 }
 
 #[test]
@@ -313,6 +684,143 @@ fn generated_write_mints_once_and_preserves_identity_across_updates() {
     assert!(!stored.machine_id_minted);
     assert_eq!(stored.manifest.machine_id, first);
     assert_eq!(stored.manifest.name, "renamed-worker");
+    assert_eq!(
+        stored.manifest.installation.unwrap().scope,
+        platform::InstallationScope::System
+    );
+    assert_eq!(stored.manifest.worker_identity.unwrap().name, "build-agent");
+}
+
+#[test]
+fn user_store_creates_missing_restricted_config_root_without_elevation() {
+    let temp = TestDir::new();
+    let trusted_root = fs::canonicalize(temp.path()).unwrap().join("config");
+    let path = trusted_root.join("Styrn/machine.toml");
+    let principal = current_worker_principal();
+    let store = MachineManifestStore::new_user(&path, principal).unwrap();
+    let draft = current_user_manifest().without_machine_id();
+
+    let minted = store.write_generated(&draft).unwrap();
+
+    assert_eq!(minted.get_version_num(), 7);
+    assert_eq!(store.read().unwrap().manifest.machine_id, minted);
+    #[cfg(unix)]
+    {
+        assert_eq!(fs::metadata(&trusted_root).unwrap().mode() & 0o777, 0o700);
+        assert_eq!(
+            fs::metadata(path.parent().unwrap()).unwrap().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(fs::metadata(&path).unwrap().mode() & 0o777, 0o600);
+    }
+}
+
+#[test]
+fn explicit_user_store_does_not_require_canonical_path_environment() {
+    const CHILD: &str = "STYRN_EXPLICIT_USER_STORE_NO_HOME_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "explicit_user_store_does_not_require_canonical_path_environment",
+                "--nocapture",
+            ])
+            .env(CHILD, "1")
+            .env_remove("HOME")
+            .env_remove("XDG_CONFIG_HOME")
+            .env_remove("APPDATA")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "isolated explicit-path child failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        return;
+    }
+
+    let path = std::env::temp_dir()
+        .join(format!("styrn-explicit-user-store-{}", std::process::id()))
+        .join("machine.toml");
+    MachineManifestStore::new_user(path, current_worker_principal()).unwrap();
+}
+
+#[cfg(unix)]
+#[test]
+fn user_store_rejects_secure_root_below_non_sticky_world_writable_parent_without_partial_state() {
+    let temp = TestDir::new();
+    let insecure = temp.path().join("insecure");
+    let trusted_root = insecure.join("config");
+    fs::create_dir(&insecure).unwrap();
+    fs::set_permissions(&insecure, fs::Permissions::from_mode(0o777)).unwrap();
+    fs::create_dir(&trusted_root).unwrap();
+    fs::set_permissions(&trusted_root, fs::Permissions::from_mode(0o700)).unwrap();
+    let path = trusted_root.join("Styrn/machine.toml");
+    let store = MachineManifestStore::new_user(&path, current_worker_principal()).unwrap();
+
+    let error = store
+        .write_generated(&current_user_manifest().without_machine_id())
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        manifest::ManifestError::Security(_) | manifest::ManifestError::Write(_)
+    ));
+    assert!(!path.parent().unwrap().exists());
+    assert_eq!(fs::read_dir(&trusted_root).unwrap().count(), 0);
+    fs::set_permissions(insecure, fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+#[test]
+fn scope_mismatch_is_rejected_before_lock_or_directory_creation() {
+    let temp = TestDir::new();
+    let directory = temp.path().join("system-store");
+    let path = directory.join("machine.toml");
+    let store = MachineManifestStore::new_system(&path, current_worker_principal()).unwrap();
+
+    let error = store
+        .write_generated(&current_user_manifest().without_machine_id())
+        .unwrap_err();
+
+    assert_eq!(
+        error.to_string(),
+        "invalid machine manifest: manifest installation scope does not match its store"
+    );
+    assert!(!directory.exists());
+}
+
+#[test]
+fn user_store_rejects_a_different_manifest_principal_before_filesystem_mutation() {
+    let temp = TestDir::new();
+    let trusted_root = fs::canonicalize(temp.path()).unwrap().join("config");
+    let path = trusted_root.join("Styrn/machine.toml");
+    let store = MachineManifestStore::new_user(&path, current_worker_principal()).unwrap();
+    let mut draft = current_user_manifest().without_machine_id();
+    let identity = draft.worker_identity.as_mut().unwrap();
+    #[cfg(unix)]
+    {
+        identity.principal_id = if identity.principal_id == "1" {
+            "2"
+        } else {
+            "1"
+        }
+        .to_owned();
+    }
+    #[cfg(windows)]
+    {
+        identity.principal_id = "S-1-5-21-1-2-3-4242".to_owned();
+    }
+    identity.name = "different-native-account".to_owned();
+    draft.transport.as_mut().unwrap().user = Some(identity.name.clone());
+
+    let error = store.write_generated(&draft).unwrap_err();
+
+    assert_eq!(
+        error.to_string(),
+        "invalid machine manifest: manifest worker identity does not match its store principal"
+    );
+    assert!(!trusted_root.exists());
 }
 
 #[cfg(unix)]
@@ -589,6 +1097,7 @@ fn native_directory_publish_never_replaces_an_existing_destination() {
     let staging = platform::create_private_manifest_staging_directory(
         &staging_path,
         platform::ManifestOwner::CurrentProcess,
+        &current_worker_principal(),
     )
     .unwrap();
     fs::write(staging.path().join("creator"), b"staging").unwrap();
@@ -613,6 +1122,7 @@ fn concurrent_native_directory_publishers_produce_exactly_one_winner() {
         platform::create_private_manifest_staging_directory(
             &path,
             platform::ManifestOwner::CurrentProcess,
+            &current_worker_principal(),
         )
         .unwrap()
     });
@@ -686,6 +1196,7 @@ fn private_staging_leaf_is_0700_at_creation_under_a_permissive_umask() {
     let staging = platform::create_private_manifest_staging_directory(
         &staging_path,
         platform::ManifestOwner::CurrentProcess,
+        &current_worker_principal(),
     )
     .unwrap();
 
@@ -709,17 +1220,19 @@ fn system_destination_never_creates_missing_broad_ancestors() {
 
 #[cfg(unix)]
 #[test]
-#[ignore = "environmental: run as root to verify real system ownership"]
+#[ignore = "environmental: root plus STYRN_UNIX_TEST_WORKER selecting a real unprivileged account"]
 fn generated_system_manifest_is_root_owned_and_not_worker_writable() {
+    let worker = std::env::var("STYRN_UNIX_TEST_WORKER")
+        .expect("STYRN_UNIX_TEST_WORKER must select a real unprivileged account");
+    let principal = platform::resolve_named_worker_principal(&worker).unwrap();
     let temp = TestDir::new();
-    let config = temp.path().join("styrn");
+    let config = fs::canonicalize(temp.path()).unwrap().join("styrn");
     fs::create_dir(&config).unwrap();
     let path = config.join("machine.toml");
-    let draft = MachineManifest::parse_toml(&fs::read_to_string("examples/machine.toml").unwrap())
-        .unwrap()
-        .without_machine_id();
+    let draft = system_manifest_for(&principal).without_machine_id();
 
-    MachineManifestStore::new(&path)
+    MachineManifestStore::new_system(&path, principal)
+        .unwrap()
         .write_generated(&draft)
         .unwrap();
 
@@ -757,7 +1270,7 @@ fn deterministic_unix_hardening_sets_readable_file_and_protects_replacement_path
     assert!(platform::verify_manifest_security(
         &path,
         platform::ManifestOwner::CurrentProcess,
-        "styrn",
+        &current_worker_principal(),
         temp.path()
     )
     .is_err());
@@ -766,7 +1279,7 @@ fn deterministic_unix_hardening_sets_readable_file_and_protects_replacement_path
     assert!(platform::verify_manifest_security(
         &path,
         platform::ManifestOwner::CurrentProcess,
-        "styrn",
+        &current_worker_principal(),
         temp.path()
     )
     .is_err());
@@ -852,7 +1365,7 @@ fn security_verification_rejects_worker_writable_grandparent() {
     assert!(platform::verify_manifest_security(
         &path,
         platform::ManifestOwner::CurrentProcess,
-        "styrn",
+        &current_worker_principal(),
         temp.path()
     )
     .is_err());
@@ -910,28 +1423,30 @@ fn post_replace_verification_error_reports_that_the_destination_changed() {
 
 #[cfg(unix)]
 #[test]
-#[ignore = "environmental: run as root on a host with an unprivileged styrn account"]
-fn real_styrn_account_can_read_but_cannot_write_or_replace_manifest() {
+#[ignore = "environmental: root plus STYRN_UNIX_TEST_WORKER selecting a real unprivileged account"]
+fn real_selected_account_can_read_but_cannot_write_or_replace_manifest() {
     use std::ffi::CString;
     use std::os::unix::process::ExitStatusExt;
     use std::process::ExitStatus;
 
     assert_eq!(unsafe { libc::geteuid() }, 0, "requires root privileges");
-    let account = CString::new("styrn").unwrap();
+    let worker = std::env::var("STYRN_UNIX_TEST_WORKER")
+        .expect("STYRN_UNIX_TEST_WORKER must select a real unprivileged account");
+    let principal = platform::resolve_named_worker_principal(&worker).unwrap();
+    let account = CString::new(worker).unwrap();
     let password = unsafe { libc::getpwnam(account.as_ptr()) };
-    assert!(!password.is_null(), "requires a real styrn account");
+    assert!(!password.is_null(), "selected worker account must exist");
     let uid = unsafe { (*password).pw_uid };
     let gid = unsafe { (*password).pw_gid };
-    assert_ne!(uid, 0, "styrn must be an unprivileged account");
+    assert_ne!(uid, 0, "selected worker must be an unprivileged account");
 
     let temp = TestDir::new();
-    let config = temp.path().join("styrn");
+    let config = fs::canonicalize(temp.path()).unwrap().join("styrn");
     fs::create_dir(&config).unwrap();
     let path = config.join("machine.toml");
-    let draft = MachineManifest::parse_toml(&fs::read_to_string("examples/machine.toml").unwrap())
+    let draft = system_manifest_for(&principal).without_machine_id();
+    MachineManifestStore::new_system(&path, principal)
         .unwrap()
-        .without_machine_id();
-    MachineManifestStore::new(&path)
         .write_generated(&draft)
         .unwrap();
 
@@ -944,7 +1459,7 @@ fn real_styrn_account_can_read_but_cannot_write_or_replace_manifest() {
         let group_ok = unsafe {
             libc::initgroups(
                 account.as_ptr(),
-                libc::c_int::try_from(gid).expect("styrn gid must fit c_int"),
+                libc::c_int::try_from(gid).expect("selected worker gid must fit c_int"),
             )
         } == 0;
         let gid_ok = unsafe { libc::setgid(gid) } == 0;
@@ -1244,6 +1759,25 @@ fn replace_line(input: &str, starts_with: &str, replacement: &str) -> String {
         .join("\n")
 }
 
+fn remove_toml_table(input: &str, table: &str) -> String {
+    let header = format!("[{table}]");
+    let mut removing = false;
+    input
+        .lines()
+        .filter(|line| {
+            if *line == header {
+                removing = true;
+                return false;
+            }
+            if removing && line.starts_with('[') {
+                removing = false;
+            }
+            !removing
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn assert_no_manifest_temporaries(directory: &Path) {
     assert!(
         fs::read_dir(directory)
@@ -1295,4 +1829,38 @@ fn insert_dynamic_key(manifest: &mut MachineManifest, section: &str, key: &str) 
         }
         _ => unreachable!(),
     }
+}
+
+fn set_manifest_paths_root(manifest: &mut MachineManifest, root: &str, separator: char) {
+    manifest.paths.root = root.to_owned();
+    manifest.paths.repos = format!("{root}{separator}repos");
+    manifest.paths.jobs = format!("{root}{separator}jobs");
+    manifest.paths.cache = format!("{root}{separator}cache");
+    manifest.paths.artifacts = format!("{root}{separator}artifacts");
+    manifest.paths.logs = format!("{root}{separator}logs");
+}
+
+fn set_json_paths_root(manifest: &mut Value, root: &str, separator: char) {
+    for (field, value) in [
+        ("root", root.to_owned()),
+        ("repos", format!("{root}{separator}repos")),
+        ("jobs", format!("{root}{separator}jobs")),
+        ("cache", format!("{root}{separator}cache")),
+        ("artifacts", format!("{root}{separator}artifacts")),
+        ("logs", format!("{root}{separator}logs")),
+    ] {
+        manifest["paths"][field] = Value::String(value);
+    }
+}
+
+fn make_json_windows(manifest: &mut Value) {
+    manifest["platform"]["os"] = Value::String("windows".to_owned());
+    manifest["worker_identity"]["principal_kind"] = Value::String("windows-sid".to_owned());
+    manifest["worker_identity"]["principal_id"] = Value::String("S-1-5-21-1-2-3-1001".to_owned());
+}
+
+fn make_json_system_scope(manifest: &mut Value) {
+    manifest["installation"]["scope"] = Value::String("system".to_owned());
+    manifest["worker_identity"]["mode"] = Value::String("dedicated".to_owned());
+    manifest["worker_identity"]["isolation"] = Value::String("dedicated-account".to_owned());
 }

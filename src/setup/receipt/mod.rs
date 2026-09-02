@@ -13,7 +13,16 @@ use std::{
 use thiserror::Error;
 use uuid::Uuid;
 
+pub(crate) use crate::platform::InstallationScope;
+use crate::platform::WorkerPrincipal;
+
 const SCHEMA_VERSION: u32 = 1;
+
+#[cfg(test)]
+fn fixture_worker_principal() -> WorkerPrincipal {
+    crate::platform::resolve_current_worker_principal()
+        .expect("receipt security tests require a real non-privileged caller")
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub(in crate::setup) struct ReceiptDocument {
@@ -104,20 +113,13 @@ struct ReceiptDocumentWire {
     entries: Vec<ReceiptEntry>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum InstallationScope {
-    User,
-    System,
-}
-
 #[derive(Clone, Debug)]
 pub(crate) struct ReceiptStore {
     scope: InstallationScope,
     path: PathBuf,
     trusted_root: PathBuf,
     owner: crate::platform::ManifestOwner,
-    worker: Option<WorkerPrincipal>,
+    worker: WorkerPrincipal,
     #[cfg(test)]
     interruption: Option<PublicationInterruption>,
     #[cfg(test)]
@@ -204,43 +206,57 @@ enum IntentReadInterruption {
     Inode,
 }
 
-#[derive(Clone, Debug)]
-struct WorkerPrincipal(String);
-
-impl WorkerPrincipal {
-    fn parse(value: &str) -> Result<Self, ReceiptStoreError> {
-        if value.is_empty()
-            || value.len() > 256
-            || value.trim() != value
-            || value.chars().any(char::is_control)
-        {
-            return Err(ReceiptStoreError::InvalidWorkerPrincipal);
-        }
-        Ok(Self(value.to_owned()))
-    }
-
-    fn as_str(&self) -> &str {
-        &self.0
-    }
-}
-
 impl ReceiptStore {
-    fn new_system(path: impl Into<PathBuf>, worker: &str) -> Result<Self, ReceiptStoreError> {
+    fn new_system(
+        path: impl Into<PathBuf>,
+        worker: WorkerPrincipal,
+    ) -> Result<Self, ReceiptStoreError> {
         let path = path.into();
         let trusted_root = path.parent().map(Path::to_path_buf).unwrap_or_default();
-        Ok(Self {
+        let store = Self {
             scope: InstallationScope::System,
             path,
             trusted_root,
             owner: crate::platform::ManifestOwner::System,
-            worker: Some(WorkerPrincipal::parse(worker)?),
+            worker,
             #[cfg(test)]
             interruption: None,
             #[cfg(test)]
             interrupt_after_prepare: false,
             #[cfg(test)]
             intent_read_interruption: None,
-        })
+        };
+        store.validate_destination_policy()?;
+        store.verify_bound_principal()?;
+        Ok(store)
+    }
+
+    fn new_user(
+        path: impl Into<PathBuf>,
+        worker: WorkerPrincipal,
+    ) -> Result<Self, ReceiptStoreError> {
+        let path = path.into();
+        let trusted_root = path
+            .parent()
+            .and_then(Path::parent)
+            .map(Path::to_path_buf)
+            .unwrap_or_default();
+        let store = Self {
+            scope: InstallationScope::User,
+            path,
+            trusted_root,
+            owner: crate::platform::ManifestOwner::User,
+            worker,
+            #[cfg(test)]
+            interruption: None,
+            #[cfg(test)]
+            interrupt_after_prepare: false,
+            #[cfg(test)]
+            intent_read_interruption: None,
+        };
+        store.validate_destination_policy()?;
+        store.verify_bound_principal()?;
+        Ok(store)
     }
 
     #[cfg(test)]
@@ -252,7 +268,7 @@ impl ReceiptStore {
             path,
             trusted_root,
             owner: crate::platform::ManifestOwner::CurrentProcess,
-            worker: Some(WorkerPrincipal("fixture-worker".to_owned())),
+            worker: fixture_worker_principal(),
             interruption: None,
             interrupt_after_prepare: false,
             intent_read_interruption: None,
@@ -272,7 +288,7 @@ impl ReceiptStore {
             path,
             trusted_root,
             owner: crate::platform::ManifestOwner::User,
-            worker: None,
+            worker: fixture_worker_principal(),
             interruption: None,
             interrupt_after_prepare: false,
             intent_read_interruption: None,
@@ -350,6 +366,7 @@ impl ReceiptStore {
     /// Receipt-driven mutation must use [`ReceiptStore::begin_apply`] instead.
     pub(in crate::setup) fn read_snapshot(&self) -> Result<ReceiptDocument, ReceiptStoreError> {
         let destination = self.validate_destination_policy()?;
+        self.verify_bound_principal()?;
         match fs::symlink_metadata(destination) {
             Ok(_) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -363,7 +380,7 @@ impl ReceiptStore {
         let mut receipt = match crate::platform::open_verified_manifest_file_for_read(
             &self.path,
             self.owner,
-            self.worker_name(),
+            &self.worker,
             &self.trusted_root,
         ) {
             Ok(file) => file,
@@ -393,9 +410,10 @@ impl ReceiptStore {
         _authority: &crate::setup::action::JournalAuthority,
     ) -> Result<ReceiptApplySession<'a>, ReceiptStoreError> {
         let destination = self.validate_destination_policy()?.to_path_buf();
+        self.verify_bound_principal()?;
         self.prepare_destination(&destination)?;
         self.preflight_writer_state()?;
-        let lock = crate::platform::open_manifest_lock(&self.lock_path(), self.owner)
+        let lock = crate::platform::open_manifest_lock(&self.lock_path(), self.owner, &self.worker)
             .map_err(ReceiptStoreError::Write)?;
         lock.lock().map_err(ReceiptStoreError::Write)?;
         self.read_locked()?;
@@ -425,9 +443,10 @@ impl ReceiptStore {
             return Err(ReceiptStoreError::NonAppliedAppend);
         }
         let destination = self.validate_destination_policy()?.to_path_buf();
+        self.verify_bound_principal()?;
         self.prepare_destination(&destination)?;
         self.preflight_writer_state()?;
-        let lock = crate::platform::open_manifest_lock(&self.lock_path(), self.owner)
+        let lock = crate::platform::open_manifest_lock(&self.lock_path(), self.owner, &self.worker)
             .map_err(ReceiptStoreError::Write)?;
         lock.lock().map_err(ReceiptStoreError::Write)?;
 
@@ -442,7 +461,7 @@ impl ReceiptStore {
         let mut file = match crate::platform::open_verified_manifest_file_for_read(
             &self.path,
             self.owner,
-            self.worker_name(),
+            &self.worker,
             &self.trusted_root,
         ) {
             Ok(file) => file,
@@ -492,13 +511,14 @@ impl ReceiptStore {
             .ok_or(ReceiptStoreError::InvalidDestination)?;
         let temporary = destination.join(format!(".receipt.json.{}.tmp", Uuid::now_v7()));
         let result = (|| {
-            let mut file = crate::platform::create_private_file(&temporary, self.owner)
-                .map_err(ReceiptStoreError::Write)?;
+            let mut file =
+                crate::platform::create_private_file(&temporary, self.owner, &self.worker)
+                    .map_err(ReceiptStoreError::Write)?;
             file.write_all(&serialized)
                 .map_err(ReceiptStoreError::Write)?;
             file.flush().map_err(ReceiptStoreError::Write)?;
             file.sync_all().map_err(ReceiptStoreError::Write)?;
-            crate::platform::harden_manifest_file(&temporary, self.owner, self.worker_name())
+            crate::platform::harden_manifest_file(&temporary, self.owner, &self.worker)
                 .map_err(ReceiptStoreError::Write)?;
             self.inject_publication_interruption(PublicationInterruptionPoint::BeforeReplace)?;
             crate::platform::replace_file(&temporary, &self.path)
@@ -564,7 +584,7 @@ impl ReceiptStore {
                     crate::platform::verify_manifest_ancestors(
                         current,
                         self.owner,
-                        self.worker_name(),
+                        &self.worker,
                         current,
                     )
                     .map_err(ReceiptStoreError::Security)?;
@@ -584,13 +604,16 @@ impl ReceiptStore {
             let parent = directory
                 .parent()
                 .ok_or(ReceiptStoreError::InvalidDestination)?;
-            match crate::platform::create_private_manifest_staging_directory(&directory, self.owner)
-            {
+            match crate::platform::create_private_manifest_staging_directory(
+                &directory,
+                self.owner,
+                &self.worker,
+            ) {
                 Ok(_) => {
                     crate::platform::harden_manifest_directory(
                         &directory,
                         self.owner,
-                        self.worker_name(),
+                        &self.worker,
                     )
                     .map_err(ReceiptStoreError::Write)?;
                     crate::platform::sync_parent_directory(parent)
@@ -600,7 +623,7 @@ impl ReceiptStore {
                     crate::platform::verify_manifest_ancestors(
                         &directory,
                         self.owner,
-                        self.worker_name(),
+                        &self.worker,
                         &directory,
                     )
                     .map_err(ReceiptStoreError::Security)?;
@@ -617,18 +640,14 @@ impl ReceiptStore {
             .ok_or(ReceiptStoreError::InvalidDestination)?;
         match self.owner {
             crate::platform::ManifestOwner::System => {
-                crate::platform::verify_manifest_parent_chain(
-                    parent,
-                    self.owner,
-                    self.worker_name(),
-                )
-                .map_err(ReceiptStoreError::Security)?;
+                crate::platform::verify_manifest_parent_chain(parent, self.owner, &self.worker)
+                    .map_err(ReceiptStoreError::Security)?;
             }
             crate::platform::ManifestOwner::User => {
                 crate::platform::verify_manifest_ancestors(
                     parent,
                     self.owner,
-                    self.worker_name(),
+                    &self.worker,
                     &self.trusted_root,
                 )
                 .map_err(ReceiptStoreError::Security)?;
@@ -638,32 +657,27 @@ impl ReceiptStore {
                 crate::platform::verify_manifest_ancestors(
                     parent,
                     self.owner,
-                    self.worker_name(),
+                    &self.worker,
                     parent,
                 )
                 .map_err(ReceiptStoreError::Security)?;
             }
             #[cfg(test)]
             crate::platform::ManifestOwner::CurrentProcessWorker => {
-                crate::platform::verify_manifest_parent_chain(
-                    parent,
-                    self.owner,
-                    self.worker_name(),
-                )
-                .map_err(ReceiptStoreError::Security)?;
+                crate::platform::verify_manifest_parent_chain(parent, self.owner, &self.worker)
+                    .map_err(ReceiptStoreError::Security)?;
             }
         }
         let staging_path = parent.join(format!(".styrn.{}.tmp", Uuid::now_v7()));
-        let staging =
-            crate::platform::create_private_manifest_staging_directory(&staging_path, self.owner)
-                .map_err(ReceiptStoreError::Write)?;
+        let staging = crate::platform::create_private_manifest_staging_directory(
+            &staging_path,
+            self.owner,
+            &self.worker,
+        )
+        .map_err(ReceiptStoreError::Write)?;
         let result = (|| {
-            crate::platform::harden_manifest_directory(
-                staging.path(),
-                self.owner,
-                self.worker_name(),
-            )
-            .map_err(ReceiptStoreError::Write)?;
+            crate::platform::harden_manifest_directory(staging.path(), self.owner, &self.worker)
+                .map_err(ReceiptStoreError::Write)?;
             match crate::platform::publish_manifest_directory(&staging, destination) {
                 Ok(()) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -684,23 +698,19 @@ impl ReceiptStore {
         crate::platform::verify_manifest_ancestors(
             destination,
             self.owner,
-            self.worker_name(),
+            &self.worker,
             &self.trusted_root,
         )
         .map_err(ReceiptStoreError::Security)?;
-        crate::platform::verify_manifest_directory_security(
-            destination,
-            self.owner,
-            self.worker_name(),
-        )
-        .map_err(ReceiptStoreError::Security)
+        crate::platform::verify_manifest_directory_security(destination, self.owner, &self.worker)
+            .map_err(ReceiptStoreError::Security)
     }
 
     fn verify_security(&self) -> Result<(), ReceiptStoreError> {
         crate::platform::verify_manifest_security(
             &self.path,
             self.owner,
-            self.worker_name(),
+            &self.worker,
             &self.trusted_root,
         )
         .map_err(ReceiptStoreError::Security)
@@ -742,11 +752,25 @@ impl ReceiptStore {
         Ok(destination)
     }
 
-    fn worker_name(&self) -> &str {
-        self.worker
-            .as_ref()
-            .map(WorkerPrincipal::as_str)
-            .unwrap_or("")
+    fn verify_bound_principal(&self) -> Result<(), ReceiptStoreError> {
+        if matches!(
+            self.owner,
+            crate::platform::ManifestOwner::System | crate::platform::ManifestOwner::User
+        ) {
+            crate::platform::verify_worker_principal(&self.worker)
+                .map_err(ReceiptStoreError::InvalidPrincipal)?;
+            if matches!(self.owner, crate::platform::ManifestOwner::User) {
+                let current = crate::platform::resolve_current_worker_principal()
+                    .map_err(ReceiptStoreError::InvalidPrincipal)?;
+                if current != self.worker {
+                    return Err(ReceiptStoreError::InvalidPrincipal(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "user receipt principal is not the current caller",
+                    )));
+                }
+            }
+        }
+        Ok(())
     }
 
     fn parse_for_scope(&self, input: &[u8]) -> Result<ReceiptDocument, ReceiptStoreError> {
@@ -831,8 +855,9 @@ impl ReceiptApplySession<'_> {
         };
         let serialized = document.to_json()?;
         let result = (|| {
-            let mut file = crate::platform::create_private_file(&path, self.store.owner)
-                .map_err(ReceiptStoreError::Write)?;
+            let mut file =
+                crate::platform::create_private_file(&path, self.store.owner, &self.store.worker)
+                    .map_err(ReceiptStoreError::Write)?;
             file.write_all(&serialized)
                 .map_err(ReceiptStoreError::Write)?;
             file.flush().map_err(ReceiptStoreError::Write)?;
@@ -963,6 +988,7 @@ impl ReceiptApplySession<'_> {
         let mut file = crate::platform::open_verified_private_file_for_read(
             path,
             self.store.owner,
+            &self.store.worker,
             expected_identity,
         )
         .map_err(ReceiptStoreError::Security)?;
@@ -1016,8 +1042,12 @@ impl ReceiptApplySession<'_> {
             }
             IntentReadInterruption::Inode => {
                 let bytes = fs::read(&saved).map_err(ReceiptStoreError::Read)?;
-                let mut replacement = crate::platform::create_private_file(path, self.store.owner)
-                    .map_err(ReceiptStoreError::Write)?;
+                let mut replacement = crate::platform::create_private_file(
+                    path,
+                    self.store.owner,
+                    &self.store.worker,
+                )
+                .map_err(ReceiptStoreError::Write)?;
                 replacement
                     .write_all(&bytes)
                     .map_err(ReceiptStoreError::Write)?;
@@ -1031,15 +1061,23 @@ impl ReceiptApplySession<'_> {
         let directory = path.parent().ok_or(ReceiptStoreError::InvalidDestination)?;
         let temporary = directory.join(format!(".receipt.json.intent.{}.tmp", Uuid::now_v7()));
         let result = (|| {
-            let mut file = crate::platform::create_private_file(&temporary, self.store.owner)
-                .map_err(ReceiptStoreError::Write)?;
+            let mut file = crate::platform::create_private_file(
+                &temporary,
+                self.store.owner,
+                &self.store.worker,
+            )
+            .map_err(ReceiptStoreError::Write)?;
             file.write_all(serialized)
                 .map_err(ReceiptStoreError::Write)?;
             file.flush().map_err(ReceiptStoreError::Write)?;
             file.sync_all().map_err(ReceiptStoreError::Write)?;
             crate::platform::replace_file(&temporary, path).map_err(ReceiptStoreError::Write)?;
-            crate::platform::verify_private_file_security(path, self.store.owner)
-                .map_err(ReceiptStoreError::PostReplaceSecurity)?;
+            crate::platform::verify_private_file_security(
+                path,
+                self.store.owner,
+                &self.store.worker,
+            )
+            .map_err(ReceiptStoreError::PostReplaceSecurity)?;
             crate::platform::sync_parent_directory(directory).map_err(ReceiptStoreError::Write)
         })();
         if result.is_err() {
@@ -1163,31 +1201,26 @@ fn canonical_receipt_path(scope: InstallationScope) -> Result<PathBuf, ReceiptSt
 }
 
 pub(crate) fn configured_receipt_store() -> Result<ReceiptStore, ReceiptStoreError> {
-    let path = canonical_receipt_path(InstallationScope::User)?;
-    let trusted_root = path
-        .parent()
-        .and_then(Path::parent)
-        .map(Path::to_path_buf)
-        .ok_or(ReceiptStoreError::InvalidDestination)?;
-    Ok(ReceiptStore {
-        scope: InstallationScope::User,
-        path,
-        trusted_root,
-        owner: crate::platform::ManifestOwner::User,
-        worker: None,
-        #[cfg(test)]
-        interruption: None,
-        #[cfg(test)]
-        interrupt_after_prepare: false,
-        #[cfg(test)]
-        intent_read_interruption: None,
-    })
+    let worker = crate::platform::resolve_current_worker_principal()
+        .map_err(ReceiptStoreError::InvalidPrincipal)?;
+    configured_receipt_store_for(InstallationScope::User, worker)
+}
+
+pub(crate) fn configured_receipt_store_for(
+    scope: InstallationScope,
+    worker: WorkerPrincipal,
+) -> Result<ReceiptStore, ReceiptStoreError> {
+    let path = canonical_receipt_path(scope)?;
+    match scope {
+        InstallationScope::User => ReceiptStore::new_user(path, worker),
+        InstallationScope::System => ReceiptStore::new_system(path, worker),
+    }
 }
 
 pub(crate) fn configured_system_receipt_store(
-    worker: &str,
+    worker: WorkerPrincipal,
 ) -> Result<ReceiptStore, ReceiptStoreError> {
-    ReceiptStore::new_system(canonical_receipt_path(InstallationScope::System)?, worker)
+    configured_receipt_store_for(InstallationScope::System, worker)
 }
 
 #[derive(Debug, Error)]
@@ -1211,7 +1244,7 @@ pub(crate) enum ReceiptStoreError {
     #[error("setup receipt transaction does not match the prepared action")]
     IntentConflict,
     #[error("setup receipt worker principal is invalid")]
-    InvalidWorkerPrincipal,
+    InvalidPrincipal(#[source] std::io::Error),
     #[error("setup receipt scope does not match the selected installation scope")]
     ScopeMismatch,
     #[error("the current user's standard state directory is unavailable")]
@@ -1593,6 +1626,9 @@ fn is_normalized_windows_path(value: &str) -> bool {
             && !matches!(segment, "." | "..")
             && !segment.contains(':')
             && !segment.ends_with(['.', ' '])
+            && !segment
+                .chars()
+                .any(|character| matches!(character, '<' | '>' | '"' | '|' | '?' | '*'))
             && !is_reserved_windows_device_name(segment)
     })
 }
@@ -1608,7 +1644,10 @@ fn is_reserved_windows_device_name(segment: &str) -> bool {
             .strip_prefix("COM")
             .or_else(|| stem.strip_prefix("LPT"))
             .is_some_and(|number| {
-                matches!(number, "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9")
+                matches!(
+                    number,
+                    "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+                )
             })
 }
 

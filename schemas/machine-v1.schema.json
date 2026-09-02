@@ -2,10 +2,117 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://styrn.dev/schemas/machine-v1.schema.json",
   "title": "Styrn machine manifest v1",
-  "description": "Canonical per-machine manifest. Normative source: docs/design.md Part 2.4 (with 2.4.1 machine_id minting and 2.4.2 field constraints). TOML on disk; this schema validates its JSON rendering via `styrn machine manifest --json`.",
+  "description": "Structural schema for the canonical per-machine manifest rendered as JSON by `styrn machine manifest --json`. Normative semantic validation, including cross-field path containment and UTF-8 byte ceilings, is performed by Styrn from docs/design.md Part 2.4.",
   "type": "object",
-  "required": ["schema_version", "machine_id", "name", "roles", "platform", "paths"],
+  "required": ["schema_version", "machine_id", "name", "roles", "platform", "installation", "paths"],
   "additionalProperties": false,
+  "allOf": [
+    {
+      "if": { "properties": { "roles": { "contains": { "const": "worker" } } }, "required": ["roles"] },
+      "then": {
+        "required": ["transport", "worker_identity"],
+        "properties": { "transport": { "required": ["user"] } }
+      },
+      "else": { "not": { "required": ["worker_identity"] } }
+    },
+    {
+      "if": { "properties": { "platform": { "properties": { "os": { "const": "windows" } }, "required": ["os"] } } },
+      "then": { "properties": { "worker_identity": { "properties": { "principal_kind": { "const": "windows-sid" } } } } },
+      "else": { "properties": { "worker_identity": { "properties": { "principal_kind": { "const": "unix-uid" } } } } }
+    },
+    {
+      "if": { "properties": { "installation": { "properties": { "scope": { "const": "user" } }, "required": ["scope"] } } },
+      "then": { "properties": { "worker_identity": { "properties": { "mode": { "const": "current-user" }, "isolation": { "const": "shared-user" } } } } }
+    },
+    {
+      "if": { "properties": { "worker_identity": { "properties": { "mode": { "const": "dedicated" } }, "required": ["mode"] } }, "required": ["worker_identity"] },
+      "then": { "properties": { "installation": { "properties": { "scope": { "const": "system" } } }, "worker_identity": { "properties": { "isolation": { "const": "dedicated-account" } } } } }
+    },
+    {
+      "if": { "properties": { "worker_identity": { "properties": { "mode": { "const": "current-user" } }, "required": ["mode"] } }, "required": ["worker_identity"] },
+      "then": { "properties": { "worker_identity": { "properties": { "isolation": { "const": "shared-user" } } } } }
+    },
+    {
+      "if": { "properties": { "platform": { "properties": { "os": { "const": "windows" } }, "required": ["os"] } } },
+      "then": { "properties": { "paths": { "properties": {
+        "root": { "$ref": "#/$defs/windowsPath" }, "repos": { "$ref": "#/$defs/windowsReposPath" },
+        "jobs": { "$ref": "#/$defs/windowsJobsPath" }, "cache": { "$ref": "#/$defs/windowsCachePath" },
+        "artifacts": { "$ref": "#/$defs/windowsArtifactsPath" }, "logs": { "$ref": "#/$defs/windowsLogsPath" }
+      } } } },
+      "else": { "properties": { "paths": { "properties": {
+        "root": { "$ref": "#/$defs/unixPath" }, "repos": { "$ref": "#/$defs/unixReposPath" },
+        "jobs": { "$ref": "#/$defs/unixJobsPath" }, "cache": { "$ref": "#/$defs/unixCachePath" },
+        "artifacts": { "$ref": "#/$defs/unixArtifactsPath" }, "logs": { "$ref": "#/$defs/unixLogsPath" }
+      } } } }
+    },
+    {
+      "if": { "properties": {
+        "platform": { "properties": { "os": { "const": "linux" } }, "required": ["os"] },
+        "installation": { "properties": { "scope": { "const": "user" } }, "required": ["scope"] }
+      }, "required": ["platform", "installation"] },
+      "then": { "properties": { "paths": { "properties": { "root": {
+        "allOf": [
+          { "not": { "pattern": "^/srv/styrn(?:/|$)" } },
+          { "not": { "pattern": "^/Users(?:/|$)" } }
+        ]
+      } } } } }
+    },
+    {
+      "if": { "properties": {
+        "platform": { "properties": { "os": { "const": "macos" } }, "required": ["os"] },
+        "installation": { "properties": { "scope": { "const": "user" } }, "required": ["scope"] }
+      }, "required": ["platform", "installation"] },
+      "then": { "properties": { "paths": { "properties": { "root": {
+        "not": { "pattern": "^(?:/Users/Shared/Styrn|/Library/Application Support/Styrn)(?:/|$)" }
+      } } } } }
+    },
+    {
+      "if": { "properties": {
+        "platform": { "properties": { "os": { "const": "windows" } }, "required": ["os"] },
+        "installation": { "properties": { "scope": { "const": "user" } }, "required": ["scope"] }
+      }, "required": ["platform", "installation"] },
+      "then": { "properties": { "paths": { "properties": { "root": {
+        "allOf": [
+          { "not": { "pattern": "^[Cc]:\\\\[Ss][Tt][Yy][Rr][Nn](?:\\\\|$)" } },
+          { "not": { "pattern": "\\\\[Pp][Rr][Oo][Gg][Rr][Aa][Mm][Dd][Aa][Tt][Aa](?:\\\\|$)" } }
+        ]
+      } } } } }
+    },
+    {
+      "if": { "properties": {
+        "platform": { "properties": { "os": { "const": "linux" } }, "required": ["os"] },
+        "installation": { "properties": { "scope": { "const": "system" } }, "required": ["scope"] }
+      }, "required": ["platform", "installation"] },
+      "then": { "properties": { "paths": { "properties": { "root": {
+        "allOf": [
+          { "not": { "pattern": "^/(?:home|Users|root)(?:/|$)" } },
+          { "not": { "pattern": "/\\.local/share(?:/|$)" } }
+        ]
+      } } } } }
+    },
+    {
+      "if": { "properties": {
+        "platform": { "properties": { "os": { "const": "macos" } }, "required": ["os"] },
+        "installation": { "properties": { "scope": { "const": "system" } }, "required": ["scope"] }
+      }, "required": ["platform", "installation"] },
+      "then": { "properties": { "paths": { "properties": { "root": {
+        "if": { "pattern": "^/Users(?:/|$)" },
+        "then": { "pattern": "^/Users/Shared(?:/|$)" }
+      } } } } }
+    },
+    {
+      "if": { "properties": {
+        "platform": { "properties": { "os": { "const": "windows" } }, "required": ["os"] },
+        "installation": { "properties": { "scope": { "const": "system" } }, "required": ["scope"] }
+      }, "required": ["platform", "installation"] },
+      "then": { "properties": { "paths": { "properties": { "root": {
+        "allOf": [
+          { "not": { "pattern": "\\\\[Uu][Ss][Ee][Rr][Ss](?:\\\\|$)" } },
+          { "not": { "pattern": "\\\\[Aa][Pp][Pp][Dd][Aa][Tt][Aa]\\\\[Ll][Oo][Cc][Aa][Ll](?:\\\\|$)" } }
+        ]
+      } } } } }
+    }
+  ],
 
   "$comment": "A manifest must never carry secrets (Part 2.4, 4.2). The top-level `not` below is a coarse structural guard, not a substitute for the secret-scanning test (implementation-plan C11 / T0.6).",
   "not": {
@@ -49,6 +156,38 @@
       }
     },
 
+    "installation": {
+      "type": "object",
+      "required": ["scope"],
+      "additionalProperties": false,
+      "properties": {
+        "scope": { "enum": ["user", "system"] }
+      }
+    },
+
+    "worker_identity": {
+      "type": "object",
+      "required": ["mode", "principal_kind", "principal_id", "name", "isolation"],
+      "additionalProperties": false,
+      "properties": {
+        "mode": { "enum": ["current-user", "dedicated"] },
+        "principal_kind": { "enum": ["unix-uid", "windows-sid"] },
+        "principal_id": { "type": "string" },
+        "name": { "type": "string", "minLength": 1, "maxLength": 256, "pattern": "^(?!\\s)(?!.*\\s$)[^\\x00-\\x1F\\x7F-\\u009F\\\\/:]+$", "description": "Structural character limit; runtime validation additionally enforces the normative 256-byte UTF-8 ceiling." },
+        "isolation": { "enum": ["shared-user", "dedicated-account"] }
+      },
+      "allOf": [
+        {
+          "if": { "properties": { "principal_kind": { "const": "unix-uid" } }, "required": ["principal_kind"] },
+          "then": { "properties": { "principal_id": { "pattern": "^(?:[1-9][0-9]{0,8}|[1-3][0-9]{9}|4[0-1][0-9]{8}|42[0-8][0-9]{7}|429[0-3][0-9]{6}|4294[0-8][0-9]{5}|42949[0-5][0-9]{4}|429496[0-6][0-9]{3}|4294967[0-1][0-9]{2}|42949672[0-8][0-9]|429496729[0-5])$" } } }
+        },
+        {
+          "if": { "properties": { "principal_kind": { "const": "windows-sid" } }, "required": ["principal_kind"] },
+          "then": { "properties": { "principal_id": { "pattern": "^S-1-(?:0|[1-9][0-9]{0,13}|1[0-9]{14}|2[0-7][0-9]{13}|280[0-9]{12}|281[0-3][0-9]{11}|2814[0-6][0-9]{10}|28147[0-3][0-9]{9}|281474[0-8][0-9]{8}|2814749[0-6][0-9]{7}|28147497[0-5][0-9]{6}|281474976[0-6][0-9]{5}|28147497670[0-9]{4}|281474976710[0-5][0-9]{2}|2814749767106[0-4][0-9]|28147497671065[0-4]|281474976710655)-(?:0|[1-9][0-9]{0,8}|[1-3][0-9]{9}|4[0-1][0-9]{8}|42[0-8][0-9]{7}|429[0-3][0-9]{6}|4294[0-8][0-9]{5}|42949[0-5][0-9]{4}|429496[0-6][0-9]{3}|4294967[0-1][0-9]{2}|42949672[0-8][0-9]|429496729[0-5])(?:-(?:0|[1-9][0-9]{0,8}|[1-3][0-9]{9}|4[0-1][0-9]{8}|42[0-8][0-9]{7}|429[0-3][0-9]{6}|4294[0-8][0-9]{5}|42949[0-5][0-9]{4}|429496[0-6][0-9]{3}|4294967[0-1][0-9]{2}|42949672[0-8][0-9]|429496729[0-5])){0,14}$", "not": { "const": "S-1-5-18" } } } }
+        }
+      ]
+    },
+
     "transport": {
       "type": "object",
       "required": ["kind", "host"],
@@ -64,6 +203,7 @@
 
     "paths": {
       "type": "object",
+      "$comment": "Standard JSON Schema cannot compare sibling string values. Leaf suffixes and path normalization are checked here; Styrn runtime validation additionally requires every leaf to equal root plus its named child exactly.",
       "required": ["root", "repos", "jobs", "cache", "artifacts", "logs"],
       "additionalProperties": false,
       "properties": {
@@ -248,6 +388,35 @@
 
   "$defs": {
     "byteCount": { "type": "integer", "minimum": 0, "description": "Sizes are integer bytes in JSON (10.1)." },
-    "positiveCount": { "type": "integer", "minimum": 1 }
+    "positiveCount": { "type": "integer", "minimum": 1 },
+    "unixPath": {
+      "type": "string",
+      "pattern": "^/[^\\\\\\x00-\\x1F\\x7F]+$",
+      "allOf": [
+        { "not": { "pattern": "//" } },
+        { "not": { "pattern": "/\\.\\.?(?:/|$)" } },
+        { "not": { "pattern": "/$" } }
+      ]
+    },
+    "windowsPath": {
+      "type": "string",
+      "pattern": "^[A-Za-z]:\\\\[^/<>:\"|?*\\x00-\\x1F\\x7F]+$",
+      "allOf": [
+        { "not": { "pattern": "\\\\\\\\" } },
+        { "not": { "pattern": "\\\\\\.\\.?(?:\\\\|$)" } },
+        { "not": { "pattern": "[ .](?:\\\\|$)" } },
+        { "not": { "pattern": "\\\\(?:[Cc][Oo][Nn]|[Pp][Rr][Nn]|[Aa][Uu][Xx]|[Nn][Uu][Ll]|[Cc][Oo][Mm][1-9¹²³]|[Ll][Pp][Tt][1-9¹²³])(?:\\.[^\\\\]*)?(?:\\\\|$)" } }
+      ]
+    },
+    "unixReposPath": { "allOf": [{ "$ref": "#/$defs/unixPath" }, { "pattern": "/repos$" }] },
+    "unixJobsPath": { "allOf": [{ "$ref": "#/$defs/unixPath" }, { "pattern": "/jobs$" }] },
+    "unixCachePath": { "allOf": [{ "$ref": "#/$defs/unixPath" }, { "pattern": "/cache$" }] },
+    "unixArtifactsPath": { "allOf": [{ "$ref": "#/$defs/unixPath" }, { "pattern": "/artifacts$" }] },
+    "unixLogsPath": { "allOf": [{ "$ref": "#/$defs/unixPath" }, { "pattern": "/logs$" }] },
+    "windowsReposPath": { "allOf": [{ "$ref": "#/$defs/windowsPath" }, { "pattern": "\\\\repos$" }] },
+    "windowsJobsPath": { "allOf": [{ "$ref": "#/$defs/windowsPath" }, { "pattern": "\\\\jobs$" }] },
+    "windowsCachePath": { "allOf": [{ "$ref": "#/$defs/windowsPath" }, { "pattern": "\\\\cache$" }] },
+    "windowsArtifactsPath": { "allOf": [{ "$ref": "#/$defs/windowsPath" }, { "pattern": "\\\\artifacts$" }] },
+    "windowsLogsPath": { "allOf": [{ "$ref": "#/$defs/windowsPath" }, { "pattern": "\\\\logs$" }] }
   }
 }

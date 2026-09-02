@@ -6,29 +6,24 @@ use std::process::{Command, Output};
 use uuid::Uuid;
 
 #[cfg(unix)]
-use std::os::unix::fs::MetadataExt;
+use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
 #[test]
 #[cfg(unix)]
 fn manifest_read_requires_hardened_ownership_and_never_rewrites() {
     let temp = TestDir::new();
     let path = temp.path().join("machine.toml");
-    let original = fs::read("examples/machine.toml").unwrap();
+    let original = current_user_manifest().into_bytes();
     fs::write(&path, &original).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
 
     let first = run(temp.path(), &["machine", "manifest", "--json"]);
     let first_json = exactly_one_json(&first.stdout);
     assert_schema_valid(&first_json);
     assert_eq!(first_json["command"], "machine manifest");
-    if system_manifest_prerequisites_available() {
-        assert!(first.status.success(), "{first:?}");
-        assert_eq!(first_json["ok"], true);
-        assert_eq!(first_json["warnings"].as_array().unwrap().len(), 0);
-    } else {
-        assert_eq!(first.status.code(), Some(2), "{first:?}");
-        assert_eq!(first_json["ok"], false);
-        assert_eq!(first_json["errors"][0]["code"], "machine.manifest_invalid");
-    }
+    assert!(first.status.success(), "{first:?}");
+    assert_eq!(first_json["ok"], true);
+    assert_eq!(first_json["warnings"].as_array().unwrap().len(), 0);
     assert_eq!(fs::read(path).unwrap(), original);
 }
 
@@ -60,34 +55,22 @@ fn init_and_manifest_report_invalid_documents_as_one_typed_exit_two_envelope() {
 #[cfg(unix)]
 fn init_never_reports_an_unhardened_repair_as_success_and_never_invents_one() {
     let repaired_dir = TestDir::new();
-    let stage_zero = remove_line(
-        &fs::read_to_string("examples/machine.toml").unwrap(),
-        "machine_id =",
-    );
+    let stage_zero = remove_line(&current_user_manifest(), "machine_id =");
     let repaired_path = repaired_dir.path().join("machine.toml");
     fs::write(&repaired_path, &stage_zero).unwrap();
+    fs::set_permissions(&repaired_path, fs::Permissions::from_mode(0o600)).unwrap();
     let repaired = run(repaired_dir.path(), &["machine", "init", "--json"]);
     let repaired_json = exactly_one_json(&repaired.stdout);
     assert_eq!(repaired_json["command"], "machine init");
-    if system_manifest_prerequisites_available() {
-        assert!(repaired.status.success(), "{repaired:?}");
-        assert_eq!(
-            repaired_json["warnings"][0]["code"],
-            "machine.machine_id_minted"
-        );
-        assert_ne!(fs::read_to_string(&repaired_path).unwrap(), stage_zero);
-        let metadata = fs::metadata(&repaired_path).unwrap();
-        assert_eq!(metadata.uid(), 0);
-        assert_eq!(metadata.mode() & 0o777, 0o644);
-    } else {
-        assert_eq!(repaired.status.code(), Some(2), "{repaired:?}");
-        assert_eq!(repaired_json["ok"], false);
-        assert_eq!(
-            repaired_json["errors"][0]["code"],
-            "machine.manifest_invalid"
-        );
-        assert_eq!(fs::read_to_string(&repaired_path).unwrap(), stage_zero);
-    }
+    assert!(repaired.status.success(), "{repaired:?}");
+    assert_eq!(
+        repaired_json["warnings"][0]["code"],
+        "machine.machine_id_minted"
+    );
+    assert_ne!(fs::read_to_string(&repaired_path).unwrap(), stage_zero);
+    let metadata = fs::metadata(&repaired_path).unwrap();
+    assert_eq!(metadata.uid(), unsafe { libc::geteuid() });
+    assert_eq!(metadata.mode() & 0o777, 0o600);
 
     let absent_dir = TestDir::new();
     let absent = run(absent_dir.path(), &["machine", "init", "--json"]);
@@ -97,23 +80,15 @@ fn init_never_reports_an_unhardened_repair_as_success_and_never_invents_one() {
     assert!(!absent_dir.path().join("machine.toml").exists());
 }
 
-#[cfg(unix)]
-fn system_manifest_prerequisites_available() -> bool {
-    let account = std::ffi::CString::new("styrn").unwrap();
-    unsafe { libc::geteuid() == 0 && !libc::getpwnam(account.as_ptr()).is_null() }
-}
-
 #[test]
 fn secret_bearing_manifest_fails_as_a_typed_json_error_without_leaking_or_rewriting() {
     let temp = TestDir::new();
     let secret = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiJzdHlybiIsInJvbGUiOiJ3b3JrZXIifQ.signaturesegmentwithenoughbase64urlchars123";
-    let original = fs::read_to_string("examples/machine.toml")
-        .unwrap()
-        .replacen(
-            "sandbox = \"elevated\"",
-            &format!("sandbox = \"{secret}\""),
-            1,
-        );
+    let original = current_user_manifest().replacen(
+        "sandbox = \"elevated\"",
+        &format!("sandbox = \"{secret}\""),
+        1,
+    );
     let path = temp.path().join("machine.toml");
     fs::write(&path, &original).unwrap();
 
@@ -136,6 +111,68 @@ fn run(config_dir: &Path, arguments: &[&str]) -> Output {
         .env("STYRN_CONFIG_DIR", config_dir)
         .output()
         .unwrap()
+}
+
+#[cfg(unix)]
+fn current_user_manifest() -> String {
+    let uid = unsafe { libc::getuid() };
+    assert_ne!(uid, 0, "root caller rejection is covered separately");
+    let password = unsafe { libc::getpwuid(uid) };
+    assert!(!password.is_null());
+    let name = unsafe { std::ffi::CStr::from_ptr((*password).pw_name) }
+        .to_str()
+        .unwrap();
+    let mut input = fs::read_to_string("examples/machine.controller-worker.toml").unwrap();
+    input = input
+        .replace(
+            "principal_id = \"501\"",
+            &format!("principal_id = \"{uid}\""),
+        )
+        .replace("name = \"alex-dev\"", &format!("name = \"{name}\""))
+        .replace("user = \"alex-dev\"", &format!("user = \"{name}\""));
+    #[cfg(target_os = "linux")]
+    {
+        input = input.replace("os = \"macos\"", "os = \"linux\"").replace(
+            "/Users/alex-dev/Library/Application Support/Styrn",
+            &format!("/home/{name}/.local/share/styrn"),
+        );
+    }
+    input
+}
+
+#[cfg(windows)]
+fn current_user_manifest() -> String {
+    let account = Command::new("whoami").output().unwrap();
+    assert!(account.status.success());
+    let qualified = String::from_utf8(account.stdout).unwrap();
+    let name = qualified.trim().rsplit('\\').next().unwrap();
+    let identity = Command::new("whoami")
+        .arg("/user")
+        .arg("/fo")
+        .arg("csv")
+        .arg("/nh")
+        .output()
+        .unwrap();
+    assert!(identity.status.success());
+    let row = String::from_utf8(identity.stdout).unwrap();
+    let sid = row.split(',').nth(1).unwrap().trim().trim_matches('"');
+    fs::read_to_string("examples/machine.controller-worker.toml")
+        .unwrap()
+        .replace("os = \"macos\"", "os = \"windows\"")
+        .replace(
+            "principal_kind = \"unix-uid\"",
+            "principal_kind = \"windows-sid\"",
+        )
+        .replace(
+            "principal_id = \"501\"",
+            &format!("principal_id = \"{sid}\""),
+        )
+        .replace("name = \"alex-dev\"", &format!("name = \"{name}\""))
+        .replace("user = \"alex-dev\"", &format!("user = \"{name}\""))
+        .replace(
+            "/Users/alex-dev/Library/Application Support/Styrn",
+            &format!("C:\\\\Users\\\\{name}\\\\AppData\\\\Local\\\\Styrn"),
+        )
 }
 
 fn exactly_one_json(stdout: &[u8]) -> Value {
@@ -184,7 +221,9 @@ impl TestDir {
     fn new() -> Self {
         let path = std::env::temp_dir().join(format!("styrn-machine-cli-{}", Uuid::now_v7()));
         fs::create_dir_all(&path).unwrap();
-        Self(path)
+        #[cfg(unix)]
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        Self(fs::canonicalize(path).unwrap())
     }
 
     fn path(&self) -> &Path {

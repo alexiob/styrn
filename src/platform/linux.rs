@@ -1,4 +1,4 @@
-use super::{ManifestOwner, PrivateFileIdentity};
+use super::{ManifestOwner, PrincipalKind, PrivateFileIdentity, WorkerPrincipal};
 use std::fs;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
@@ -11,9 +11,70 @@ pub(crate) fn platform_name() -> &'static str {
     "linux"
 }
 
+pub(super) fn resolve_current_worker_principal() -> io::Result<WorkerPrincipal> {
+    let real_uid = unsafe { libc::getuid() };
+    let effective_uid = unsafe { libc::geteuid() };
+    principal_for_uid(super::validate_unix_caller_ids(real_uid, effective_uid)?)
+}
+
+#[allow(dead_code)] // Explicit system-account selection is exercised by environmental gates.
+pub(super) fn resolve_named_worker_principal(name: &str) -> io::Result<WorkerPrincipal> {
+    let uid = lookup_worker_uid(name)?;
+    let principal = principal_for_uid(uid)?;
+    if principal.name() != name {
+        return Err(permission_denied(
+            "worker account name does not match its native uid",
+        ));
+    }
+    Ok(principal)
+}
+
+pub(super) fn verify_worker_principal(principal: &WorkerPrincipal) -> io::Result<()> {
+    if principal.principal_kind() != PrincipalKind::UnixUid {
+        return Err(invalid_data("worker principal kind does not match Unix"));
+    }
+    let current = principal_for_uid(principal.unix_uid()?)?;
+    if &current != principal {
+        return Err(permission_denied("worker uid/name identity drift detected"));
+    }
+    Ok(())
+}
+
+fn principal_for_uid(uid: u32) -> io::Result<WorkerPrincipal> {
+    if uid == 0 {
+        return Err(permission_denied("root cannot be a worker principal"));
+    }
+    let mut entry = unsafe { std::mem::zeroed::<libc::passwd>() };
+    let mut result = std::ptr::null_mut();
+    let mut buffer = vec![0_u8; 16 * 1024];
+    let status = unsafe {
+        libc::getpwuid_r(
+            uid,
+            &mut entry,
+            buffer.as_mut_ptr().cast(),
+            buffer.len(),
+            &mut result,
+        )
+    };
+    if status != 0 {
+        return Err(io::Error::from_raw_os_error(status));
+    }
+    if result.is_null() || entry.pw_name.is_null() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "worker uid has no native account mapping",
+        ));
+    }
+    let name = unsafe { std::ffi::CStr::from_ptr(entry.pw_name) }
+        .to_str()
+        .map_err(|_| invalid_data("worker account name is not UTF-8"))?;
+    WorkerPrincipal::new(PrincipalKind::UnixUid, uid.to_string(), name)
+}
+
 pub(super) fn create_private_manifest_staging_directory(
     path: &Path,
     _owner: ManifestOwner,
+    _principal: &WorkerPrincipal,
 ) -> io::Result<()> {
     let mut builder = fs::DirBuilder::new();
     builder.mode(0o700).create(path)
@@ -22,7 +83,7 @@ pub(super) fn create_private_manifest_staging_directory(
 pub(super) fn harden_manifest_directory(
     path: &Path,
     owner: ManifestOwner,
-    _worker: &str,
+    _worker: &WorkerPrincipal,
 ) -> io::Result<()> {
     require_real_directory(path)?;
     apply_owner(path, owner)?;
@@ -32,13 +93,13 @@ pub(super) fn harden_manifest_directory(
         0o755
     };
     fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
-    verify_directory(path, owner)
+    verify_directory(path, owner, _worker)
 }
 
 pub(super) fn harden_manifest_file(
     path: &Path,
     owner: ManifestOwner,
-    _worker: &str,
+    _worker: &WorkerPrincipal,
 ) -> io::Result<()> {
     require_regular_file(path)?;
     apply_owner(path, owner)?;
@@ -48,28 +109,40 @@ pub(super) fn harden_manifest_file(
         0o644
     };
     fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
-    verify_file(path, owner, mode, "manifest")
+    verify_file(path, owner, _worker, mode, "manifest")
 }
 
-pub(super) fn open_manifest_lock(path: &Path, owner: ManifestOwner) -> io::Result<fs::File> {
-    let created = create_private_file(path, owner);
+pub(super) fn open_manifest_lock(
+    path: &Path,
+    owner: ManifestOwner,
+    principal: &WorkerPrincipal,
+) -> io::Result<fs::File> {
+    let created = create_private_file(path, owner, principal);
     let file = match created {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-            verify_private_file_security(path, owner)?;
+            verify_private_file_security(path, owner, principal)?;
             fs::OpenOptions::new().read(true).write(true).open(path)?
         }
         Err(error) => return Err(error),
     };
-    verify_private_file_security(path, owner)?;
+    verify_private_file_security(path, owner, principal)?;
     Ok(file)
 }
 
-pub(super) fn verify_private_file_security(path: &Path, owner: ManifestOwner) -> io::Result<()> {
-    verify_file(path, owner, 0o600, "private store file")
+pub(super) fn verify_private_file_security(
+    path: &Path,
+    owner: ManifestOwner,
+    principal: &WorkerPrincipal,
+) -> io::Result<()> {
+    verify_file(path, owner, principal, 0o600, "private store file")
 }
 
-pub(super) fn create_private_file(path: &Path, _owner: ManifestOwner) -> io::Result<fs::File> {
+pub(super) fn create_private_file(
+    path: &Path,
+    _owner: ManifestOwner,
+    _principal: &WorkerPrincipal,
+) -> io::Result<fs::File> {
     fs::OpenOptions::new()
         .read(true)
         .write(true)
@@ -91,6 +164,7 @@ pub(super) fn private_file_identity(path: &Path) -> io::Result<PrivateFileIdenti
 pub(super) fn open_verified_private_file_for_read(
     path: &Path,
     owner: ManifestOwner,
+    principal: &WorkerPrincipal,
     expected_identity: PrivateFileIdentity,
 ) -> io::Result<fs::File> {
     let file = fs::OpenOptions::new()
@@ -107,7 +181,7 @@ pub(super) fn open_verified_private_file_for_read(
     }
     let expected_uid = match owner {
         ManifestOwner::System => 0,
-        ManifestOwner::User => unsafe { libc::geteuid() },
+        ManifestOwner::User => principal.unix_uid()?,
         #[cfg(test)]
         ManifestOwner::CurrentProcess | ManifestOwner::CurrentProcessWorker => metadata.uid(),
     };
@@ -122,7 +196,7 @@ pub(super) fn open_verified_private_file_for_read(
 pub(super) fn verify_manifest_security(
     path: &Path,
     owner: ManifestOwner,
-    worker: &str,
+    worker: &WorkerPrincipal,
     trusted_root: &Path,
 ) -> io::Result<()> {
     let parent = path
@@ -134,7 +208,7 @@ pub(super) fn verify_manifest_security(
     let directory = fs::metadata(parent)?;
     let expected_uid = match owner {
         ManifestOwner::System => 0,
-        ManifestOwner::User => unsafe { libc::geteuid() },
+        ManifestOwner::User => worker.unix_uid()?,
         #[cfg(test)]
         ManifestOwner::CurrentProcess | ManifestOwner::CurrentProcessWorker => file.uid(),
     };
@@ -155,7 +229,7 @@ pub(super) fn verify_manifest_security(
 pub(super) fn open_verified_manifest_file_for_read(
     path: &Path,
     owner: ManifestOwner,
-    worker: &str,
+    worker: &WorkerPrincipal,
     trusted_root: &Path,
 ) -> io::Result<fs::File> {
     let parent = path
@@ -174,7 +248,7 @@ pub(super) fn open_verified_manifest_file_for_read(
     let directory = fs::metadata(parent)?;
     let expected_uid = match owner {
         ManifestOwner::System => 0,
-        ManifestOwner::User => unsafe { libc::geteuid() },
+        ManifestOwner::User => worker.unix_uid()?,
         #[cfg(test)]
         ManifestOwner::CurrentProcess | ManifestOwner::CurrentProcessWorker => file_metadata.uid(),
     };
@@ -199,9 +273,9 @@ pub(super) fn verify_manifest_file_target(path: &Path) -> io::Result<()> {
 pub(super) fn verify_manifest_directory_security(
     directory: &Path,
     owner: ManifestOwner,
-    _worker: &str,
+    worker: &WorkerPrincipal,
 ) -> io::Result<()> {
-    verify_directory(directory, owner)
+    verify_directory(directory, owner, worker)
 }
 
 pub(super) fn publish_manifest_directory(staging: &Path, destination: &Path) -> io::Result<()> {
@@ -229,10 +303,10 @@ pub(super) fn publish_manifest_directory(staging: &Path, destination: &Path) -> 
 pub(super) fn verify_manifest_parent_chain(
     parent: &Path,
     owner: ManifestOwner,
-    worker: &str,
+    worker: &WorkerPrincipal,
 ) -> io::Result<()> {
     if matches!(owner, ManifestOwner::User) {
-        return verify_user_trusted_root_chain(parent);
+        return verify_user_trusted_root_chain(parent, worker.unix_uid()?);
     }
     require_real_directory(parent)?;
     let worker_uid = worker_uid(owner, worker)?;
@@ -250,7 +324,7 @@ pub(super) fn verify_manifest_parent_chain(
 pub(super) fn verify_manifest_ancestors(
     directory: &Path,
     owner: ManifestOwner,
-    worker: &str,
+    worker: &WorkerPrincipal,
     trusted_root: &Path,
 ) -> io::Result<()> {
     let system_owner = matches!(owner, ManifestOwner::System);
@@ -262,7 +336,7 @@ pub(super) fn verify_manifest_ancestors(
         ));
     }
     if matches!(owner, ManifestOwner::User) {
-        return verify_user_manifest_ancestors(directory, trusted_root);
+        return verify_user_manifest_ancestors(directory, trusted_root, worker.unix_uid()?);
     }
     if !system_owner && directory == trusted_root {
         return require_real_directory(directory);
@@ -302,10 +376,13 @@ pub(super) fn verify_manifest_ancestors(
     }
 }
 
-fn verify_user_manifest_ancestors(directory: &Path, trusted_root: &Path) -> io::Result<()> {
+fn verify_user_manifest_ancestors(
+    directory: &Path,
+    trusted_root: &Path,
+    current_uid: u32,
+) -> io::Result<()> {
     require_real_directory(directory)?;
     if directory != trusted_root {
-        let current_uid = unsafe { libc::geteuid() };
         let mut current = directory.parent();
         while let Some(ancestor) = current {
             if ancestor == trusted_root {
@@ -326,12 +403,11 @@ fn verify_user_manifest_ancestors(directory: &Path, trusted_root: &Path) -> io::
             ));
         }
     }
-    verify_user_trusted_root_chain(trusted_root)
+    verify_user_trusted_root_chain(trusted_root, current_uid)
 }
 
-fn verify_user_trusted_root_chain(path: &Path) -> io::Result<()> {
+fn verify_user_trusted_root_chain(path: &Path, current_uid: u32) -> io::Result<()> {
     require_real_directory(path)?;
-    let current_uid = unsafe { libc::geteuid() };
     let metadata = fs::metadata(path)?;
     if metadata.uid() != current_uid || metadata.mode() & 0o022 != 0 {
         return Err(permission_denied(
@@ -412,9 +488,9 @@ fn verify_ancestor_chain(
     Ok(())
 }
 
-fn worker_uid(owner: ManifestOwner, worker: &str) -> io::Result<Option<u32>> {
+fn worker_uid(owner: ManifestOwner, worker: &WorkerPrincipal) -> io::Result<Option<u32>> {
     match owner {
-        ManifestOwner::System => Ok(Some(lookup_worker_uid(worker)?)),
+        ManifestOwner::System => Ok(Some(worker.unix_uid()?)),
         ManifestOwner::User => Ok(None),
         #[cfg(test)]
         ManifestOwner::CurrentProcess => Ok(None),
@@ -442,6 +518,7 @@ fn validate_ancestor_access(
     Ok(())
 }
 
+#[allow(dead_code)] // Called by the environmental selected-account gate.
 fn lookup_worker_uid(worker: &str) -> io::Result<u32> {
     let worker = std::ffi::CString::new(worker)
         .map_err(|_| invalid_data("worker account contains a NUL byte"))?;
@@ -526,10 +603,14 @@ fn apply_owner(path: &Path, owner: ManifestOwner) -> io::Result<()> {
     }
 }
 
-fn verify_directory(path: &Path, owner: ManifestOwner) -> io::Result<()> {
+fn verify_directory(
+    path: &Path,
+    owner: ManifestOwner,
+    principal: &WorkerPrincipal,
+) -> io::Result<()> {
     require_real_directory(path)?;
     let metadata = fs::metadata(path)?;
-    verify_owner(&metadata, owner, "manifest directory")?;
+    verify_owner(&metadata, owner, principal, "manifest directory")?;
     let expected_mode = if matches!(owner, ManifestOwner::User) {
         0o700
     } else {
@@ -543,10 +624,16 @@ fn verify_directory(path: &Path, owner: ManifestOwner) -> io::Result<()> {
     Ok(())
 }
 
-fn verify_file(path: &Path, owner: ManifestOwner, mode: u32, label: &str) -> io::Result<()> {
+fn verify_file(
+    path: &Path,
+    owner: ManifestOwner,
+    principal: &WorkerPrincipal,
+    mode: u32,
+    label: &str,
+) -> io::Result<()> {
     require_regular_file(path)?;
     let metadata = fs::metadata(path)?;
-    verify_owner(&metadata, owner, label)?;
+    verify_owner(&metadata, owner, principal, label)?;
     if metadata.mode() & 0o777 != mode {
         return Err(permission_denied(&format!(
             "{label} mode must be {mode:04o}, found {:04o}",
@@ -556,10 +643,15 @@ fn verify_file(path: &Path, owner: ManifestOwner, mode: u32, label: &str) -> io:
     Ok(())
 }
 
-fn verify_owner(metadata: &fs::Metadata, owner: ManifestOwner, label: &str) -> io::Result<()> {
+fn verify_owner(
+    metadata: &fs::Metadata,
+    owner: ManifestOwner,
+    principal: &WorkerPrincipal,
+    label: &str,
+) -> io::Result<()> {
     let expected = match owner {
         ManifestOwner::System => 0,
-        ManifestOwner::User => unsafe { libc::geteuid() },
+        ManifestOwner::User => principal.unix_uid()?,
         #[cfg(test)]
         ManifestOwner::CurrentProcess | ManifestOwner::CurrentProcessWorker => metadata.uid(),
     };

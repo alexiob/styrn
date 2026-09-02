@@ -18,6 +18,8 @@ pub(crate) struct MachineManifest {
     pub(crate) name: String,
     pub(crate) roles: Vec<MachineRole>,
     pub(crate) platform: Platform,
+    pub(crate) installation: Option<Installation>,
+    pub(crate) worker_identity: Option<WorkerIdentity>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub(crate) transport: Option<Transport>,
     pub(crate) paths: Paths,
@@ -58,6 +60,9 @@ struct MachineManifestWire<'a> {
     name: &'a str,
     roles: &'a [MachineRole],
     platform: &'a Platform,
+    installation: &'a Option<Installation>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    worker_identity: &'a Option<WorkerIdentity>,
     #[serde(skip_serializing_if = "Option::is_none")]
     transport: &'a Option<Transport>,
     paths: &'a Paths,
@@ -99,6 +104,8 @@ struct RawMachineManifest {
     name: String,
     roles: Vec<MachineRole>,
     platform: Platform,
+    installation: Option<Installation>,
+    worker_identity: Option<WorkerIdentity>,
     transport: Option<Transport>,
     paths: Paths,
     controller: Option<Controller>,
@@ -124,6 +131,8 @@ pub(crate) struct MachineManifestDraft {
     pub(crate) name: String,
     pub(crate) roles: Vec<MachineRole>,
     pub(crate) platform: Platform,
+    pub(crate) installation: Option<Installation>,
+    pub(crate) worker_identity: Option<WorkerIdentity>,
     pub(crate) transport: Option<Transport>,
     pub(crate) paths: Paths,
     pub(crate) controller: Option<Controller>,
@@ -152,6 +161,7 @@ macro_rules! manifest_types {
 
 manifest_types! {
     Platform { os: OperatingSystem, arch: Architecture, hostname: String, headless: Option<bool> }
+    Installation { scope: platform::InstallationScope }
     Transport { kind: TransportKind, host: String, port: Option<u16>, user: Option<String> }
     Paths { root: String, repos: String, jobs: String, cache: String, artifacts: String, logs: String }
     Controller { enabled: Option<bool>, inventory: Option<String> }
@@ -171,6 +181,27 @@ manifest_types! {
     PendingAction { id: String, severity: PendingSeverity, message: String }
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct WorkerIdentity {
+    pub(crate) mode: WorkerIdentityMode,
+    pub(crate) principal_kind: platform::PrincipalKind,
+    pub(crate) principal_id: String,
+    pub(crate) name: String,
+    pub(crate) isolation: WorkerIsolation,
+}
+
+impl WorkerIdentity {
+    fn principal(&self) -> Result<platform::WorkerPrincipal, ManifestError> {
+        platform::WorkerPrincipal::new(
+            self.principal_kind,
+            self.principal_id.clone(),
+            self.name.clone(),
+        )
+        .map_err(|error| ManifestError::Validation(error.to_string()))
+    }
+}
+
 macro_rules! string_enum {
     ($name:ident { $($variant:ident => $value:literal),+ $(,)? }) => {
         #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -186,6 +217,19 @@ string_enum! { TransportKind { Ssh => "ssh" } }
 string_enum! { TailscaleMode { Service => "service", Gui => "gui", Tailscaled => "tailscaled" } }
 string_enum! { InstallChannel { Direct => "direct", Homebrew => "homebrew", Winget => "winget", Scoop => "scoop", Chocolatey => "chocolatey", Apt => "apt", Cargo => "cargo", Unknown => "unknown" } }
 string_enum! { PendingSeverity { Info => "info", Warning => "warning", Error => "error" } }
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum WorkerIdentityMode {
+    CurrentUser,
+    Dedicated,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum WorkerIsolation {
+    SharedUser,
+    DedicatedAccount,
+}
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub(crate) enum DesktopKind {
@@ -227,6 +271,10 @@ impl MachineManifest {
         {
             return invalid("machine_id must be an RFC UUIDv7");
         }
+        let installation = self
+            .installation
+            .as_ref()
+            .ok_or_else(|| ManifestError::Validation("installation is required".to_owned()))?;
         non_empty("name", &self.name)?;
         if self.roles.is_empty() {
             return invalid("roles must not be empty");
@@ -242,6 +290,51 @@ impl MachineManifest {
                 return invalid("roles must be unique");
             }
         }
+        let has_worker_role = self.roles.contains(&MachineRole::Worker);
+        if has_worker_role {
+            let identity = self.worker_identity.as_ref().ok_or_else(|| {
+                ManifestError::Validation(
+                    "worker_identity is required when roles contains worker".to_owned(),
+                )
+            })?;
+            let principal = identity.principal()?;
+            let expected_kind = match self.platform.os {
+                OperatingSystem::Windows => platform::PrincipalKind::WindowsSid,
+                OperatingSystem::Linux | OperatingSystem::Macos => platform::PrincipalKind::UnixUid,
+            };
+            if principal.principal_kind() != expected_kind {
+                return invalid("worker_identity.principal_kind does not match platform.os");
+            }
+            match (&identity.mode, &identity.isolation) {
+                (WorkerIdentityMode::CurrentUser, WorkerIsolation::SharedUser)
+                | (WorkerIdentityMode::Dedicated, WorkerIsolation::DedicatedAccount) => {}
+                _ => {
+                    return invalid(
+                        "worker_identity mode and isolation must describe the same account policy",
+                    );
+                }
+            }
+            if matches!(identity.mode, WorkerIdentityMode::Dedicated)
+                && installation.scope != platform::InstallationScope::System
+            {
+                return invalid("dedicated worker identity requires system installation scope");
+            }
+            if installation.scope == platform::InstallationScope::User
+                && !matches!(identity.mode, WorkerIdentityMode::CurrentUser)
+            {
+                return invalid("user installation scope requires current-user worker identity");
+            }
+            let transport = self.transport.as_ref().ok_or_else(|| {
+                ManifestError::Validation(
+                    "transport is required when roles contains worker".to_owned(),
+                )
+            })?;
+            if transport.user.as_deref() != Some(principal.name()) {
+                return invalid("transport.user must equal worker_identity.name");
+            }
+        } else if self.worker_identity.is_some() {
+            return invalid("worker_identity requires a worker role");
+        }
         non_empty("platform.hostname", &self.platform.hostname)?;
         for (name, value) in [
             ("paths.root", &self.paths.root),
@@ -253,6 +346,8 @@ impl MachineManifest {
         ] {
             non_empty(name, value)?;
         }
+        self.paths
+            .validate_for(&self.platform.os, installation.scope)?;
         if let Some(transport) = &self.transport {
             non_empty("transport.host", &transport.host)?;
             if transport.port == Some(0) {
@@ -328,6 +423,8 @@ impl MachineManifest {
             name: &self.name,
             roles: &self.roles,
             platform: &self.platform,
+            installation: &self.installation,
+            worker_identity: &self.worker_identity,
             transport: &self.transport,
             paths: &self.paths,
             controller: &self.controller,
@@ -364,6 +461,8 @@ impl RawMachineManifest {
             name: self.name,
             roles: self.roles,
             platform: self.platform,
+            installation: self.installation,
+            worker_identity: self.worker_identity,
             transport: self.transport,
             paths: self.paths,
             controller: self.controller,
@@ -391,6 +490,8 @@ impl From<MachineManifest> for MachineManifestDraft {
             name: value.name,
             roles: value.roles,
             platform: value.platform,
+            installation: value.installation,
+            worker_identity: value.worker_identity,
             transport: value.transport,
             paths: value.paths,
             controller: value.controller,
@@ -420,6 +521,8 @@ impl MachineManifestDraft {
             name: self.name.clone(),
             roles: self.roles.clone(),
             platform: self.platform.clone(),
+            installation: self.installation.clone(),
+            worker_identity: self.worker_identity.clone(),
             transport: self.transport.clone(),
             paths: self.paths.clone(),
             controller: self.controller.clone(),
@@ -448,6 +551,8 @@ pub(crate) struct ReadOutcome {
 
 #[derive(Debug)]
 pub(crate) struct MachineManifestStore {
+    scope: platform::InstallationScope,
+    principal: platform::WorkerPrincipal,
     path: PathBuf,
     trusted_root: PathBuf,
     security: ManifestSecurity,
@@ -465,6 +570,7 @@ enum DestinationOrigin {
 #[derive(Clone, Copy, Debug)]
 enum ManifestSecurity {
     System,
+    User,
     #[cfg(test)]
     CurrentProcess,
     #[cfg(test)]
@@ -479,31 +585,71 @@ enum ManifestSecurity {
     CurrentProcessWorker,
 }
 
-fn canonical_manifest_path() -> PathBuf {
+#[cfg(test)]
+fn fixture_worker_principal() -> platform::WorkerPrincipal {
+    platform::resolve_current_worker_principal()
+        .expect("manifest security tests require a real non-privileged caller")
+}
+
+fn canonical_manifest_path(scope: platform::InstallationScope) -> Result<PathBuf, ManifestError> {
+    if scope == platform::InstallationScope::System {
+        #[cfg(target_os = "linux")]
+        let path = PathBuf::from("/etc/styrn/machine.toml");
+        #[cfg(target_os = "macos")]
+        let path = PathBuf::from("/Library/Application Support/Styrn/machine.toml");
+        #[cfg(target_os = "windows")]
+        let path = PathBuf::from(r"C:\ProgramData\Styrn\machine.toml");
+        return Ok(path);
+    }
+
     #[cfg(target_os = "linux")]
-    {
-        PathBuf::from("/etc/styrn/machine.toml")
-    }
+    let root = std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")));
     #[cfg(target_os = "macos")]
-    {
-        PathBuf::from("/Library/Application Support/Styrn/machine.toml")
-    }
+    let root = std::env::var_os("HOME")
+        .map(|home| PathBuf::from(home).join("Library/Application Support"));
     #[cfg(target_os = "windows")]
-    {
-        PathBuf::from(r"C:\ProgramData\Styrn\machine.toml")
+    let root = std::env::var_os("APPDATA").map(PathBuf::from);
+    let root = root.ok_or(ManifestError::UserConfigDirectoryUnavailable)?;
+    if !root.is_absolute() {
+        return Err(ManifestError::UserConfigDirectoryUnavailable);
     }
+    #[cfg(target_os = "linux")]
+    let application = "styrn";
+    #[cfg(any(target_os = "macos", target_os = "windows"))]
+    let application = "Styrn";
+    Ok(root.join(application).join("machine.toml"))
 }
 
 #[allow(dead_code)] // Referenced by the executable; integration tests compile this module separately.
-pub(crate) fn configured_manifest_store() -> MachineManifestStore {
+pub(crate) fn configured_manifest_store() -> Result<MachineManifestStore, ManifestError> {
+    let principal =
+        platform::resolve_current_worker_principal().map_err(ManifestError::CallerIdentity)?;
     if let Some(directory) = std::env::var_os("STYRN_CONFIG_DIR") {
-        return MachineManifestStore::new(PathBuf::from(directory).join("machine.toml"));
+        return MachineManifestStore::new_user_override(
+            PathBuf::from(directory).join("machine.toml"),
+            principal,
+        );
     }
-    MachineManifestStore::new_canonical(canonical_manifest_path())
+    configured_manifest_store_for(platform::InstallationScope::User, principal)
+}
+
+#[allow(dead_code)] // T0.12 setup supplies one resolved principal to both canonical stores.
+pub(crate) fn configured_manifest_store_for(
+    scope: platform::InstallationScope,
+    principal: platform::WorkerPrincipal,
+) -> Result<MachineManifestStore, ManifestError> {
+    let path = canonical_manifest_path(scope)?;
+    match scope {
+        platform::InstallationScope::User => MachineManifestStore::new_user(path, principal),
+        platform::InstallationScope::System => MachineManifestStore::new_system(path, principal),
+    }
 }
 
 impl MachineManifestStore {
-    #[allow(dead_code)] // Integration test crates include this module without the executable.
+    #[cfg(test)]
+    #[allow(dead_code)]
     pub(crate) fn new(path: impl Into<PathBuf>) -> Self {
         let path = path.into();
         let trusted_root = path
@@ -511,6 +657,8 @@ impl MachineManifestStore {
             .map(std::path::Path::to_path_buf)
             .unwrap_or_default();
         Self {
+            scope: platform::InstallationScope::System,
+            principal: fixture_worker_principal(),
             path,
             trusted_root,
             security: ManifestSecurity::System,
@@ -518,18 +666,72 @@ impl MachineManifestStore {
         }
     }
 
-    fn new_canonical(path: impl Into<PathBuf>) -> Self {
+    #[allow(dead_code)] // Integration test crates include this module without the executable.
+    pub(crate) fn new_system(
+        path: impl Into<PathBuf>,
+        principal: platform::WorkerPrincipal,
+    ) -> Result<Self, ManifestError> {
         let path = path.into();
         let trusted_root = path
             .parent()
             .map(std::path::Path::to_path_buf)
             .unwrap_or_default();
-        Self {
+        let store = Self {
+            scope: platform::InstallationScope::System,
+            principal,
             path,
             trusted_root,
             security: ManifestSecurity::System,
+            destination_origin: DestinationOrigin::Override,
+        };
+        store.validate_destination_policy()?;
+        store.verify_bound_principal()?;
+        Ok(store)
+    }
+
+    pub(crate) fn new_user(
+        path: impl Into<PathBuf>,
+        principal: platform::WorkerPrincipal,
+    ) -> Result<Self, ManifestError> {
+        let path = path.into();
+        let trusted_root = path
+            .parent()
+            .and_then(std::path::Path::parent)
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_default();
+        let store = Self {
+            scope: platform::InstallationScope::User,
+            principal,
+            path,
+            trusted_root,
+            security: ManifestSecurity::User,
             destination_origin: DestinationOrigin::Canonical,
-        }
+        };
+        store.validate_destination_policy()?;
+        store.verify_bound_principal()?;
+        Ok(store)
+    }
+
+    fn new_user_override(
+        path: impl Into<PathBuf>,
+        principal: platform::WorkerPrincipal,
+    ) -> Result<Self, ManifestError> {
+        let path = path.into();
+        let trusted_root = path
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_default();
+        let store = Self {
+            scope: platform::InstallationScope::User,
+            principal,
+            path,
+            trusted_root,
+            security: ManifestSecurity::User,
+            destination_origin: DestinationOrigin::Override,
+        };
+        store.validate_destination_policy()?;
+        store.verify_bound_principal()?;
+        Ok(store)
     }
 
     #[cfg(test)]
@@ -541,6 +743,8 @@ impl MachineManifestStore {
             .map(std::path::Path::to_path_buf)
             .unwrap_or_default();
         Self {
+            scope: platform::InstallationScope::System,
+            principal: fixture_worker_principal(),
             path,
             trusted_root,
             security: ManifestSecurity::CurrentProcess,
@@ -555,6 +759,8 @@ impl MachineManifestStore {
         trusted_root: impl Into<PathBuf>,
     ) -> Self {
         Self {
+            scope: platform::InstallationScope::System,
+            principal: fixture_worker_principal(),
             path: path.into(),
             trusted_root: trusted_root.into(),
             security: ManifestSecurity::CurrentProcess,
@@ -571,6 +777,8 @@ impl MachineManifestStore {
             .map(std::path::Path::to_path_buf)
             .unwrap_or_default();
         Self {
+            scope: platform::InstallationScope::System,
+            principal: fixture_worker_principal(),
             path,
             trusted_root,
             security: ManifestSecurity::CurrentProcessWorker,
@@ -587,6 +795,8 @@ impl MachineManifestStore {
             .map(std::path::Path::to_path_buf)
             .unwrap_or_default();
         Self {
+            scope: platform::InstallationScope::System,
+            principal: fixture_worker_principal(),
             path,
             trusted_root,
             security: ManifestSecurity::CurrentProcess,
@@ -603,6 +813,8 @@ impl MachineManifestStore {
             .map(std::path::Path::to_path_buf)
             .unwrap_or_default();
         Self {
+            scope: platform::InstallationScope::System,
+            principal: fixture_worker_principal(),
             path,
             trusted_root,
             security: ManifestSecurity::FailBeforeReplace,
@@ -619,6 +831,8 @@ impl MachineManifestStore {
             .map(std::path::Path::to_path_buf)
             .unwrap_or_default();
         Self {
+            scope: platform::InstallationScope::System,
+            principal: fixture_worker_principal(),
             path,
             trusted_root,
             security: ManifestSecurity::FailBeforeReplace,
@@ -635,6 +849,8 @@ impl MachineManifestStore {
             .map(std::path::Path::to_path_buf)
             .unwrap_or_default();
         Self {
+            scope: platform::InstallationScope::System,
+            principal: fixture_worker_principal(),
             path,
             trusted_root,
             security: ManifestSecurity::DirectoryPublicationRace,
@@ -653,6 +869,8 @@ impl MachineManifestStore {
             .map(std::path::Path::to_path_buf)
             .unwrap_or_default();
         Self {
+            scope: platform::InstallationScope::System,
+            principal: fixture_worker_principal(),
             path,
             trusted_root,
             security: ManifestSecurity::DirectoryPublicationAndCleanupFailure,
@@ -669,6 +887,8 @@ impl MachineManifestStore {
             .map(std::path::Path::to_path_buf)
             .unwrap_or_default();
         Self {
+            scope: platform::InstallationScope::System,
+            principal: fixture_worker_principal(),
             path,
             trusted_root,
             security: ManifestSecurity::FailAfterReplace,
@@ -678,6 +898,7 @@ impl MachineManifestStore {
 
     pub(crate) fn read(&self) -> Result<ReadOutcome, ManifestError> {
         self.validate_destination_policy()?;
+        self.verify_bound_principal()?;
         platform::verify_manifest_file_target(&self.path).map_err(ManifestError::Security)?;
         self.verify_security()?;
         let raw = parse_raw(&fs::read_to_string(&self.path).map_err(ManifestError::Read)?)?;
@@ -690,6 +911,7 @@ impl MachineManifestStore {
             .ok_or_else(|| ManifestError::Validation("machine_id is required".to_owned()))?;
         let manifest = raw.into_manifest(machine_id);
         manifest.validate()?;
+        self.validate_manifest_binding(&manifest)?;
         Ok(ReadOutcome {
             manifest,
             machine_id_minted: false,
@@ -697,6 +919,7 @@ impl MachineManifestStore {
     }
 
     pub(crate) fn reconcile(&self) -> Result<ReadOutcome, ManifestError> {
+        self.preflight_document_binding(true)?;
         self.with_mutation_lock(|| self.reconcile_locked())
     }
 
@@ -713,6 +936,7 @@ impl MachineManifestStore {
             Some(machine_id) => {
                 let manifest = raw.into_manifest(machine_id);
                 manifest.validate()?;
+                self.validate_manifest_binding(&manifest)?;
                 self.write_manifest(&manifest)?;
                 Ok(ReadOutcome {
                     manifest,
@@ -722,6 +946,7 @@ impl MachineManifestStore {
             None => {
                 let manifest = raw.into_manifest(Uuid::now_v7());
                 manifest.validate()?;
+                self.validate_manifest_binding(&manifest)?;
                 self.write_manifest(&manifest)?;
                 Ok(ReadOutcome {
                     manifest,
@@ -736,12 +961,16 @@ impl MachineManifestStore {
         &self,
         draft: &MachineManifestDraft,
     ) -> Result<Uuid, ManifestError> {
+        let candidate = draft.with_machine_id(Uuid::now_v7());
+        candidate.validate()?;
+        self.validate_manifest_binding(&candidate)?;
         self.with_mutation_lock(|| {
             let machine_id = self
                 .existing_machine_id_for_generated()?
                 .unwrap_or_else(Uuid::now_v7);
             let manifest = draft.with_machine_id(machine_id);
             manifest.validate()?;
+            self.validate_manifest_binding(&manifest)?;
             self.write_manifest(&manifest)?;
             Ok(machine_id)
         })
@@ -763,7 +992,9 @@ impl MachineManifestStore {
             .map(parse_canonical_uuid)
             .transpose()?
             .unwrap_or_else(Uuid::now_v7);
-        raw.into_manifest(machine_id).validate()?;
+        let manifest = raw.into_manifest(machine_id);
+        manifest.validate()?;
+        self.validate_manifest_binding(&manifest)?;
         Ok(Some(machine_id))
     }
 
@@ -772,6 +1003,7 @@ impl MachineManifestStore {
         operation: impl FnOnce() -> Result<T, ManifestError>,
     ) -> Result<T, ManifestError> {
         let destination_dir = self.validate_destination_policy()?;
+        self.verify_bound_principal()?;
         self.prepare_destination(destination_dir)?;
         let lock_path = destination_dir.join(format!(
             ".{}.lock",
@@ -780,13 +1012,16 @@ impl MachineManifestStore {
                 .and_then(|name| name.to_str())
                 .unwrap_or("machine.toml")
         ));
-        let lock = platform::open_manifest_lock(&lock_path, self.platform_owner())
+        let lock = platform::open_manifest_lock(&lock_path, self.platform_owner(), &self.principal)
             .map_err(ManifestError::Write)?;
         lock.lock().map_err(ManifestError::Write)?;
         operation()
     }
 
     fn prepare_destination(&self, destination_dir: &std::path::Path) -> Result<(), ManifestError> {
+        if self.scope == platform::InstallationScope::User {
+            self.prepare_user_trusted_root()?;
+        }
         let metadata = match fs::symlink_metadata(destination_dir) {
             Ok(metadata) => Some(metadata),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
@@ -799,7 +1034,7 @@ impl MachineManifestStore {
                     "manifest directory must be below an existing parent".to_owned(),
                 )
             })?;
-            platform::verify_manifest_parent_chain(parent, self.platform_owner(), "styrn")
+            platform::verify_manifest_parent_chain(parent, self.platform_owner(), &self.principal)
                 .map_err(ManifestError::Write)?;
 
             if metadata.is_none() {
@@ -810,7 +1045,7 @@ impl MachineManifestStore {
                 return platform::verify_manifest_directory_security(
                     destination_dir,
                     self.platform_owner(),
-                    "styrn",
+                    &self.principal,
                 )
                 .map_err(ManifestError::Write);
             }
@@ -823,7 +1058,7 @@ impl MachineManifestStore {
         platform::verify_manifest_ancestors(
             destination_dir,
             self.platform_owner(),
-            "styrn",
+            &self.principal,
             &self.trusted_root,
         )
         .map_err(ManifestError::Write)?;
@@ -831,7 +1066,7 @@ impl MachineManifestStore {
             platform::verify_manifest_directory_security(
                 destination_dir,
                 self.platform_owner(),
-                "styrn",
+                &self.principal,
             )
             .map_err(ManifestError::Write)
         } else {
@@ -841,6 +1076,60 @@ impl MachineManifestStore {
                 Ok(())
             }
         }
+    }
+
+    fn prepare_user_trusted_root(&self) -> Result<(), ManifestError> {
+        let mut missing = Vec::new();
+        let mut current = self.trusted_root.as_path();
+        loop {
+            match fs::symlink_metadata(current) {
+                Ok(_) => {
+                    platform::verify_manifest_ancestors(
+                        current,
+                        self.platform_owner(),
+                        &self.principal,
+                        current,
+                    )
+                    .map_err(ManifestError::Security)?;
+                    break;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    missing.push(current.to_path_buf());
+                    current = current.parent().ok_or_else(|| {
+                        ManifestError::Validation(
+                            "user manifest trusted root has no existing ancestor".to_owned(),
+                        )
+                    })?;
+                }
+                Err(error) => return Err(ManifestError::Read(error)),
+            }
+        }
+        for directory in missing.into_iter().rev() {
+            let parent = directory.parent().ok_or_else(|| {
+                ManifestError::Validation("user manifest root has no parent".to_owned())
+            })?;
+            match platform::create_private_manifest_staging_directory(
+                &directory,
+                self.platform_owner(),
+                &self.principal,
+            ) {
+                Ok(_) => {
+                    self.harden_directory(&directory)?;
+                    platform::sync_parent_directory(parent).map_err(ManifestError::Write)?;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                    platform::verify_manifest_ancestors(
+                        &directory,
+                        self.platform_owner(),
+                        &self.principal,
+                        &directory,
+                    )
+                    .map_err(ManifestError::Security)?;
+                }
+                Err(error) => return Err(ManifestError::Write(error)),
+            }
+        }
+        Ok(())
     }
 
     fn create_and_publish_directory(
@@ -860,6 +1149,7 @@ impl MachineManifestStore {
         let staging = platform::create_private_manifest_staging_directory(
             &staging_path,
             self.platform_owner(),
+            &self.principal,
         )
         .map_err(ManifestError::Write)?;
 
@@ -909,26 +1199,37 @@ impl MachineManifestStore {
         let destination_dir = self.path.parent().ok_or_else(|| {
             ManifestError::Validation("manifest path has no parent directory".to_owned())
         })?;
+        let invalid_common = !self.path.is_absolute()
+            || self.path.components().any(|component| {
+                matches!(
+                    component,
+                    std::path::Component::CurDir | std::path::Component::ParentDir
+                )
+            })
+            || self.path.components().collect::<PathBuf>().as_os_str() != self.path.as_os_str()
+            || destination_dir
+                .components()
+                .filter(|component| matches!(component, std::path::Component::Normal(_)))
+                .count()
+                < 2;
+        let invalid_scope_root = match self.scope {
+            platform::InstallationScope::System => destination_dir != self.trusted_root,
+            platform::InstallationScope::User => {
+                if self.destination_origin == DestinationOrigin::Override {
+                    destination_dir != self.trusted_root
+                } else {
+                    destination_dir.parent() != Some(self.trusted_root.as_path())
+                }
+            }
+        };
+        let invalid_system = self.scope == platform::InstallationScope::System
+            && (!has_supported_system_path_root(&self.path)
+                || is_broad_system_root(destination_dir));
         if self.destination_origin != DestinationOrigin::Test
-            && (!self.path.is_absolute()
-                || self.path.components().any(|component| {
-                    matches!(
-                        component,
-                        std::path::Component::CurDir | std::path::Component::ParentDir
-                    )
-                })
-                || self.path.components().collect::<PathBuf>().as_os_str() != self.path.as_os_str()
-                || !has_supported_system_path_root(&self.path)
-                || destination_dir != self.trusted_root
-                || destination_dir
-                    .components()
-                    .filter(|component| matches!(component, std::path::Component::Normal(_)))
-                    .count()
-                    < 2
-                || is_broad_system_root(destination_dir))
+            && (invalid_common || invalid_scope_root || invalid_system)
         {
             return Err(ManifestError::Validation(
-                "system manifest destination must be a normalized dedicated directory below a system root"
+                "manifest destination must be a normalized dedicated directory for its installation scope"
                     .to_owned(),
             ));
         }
@@ -948,8 +1249,9 @@ impl MachineManifestStore {
             Uuid::now_v7()
         ));
         let result = (|| {
-            let mut file = platform::create_private_file(&temporary, self.platform_owner())
-                .map_err(ManifestError::Write)?;
+            let mut file =
+                platform::create_private_file(&temporary, self.platform_owner(), &self.principal)
+                    .map_err(ManifestError::Write)?;
             file.write_all(manifest.to_toml()?.as_bytes())
                 .map_err(ManifestError::Write)?;
             file.flush().map_err(ManifestError::Write)?;
@@ -966,13 +1268,13 @@ impl MachineManifestStore {
 
     fn harden_directory(&self, path: &std::path::Path) -> Result<(), ManifestError> {
         self.ensure_hardening_available()?;
-        platform::harden_manifest_directory(path, self.platform_owner(), "styrn")
+        platform::harden_manifest_directory(path, self.platform_owner(), &self.principal)
             .map_err(ManifestError::Write)
     }
 
     fn harden_temporary(&self, path: &std::path::Path) -> Result<(), ManifestError> {
         self.ensure_hardening_available()?;
-        platform::harden_manifest_file(path, self.platform_owner(), "styrn")
+        platform::harden_manifest_file(path, self.platform_owner(), &self.principal)
             .map_err(ManifestError::Write)
     }
 
@@ -996,7 +1298,7 @@ impl MachineManifestStore {
         platform::verify_manifest_security(
             &self.path,
             self.platform_owner(),
-            "styrn",
+            &self.principal,
             &self.trusted_root,
         )
     }
@@ -1004,6 +1306,7 @@ impl MachineManifestStore {
     fn platform_owner(&self) -> platform::ManifestOwner {
         match self.security {
             ManifestSecurity::System => platform::ManifestOwner::System,
+            ManifestSecurity::User => platform::ManifestOwner::User,
             #[cfg(test)]
             ManifestSecurity::CurrentProcess
             | ManifestSecurity::FailBeforeReplace
@@ -1030,6 +1333,72 @@ impl MachineManifestStore {
         {
             false
         }
+    }
+
+    fn verify_bound_principal(&self) -> Result<(), ManifestError> {
+        if matches!(
+            self.security,
+            ManifestSecurity::System | ManifestSecurity::User
+        ) {
+            platform::verify_worker_principal(&self.principal)
+                .map_err(ManifestError::CallerIdentity)?;
+            if self.scope == platform::InstallationScope::User {
+                let current = platform::resolve_current_worker_principal()
+                    .map_err(ManifestError::CallerIdentity)?;
+                if current != self.principal {
+                    return Err(ManifestError::CallerIdentity(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "user manifest principal is not the current caller",
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_manifest_binding(&self, manifest: &MachineManifest) -> Result<(), ManifestError> {
+        if !matches!(
+            self.security,
+            ManifestSecurity::System | ManifestSecurity::User
+        ) {
+            return Ok(());
+        }
+        let scope = manifest
+            .installation
+            .as_ref()
+            .ok_or_else(|| ManifestError::Validation("installation is required".to_owned()))?
+            .scope;
+        if scope != self.scope {
+            return invalid("manifest installation scope does not match its store");
+        }
+        if manifest.roles.contains(&MachineRole::Worker) {
+            let identity = manifest.worker_identity.as_ref().ok_or_else(|| {
+                ManifestError::Validation("worker_identity is required".to_owned())
+            })?;
+            if identity.principal()? != self.principal {
+                return invalid("manifest worker identity does not match its store principal");
+            }
+        }
+        Ok(())
+    }
+
+    fn preflight_document_binding(&self, allow_missing_id: bool) -> Result<(), ManifestError> {
+        self.validate_destination_policy()?;
+        self.verify_bound_principal()?;
+        platform::verify_manifest_file_target(&self.path).map_err(ManifestError::Security)?;
+        self.verify_security()?;
+        let raw = parse_raw(&fs::read_to_string(&self.path).map_err(ManifestError::Read)?)?;
+        let machine_id = raw
+            .machine_id
+            .as_deref()
+            .map(parse_canonical_uuid)
+            .transpose()?;
+        if !allow_missing_id && machine_id.is_none() {
+            return invalid("machine_id is required");
+        }
+        let manifest = raw.into_manifest(machine_id.unwrap_or_else(Uuid::now_v7));
+        manifest.validate()?;
+        self.validate_manifest_binding(&manifest)
     }
 
     fn ensure_hardening_available(&self) -> Result<(), ManifestError> {
@@ -1094,6 +1463,163 @@ fn non_empty(name: &str, value: &str) -> Result<(), ManifestError> {
     } else {
         Ok(())
     }
+}
+
+impl Paths {
+    fn validate_for(
+        &self,
+        os: &OperatingSystem,
+        scope: platform::InstallationScope,
+    ) -> Result<(), ManifestError> {
+        validate_native_manifest_path("paths.root", &self.root, os)?;
+        let separator = if matches!(os, OperatingSystem::Windows) {
+            '\\'
+        } else {
+            '/'
+        };
+        for (field, value, leaf) in [
+            ("paths.repos", &self.repos, "repos"),
+            ("paths.jobs", &self.jobs, "jobs"),
+            ("paths.cache", &self.cache, "cache"),
+            ("paths.artifacts", &self.artifacts, "artifacts"),
+            ("paths.logs", &self.logs, "logs"),
+        ] {
+            validate_native_manifest_path(field, value, os)?;
+            if value != &format!("{}{separator}{leaf}", self.root) {
+                return invalid(&format!("{field} must be the {leaf} child of paths.root"));
+            }
+        }
+
+        let root = self.root.as_str();
+        let opposite_scope_family = match (os, scope) {
+            (OperatingSystem::Linux, platform::InstallationScope::User) => {
+                unix_is_or_descendant(root, "/srv/styrn") || unix_is_or_descendant(root, "/Users")
+            }
+            (OperatingSystem::Linux, platform::InstallationScope::System) => {
+                ["/home", "/Users", "/root"]
+                    .iter()
+                    .any(|base| unix_is_or_descendant(root, base))
+                    || root.ends_with("/.local/share")
+                    || root.contains("/.local/share/")
+            }
+            (OperatingSystem::Macos, platform::InstallationScope::User) => {
+                ["/Users/Shared/Styrn", "/Library/Application Support/Styrn"]
+                    .iter()
+                    .any(|base| unix_is_or_descendant(root, base))
+            }
+            (OperatingSystem::Macos, platform::InstallationScope::System) => {
+                unix_is_or_descendant(root, "/Users")
+                    && !unix_is_or_descendant(root, "/Users/Shared")
+            }
+            (OperatingSystem::Windows, platform::InstallationScope::User) => {
+                windows_is_or_descendant(root, r"C:\Styrn")
+                    || windows_has_component(root, "programdata")
+            }
+            (OperatingSystem::Windows, platform::InstallationScope::System) => {
+                windows_has_component(root, "users")
+                    || windows_has_component_pair(root, "appdata", "local")
+            }
+        };
+        if opposite_scope_family {
+            return invalid("paths.root conflicts with installation.scope or platform.os");
+        }
+        Ok(())
+    }
+}
+
+fn validate_native_manifest_path(
+    field: &str,
+    value: &str,
+    os: &OperatingSystem,
+) -> Result<(), ManifestError> {
+    if value.chars().any(char::is_control) {
+        return invalid(&format!("{field} contains control characters"));
+    }
+    match os {
+        OperatingSystem::Linux | OperatingSystem::Macos => {
+            if !value.starts_with('/')
+                || value.ends_with('/')
+                || value.contains('\\')
+                || value
+                    .split('/')
+                    .skip(1)
+                    .any(|component| component.is_empty() || matches!(component, "." | ".."))
+            {
+                return invalid(&format!("{field} must be a normalized absolute Unix path"));
+            }
+        }
+        OperatingSystem::Windows => {
+            let bytes = value.as_bytes();
+            if bytes.len() < 4
+                || !bytes[0].is_ascii_alphabetic()
+                || bytes[1] != b':'
+                || bytes[2] != b'\\'
+                || value.ends_with('\\')
+                || value.contains('/')
+                || value[3..].contains(':')
+                || value[3..].split('\\').any(|component| {
+                    component.is_empty()
+                        || matches!(component, "." | "..")
+                        || component.ends_with(['.', ' '])
+                        || component
+                            .chars()
+                            .any(|character| matches!(character, '<' | '>' | '"' | '|' | '?' | '*'))
+                        || is_reserved_windows_device_name(component)
+                })
+            {
+                return invalid(&format!(
+                    "{field} must be a normalized absolute Windows drive path"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn unix_is_or_descendant(path: &str, base: &str) -> bool {
+    path == base
+        || path
+            .strip_prefix(base)
+            .is_some_and(|rest| rest.starts_with('/'))
+}
+
+fn windows_is_or_descendant(path: &str, base: &str) -> bool {
+    let path = path.to_ascii_lowercase();
+    let base = base.to_ascii_lowercase();
+    path == base
+        || path
+            .strip_prefix(&base)
+            .is_some_and(|rest| rest.starts_with('\\'))
+}
+
+fn windows_has_component(path: &str, expected: &str) -> bool {
+    path.split('\\')
+        .skip(1)
+        .any(|component| component.eq_ignore_ascii_case(expected))
+}
+
+fn windows_has_component_pair(path: &str, first: &str, second: &str) -> bool {
+    let components = path.split('\\').skip(1).collect::<Vec<_>>();
+    components
+        .windows(2)
+        .any(|pair| pair[0].eq_ignore_ascii_case(first) && pair[1].eq_ignore_ascii_case(second))
+}
+
+fn is_reserved_windows_device_name(component: &str) -> bool {
+    let stem = component
+        .split_once('.')
+        .map_or(component, |(stem, _)| stem)
+        .to_ascii_uppercase();
+    matches!(stem.as_str(), "CON" | "PRN" | "AUX" | "NUL")
+        || stem
+            .strip_prefix("COM")
+            .or_else(|| stem.strip_prefix("LPT"))
+            .is_some_and(|number| {
+                matches!(
+                    number,
+                    "1" | "2" | "3" | "4" | "5" | "6" | "7" | "8" | "9" | "¹" | "²" | "³"
+                )
+            })
 }
 
 fn invalid<T>(message: &str) -> Result<T, ManifestError> {
@@ -1246,6 +1772,10 @@ pub(crate) enum ManifestError {
     Write(std::io::Error),
     #[error("machine manifest security verification failed: {0}")]
     Security(std::io::Error),
+    #[error("could not establish a safe native worker identity: {0}")]
+    CallerIdentity(std::io::Error),
+    #[error("the current user's standard configuration directory is unavailable")]
+    UserConfigDirectoryUnavailable,
     #[error("machine manifest was replaced but security verification failed: {0}")]
     PostReplaceSecurity(std::io::Error),
     #[error(

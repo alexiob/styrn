@@ -503,13 +503,13 @@ fn ordinary_current_user_scope_can_recover_its_restricted_journal_without_privil
     crate::platform::harden_manifest_directory(
         &fixture.root,
         crate::platform::ManifestOwner::User,
-        "",
+        &crate::platform::resolve_current_worker_principal().unwrap(),
     )
     .unwrap();
     crate::platform::harden_manifest_directory(
         fixture.receipt_path().parent().unwrap(),
         crate::platform::ManifestOwner::User,
-        "",
+        &crate::platform::resolve_current_worker_principal().unwrap(),
     )
     .unwrap();
     let failing_store =

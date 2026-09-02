@@ -12,6 +12,16 @@ name = "mbp-main"
 
 roles = ["controller", "worker"]
 
+[installation]
+scope = "user"
+
+[worker_identity]
+mode = "current-user"
+principal_kind = "unix-uid"
+principal_id = "501"
+name = "alex-dev"
+isolation = "shared-user"
+
 [platform]
 os = "macos"
 arch = "aarch64"
@@ -22,15 +32,15 @@ headless = false
 kind = "ssh"
 host = "mbp-main"
 port = 22
-user = "styrn"
+user = "alex-dev"
 
 [paths]
-root = "/Users/Shared/Styrn"
-repos = "/Users/Shared/Styrn/repos"
-jobs = "/Users/Shared/Styrn/jobs"
-cache = "/Users/Shared/Styrn/cache"
-artifacts = "/Users/Shared/Styrn/artifacts"
-logs = "/Users/Shared/Styrn/logs"
+root = "/Users/alex-dev/Library/Application Support/Styrn"
+repos = "/Users/alex-dev/Library/Application Support/Styrn/repos"
+jobs = "/Users/alex-dev/Library/Application Support/Styrn/jobs"
+cache = "/Users/alex-dev/Library/Application Support/Styrn/cache"
+artifacts = "/Users/alex-dev/Library/Application Support/Styrn/artifacts"
+logs = "/Users/alex-dev/Library/Application Support/Styrn/logs"
 
 [controller]
 enabled = true

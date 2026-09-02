@@ -48,10 +48,12 @@ fn run(parsed: cli::ParsedCli) {
         cli::MachineAction::Manifest => "machine manifest",
         cli::MachineAction::Init => "machine init",
     };
-    let store = manifest::configured_manifest_store();
-    let result = match action {
-        cli::MachineAction::Manifest => store.read(),
-        cli::MachineAction::Init => store.reconcile(),
+    let result = match manifest::configured_manifest_store() {
+        Ok(store) => match action {
+            cli::MachineAction::Manifest => store.read(),
+            cli::MachineAction::Init => store.reconcile(),
+        },
+        Err(error) => Err(error),
     };
     match result {
         Ok(outcome) => {
