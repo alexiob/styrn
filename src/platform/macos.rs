@@ -17,6 +17,8 @@ type Acl = *mut std::ffi::c_void;
 type AclEntry = *mut std::ffi::c_void;
 #[cfg(test)]
 type AclPermset = *mut std::ffi::c_void;
+#[cfg(test)]
+type AclFlagset = *mut std::ffi::c_void;
 
 const ACL_TYPE_EXTENDED: i32 = 0x100;
 const ACL_FIRST_ENTRY: i32 = 0;
@@ -29,6 +31,10 @@ const ACL_WRITE_DATA: i32 = 1 << 2;
 const ACL_DELETE: i32 = 1 << 4;
 #[cfg(test)]
 const ACL_DELETE_CHILD: i32 = 1 << 6;
+#[cfg(test)]
+const ACL_ENTRY_FILE_INHERIT: i32 = 1 << 5;
+#[cfg(test)]
+const ACL_ENTRY_DIRECTORY_INHERIT: i32 = 1 << 6;
 
 unsafe extern "C" {
     fn renamex_np(old: *const i8, new: *const i8, flags: u32) -> i32;
@@ -37,6 +43,7 @@ unsafe extern "C" {
     fn acl_get_file(path: *const i8, kind: i32) -> Acl;
     #[allow(dead_code)]
     fn acl_get_fd_np(fd: i32, kind: i32) -> Acl;
+    fn acl_set_fd_np(fd: i32, acl: Acl, kind: i32) -> i32;
     fn acl_set_file(path: *const i8, kind: i32, acl: Acl) -> i32;
     fn acl_get_entry(acl: Acl, entry_id: i32, entry: *mut AclEntry) -> i32;
     fn acl_get_tag_type(entry: AclEntry, tag: *mut i32) -> i32;
@@ -50,6 +57,12 @@ unsafe extern "C" {
     fn acl_get_permset(entry: AclEntry, permset: *mut AclPermset) -> i32;
     #[cfg(test)]
     fn acl_add_perm(permset: AclPermset, permission: i32) -> i32;
+    #[cfg(test)]
+    fn acl_get_flagset_np(entry: AclEntry, flagset: *mut AclFlagset) -> i32;
+    #[cfg(test)]
+    fn acl_add_flag_np(flagset: AclFlagset, flag: i32) -> i32;
+    #[cfg(test)]
+    fn acl_set_flagset_np(entry: AclEntry, flagset: AclFlagset) -> i32;
     #[cfg(test)]
     fn mbr_uid_to_uuid(uid: u32, uuid: *mut u8) -> i32;
 }
@@ -75,7 +88,7 @@ pub(super) fn default_worker_root(
         super::InstallationScope::System => Ok((
             PathBuf::from("/Users/Shared/Styrn"),
             super::WorkerRootCreationPolicy::ExistingParent {
-                require_trusted_ancestry: true,
+                allow_untrusted_parent_create: false,
             },
         )),
         super::InstallationScope::User => {
@@ -118,14 +131,9 @@ pub(super) fn worker_root_path_is_normalized(path: &Path) -> bool {
 #[allow(dead_code)] // Consumed by the T0.14 setup action integration follow-up.
 pub(super) fn create_worker_directory_layout(
     layout: &super::WorkerDirectoryLayout,
-) -> io::Result<()> {
+) -> io::Result<super::WorkerDirectoryCreation> {
     let root_components = absolute_worker_components(layout.root())?;
-    let require_trusted_ancestry = matches!(
-        &layout.creation_policy,
-        super::WorkerRootCreationPolicy::ExistingParent {
-            require_trusted_ancestry: true
-        }
-    );
+    let expected_uid = layout.principal.unix_uid()?;
     let first_creatable = match &layout.creation_policy {
         super::WorkerRootCreationPolicy::ExistingParent { .. } => root_components
             .len()
@@ -145,40 +153,56 @@ pub(super) fn create_worker_directory_layout(
     };
 
     let mut directory = open_worker_filesystem_root()?;
-    if require_trusted_ancestry {
-        verify_trusted_worker_ancestor(&directory)?;
-    }
+    verify_worker_creation_ancestor(&directory, expected_uid)?;
     for component in &root_components[..first_creatable] {
         directory = open_worker_directory_at(&directory, component)?;
-        if require_trusted_ancestry {
-            verify_trusted_worker_ancestor(&directory)?;
-        }
+        verify_worker_creation_ancestor(&directory, expected_uid)?;
     }
     let creation_lock = directory;
     if unsafe { libc::flock(creation_lock.as_raw_fd(), libc::LOCK_EX) } == -1 {
         return Err(io::Error::last_os_error());
     }
     let mut directory = creation_lock.try_clone()?;
-    for component in &root_components[first_creatable..] {
-        directory = open_or_create_worker_directory_at(&directory, component, true)?;
+    let mut root_disposition = None;
+    for (index, component) in root_components[first_creatable..].iter().enumerate() {
+        let is_root = first_creatable + index + 1 == root_components.len();
+        let opened =
+            open_or_create_worker_directory_at(&directory, component, true, expected_uid, is_root)?;
+        if is_root {
+            root_disposition = Some(opened.disposition);
+        }
+        directory = opened.directory;
     }
     let root_identity = worker_directory_identity(&directory)?;
+    let root_observation = super::WorkerDirectoryNodeObservation::new(
+        layout.root().to_path_buf(),
+        root_disposition.expect("the normalized worker root has a leaf component"),
+        root_identity,
+    );
 
     let mut children = Vec::with_capacity(super::WorkerDirectoryLayout::child_names().len());
     for name in super::WorkerDirectoryLayout::child_names() {
         match open_worker_directory_at(&directory, name.as_bytes()) {
-            Ok(child) => children.push((name, Some(child))),
+            Ok(child) => {
+                verify_worker_directory_security(&child, expected_uid)?;
+                children.push(Some(OpenedWorkerDirectory {
+                    directory: child,
+                    disposition: super::WorkerDirectoryNodeDisposition::Existing,
+                }));
+            }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                children.push((name, None));
+                children.push(None);
             }
             Err(error) => return Err(error),
         }
     }
-    for (name, child) in &mut children {
+    for (index, child) in children.iter_mut().enumerate() {
         if child.is_none() {
             *child = Some(open_or_create_worker_directory_at(
                 &directory,
-                name.as_bytes(),
+                super::WorkerDirectoryLayout::child_names()[index].as_bytes(),
+                true,
+                expected_uid,
                 true,
             )?);
         }
@@ -190,16 +214,36 @@ pub(super) fn create_worker_directory_layout(
         ));
     }
     verify_worker_path_identity(layout.root(), root_identity)?;
-    for (name, child) in children {
+    let mut child_observations = Vec::with_capacity(children.len());
+    for (name, child) in super::WorkerDirectoryLayout::child_names()
+        .into_iter()
+        .zip(children)
+    {
         let child = child.expect("every fixed worker child was opened or created");
         let reopened = open_worker_directory_at(&directory, name.as_bytes())?;
-        if worker_directory_identity(&reopened)? != worker_directory_identity(&child)? {
+        let identity = worker_directory_identity(&child.directory)?;
+        if worker_directory_identity(&reopened)? != identity {
             return Err(permission_denied(
                 "worker layout child identity changed during creation",
             ));
         }
+        child_observations.push(super::WorkerDirectoryNodeObservation::new(
+            layout.root().join(name),
+            child.disposition,
+            identity,
+        ));
     }
-    Ok(())
+    Ok(super::WorkerDirectoryCreation::new(
+        root_observation,
+        child_observations
+            .try_into()
+            .unwrap_or_else(|_| unreachable!("the worker layout always has exactly five children")),
+    ))
+}
+
+struct OpenedWorkerDirectory {
+    directory: std::fs::File,
+    disposition: super::WorkerDirectoryNodeDisposition,
 }
 
 fn absolute_worker_components(path: &Path) -> io::Result<Vec<&[u8]>> {
@@ -236,7 +280,10 @@ fn open_existing_worker_path(path: &Path) -> io::Result<std::fs::File> {
     Ok(directory)
 }
 
-fn verify_worker_path_identity(path: &Path, expected: (u64, u64)) -> io::Result<()> {
+fn verify_worker_path_identity(
+    path: &Path,
+    expected: super::WorkerDirectoryIdentity,
+) -> io::Result<()> {
     let reopened = open_existing_worker_path(path)?;
     if worker_directory_identity(&reopened)? != expected {
         return Err(permission_denied(
@@ -250,31 +297,88 @@ fn open_or_create_worker_directory_at(
     parent: &std::fs::File,
     name: &[u8],
     may_create: bool,
-) -> io::Result<std::fs::File> {
+    expected_uid: u32,
+    existing_must_be_canonical: bool,
+) -> io::Result<OpenedWorkerDirectory> {
     match open_worker_directory_at(parent, name) {
-        Ok(directory) => return Ok(directory),
+        Ok(directory) => {
+            verify_existing_worker_directory(&directory, expected_uid, existing_must_be_canonical)?;
+            return Ok(OpenedWorkerDirectory {
+                directory,
+                disposition: super::WorkerDirectoryNodeDisposition::Existing,
+            });
+        }
         Err(error) if error.kind() == io::ErrorKind::NotFound && may_create => {}
         Err(error) => return Err(error),
     }
     let name = CString::new(name)
         .map_err(|_| invalid_data("worker directory component contains a NUL byte"))?;
-    if unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) } == -1 {
+    let created = if unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) } == -1 {
         let error = io::Error::last_os_error();
         if error.kind() != io::ErrorKind::AlreadyExists {
             return Err(worker_directory_open_error(error));
         }
-    }
+        false
+    } else {
+        true
+    };
     let directory = open_worker_directory_at(parent, name.to_bytes())?;
-    let mut status = unsafe { std::mem::zeroed::<libc::stat>() };
-    if unsafe { libc::fstat(directory.as_raw_fd(), &mut status) } == -1 {
+    if created {
+        harden_new_worker_directory(&directory, expected_uid)?;
+    } else {
+        verify_existing_worker_directory(&directory, expected_uid, existing_must_be_canonical)?;
+    }
+    Ok(OpenedWorkerDirectory {
+        directory,
+        disposition: if created {
+            super::WorkerDirectoryNodeDisposition::Created
+        } else {
+            super::WorkerDirectoryNodeDisposition::Existing
+        },
+    })
+}
+
+fn verify_existing_worker_directory(
+    directory: &std::fs::File,
+    expected_uid: u32,
+    must_be_canonical: bool,
+) -> io::Result<()> {
+    if must_be_canonical {
+        verify_worker_directory_security(directory, expected_uid)
+    } else {
+        verify_worker_creation_ancestor(directory, expected_uid)
+    }
+}
+
+fn harden_new_worker_directory(directory: &std::fs::File, expected_uid: u32) -> io::Result<()> {
+    let acl = unsafe { acl_init(0) };
+    if acl.is_null() {
         return Err(io::Error::last_os_error());
     }
-    if status.st_uid != unsafe { libc::geteuid() } || status.st_mode & 0o777 != 0o700 {
+    let acl = OwnedAcl(acl);
+    if unsafe { acl_set_fd_np(directory.as_raw_fd(), acl.0, ACL_TYPE_EXTENDED) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if unsafe { libc::fchown(directory.as_raw_fd(), expected_uid, !0 as libc::gid_t) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    if unsafe { libc::fchmod(directory.as_raw_fd(), 0o700) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    verify_worker_directory_security(directory, expected_uid)
+}
+
+fn verify_worker_directory_security(
+    directory: &std::fs::File,
+    expected_uid: u32,
+) -> io::Result<()> {
+    let status = worker_directory_status(directory)?;
+    if status.st_uid != expected_uid || status.st_mode & 0o777 != 0o700 {
         return Err(permission_denied(
-            "new worker directory is not owned by the creator with mode 0700",
+            "worker directory owner or mode does not match the exact policy",
         ));
     }
-    Ok(directory)
+    verify_no_extended_acl_fd(directory.as_raw_fd())
 }
 
 fn open_worker_directory_at(parent: &std::fs::File, name: &[u8]) -> io::Result<std::fs::File> {
@@ -295,7 +399,18 @@ fn open_worker_directory_at(parent: &std::fs::File, name: &[u8]) -> io::Result<s
     Ok(directory)
 }
 
-fn worker_directory_identity(directory: &std::fs::File) -> io::Result<(u64, u64)> {
+fn worker_directory_identity(
+    directory: &std::fs::File,
+) -> io::Result<super::WorkerDirectoryIdentity> {
+    let status = worker_directory_status(directory)?;
+    Ok(super::WorkerDirectoryIdentity::from_unix(
+        u64::try_from(status.st_dev)
+            .map_err(|_| invalid_data("worker directory device identity is invalid"))?,
+        status.st_ino,
+    ))
+}
+
+fn worker_directory_status(directory: &std::fs::File) -> io::Result<libc::stat> {
     let mut status = unsafe { std::mem::zeroed::<libc::stat>() };
     if unsafe { libc::fstat(directory.as_raw_fd(), &mut status) } == -1 {
         return Err(io::Error::last_os_error());
@@ -305,28 +420,21 @@ fn worker_directory_identity(directory: &std::fs::File) -> io::Result<(u64, u64)
             "worker layout path is not a real directory",
         ));
     }
-    Ok((
-        u64::try_from(status.st_dev)
-            .map_err(|_| invalid_data("worker directory device identity is invalid"))?,
-        status.st_ino,
-    ))
+    Ok(status)
 }
 
-fn verify_trusted_worker_ancestor(directory: &std::fs::File) -> io::Result<()> {
-    let mut status = unsafe { std::mem::zeroed::<libc::stat>() };
-    if unsafe { libc::fstat(directory.as_raw_fd(), &mut status) } == -1 {
-        return Err(io::Error::last_os_error());
-    }
-    let effective_uid = unsafe { libc::geteuid() };
-    if (status.st_uid != 0 && status.st_uid != effective_uid)
-        || (status.st_mode & 0o022 != 0 && status.st_mode & libc::S_ISVTX == 0)
+fn verify_worker_creation_ancestor(directory: &std::fs::File, expected_uid: u32) -> io::Result<()> {
+    let status = worker_directory_status(directory)?;
+    if (status.st_uid != 0 && status.st_uid != expected_uid)
+        || (status.st_mode & 0o022 != 0
+            && !(status.st_uid == 0 && status.st_mode & libc::S_ISVTX != 0))
     {
         return Err(permission_denied(
-            "system worker root ancestor is controlled by an untrusted principal",
+            "worker root ancestor is controlled by an untrusted principal",
         ));
     }
-    verify_no_extended_acl_fd(directory.as_raw_fd())
-        .map_err(|_| permission_denied("system worker root ancestor has an untrusted extended ACL"))
+    verify_no_extended_allow_acl_fd(directory.as_raw_fd())
+        .map_err(|_| permission_denied("worker root ancestor has an untrusted extended ACL"))
 }
 
 fn worker_directory_open_error(error: io::Error) -> io::Error {
@@ -824,7 +932,7 @@ pub(super) fn prepare_verified_private_file_removal(
     };
     if !parent_metadata.is_dir()
         || parent_metadata.uid() != expected_uid
-        || parent_metadata.mode() & 0o077 != 0
+        || !super::private_file_parent_mode_is_valid(owner, parent_metadata.mode())
     {
         return Err(permission_denied(
             "private file parent ownership or mode is insecure",
@@ -1182,6 +1290,14 @@ fn validate_user_ancestor_access(
 
 fn verify_trusted_root_has_no_extended_allow_acl(path: &Path) -> io::Result<()> {
     let acl = unsafe { acl_get_file(c_path(path)?.as_ptr(), ACL_TYPE_EXTENDED) };
+    verify_no_extended_allow_acl_value(acl)
+}
+
+fn verify_no_extended_allow_acl_fd(fd: i32) -> io::Result<()> {
+    verify_no_extended_allow_acl_value(unsafe { acl_get_fd_np(fd, ACL_TYPE_EXTENDED) })
+}
+
+fn verify_no_extended_allow_acl_value(acl: Acl) -> io::Result<()> {
     if acl.is_null() {
         let error = io::Error::last_os_error();
         return if error.kind() == io::ErrorKind::NotFound {
@@ -1551,6 +1667,120 @@ mod tests {
     }
 
     #[test]
+    fn existing_acl_bearing_canonical_worker_root_is_rejected_without_rewrite() {
+        let principal = test_principal();
+        let parent = fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!(
+                "styrn-worker-existing-acl-{}-{}",
+                std::process::id(),
+                uuid::Uuid::now_v7()
+            ));
+        let root = parent.join("root");
+        fs::create_dir_all(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        seed_current_user_acl(&root, ACL_EXTENDED_ALLOW);
+        let layout = crate::platform::resolve_worker_directory_layout(
+            crate::platform::InstallationScope::System,
+            &principal,
+            Some(&root),
+        )
+        .unwrap();
+
+        let error = create_worker_directory_layout(&layout).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(verify_no_extended_acl(&root).is_err());
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
+        clear_extended_acl(&root).unwrap();
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn user_profile_anchor_with_mutating_allow_acl_is_rejected_before_creation() {
+        let principal = test_principal();
+        let parent = fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!(
+                "styrn-worker-profile-acl-{}-{}",
+                std::process::id(),
+                uuid::Uuid::now_v7()
+            ));
+        let profile = parent.join("profile");
+        fs::create_dir_all(&profile).unwrap();
+        fs::set_permissions(&profile, fs::Permissions::from_mode(0o700)).unwrap();
+        seed_current_user_acl(&profile, ACL_EXTENDED_ALLOW);
+        let root = profile.join("Library/Application Support/Styrn");
+        let layout = crate::platform::WorkerDirectoryLayout::new(
+            root,
+            crate::platform::WorkerRootCreationPolicy::CreateMissingFrom(profile.clone()),
+            principal,
+        );
+
+        let error = create_worker_directory_layout(&layout).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(!profile.join("Library").exists());
+        assert!(verify_no_extended_acl(&profile).is_err());
+        clear_extended_acl(&profile).unwrap();
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn new_worker_nodes_clear_inherited_extended_acl_before_descending() {
+        let principal = test_principal();
+        let parent = fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!(
+                "styrn-worker-inherited-acl-{}-{}",
+                std::process::id(),
+                uuid::Uuid::now_v7()
+            ));
+        let profile = parent.join("profile");
+        fs::create_dir_all(&profile).unwrap();
+        fs::set_permissions(&profile, fs::Permissions::from_mode(0o700)).unwrap();
+        seed_current_user_acl_with_flags_and_permissions(
+            &profile,
+            ACL_EXTENDED_DENY,
+            &[ACL_ENTRY_FILE_INHERIT, ACL_ENTRY_DIRECTORY_INHERIT],
+            &[ACL_WRITE_DATA],
+        );
+        let inheritance_probe = profile.join("inheritance-probe");
+        fs::create_dir(&inheritance_probe).unwrap();
+        assert!(verify_no_extended_acl(&inheritance_probe).is_err());
+        clear_extended_acl(&inheritance_probe).unwrap();
+        fs::remove_dir(&inheritance_probe).unwrap();
+        let root = profile.join("Library/Application Support/Styrn");
+        let layout = crate::platform::WorkerDirectoryLayout::new(
+            root.clone(),
+            crate::platform::WorkerRootCreationPolicy::CreateMissingFrom(profile.clone()),
+            principal,
+        );
+
+        create_worker_directory_layout(&layout).unwrap();
+
+        for path in [
+            profile.join("Library"),
+            profile.join("Library/Application Support"),
+            root.clone(),
+            root.join("repos"),
+            root.join("jobs"),
+            root.join("cache"),
+            root.join("artifacts"),
+            root.join("logs"),
+        ] {
+            verify_no_extended_acl(&path).unwrap();
+            assert_eq!(
+                fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
+        assert!(verify_no_extended_acl(&profile).is_err());
+        clear_extended_acl(&profile).unwrap();
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
     fn deterministic_policy_rejects_wrong_owner_and_worker_write_paths() {
         let valid = UnixManifestInspection {
             expected_uid: 0,
@@ -1726,7 +1956,30 @@ mod tests {
         seed_current_user_acls(path, &[tag]);
     }
 
+    fn seed_current_user_acl_with_flags_and_permissions(
+        path: &Path,
+        tag: i32,
+        flags: &[i32],
+        permissions: &[i32],
+    ) {
+        seed_current_user_acls_with_flags(path, &[tag], flags, permissions);
+    }
+
     fn seed_current_user_acls(path: &Path, tags: &[i32]) {
+        seed_current_user_acls_with_flags(
+            path,
+            tags,
+            &[],
+            &[ACL_WRITE_DATA, ACL_DELETE, ACL_DELETE_CHILD],
+        );
+    }
+
+    fn seed_current_user_acls_with_flags(
+        path: &Path,
+        tags: &[i32],
+        flags: &[i32],
+        acl_permissions: &[i32],
+    ) {
         let mut acl = unsafe { acl_init(tags.len().try_into().unwrap()) };
         assert!(!acl.is_null());
         let mut uuid = [0_u8; 16];
@@ -1741,9 +1994,15 @@ mod tests {
             assert_eq!(unsafe { acl_set_qualifier(entry, uuid.as_ptr().cast()) }, 0);
             let mut permissions = std::ptr::null_mut();
             assert_eq!(unsafe { acl_get_permset(entry, &mut permissions) }, 0);
-            assert_eq!(unsafe { acl_add_perm(permissions, ACL_WRITE_DATA) }, 0);
-            assert_eq!(unsafe { acl_add_perm(permissions, ACL_DELETE) }, 0);
-            assert_eq!(unsafe { acl_add_perm(permissions, ACL_DELETE_CHILD) }, 0);
+            for permission in acl_permissions {
+                assert_eq!(unsafe { acl_add_perm(permissions, *permission) }, 0);
+            }
+            let mut flagset = std::ptr::null_mut();
+            assert_eq!(unsafe { acl_get_flagset_np(entry, &mut flagset) }, 0);
+            for flag in flags {
+                assert_eq!(unsafe { acl_add_flag_np(flagset, *flag) }, 0);
+            }
+            assert_eq!(unsafe { acl_set_flagset_np(entry, flagset) }, 0);
         }
         let path = c_path(path).unwrap();
         assert_eq!(

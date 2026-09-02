@@ -34,7 +34,7 @@ pub(super) fn default_worker_root(
         super::InstallationScope::System => Ok((
             PathBuf::from("/srv/styrn"),
             super::WorkerRootCreationPolicy::ExistingParent {
-                require_trusted_ancestry: true,
+                allow_untrusted_parent_create: false,
             },
         )),
         super::InstallationScope::User => {
@@ -44,7 +44,7 @@ pub(super) fn default_worker_root(
             let home = PathBuf::from(account.home);
             let (data_home, creation_policy) = match std::env::var_os("XDG_DATA_HOME") {
                 Some(value) if Path::new(&value).is_absolute() => (
-                    PathBuf::from(value),
+                    normalize_xdg_data_home(value),
                     super::WorkerRootCreationPolicy::CreateMissingFrom(PathBuf::from("/")),
                 ),
                 _ => (
@@ -60,6 +60,14 @@ pub(super) fn default_worker_root(
             Ok((data_home.join("styrn"), creation_policy))
         }
     }
+}
+
+fn normalize_xdg_data_home(value: OsString) -> PathBuf {
+    let mut bytes = value.into_vec();
+    while bytes.len() > 1 && bytes.last() == Some(&b'/') {
+        bytes.pop();
+    }
+    PathBuf::from(OsString::from_vec(bytes))
 }
 
 #[allow(dead_code)] // Consumed by the T0.14 setup action integration follow-up.
@@ -89,14 +97,9 @@ pub(super) fn worker_root_path_is_normalized(path: &Path) -> bool {
 #[allow(dead_code)] // Consumed by the T0.14 setup action integration follow-up.
 pub(super) fn create_worker_directory_layout(
     layout: &super::WorkerDirectoryLayout,
-) -> io::Result<()> {
+) -> io::Result<super::WorkerDirectoryCreation> {
     let root_components = absolute_worker_components(layout.root())?;
-    let require_trusted_ancestry = matches!(
-        &layout.creation_policy,
-        super::WorkerRootCreationPolicy::ExistingParent {
-            require_trusted_ancestry: true
-        }
-    );
+    let expected_uid = layout.principal.unix_uid()?;
     let first_creatable = match &layout.creation_policy {
         super::WorkerRootCreationPolicy::ExistingParent { .. } => root_components
             .len()
@@ -116,40 +119,56 @@ pub(super) fn create_worker_directory_layout(
     };
 
     let mut directory = open_worker_filesystem_root()?;
-    if require_trusted_ancestry {
-        verify_trusted_worker_ancestor(&directory)?;
-    }
+    verify_worker_creation_ancestor(&directory, expected_uid)?;
     for component in &root_components[..first_creatable] {
         directory = open_worker_directory_at(&directory, component)?;
-        if require_trusted_ancestry {
-            verify_trusted_worker_ancestor(&directory)?;
-        }
+        verify_worker_creation_ancestor(&directory, expected_uid)?;
     }
     let creation_lock = directory;
     if unsafe { libc::flock(creation_lock.as_raw_fd(), libc::LOCK_EX) } == -1 {
         return Err(io::Error::last_os_error());
     }
     let mut directory = creation_lock.try_clone()?;
-    for component in &root_components[first_creatable..] {
-        directory = open_or_create_worker_directory_at(&directory, component, true)?;
+    let mut root_disposition = None;
+    for (index, component) in root_components[first_creatable..].iter().enumerate() {
+        let is_root = first_creatable + index + 1 == root_components.len();
+        let opened =
+            open_or_create_worker_directory_at(&directory, component, true, expected_uid, is_root)?;
+        if is_root {
+            root_disposition = Some(opened.disposition);
+        }
+        directory = opened.directory;
     }
     let root_identity = worker_directory_identity(&directory)?;
+    let root_observation = super::WorkerDirectoryNodeObservation::new(
+        layout.root().to_path_buf(),
+        root_disposition.expect("the normalized worker root has a leaf component"),
+        root_identity,
+    );
 
     let mut children = Vec::with_capacity(super::WorkerDirectoryLayout::child_names().len());
     for name in super::WorkerDirectoryLayout::child_names() {
         match open_worker_directory_at(&directory, name.as_bytes()) {
-            Ok(child) => children.push((name, Some(child))),
+            Ok(child) => {
+                verify_worker_directory_security(&child, expected_uid)?;
+                children.push(Some(OpenedWorkerDirectory {
+                    directory: child,
+                    disposition: super::WorkerDirectoryNodeDisposition::Existing,
+                }));
+            }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                children.push((name, None));
+                children.push(None);
             }
             Err(error) => return Err(error),
         }
     }
-    for (name, child) in &mut children {
+    for (index, child) in children.iter_mut().enumerate() {
         if child.is_none() {
             *child = Some(open_or_create_worker_directory_at(
                 &directory,
-                name.as_bytes(),
+                super::WorkerDirectoryLayout::child_names()[index].as_bytes(),
+                true,
+                expected_uid,
                 true,
             )?);
         }
@@ -161,16 +180,36 @@ pub(super) fn create_worker_directory_layout(
         ));
     }
     verify_worker_path_identity(layout.root(), root_identity)?;
-    for (name, child) in children {
+    let mut child_observations = Vec::with_capacity(children.len());
+    for (name, child) in super::WorkerDirectoryLayout::child_names()
+        .into_iter()
+        .zip(children)
+    {
         let child = child.expect("every fixed worker child was opened or created");
         let reopened = open_worker_directory_at(&directory, name.as_bytes())?;
-        if worker_directory_identity(&reopened)? != worker_directory_identity(&child)? {
+        let identity = worker_directory_identity(&child.directory)?;
+        if worker_directory_identity(&reopened)? != identity {
             return Err(permission_denied(
                 "worker layout child identity changed during creation",
             ));
         }
+        child_observations.push(super::WorkerDirectoryNodeObservation::new(
+            layout.root().join(name),
+            child.disposition,
+            identity,
+        ));
     }
-    Ok(())
+    Ok(super::WorkerDirectoryCreation::new(
+        root_observation,
+        child_observations
+            .try_into()
+            .unwrap_or_else(|_| unreachable!("the worker layout always has exactly five children")),
+    ))
+}
+
+struct OpenedWorkerDirectory {
+    directory: std::fs::File,
+    disposition: super::WorkerDirectoryNodeDisposition,
 }
 
 fn absolute_worker_components(path: &Path) -> io::Result<Vec<&[u8]>> {
@@ -207,7 +246,10 @@ fn open_existing_worker_path(path: &Path) -> io::Result<std::fs::File> {
     Ok(directory)
 }
 
-fn verify_worker_path_identity(path: &Path, expected: (u64, u64)) -> io::Result<()> {
+fn verify_worker_path_identity(
+    path: &Path,
+    expected: super::WorkerDirectoryIdentity,
+) -> io::Result<()> {
     let reopened = open_existing_worker_path(path)?;
     if worker_directory_identity(&reopened)? != expected {
         return Err(permission_denied(
@@ -221,31 +263,84 @@ fn open_or_create_worker_directory_at(
     parent: &std::fs::File,
     name: &[u8],
     may_create: bool,
-) -> io::Result<std::fs::File> {
+    expected_uid: u32,
+    existing_must_be_canonical: bool,
+) -> io::Result<OpenedWorkerDirectory> {
     match open_worker_directory_at(parent, name) {
-        Ok(directory) => return Ok(directory),
+        Ok(directory) => {
+            verify_existing_worker_directory(&directory, expected_uid, existing_must_be_canonical)?;
+            return Ok(OpenedWorkerDirectory {
+                directory,
+                disposition: super::WorkerDirectoryNodeDisposition::Existing,
+            });
+        }
         Err(error) if error.kind() == io::ErrorKind::NotFound && may_create => {}
         Err(error) => return Err(error),
     }
     let name = CString::new(name)
         .map_err(|_| invalid_data("worker directory component contains a NUL byte"))?;
-    if unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) } == -1 {
+    let created = if unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) } == -1 {
         let error = io::Error::last_os_error();
         if error.kind() != io::ErrorKind::AlreadyExists {
             return Err(worker_directory_open_error(error));
         }
-    }
+        false
+    } else {
+        true
+    };
     let directory = open_worker_directory_at(parent, name.to_bytes())?;
-    let mut status = unsafe { std::mem::zeroed::<libc::stat>() };
-    if unsafe { libc::fstat(directory.as_raw_fd(), &mut status) } == -1 {
+    if created {
+        harden_new_worker_directory(&directory, expected_uid)?;
+    } else {
+        verify_existing_worker_directory(&directory, expected_uid, existing_must_be_canonical)?;
+    }
+    Ok(OpenedWorkerDirectory {
+        directory,
+        disposition: if created {
+            super::WorkerDirectoryNodeDisposition::Created
+        } else {
+            super::WorkerDirectoryNodeDisposition::Existing
+        },
+    })
+}
+
+fn verify_existing_worker_directory(
+    directory: &std::fs::File,
+    expected_uid: u32,
+    must_be_canonical: bool,
+) -> io::Result<()> {
+    if must_be_canonical {
+        verify_worker_directory_security(directory, expected_uid)
+    } else {
+        verify_worker_creation_ancestor(directory, expected_uid)
+    }
+}
+
+fn harden_new_worker_directory(directory: &std::fs::File, expected_uid: u32) -> io::Result<()> {
+    clear_posix_acl(directory, c"system.posix_acl_access")?;
+    clear_posix_acl(directory, c"system.posix_acl_default")?;
+    if unsafe { libc::fchown(directory.as_raw_fd(), expected_uid, !0 as libc::gid_t) } == -1 {
         return Err(io::Error::last_os_error());
     }
-    if status.st_uid != unsafe { libc::geteuid() } || status.st_mode & 0o777 != 0o700 {
+    if unsafe { libc::fchmod(directory.as_raw_fd(), 0o700) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    verify_worker_directory_security(directory, expected_uid)
+}
+
+fn verify_worker_directory_security(
+    directory: &std::fs::File,
+    expected_uid: u32,
+) -> io::Result<()> {
+    let status = worker_directory_status(directory)?;
+    if status.st_uid != expected_uid || status.st_mode & 0o777 != 0o700 {
         return Err(permission_denied(
-            "new worker directory is not owned by the creator with mode 0700",
+            "worker directory owner or mode does not match the exact policy",
         ));
     }
-    Ok(directory)
+    let access = posix_acl_present(directory, c"system.posix_acl_access")?;
+    let default = posix_acl_present(directory, c"system.posix_acl_default")?;
+    validate_worker_acl_presence(access, default)
 }
 
 fn open_worker_directory_at(parent: &std::fs::File, name: &[u8]) -> io::Result<std::fs::File> {
@@ -266,7 +361,17 @@ fn open_worker_directory_at(parent: &std::fs::File, name: &[u8]) -> io::Result<s
     Ok(directory)
 }
 
-fn worker_directory_identity(directory: &std::fs::File) -> io::Result<(u64, u64)> {
+fn worker_directory_identity(
+    directory: &std::fs::File,
+) -> io::Result<super::WorkerDirectoryIdentity> {
+    let status = worker_directory_status(directory)?;
+    Ok(super::WorkerDirectoryIdentity::from_unix(
+        status.st_dev,
+        status.st_ino,
+    ))
+}
+
+fn worker_directory_status(directory: &std::fs::File) -> io::Result<libc::stat> {
     let mut status = unsafe { std::mem::zeroed::<libc::stat>() };
     if unsafe { libc::fstat(directory.as_raw_fd(), &mut status) } == -1 {
         return Err(io::Error::last_os_error());
@@ -276,36 +381,48 @@ fn worker_directory_identity(directory: &std::fs::File) -> io::Result<(u64, u64)
             "worker layout path is not a real directory",
         ));
     }
-    Ok((status.st_dev, status.st_ino))
+    Ok(status)
 }
 
-fn verify_trusted_worker_ancestor(directory: &std::fs::File) -> io::Result<()> {
-    let mut status = unsafe { std::mem::zeroed::<libc::stat>() };
-    if unsafe { libc::fstat(directory.as_raw_fd(), &mut status) } == -1 {
-        return Err(io::Error::last_os_error());
-    }
-    let effective_uid = unsafe { libc::geteuid() };
-    if (status.st_uid != 0 && status.st_uid != effective_uid)
-        || (status.st_mode & 0o022 != 0 && status.st_mode & libc::S_ISVTX == 0)
+fn verify_worker_creation_ancestor(directory: &std::fs::File, expected_uid: u32) -> io::Result<()> {
+    let status = worker_directory_status(directory)?;
+    if (status.st_uid != 0 && status.st_uid != expected_uid)
+        || (status.st_mode & 0o022 != 0
+            && !(status.st_uid == 0 && status.st_mode & libc::S_ISVTX != 0))
     {
         return Err(permission_denied(
-            "system worker root ancestor is controlled by an untrusted principal",
+            "worker root ancestor is controlled by an untrusted principal",
         ));
     }
+    if posix_acl_present(directory, c"system.posix_acl_access")? {
+        return Err(permission_denied(
+            "worker root ancestor has an untrusted access ACL",
+        ));
+    }
+    Ok(())
+}
+
+fn posix_acl_present(directory: &std::fs::File, name: &std::ffi::CStr) -> io::Result<bool> {
     let acl_size = unsafe {
         libc::fgetxattr(
             directory.as_raw_fd(),
-            c"system.posix_acl_access".as_ptr(),
+            name.as_ptr(),
             std::ptr::null_mut(),
             0,
         )
     };
-    if acl_size > 0 {
-        return Err(permission_denied(
-            "system worker root ancestor has an untrusted extended ACL",
-        ));
+    if acl_size >= 0 {
+        return Ok(acl_size > 0);
     }
-    if acl_size == 0 {
+    let error = io::Error::last_os_error();
+    match error.raw_os_error() {
+        Some(libc::ENODATA | libc::ENOTSUP) => Ok(false),
+        _ => Err(error),
+    }
+}
+
+fn clear_posix_acl(directory: &std::fs::File, name: &std::ffi::CStr) -> io::Result<()> {
+    if unsafe { libc::fremovexattr(directory.as_raw_fd(), name.as_ptr()) } == 0 {
         return Ok(());
     }
     let error = io::Error::last_os_error();
@@ -313,6 +430,15 @@ fn verify_trusted_worker_ancestor(directory: &std::fs::File) -> io::Result<()> {
         Some(libc::ENODATA | libc::ENOTSUP) => Ok(()),
         _ => Err(error),
     }
+}
+
+fn validate_worker_acl_presence(access: bool, default: bool) -> io::Result<()> {
+    if access || default {
+        return Err(permission_denied(
+            "worker directory has an access or default ACL",
+        ));
+    }
+    Ok(())
 }
 
 fn worker_directory_open_error(error: io::Error) -> io::Error {
@@ -803,7 +929,7 @@ pub(super) fn prepare_verified_private_file_removal(
     };
     if !parent_metadata.is_dir()
         || parent_metadata.uid() != expected_uid
-        || parent_metadata.mode() & 0o077 != 0
+        || !super::private_file_parent_mode_is_valid(owner, parent_metadata.mode())
     {
         return Err(permission_denied(
             "private file parent ownership or mode is insecure",
@@ -1384,6 +1510,153 @@ fn invalid_data(message: &str) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn canonical_worker_acl_policy_rejects_access_and_default_acl_presence() {
+        assert!(validate_worker_acl_presence(false, false).is_ok());
+        assert!(validate_worker_acl_presence(true, false).is_err());
+        assert!(validate_worker_acl_presence(false, true).is_err());
+        assert!(validate_worker_acl_presence(true, true).is_err());
+    }
+
+    #[test]
+    #[ignore = "environmental: requires native Linux filesystem POSIX access/default ACL support"]
+    fn native_existing_access_or_default_acl_is_rejected_without_rewrite() {
+        for attribute in [c"system.posix_acl_access", c"system.posix_acl_default"] {
+            let principal = resolve_current_worker_principal().unwrap();
+            let parent = fs::canonicalize(std::env::temp_dir())
+                .unwrap()
+                .join(format!(
+                    "styrn-worker-existing-posix-acl-{}-{}",
+                    std::process::id(),
+                    uuid::Uuid::now_v7()
+                ));
+            let root = parent.join("root");
+            fs::create_dir_all(&root).unwrap();
+            fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+            set_test_posix_acl(&root, attribute);
+            let layout = crate::platform::resolve_worker_directory_layout(
+                crate::platform::InstallationScope::System,
+                &principal,
+                Some(&root),
+            )
+            .unwrap();
+
+            let error = create_worker_directory_layout(&layout).unwrap_err();
+
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+            assert!(posix_acl_present_path(&root, attribute).unwrap());
+            assert_eq!(fs::read_dir(&root).unwrap().count(), 0);
+            remove_test_posix_acl(&root, attribute);
+            fs::remove_dir_all(parent).unwrap();
+        }
+    }
+
+    #[test]
+    #[ignore = "environmental: requires native Linux filesystem POSIX default ACL inheritance"]
+    fn native_new_worker_nodes_clear_inherited_access_and_default_acls() {
+        let principal = resolve_current_worker_principal().unwrap();
+        let parent = fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!(
+                "styrn-worker-inherited-posix-acl-{}-{}",
+                std::process::id(),
+                uuid::Uuid::now_v7()
+            ));
+        let profile = parent.join("profile");
+        fs::create_dir_all(&profile).unwrap();
+        fs::set_permissions(&profile, fs::Permissions::from_mode(0o700)).unwrap();
+        set_test_posix_acl(&profile, c"system.posix_acl_default");
+        let probe = profile.join("inheritance-probe");
+        fs::create_dir(&probe).unwrap();
+        assert!(posix_acl_present_path(&probe, c"system.posix_acl_access").unwrap());
+        assert!(posix_acl_present_path(&probe, c"system.posix_acl_default").unwrap());
+        remove_test_posix_acl(&probe, c"system.posix_acl_access");
+        remove_test_posix_acl(&probe, c"system.posix_acl_default");
+        fs::remove_dir(&probe).unwrap();
+        let root = profile.join("new/data/styrn");
+        let layout = crate::platform::WorkerDirectoryLayout::new(
+            root.clone(),
+            crate::platform::WorkerRootCreationPolicy::CreateMissingFrom(profile.clone()),
+            principal,
+        );
+
+        create_worker_directory_layout(&layout).unwrap();
+
+        for path in [
+            profile.join("new"),
+            profile.join("new/data"),
+            root.clone(),
+            root.join("repos"),
+            root.join("jobs"),
+            root.join("cache"),
+            root.join("artifacts"),
+            root.join("logs"),
+        ] {
+            assert!(!posix_acl_present_path(&path, c"system.posix_acl_access").unwrap());
+            assert!(!posix_acl_present_path(&path, c"system.posix_acl_default").unwrap());
+            assert_eq!(
+                fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+        }
+        remove_test_posix_acl(&profile, c"system.posix_acl_default");
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    fn set_test_posix_acl(path: &Path, attribute: &std::ffi::CStr) {
+        let path = CString::new(path.as_os_str().as_bytes()).unwrap();
+        let mut value = 2_u32.to_le_bytes().to_vec();
+        for (tag, permissions, id) in [
+            (0x01_u16, 0x07_u16, u32::MAX),
+            (
+                0x02_u16,
+                0x07_u16,
+                unsafe { libc::geteuid() }.wrapping_add(1),
+            ),
+            (0x04_u16, 0x00_u16, u32::MAX),
+            (0x10_u16, 0x07_u16, u32::MAX),
+            (0x20_u16, 0x00_u16, u32::MAX),
+        ] {
+            value.extend_from_slice(&tag.to_le_bytes());
+            value.extend_from_slice(&permissions.to_le_bytes());
+            value.extend_from_slice(&id.to_le_bytes());
+        }
+        assert_eq!(
+            unsafe {
+                libc::setxattr(
+                    path.as_ptr(),
+                    attribute.as_ptr(),
+                    value.as_ptr().cast(),
+                    value.len(),
+                    0,
+                )
+            },
+            0,
+            "{}",
+            io::Error::last_os_error()
+        );
+    }
+
+    fn posix_acl_present_path(path: &Path, attribute: &std::ffi::CStr) -> io::Result<bool> {
+        let path = CString::new(path.as_os_str().as_bytes()).unwrap();
+        let size =
+            unsafe { libc::getxattr(path.as_ptr(), attribute.as_ptr(), std::ptr::null_mut(), 0) };
+        if size >= 0 {
+            return Ok(size > 0);
+        }
+        let error = io::Error::last_os_error();
+        match error.raw_os_error() {
+            Some(libc::ENODATA | libc::ENOTSUP) => Ok(false),
+            _ => Err(error),
+        }
+    }
+
+    fn remove_test_posix_acl(path: &Path, attribute: &std::ffi::CStr) {
+        let path = CString::new(path.as_os_str().as_bytes()).unwrap();
+        let result = unsafe { libc::removexattr(path.as_ptr(), attribute.as_ptr()) };
+        assert!(result == 0 || io::Error::last_os_error().raw_os_error() == Some(libc::ENODATA));
+    }
 
     #[test]
     fn retained_worker_root_identity_detects_path_replacement() {

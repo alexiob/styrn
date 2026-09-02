@@ -66,6 +66,7 @@ const FILE_SYNCHRONOUS_IO_NONALERT: u32 = 0x0000_0020;
 const FILE_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
 const FILE_OPEN: u32 = 1;
 const FILE_CREATE: u32 = 2;
+const FILE_ID_INFO_CLASS: u32 = 18;
 const OBJ_CASE_INSENSITIVE: u32 = 0x0000_0040;
 const PARENT_TAKEOVER_ACCESS: u32 =
     0x0000_0040 | 0x0001_0000 | 0x0004_0000 | 0x0008_0000 | 0x4000_0000 | 0x1000_0000;
@@ -286,6 +287,12 @@ struct ByHandleFileInformation {
 }
 
 #[repr(C)]
+struct FileIdInfo {
+    volume_serial_number: u64,
+    file_id: [u8; 16],
+}
+
+#[repr(C)]
 #[allow(dead_code)] // Source-including manifest tests omit authorization execution.
 struct FileDispositionInformation {
     delete_file: u8,
@@ -427,7 +434,7 @@ pub(super) fn default_worker_root(
         super::InstallationScope::System => Ok((
             PathBuf::from(r"C:\Styrn"),
             super::WorkerRootCreationPolicy::ExistingParent {
-                require_trusted_ancestry: true,
+                allow_untrusted_parent_create: true,
             },
         )),
         super::InstallationScope::User => {
@@ -441,7 +448,7 @@ pub(super) fn default_worker_root(
                 super::WorkerRootCreationPolicy::CreateMissingFrom(profile)
             } else {
                 super::WorkerRootCreationPolicy::ExistingParent {
-                    require_trusted_ancestry: false,
+                    allow_untrusted_parent_create: false,
                 }
             };
             let root = data.join("Styrn");
@@ -549,20 +556,20 @@ fn current_known_folder(folder: &Guid, label: &str) -> io::Result<PathBuf> {
 #[allow(dead_code)] // Consumed by the T0.14 setup action integration follow-up.
 pub(super) fn create_worker_directory_layout(
     layout: &super::WorkerDirectoryLayout,
-) -> io::Result<()> {
+) -> io::Result<super::WorkerDirectoryCreation> {
     let root_path = WindowsWorkerPath::parse(layout.root())?;
-    let require_trusted_ancestry = matches!(
-        &layout.creation_policy,
+    let (first_creatable, allow_untrusted_parent_create) = match &layout.creation_policy {
         super::WorkerRootCreationPolicy::ExistingParent {
-            require_trusted_ancestry: true
-        }
-    );
-    let first_creatable = match &layout.creation_policy {
-        super::WorkerRootCreationPolicy::ExistingParent { .. } => root_path
-            .components
-            .len()
-            .checked_sub(1)
-            .ok_or_else(|| invalid_data("worker root has no leaf component"))?,
+            allow_untrusted_parent_create,
+            ..
+        } => (
+            root_path
+                .components
+                .len()
+                .checked_sub(1)
+                .ok_or_else(|| invalid_data("worker root has no leaf component"))?,
+            *allow_untrusted_parent_create,
+        ),
         super::WorkerRootCreationPolicy::CreateMissingFrom(anchor) => {
             let anchor = WindowsWorkerPath::parse(anchor)?;
             if !root_path.has_component_prefix(&anchor)
@@ -572,45 +579,64 @@ pub(super) fn create_worker_directory_layout(
                     "worker standard root escapes its native profile anchor",
                 ));
             }
-            anchor.components.len()
+            (anchor.components.len(), false)
         }
     };
-    let security = WorkerCreationSecurity::new()?;
-    let _creation_lock = WorkerLayoutLock::acquire(layout.root(), &security)?;
-    let mut directory = open_worker_volume_root(&root_path.volume_root, require_trusted_ancestry)?;
-    if require_trusted_ancestry {
-        verify_trusted_worker_ancestor(&directory, &security.owner_sid)?;
-    }
-    for component in &root_path.components[..first_creatable] {
-        directory = open_worker_directory_at_with_security(
-            &directory,
-            component,
-            require_trusted_ancestry,
-        )?;
-        if require_trusted_ancestry {
-            verify_trusted_worker_ancestor(&directory, &security.owner_sid)?;
+    let security = WorkerCreationSecurity::new(&layout.principal)?;
+    let prepared = prepare_worker_root(
+        &root_path,
+        first_creatable,
+        allow_untrusted_parent_create,
+        &security,
+    )?;
+    let lock_suffix = &root_path.components[prepared.next_component..];
+    let _creation_lock = WorkerLayoutLock::acquire(&prepared.directory, lock_suffix, &security)?;
+    let mut directory = prepared.directory;
+    let mut root_disposition = prepared.root_disposition;
+    for (index, component) in root_path.components[prepared.next_component..]
+        .iter()
+        .enumerate()
+    {
+        let component_index = prepared.next_component + index;
+        let is_root = component_index + 1 == root_path.components.len();
+        let opened =
+            open_or_create_worker_directory_at(&directory, component, true, &security, is_root)?;
+        if is_root {
+            root_disposition = Some(opened.disposition);
         }
-    }
-    for component in &root_path.components[first_creatable..] {
-        directory = open_or_create_worker_directory_at(&directory, component, true, &security)?;
+        directory = opened.directory;
     }
     let root_identity = worker_directory_identity(&directory)?;
+    let root_observation = super::WorkerDirectoryNodeObservation::new(
+        layout.root().to_path_buf(),
+        root_disposition.expect("the normalized worker root has a leaf component"),
+        root_identity,
+    );
 
     let mut children = Vec::with_capacity(super::WorkerDirectoryLayout::child_names().len());
     for name in super::WorkerDirectoryLayout::child_names() {
         let name = name.encode_utf16().collect::<Vec<_>>();
-        match open_worker_directory_at(&directory, &name) {
-            Ok(child) => children.push((name, Some(child))),
+        match open_worker_directory_at_with_security(&directory, &name, true) {
+            Ok(child) => {
+                verify_worker_directory_security(&child, &security.owner_sid)?;
+                children.push(Some(OpenedWorkerDirectory {
+                    directory: child,
+                    disposition: super::WorkerDirectoryNodeDisposition::Existing,
+                }));
+            }
             Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                children.push((name, None));
+                children.push(None);
             }
             Err(error) => return Err(error),
         }
     }
-    for (name, child) in &mut children {
+    for (index, child) in children.iter_mut().enumerate() {
         if child.is_none() {
+            let name = super::WorkerDirectoryLayout::child_names()[index]
+                .encode_utf16()
+                .collect::<Vec<_>>();
             *child = Some(open_or_create_worker_directory_at(
-                &directory, name, true, &security,
+                &directory, &name, true, &security, true,
             )?);
         }
     }
@@ -626,16 +652,91 @@ pub(super) fn create_worker_directory_layout(
             "worker root pathname changed during layout creation",
         ));
     }
-    for (name, child) in children {
+    let mut child_observations = Vec::with_capacity(children.len());
+    for (name, child) in super::WorkerDirectoryLayout::child_names()
+        .into_iter()
+        .zip(children)
+    {
         let child = child.expect("every fixed worker child was opened or created");
-        let reopened = open_worker_directory_at(&directory, &name)?;
-        if worker_directory_identity(&reopened)? != worker_directory_identity(&child)? {
+        let name_units = name.encode_utf16().collect::<Vec<_>>();
+        let reopened = open_worker_directory_at(&directory, &name_units)?;
+        let identity = worker_directory_identity(&child.directory)?;
+        if worker_directory_identity(&reopened)? != identity {
             return Err(permission_denied(
                 "worker layout child identity changed during creation",
             ));
         }
+        child_observations.push(super::WorkerDirectoryNodeObservation::new(
+            layout.root().join(name),
+            child.disposition,
+            identity,
+        ));
     }
-    Ok(())
+    Ok(super::WorkerDirectoryCreation::new(
+        root_observation,
+        child_observations
+            .try_into()
+            .unwrap_or_else(|_| unreachable!("the worker layout always has exactly five children")),
+    ))
+}
+
+struct PreparedWorkerRoot {
+    directory: std::fs::File,
+    next_component: usize,
+    root_disposition: Option<super::WorkerDirectoryNodeDisposition>,
+}
+
+struct OpenedWorkerDirectory {
+    directory: std::fs::File,
+    disposition: super::WorkerDirectoryNodeDisposition,
+}
+
+fn prepare_worker_root(
+    path: &WindowsWorkerPath,
+    first_creatable: usize,
+    allow_untrusted_parent_create: bool,
+    security: &WorkerCreationSecurity,
+) -> io::Result<PreparedWorkerRoot> {
+    let mut directory = open_worker_volume_root(&path.volume_root, true)?;
+    verify_trusted_worker_ancestor(
+        &directory,
+        &security.owner_sid,
+        first_creatable != 0 || allow_untrusted_parent_create,
+    )?;
+    for (index, component) in path.components.iter().enumerate() {
+        match open_worker_directory_at_with_security(&directory, component, true) {
+            Ok(opened) => {
+                if index + 1 == path.components.len() {
+                    verify_worker_directory_security(&opened, &security.owner_sid)?;
+                } else {
+                    verify_trusted_worker_ancestor(
+                        &opened,
+                        &security.owner_sid,
+                        index + 1 < first_creatable,
+                    )?;
+                }
+                directory = opened;
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound && index >= first_creatable => {
+                verify_trusted_worker_ancestor(
+                    &directory,
+                    &security.owner_sid,
+                    allow_untrusted_parent_create,
+                )?;
+                return Ok(PreparedWorkerRoot {
+                    directory,
+                    next_component: index,
+                    root_disposition: None,
+                });
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(PreparedWorkerRoot {
+        directory,
+        next_component: path.components.len(),
+        root_disposition: Some(super::WorkerDirectoryNodeDisposition::Existing),
+    })
 }
 
 struct WindowsWorkerPath {
@@ -693,8 +794,8 @@ struct WorkerCreationSecurity {
 }
 
 impl WorkerCreationSecurity {
-    fn new() -> io::Result<Self> {
-        let owner_sid = current_user_sid()?;
+    fn new(principal: &WorkerPrincipal) -> io::Result<Self> {
+        let owner_sid = principal_sid(principal)?;
         let owner = sid_to_string(owner_sid.as_ptr().cast())?;
         let system = well_known_sid(WIN_LOCAL_SYSTEM_SID)?;
         let administrators = well_known_sid(WIN_BUILTIN_ADMINISTRATORS_SID)?;
@@ -733,19 +834,14 @@ struct WorkerLayoutLock {
 }
 
 impl WorkerLayoutLock {
-    fn acquire(path: &Path, security: &WorkerCreationSecurity) -> io::Result<Self> {
+    fn acquire(
+        canonical_parent: &std::fs::File,
+        missing_suffix: &[Vec<u16>],
+        security: &WorkerCreationSecurity,
+    ) -> io::Result<Self> {
         use std::fmt::Write;
 
-        let mut bytes = Vec::new();
-        let mut folded = path.as_os_str().encode_wide().collect::<Vec<_>>();
-        let folded_length = u32::try_from(folded.len())
-            .map_err(|_| invalid_data("worker root path is too long for a coordination lock"))?;
-        if unsafe { CharUpperBuffW(folded.as_mut_ptr(), folded_length) } == 0 {
-            return Err(io::Error::last_os_error());
-        }
-        for unit in folded {
-            bytes.extend_from_slice(&unit.to_le_bytes());
-        }
+        let bytes = worker_layout_lock_key(canonical_parent, missing_suffix)?;
         let digest = Sha256::digest(bytes);
         let mut name = String::from(r"Global\Styrn.WorkerLayout.");
         for byte in digest {
@@ -768,6 +864,29 @@ impl WorkerLayoutLock {
         }
         Ok(Self { handle })
     }
+}
+
+fn worker_layout_lock_key(
+    canonical_parent: &std::fs::File,
+    missing_suffix: &[Vec<u16>],
+) -> io::Result<Vec<u8>> {
+    let identity = worker_directory_identity(canonical_parent)?;
+    let mut bytes = Vec::new();
+    bytes.extend_from_slice(&identity.volume.to_le_bytes());
+    bytes.extend_from_slice(&identity.file_id);
+    for component in missing_suffix {
+        let mut folded = component.clone();
+        let folded_length = u32::try_from(folded.len())
+            .map_err(|_| invalid_data("worker root path is too long for a coordination lock"))?;
+        if folded_length > 0 && unsafe { CharUpperBuffW(folded.as_mut_ptr(), folded_length) } == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        bytes.extend_from_slice(&folded_length.to_le_bytes());
+        for unit in folded {
+            bytes.extend_from_slice(&unit.to_le_bytes());
+        }
+    }
+    Ok(bytes)
 }
 
 impl Drop for WorkerLayoutLock {
@@ -816,21 +935,56 @@ fn open_or_create_worker_directory_at(
     name: &[u16],
     may_create: bool,
     security: &WorkerCreationSecurity,
-) -> io::Result<std::fs::File> {
-    match open_worker_directory_at(parent, name) {
-        Ok(directory) => return Ok(directory),
+    existing_must_be_canonical: bool,
+) -> io::Result<OpenedWorkerDirectory> {
+    match open_worker_directory_at_with_security(parent, name, true) {
+        Ok(directory) => {
+            verify_existing_worker_directory(
+                &directory,
+                &security.owner_sid,
+                existing_must_be_canonical,
+            )?;
+            return Ok(OpenedWorkerDirectory {
+                directory,
+                disposition: super::WorkerDirectoryNodeDisposition::Existing,
+            });
+        }
         Err(error) if error.kind() == io::ErrorKind::NotFound && may_create => {}
         Err(error) => return Err(error),
     }
     match nt_open_worker_directory_at(parent, name, FILE_CREATE, security.descriptor.0, false) {
         Ok(directory) => {
-            verify_new_worker_directory_security(&directory, &security.owner_sid)?;
-            Ok(directory)
+            verify_worker_directory_security(&directory, &security.owner_sid)?;
+            Ok(OpenedWorkerDirectory {
+                directory,
+                disposition: super::WorkerDirectoryNodeDisposition::Created,
+            })
         }
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-            open_worker_directory_at(parent, name)
+            let directory = open_worker_directory_at_with_security(parent, name, true)?;
+            verify_existing_worker_directory(
+                &directory,
+                &security.owner_sid,
+                existing_must_be_canonical,
+            )?;
+            Ok(OpenedWorkerDirectory {
+                directory,
+                disposition: super::WorkerDirectoryNodeDisposition::Existing,
+            })
         }
         Err(error) => Err(error),
+    }
+}
+
+fn verify_existing_worker_directory(
+    directory: &std::fs::File,
+    expected_owner: &[u8],
+    must_be_canonical: bool,
+) -> io::Result<()> {
+    if must_be_canonical {
+        verify_worker_directory_security(directory, expected_owner)
+    } else {
+        verify_trusted_worker_ancestor(directory, expected_owner, false)
     }
 }
 
@@ -924,29 +1078,46 @@ fn worker_directory_windows_error(error: io::Error) -> io::Error {
     }
 }
 
-fn worker_directory_identity(directory: &std::fs::File) -> io::Result<(u64, u64)> {
+fn worker_directory_identity(
+    directory: &std::fs::File,
+) -> io::Result<super::WorkerDirectoryIdentity> {
     use std::os::windows::io::AsRawHandle;
 
-    let mut information = unsafe { std::mem::zeroed::<ByHandleFileInformation>() };
-    if unsafe { GetFileInformationByHandle(directory.as_raw_handle(), &mut information) } == 0 {
+    let mut attributes = unsafe { std::mem::zeroed::<ByHandleFileInformation>() };
+    if unsafe { GetFileInformationByHandle(directory.as_raw_handle(), &mut attributes) } == 0 {
         return Err(io::Error::last_os_error());
     }
-    if information.file_attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
-        || information.file_attributes & FILE_ATTRIBUTE_DIRECTORY == 0
+    if attributes.file_attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        || attributes.file_attributes & FILE_ATTRIBUTE_DIRECTORY == 0
     {
         return Err(permission_denied(
             "worker layout path is a reparse point or non-directory",
         ));
     }
-    Ok((
-        u64::from(information.volume_serial_number),
-        (u64::from(information.file_index_high) << 32) | u64::from(information.file_index_low),
+    let mut identity = unsafe { std::mem::zeroed::<FileIdInfo>() };
+    if unsafe {
+        GetFileInformationByHandleEx(
+            directory.as_raw_handle(),
+            FILE_ID_INFO_CLASS,
+            std::ptr::addr_of_mut!(identity).cast(),
+            std::mem::size_of::<FileIdInfo>()
+                .try_into()
+                .map_err(|_| invalid_data("Windows FILE_ID_INFO size is invalid"))?,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(super::WorkerDirectoryIdentity::from_windows(
+        identity.volume_serial_number,
+        identity.file_id,
     ))
 }
 
 fn verify_trusted_worker_ancestor(
     directory: &std::fs::File,
     creation_authority: &[u8],
+    allow_untrusted_create_child: bool,
 ) -> io::Result<()> {
     use std::os::windows::io::AsRawHandle;
 
@@ -988,12 +1159,13 @@ fn verify_trusted_worker_ancestor(
         &trusted_installer,
         creation_authority,
     )?;
-    validate_worker_ancestor_acl(owner_is_trusted, &entries)
+    validate_worker_ancestor_acl(owner_is_trusted, &entries, allow_untrusted_create_child)
 }
 
 fn validate_worker_ancestor_acl(
     owner_is_trusted: bool,
     entries: &[AceInspection],
+    allow_untrusted_create_child: bool,
 ) -> io::Result<()> {
     if !owner_is_trusted {
         return Err(permission_denied(
@@ -1001,16 +1173,21 @@ fn validate_worker_ancestor_acl(
         ));
     }
     if entries.iter().any(|entry| {
-        entry.allowed
-            && entry.flags & INHERIT_ONLY_ACE == 0
-            && !matches!(
+        if !entry.allowed
+            || entry.flags & INHERIT_ONLY_ACE != 0
+            || matches!(
                 entry.principal,
                 Principal::System
                     | Principal::Administrators
                     | Principal::TrustedInstaller
                     | Principal::Worker
             )
-            && entry.mask & (PARENT_TAKEOVER_ACCESS | 0x0000_0002 | 0x0000_0004) != 0
+        {
+            return false;
+        }
+        let create_child = entry.mask & 0x0000_0004 != 0;
+        entry.mask & (PARENT_TAKEOVER_ACCESS | 0x0000_0002) != 0
+            || (create_child && !allow_untrusted_create_child)
     }) {
         return Err(permission_denied(
             "system worker root ancestor is writable by an untrusted principal",
@@ -1019,7 +1196,7 @@ fn validate_worker_ancestor_acl(
     Ok(())
 }
 
-fn verify_new_worker_directory_security(
+fn verify_worker_directory_security(
     directory: &std::fs::File,
     expected_owner: &[u8],
 ) -> io::Result<()> {
@@ -1697,6 +1874,12 @@ unsafe extern "system" {
         file: *mut c_void,
         information: *mut ByHandleFileInformation,
     ) -> i32;
+    fn GetFileInformationByHandleEx(
+        file: *mut c_void,
+        information_class: u32,
+        information: *mut c_void,
+        information_size: u32,
+    ) -> i32;
     #[allow(dead_code)]
     fn SetFileInformationByHandle(
         file: *mut c_void,
@@ -1715,6 +1898,8 @@ unsafe extern "system" {
         buffer: *mut u16,
         file_part: *mut *mut u16,
     ) -> u32;
+    #[cfg(test)]
+    fn GetShortPathNameW(long_path: *const u16, short_path: *mut u16, buffer_length: u32) -> u32;
     fn CreateMutexW(
         mutex_attributes: *const SecurityAttributes,
         initial_owner: i32,
@@ -3251,15 +3436,206 @@ mod tests {
             flags: 0,
             allowed: true,
         };
-        assert!(validate_worker_ancestor_acl(true, &[trusted_write]).is_ok());
+        assert!(validate_worker_ancestor_acl(true, &[trusted_write], false).is_ok());
+        let stock_system_drive_create_only = AceInspection {
+            principal: Principal::Unexpected,
+            mask: 0x0000_0004 | SYNCHRONIZE,
+            flags: 0,
+            allowed: true,
+        };
+        assert!(
+            validate_worker_ancestor_acl(true, &[stock_system_drive_create_only], true,).is_ok()
+        );
+        assert!(
+            validate_worker_ancestor_acl(true, &[stock_system_drive_create_only], false,).is_err()
+        );
         let everyone_write = AceInspection {
             principal: Principal::Unexpected,
             mask: GENERIC_WRITE,
             flags: 0,
             allowed: true,
         };
-        assert!(validate_worker_ancestor_acl(true, &[everyone_write]).is_err());
-        assert!(validate_worker_ancestor_acl(false, &[]).is_err());
+        assert!(validate_worker_ancestor_acl(true, &[everyone_write], true).is_err());
+        for takeover in [
+            0x0000_0002,
+            0x0000_0040,
+            0x0001_0000,
+            0x0004_0000,
+            0x0008_0000,
+            GENERIC_WRITE,
+            0x1000_0000,
+        ] {
+            assert!(validate_worker_ancestor_acl(
+                true,
+                &[AceInspection {
+                    principal: Principal::Unexpected,
+                    mask: takeover,
+                    flags: 0,
+                    allowed: true,
+                }],
+                true,
+            )
+            .is_err());
+        }
+        assert!(validate_worker_ancestor_acl(false, &[], true).is_err());
+    }
+
+    #[test]
+    fn native_windows_system_drive_acl_allows_only_the_narrow_create_policy() {
+        let principal = test_principal();
+        let security = WorkerCreationSecurity::new(&principal).unwrap();
+        let root = WindowsWorkerPath::parse(Path::new(r"C:\Styrn")).unwrap();
+        let volume = open_worker_volume_root(&root.volume_root, true).unwrap();
+
+        verify_trusted_worker_ancestor(&volume, &security.owner_sid, true).unwrap();
+    }
+
+    #[test]
+    fn existing_canonical_worker_dacl_is_rejected_without_rewrite() {
+        let principal = test_principal();
+        let parent = std::env::temp_dir().join(format!(
+            "styrn-worker-existing-dacl-{}-{}",
+            std::process::id(),
+            uuid::Uuid::now_v7()
+        ));
+        std::fs::create_dir(&parent).unwrap();
+        let root = parent.join("root");
+        let layout = crate::platform::resolve_worker_directory_layout(
+            crate::platform::InstallationScope::System,
+            &principal,
+            Some(&root),
+        )
+        .unwrap();
+        create_worker_directory_layout(&layout).unwrap();
+        apply_sddl(
+            &root,
+            &format!(
+                "O:{0}D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;{0})(A;OICI;FA;;;WD)",
+                principal.principal_id()
+            ),
+        )
+        .unwrap();
+        let sentinel = root.join("sentinel.txt");
+        std::fs::write(&sentinel, b"preserve\n").unwrap();
+
+        let error = create_worker_directory_layout(&layout).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(inspect_user_acl(&root, &principal, AclKind::UserDirectory).is_err());
+        assert_eq!(std::fs::read(&sentinel).unwrap(), b"preserve\n");
+        std::fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    #[ignore = "environmental: destructive only on a disposable elevated Windows host with C:\\Styrn absent"]
+    fn native_windows_precreated_insecure_system_root_is_rejected_without_takeover() {
+        let principal = test_principal();
+        let root = Path::new(r"C:\Styrn");
+        assert!(
+            !root.exists(),
+            "the disposable host must start without C:\\Styrn"
+        );
+        std::fs::create_dir(root).unwrap();
+        apply_sddl(
+            root,
+            &format!(
+                "O:{0}D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;{0})(A;OICI;FA;;;WD)",
+                principal.principal_id()
+            ),
+        )
+        .unwrap();
+        let layout = crate::platform::resolve_worker_directory_layout(
+            crate::platform::InstallationScope::System,
+            &principal,
+            None,
+        )
+        .unwrap();
+
+        let error = create_worker_directory_layout(&layout).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(std::fs::read_dir(root).unwrap().count(), 0);
+        std::fs::remove_dir(root).unwrap();
+    }
+
+    #[test]
+    #[ignore = "environmental: requires native Windows volume with 8.3 alias generation enabled"]
+    fn native_windows_long_and_short_prefixes_share_one_layout_lock_key() {
+        let principal = test_principal();
+        let security = WorkerCreationSecurity::new(&principal).unwrap();
+        let parent = std::env::temp_dir().join(format!(
+            "styrn worker alias parent {} {}",
+            std::process::id(),
+            uuid::Uuid::now_v7()
+        ));
+        std::fs::create_dir(&parent).unwrap();
+        let long = wide_os(&parent);
+        let mut short = vec![0_u16; 32_768];
+        let length = unsafe {
+            GetShortPathNameW(
+                long.as_ptr(),
+                short.as_mut_ptr(),
+                short.len().try_into().unwrap(),
+            )
+        };
+        assert!(length > 0 && usize::try_from(length).unwrap() < short.len());
+        short.truncate(length as usize);
+        let short_parent = PathBuf::from(std::ffi::OsString::from_wide(&short));
+        assert_ne!(short_parent, parent, "8.3 alias generation is unavailable");
+        let long_root = WindowsWorkerPath::parse(&parent.join("Missing Worker Root")).unwrap();
+        let short_root =
+            WindowsWorkerPath::parse(&short_parent.join("Missing Worker Root")).unwrap();
+        let long_prepared =
+            prepare_worker_root(&long_root, long_root.components.len() - 1, false, &security)
+                .unwrap();
+        let short_prepared = prepare_worker_root(
+            &short_root,
+            short_root.components.len() - 1,
+            false,
+            &security,
+        )
+        .unwrap();
+
+        assert_eq!(
+            worker_layout_lock_key(
+                &long_prepared.directory,
+                &long_root.components[long_prepared.next_component..],
+            )
+            .unwrap(),
+            worker_layout_lock_key(
+                &short_prepared.directory,
+                &short_root.components[short_prepared.next_component..],
+            )
+            .unwrap(),
+        );
+        std::fs::remove_dir(parent).unwrap();
+    }
+
+    #[test]
+    #[ignore = "environmental: requires STYRN_TEST_REFS_ROOT on a native ReFS volume"]
+    fn native_windows_refs_identity_uses_the_full_file_id() {
+        let refs_root = PathBuf::from(
+            std::env::var_os("STYRN_TEST_REFS_ROOT")
+                .expect("STYRN_TEST_REFS_ROOT must name a disposable ReFS directory"),
+        );
+        let parent = refs_root.join(format!(
+            "styrn-worker-refs-{}-{}",
+            std::process::id(),
+            uuid::Uuid::now_v7()
+        ));
+        let first = parent.join("first");
+        let second = parent.join("second");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir(&second).unwrap();
+        let first = open_existing_worker_path(&WindowsWorkerPath::parse(&first).unwrap()).unwrap();
+        let second =
+            open_existing_worker_path(&WindowsWorkerPath::parse(&second).unwrap()).unwrap();
+
+        assert_ne!(
+            worker_directory_identity(&first).unwrap(),
+            worker_directory_identity(&second).unwrap()
+        );
+        std::fs::remove_dir_all(parent).unwrap();
     }
 
     #[test]

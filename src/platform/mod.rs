@@ -45,17 +45,107 @@ pub(crate) struct WorkerDirectoryLayout {
     artifacts: PathBuf,
     logs: PathBuf,
     creation_policy: WorkerRootCreationPolicy,
+    principal: WorkerPrincipal,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub(super) enum WorkerRootCreationPolicy {
-    ExistingParent { require_trusted_ancestry: bool },
+    ExistingParent { allow_untrusted_parent_create: bool },
     CreateMissingFrom(PathBuf),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum WorkerDirectoryNodeDisposition {
+    Created,
+    Existing,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct WorkerDirectoryIdentity {
+    volume: u64,
+    file_id: [u8; 16],
+}
+
+impl WorkerDirectoryIdentity {
+    #[cfg(unix)]
+    pub(super) fn from_unix(device: u64, inode: u64) -> Self {
+        let mut file_id = [0_u8; 16];
+        file_id[..8].copy_from_slice(&inode.to_ne_bytes());
+        Self {
+            volume: device,
+            file_id,
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    pub(super) fn from_windows(volume: u64, file_id: [u8; 16]) -> Self {
+        Self { volume, file_id }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct WorkerDirectoryNodeObservation {
+    path: PathBuf,
+    disposition: WorkerDirectoryNodeDisposition,
+    identity: WorkerDirectoryIdentity,
+}
+
+#[allow(dead_code)] // Consumed by the deferred T0.14 receipt integration.
+impl WorkerDirectoryNodeObservation {
+    pub(super) fn new(
+        path: PathBuf,
+        disposition: WorkerDirectoryNodeDisposition,
+        identity: WorkerDirectoryIdentity,
+    ) -> Self {
+        Self {
+            path,
+            disposition,
+            identity,
+        }
+    }
+
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub(crate) fn disposition(&self) -> WorkerDirectoryNodeDisposition {
+        self.disposition
+    }
+
+    pub(crate) fn identity(&self) -> WorkerDirectoryIdentity {
+        self.identity
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct WorkerDirectoryCreation {
+    nodes: [WorkerDirectoryNodeObservation; 6],
+}
+
+#[allow(dead_code)] // Consumed by the deferred T0.14 receipt integration.
+impl WorkerDirectoryCreation {
+    pub(super) fn new(
+        root: WorkerDirectoryNodeObservation,
+        children: [WorkerDirectoryNodeObservation; 5],
+    ) -> Self {
+        let [repos, jobs, cache, artifacts, logs] = children;
+        Self {
+            nodes: [root, repos, jobs, cache, artifacts, logs],
+        }
+    }
+
+    pub(crate) fn nodes(&self) -> &[WorkerDirectoryNodeObservation; 6] {
+        &self.nodes
+    }
 }
 
 #[allow(dead_code)] // Consumed by the T0.14 setup action integration follow-up.
 impl WorkerDirectoryLayout {
-    fn new(root: PathBuf, creation_policy: WorkerRootCreationPolicy) -> Self {
+    fn new(
+        root: PathBuf,
+        creation_policy: WorkerRootCreationPolicy,
+        principal: WorkerPrincipal,
+    ) -> Self {
         Self {
             repos: root.join("repos"),
             jobs: root.join("jobs"),
@@ -64,6 +154,7 @@ impl WorkerDirectoryLayout {
             logs: root.join("logs"),
             root,
             creation_policy,
+            principal,
         }
     }
 
@@ -108,13 +199,17 @@ pub(crate) fn resolve_worker_directory_layout(
         (
             root.to_path_buf(),
             WorkerRootCreationPolicy::ExistingParent {
-                require_trusted_ancestry: true,
+                allow_untrusted_parent_create: false,
             },
         )
     } else {
         platform_impl::default_worker_root(scope, principal)?
     };
-    Ok(WorkerDirectoryLayout::new(root, creation_policy))
+    Ok(WorkerDirectoryLayout::new(
+        root,
+        creation_policy,
+        principal.clone(),
+    ))
 }
 
 /// Creates the fixed worker layout without enumerating or rewriting descendants.
@@ -124,7 +219,7 @@ pub(crate) fn resolve_worker_directory_layout(
 #[allow(dead_code)] // Consumed by the T0.14 setup action integration follow-up.
 pub(crate) fn create_worker_directory_layout(
     layout: &WorkerDirectoryLayout,
-) -> std::io::Result<()> {
+) -> std::io::Result<WorkerDirectoryCreation> {
     platform_impl::create_worker_directory_layout(layout)
 }
 
@@ -1325,7 +1420,7 @@ mod setup_execution_tests {
         let route = root.join("route");
         let request_parent = route.join("requests");
         std::fs::create_dir_all(&request_parent).unwrap();
-        std::fs::set_permissions(&request_parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&request_parent, std::fs::Permissions::from_mode(0o755)).unwrap();
         let request = request_parent.join("request.json");
         std::fs::write(&request, b"original").unwrap();
         std::fs::set_permissions(&request, std::fs::Permissions::from_mode(0o600)).unwrap();
@@ -1353,6 +1448,43 @@ mod setup_execution_tests {
 
         std::fs::remove_file(&route).unwrap();
         std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn private_file_removal_parent_mode_is_owner_aware() {
+        assert!(private_file_parent_mode_is_valid(
+            ManifestOwner::User,
+            0o700
+        ));
+        assert!(!private_file_parent_mode_is_valid(
+            ManifestOwner::User,
+            0o755
+        ));
+        assert!(private_file_parent_mode_is_valid(
+            ManifestOwner::System,
+            0o755
+        ));
+        assert!(private_file_parent_mode_is_valid(
+            ManifestOwner::System,
+            0o700
+        ));
+        assert!(!private_file_parent_mode_is_valid(
+            ManifestOwner::System,
+            0o775
+        ));
+        assert!(private_file_parent_mode_is_valid(
+            ManifestOwner::CurrentProcess,
+            0o755
+        ));
+        assert!(private_file_parent_mode_is_valid(
+            ManifestOwner::CurrentProcess,
+            0o700
+        ));
+        assert!(!private_file_parent_mode_is_valid(
+            ManifestOwner::CurrentProcess,
+            0o775
+        ));
     }
 
     #[cfg(unix)]
@@ -1714,24 +1846,69 @@ mod worker_directory_tests {
     }
 
     #[test]
+    fn worker_directory_creation_reports_created_then_existing_canonical_identities() {
+        let principal = resolve_current_worker_principal().unwrap();
+        let parent = unique_test_directory("layout-observations");
+        std::fs::create_dir(&parent).unwrap();
+        let root = parent.join("chosen-root");
+        let layout =
+            resolve_worker_directory_layout(InstallationScope::System, &principal, Some(&root))
+                .unwrap();
+
+        let created = create_worker_directory_layout(&layout).unwrap();
+        let existing = create_worker_directory_layout(&layout).unwrap();
+
+        let expected_paths = std::iter::once(root.clone())
+            .chain(
+                WorkerDirectoryLayout::child_names()
+                    .into_iter()
+                    .map(|name| root.join(name)),
+            )
+            .collect::<Vec<_>>();
+        assert_eq!(created.nodes().len(), 6);
+        assert_eq!(existing.nodes().len(), 6);
+        for ((created, existing), expected_path) in created
+            .nodes()
+            .iter()
+            .zip(existing.nodes())
+            .zip(expected_paths)
+        {
+            assert_eq!(created.path(), expected_path);
+            assert_eq!(
+                created.disposition(),
+                WorkerDirectoryNodeDisposition::Created
+            );
+            assert_eq!(existing.path(), created.path());
+            assert_eq!(
+                existing.disposition(),
+                WorkerDirectoryNodeDisposition::Existing
+            );
+            assert_eq!(existing.identity(), created.identity());
+        }
+
+        std::fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
     fn worker_directory_rerun_preserves_preexisting_descendants_without_resetting_them() {
         let principal = resolve_current_worker_principal().unwrap();
         let parent = unique_test_directory("preserve-layout");
         let root = parent.join("chosen-root");
+        std::fs::create_dir(&parent).unwrap();
+        let layout =
+            resolve_worker_directory_layout(InstallationScope::System, &principal, Some(&root))
+                .unwrap();
+        create_worker_directory_layout(&layout).unwrap();
         let repos = root.join("repos");
         let existing = repos.join("existing-project");
-        std::fs::create_dir_all(&existing).unwrap();
+        std::fs::create_dir(&existing).unwrap();
         let sentinel = existing.join("sentinel.txt");
         std::fs::write(&sentinel, b"owned before layout creation\n").unwrap();
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&repos, std::fs::Permissions::from_mode(0o731)).unwrap();
             std::fs::set_permissions(&existing, std::fs::Permissions::from_mode(0o711)).unwrap();
         }
-        let layout =
-            resolve_worker_directory_layout(InstallationScope::System, &principal, Some(&root))
-                .unwrap();
 
         create_worker_directory_layout(&layout).unwrap();
         create_worker_directory_layout(&layout).unwrap();
@@ -1745,7 +1922,7 @@ mod worker_directory_tests {
             use std::os::unix::fs::PermissionsExt;
             assert_eq!(
                 std::fs::metadata(&repos).unwrap().permissions().mode() & 0o777,
-                0o731
+                0o700
             );
             assert_eq!(
                 std::fs::metadata(&existing).unwrap().permissions().mode() & 0o777,
@@ -1777,6 +1954,70 @@ mod worker_directory_tests {
             BTreeSet::from(["repos".to_owned()])
         );
 
+        std::fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worker_directory_creation_rejects_an_insecure_existing_root_without_mutating_it() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let principal = resolve_current_worker_principal().unwrap();
+        let parent = unique_test_directory("insecure-existing-root");
+        let root = parent.join("chosen-root");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let unrelated = root.join("operator-notes.txt");
+        std::fs::write(&unrelated, b"leave this entry alone\n").unwrap();
+        let before = std::fs::metadata(&root).unwrap();
+        let layout =
+            resolve_worker_directory_layout(InstallationScope::System, &principal, Some(&root))
+                .unwrap();
+
+        let error = create_worker_directory_layout(&layout).unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        let after = std::fs::metadata(&root).unwrap();
+        assert_eq!(after.permissions().mode() & 0o777, 0o755);
+        assert_eq!((before.dev(), before.ino()), (after.dev(), after.ino()));
+        assert_eq!(
+            std::fs::read(&unrelated).unwrap(),
+            b"leave this entry alone\n"
+        );
+        assert_eq!(
+            directory_entry_names(&root),
+            BTreeSet::from(["operator-notes.txt".to_owned()])
+        );
+        std::fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn worker_directory_creation_preflights_every_existing_canonical_child() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let principal = resolve_current_worker_principal().unwrap();
+        let parent = unique_test_directory("insecure-existing-child");
+        let root = parent.join("chosen-root");
+        let repos = root.join("repos");
+        std::fs::create_dir_all(&repos).unwrap();
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(&repos, std::fs::Permissions::from_mode(0o750)).unwrap();
+        let layout =
+            resolve_worker_directory_layout(InstallationScope::System, &principal, Some(&root))
+                .unwrap();
+
+        let error = create_worker_directory_layout(&layout).unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            directory_entry_names(&root),
+            BTreeSet::from(["repos".to_owned()])
+        );
+        assert_eq!(
+            std::fs::metadata(&repos).unwrap().permissions().mode() & 0o777,
+            0o750
+        );
         std::fs::remove_dir_all(parent).unwrap();
     }
 
@@ -1897,9 +2138,11 @@ mod worker_directory_tests {
         let profile = parent.join("profile");
         std::fs::create_dir_all(&profile).unwrap();
         let root = profile.join("new/data/base/styrn");
+        let principal = resolve_current_worker_principal().unwrap();
         let layout = WorkerDirectoryLayout::new(
             root.clone(),
             WorkerRootCreationPolicy::CreateMissingFrom(profile.clone()),
+            principal,
         );
 
         create_worker_directory_layout(&layout).unwrap();
@@ -1921,6 +2164,35 @@ mod worker_directory_tests {
         }
         assert_eq!(directory_entry_names(&root).len(), 5);
 
+        std::fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn user_profile_anchor_rejects_unrelated_mutation_before_creating_a_base() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let principal = resolve_current_worker_principal().unwrap();
+        let parent = unique_test_directory("mutable-profile-anchor");
+        let profile = parent.join("profile");
+        std::fs::create_dir_all(&profile).unwrap();
+        std::fs::set_permissions(&profile, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let root = profile.join("new/data/styrn");
+        let layout = WorkerDirectoryLayout::new(
+            root.clone(),
+            WorkerRootCreationPolicy::CreateMissingFrom(profile.clone()),
+            principal,
+        );
+
+        let error = create_worker_directory_layout(&layout).unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(!profile.join("new").exists());
+        assert_eq!(
+            std::fs::metadata(&profile).unwrap().permissions().mode() & 0o777,
+            0o777
+        );
+        std::fs::set_permissions(&profile, std::fs::Permissions::from_mode(0o700)).unwrap();
         std::fs::remove_dir_all(parent).unwrap();
     }
 
@@ -1974,14 +2246,14 @@ mod worker_directory_tests {
         let principal = resolve_current_worker_principal().unwrap();
         let parent = unique_test_directory("unrelated-root-entry");
         let root = parent.join("chosen-root");
-        std::fs::create_dir_all(&root).unwrap();
-        let unrelated = root.join("operator-notes.txt");
-        std::fs::write(&unrelated, b"leave this entry alone\n").unwrap();
-        let before = std::fs::metadata(&unrelated).unwrap();
+        std::fs::create_dir(&parent).unwrap();
         let layout =
             resolve_worker_directory_layout(InstallationScope::System, &principal, Some(&root))
                 .unwrap();
-
+        create_worker_directory_layout(&layout).unwrap();
+        let unrelated = root.join("operator-notes.txt");
+        std::fs::write(&unrelated, b"leave this entry alone\n").unwrap();
+        let before = std::fs::metadata(&unrelated).unwrap();
         create_worker_directory_layout(&layout).unwrap();
 
         assert_eq!(
@@ -2088,6 +2360,44 @@ mod worker_directory_tests {
         std::fs::remove_dir_all(parent).unwrap();
     }
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn absolute_xdg_data_home_with_trailing_slash_is_lexically_normalized() {
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+        if let Some(expected) = std::env::var_os(XDG_CHILD_ROOT_ENV) {
+            let principal = resolve_current_worker_principal().unwrap();
+            let layout =
+                resolve_worker_directory_layout(InstallationScope::User, &principal, None).unwrap();
+            assert_eq!(layout.root(), Path::new(&expected));
+            create_worker_directory_layout(&layout).unwrap();
+            return;
+        }
+
+        let parent = unique_test_directory("xdg-base-trailing-slash");
+        std::fs::create_dir(&parent).unwrap();
+        let data_home = parent.join("fresh/xdg/data");
+        let mut spelling = data_home.as_os_str().as_bytes().to_vec();
+        spelling.push(b'/');
+        let root = data_home.join("styrn");
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "platform::worker_directory_tests::absolute_xdg_data_home_with_trailing_slash_is_lexically_normalized",
+            ])
+            .env("XDG_DATA_HOME", std::ffi::OsString::from_vec(spelling))
+            .env(XDG_CHILD_ROOT_ENV, &root)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "child failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(directory_entry_names(&root).len(), 5);
+        std::fs::remove_dir_all(parent).unwrap();
+    }
+
     #[cfg(target_os = "windows")]
     #[test]
     #[ignore = "environmental: native Windows Developer Mode or SeCreateSymbolicLinkPrivilege"]
@@ -2169,6 +2479,16 @@ pub(crate) enum ManifestOwner {
     CurrentProcess,
     #[cfg(test)]
     CurrentProcessWorker,
+}
+
+#[cfg(unix)]
+fn private_file_parent_mode_is_valid(owner: ManifestOwner, mode: u32) -> bool {
+    match owner {
+        ManifestOwner::User => mode & 0o777 == 0o700,
+        ManifestOwner::System => mode & 0o022 == 0,
+        #[cfg(test)]
+        ManifestOwner::CurrentProcess | ManifestOwner::CurrentProcessWorker => mode & 0o022 == 0,
+    }
 }
 
 /// A staging pathname created with the platform's private-at-creation policy.
