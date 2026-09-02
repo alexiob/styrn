@@ -213,10 +213,20 @@ impl WorkerDirectoryCreationError {
     }
 
     #[cfg(target_os = "windows")]
-    pub(crate) fn retained_creation_observation_count(&self) -> usize {
+    pub(crate) fn retained_creation_evidence_count(&self) -> usize {
         match self.inner.as_ref() {
             WorkerDirectoryCreationErrorInner::RetainedWindowsEvidence { evidence, .. } => {
-                evidence.observations().len()
+                evidence.retained_count()
+            }
+            WorkerDirectoryCreationErrorInner::Native(_) => 0,
+        }
+    }
+
+    #[cfg(all(target_os = "windows", test))]
+    pub(crate) fn retained_unresolved_creation_evidence_count(&self) -> usize {
+        match self.inner.as_ref() {
+            WorkerDirectoryCreationErrorInner::RetainedWindowsEvidence { evidence, .. } => {
+                evidence.unresolved_count()
             }
             WorkerDirectoryCreationErrorInner::Native(_) => 0,
         }
@@ -234,10 +244,10 @@ impl WorkerDirectoryCreationError {
         else {
             return Err(WorkerDirectoryFailureBindingError::NoRetainedEvidence);
         };
-        platform_impl::reverify_worker_directory_failure_evidence(evidence)
+        let observations = platform_impl::reverify_worker_directory_failure_evidence(evidence)
             .map_err(WorkerDirectoryFailureBindingError::Reverification)?;
         bind(VerifiedWorkerDirectoryFailureBinding {
-            nodes: evidence.observations(),
+            nodes: &observations,
             _authority: evidence,
         })
         .map_err(WorkerDirectoryFailureBindingError::Binding)
@@ -268,7 +278,7 @@ impl std::fmt::Debug for WorkerDirectoryCreationError {
                 .field("primary", primary)
                 .field("operation_error", operation_error)
                 .field("privilege_cleanup_failed", privilege_cleanup_failed)
-                .field("retained_observations", &evidence.observations())
+                .field("retained_creation_count", &evidence.retained_count())
                 .finish_non_exhaustive(),
         }
     }
@@ -3020,7 +3030,10 @@ mod worker_directory_tests {
         let layout =
             resolve_worker_directory_layout(InstallationScope::System, &principal, Some(&root))
                 .unwrap();
-        create_worker_directory_layout(&layout).unwrap();
+        create_worker_directory_layout(&layout)
+            .unwrap()
+            .bind_after_reverify(|_| Ok::<_, ()>(()))
+            .unwrap();
         let unrelated = root.join("operator-notes.txt");
         std::fs::write(&unrelated, b"leave this entry alone\n").unwrap();
         let before = std::fs::metadata(&unrelated).unwrap();
@@ -3054,7 +3067,10 @@ mod worker_directory_tests {
                 Some(Path::new(&root)),
             )
             .unwrap();
-            create_worker_directory_layout(&layout).unwrap();
+            create_worker_directory_layout(&layout)
+                .unwrap()
+                .bind_after_reverify(|_| Ok::<_, ()>(()))
+                .unwrap();
             return;
         }
 

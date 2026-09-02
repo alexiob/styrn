@@ -35,6 +35,8 @@ thread_local! {
     static WORKER_PUBLICATION_INTERRUPT: std::cell::Cell<Option<WorkerPublicationInterruption>> = const {
         std::cell::Cell::new(None)
     };
+    static WORKER_RECOVERY_IDENTITY_OVERRIDE: std::cell::RefCell<Option<(Vec<u8>, super::WorkerDirectoryIdentity)>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(test)]
@@ -50,6 +52,29 @@ fn set_worker_mkdir_interrupt_after(remaining: Option<usize>) {
 #[cfg(test)]
 fn set_worker_publication_interrupt(interruption: Option<WorkerPublicationInterruption>) {
     WORKER_PUBLICATION_INTERRUPT.with(|slot| slot.set(interruption));
+}
+
+#[cfg(test)]
+fn set_worker_recovery_identity_override(
+    override_value: Option<(Vec<u8>, super::WorkerDirectoryIdentity)>,
+) {
+    WORKER_RECOVERY_IDENTITY_OVERRIDE.with(|slot| *slot.borrow_mut() = override_value);
+}
+
+fn worker_recovery_candidate_identity(
+    _name: &[u8],
+    directory: &std::fs::File,
+) -> io::Result<super::WorkerDirectoryIdentity> {
+    #[cfg(test)]
+    if let Some((_, identity)) = WORKER_RECOVERY_IDENTITY_OVERRIDE.with(|slot| {
+        slot.borrow()
+            .as_ref()
+            .filter(|(candidate, _)| candidate.as_slice() == _name)
+            .cloned()
+    }) {
+        return Ok(identity);
+    }
+    worker_directory_identity(directory)
 }
 
 #[allow(dead_code)]
@@ -211,7 +236,6 @@ pub(super) fn create_worker_directory_layout(
             component,
             true,
             expected_uid,
-            false,
             false,
         )?;
         if let Some(provenance) = opened.provenance {
@@ -667,7 +691,6 @@ fn open_or_create_worker_directory_at(
     may_create: bool,
     expected_uid: u32,
     existing_must_be_canonical: bool,
-    complete_root: bool,
 ) -> io::Result<OpenedWorkerDirectory> {
     match open_worker_directory_at(parent, name) {
         Ok(directory) => {
@@ -675,19 +698,12 @@ fn open_or_create_worker_directory_at(
                 staging_parent,
                 parent,
                 name,
-                worker_directory_identity(&directory)?,
+                worker_recovery_candidate_identity(name, &directory)?,
             )? {
-                verify_staged_or_published_worker_directory(&directory, expected_uid)?;
-                if existing_must_be_canonical && !complete_root {
-                    harden_new_worker_directory(&directory, expected_uid)?;
-                    directory.sync_all()?;
-                    parent.sync_all()?;
-                }
-                return Ok(OpenedWorkerDirectory {
-                    directory,
-                    disposition: super::WorkerDirectoryNodeDisposition::Created,
-                    provenance: Some(provenance),
-                });
+                drop(provenance);
+                return Err(permission_denied(
+                    "published worker creation provenance is replayable conflict evidence, not receipt ownership",
+                ));
             }
             verify_existing_worker_directory(&directory, expected_uid, existing_must_be_canonical)?;
             return Ok(OpenedWorkerDirectory {
@@ -726,18 +742,11 @@ fn create_or_open_complete_worker_root(
                 root_parent,
                 root_parent,
                 root_name,
-                worker_directory_identity(&directory)?,
+                worker_recovery_candidate_identity(root_name, &directory)?,
             )? {
-                verify_staged_or_published_worker_directory(&directory, expected_uid)?;
-                let children =
-                    open_or_create_worker_children(root_parent, &directory, expected_uid, true)?;
-                return Ok((
-                    OpenedWorkerDirectory {
-                        directory,
-                        disposition: super::WorkerDirectoryNodeDisposition::Created,
-                        provenance: Some(provenance),
-                    },
-                    Some(children),
+                drop(provenance);
+                return Err(permission_denied(
+                    "published worker creation provenance is replayable conflict evidence, not receipt ownership",
                 ));
             }
             verify_worker_directory_security(&directory, expected_uid)?;
@@ -816,7 +825,6 @@ fn open_or_create_worker_children(
             true,
             expected_uid,
             true,
-            false,
         )?;
         if require_provenance_for_existing
             && child.disposition == super::WorkerDirectoryNodeDisposition::Existing
@@ -1050,6 +1058,31 @@ fn verify_staged_or_published_worker_directory(
     verify_staged_worker_directory_security(directory, unsafe { libc::geteuid() }, expected_uid)
 }
 
+fn verify_unpublished_worker_recovery_authority(
+    staged: &StagedWorkerDirectory,
+    expected_uid: u32,
+) -> io::Result<()> {
+    if staged.created {
+        return Ok(());
+    }
+    // A reopened inode number is replayable. Recovery is automatic only while
+    // this complete candidate is still inaccessible to a distinct worker.
+    let creator_uid = unsafe { libc::geteuid() };
+    let status = worker_directory_status(&staged.directory)?;
+    if creator_uid == expected_uid
+        || status.st_uid != creator_uid
+        || status.st_mode & 0o777 != 0o700
+    {
+        return Err(permission_denied(
+            "interrupted worker staging recovery lacks distinct creator-only authority",
+        ));
+    }
+    validate_worker_acl_presence(
+        posix_acl_present(&staged.directory, c"system.posix_acl_access")?,
+        posix_acl_present(&staged.directory, c"system.posix_acl_default")?,
+    )
+}
+
 fn verify_staged_worker_directory_entries(
     directory: &std::fs::File,
     allow_canonical_children: bool,
@@ -1140,6 +1173,7 @@ fn publish_staged_worker_directory(
         unsafe { libc::geteuid() },
         created_expected_uid,
     )?;
+    verify_unpublished_worker_recovery_authority(&staged, created_expected_uid)?;
     let provenance = match open_worker_creation_provenance(
         staging_parent,
         destination_parent,
@@ -2607,7 +2641,7 @@ mod tests {
     }
 
     #[test]
-    fn interrupted_deterministic_worker_staging_is_validated_and_resumed() {
+    fn same_uid_interrupted_worker_staging_is_retained_as_a_conflict() {
         let principal = resolve_current_worker_principal().unwrap();
         let parent = fs::canonicalize(std::env::temp_dir())
             .unwrap()
@@ -2633,29 +2667,22 @@ mod tests {
         set_worker_mkdir_interrupt_after(None);
         assert!(interrupted.is_err());
         assert!(!root.exists());
+        let parent_directory = open_existing_worker_path(&parent).unwrap();
+        let retained_before = worker_parent_entry_snapshot(&parent_directory).unwrap();
 
-        let creation = create_worker_directory_layout(&layout).unwrap();
-        creation
-            .bind_after_reverify(|binding| {
-                assert!(binding.observations().iter().all(|node| {
-                    node.disposition() == super::super::WorkerDirectoryNodeDisposition::Created
-                }));
-                Ok::<_, ()>(())
-            })
-            .unwrap();
+        let error = create_worker_directory_layout(&layout).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(!root.exists());
         assert_eq!(
-            fs::read_dir(&parent)
-                .unwrap()
-                .map(|entry| entry.unwrap().file_name())
-                .collect::<Vec<_>>(),
-            vec![std::ffi::OsString::from("root")]
+            worker_parent_entry_snapshot(&parent_directory).unwrap(),
+            retained_before
         );
-        assert_eq!(fs::read_dir(&root).unwrap().count(), 5);
         fs::remove_dir_all(parent).unwrap();
     }
 
     #[test]
-    fn interruption_after_ownership_preparation_recovers_only_exact_provenance() {
+    fn same_uid_interruption_after_provenance_retains_conflict_evidence() {
         let principal = resolve_current_worker_principal().unwrap();
         let parent = fs::canonicalize(std::env::temp_dir())
             .unwrap()
@@ -2681,22 +2708,77 @@ mod tests {
         set_worker_publication_interrupt(None);
         assert!(interrupted.is_err());
         assert!(!root.exists());
+        let parent_directory = open_existing_worker_path(&parent).unwrap();
+        let retained_before = worker_parent_entry_snapshot(&parent_directory).unwrap();
 
-        create_worker_directory_layout(&layout)
-            .unwrap()
-            .bind_after_reverify(|binding| {
-                assert!(binding.observations().iter().all(|node| {
-                    node.disposition() == super::super::WorkerDirectoryNodeDisposition::Created
-                }));
-                Ok::<_, ()>(())
-            })
-            .unwrap();
+        let error = create_worker_directory_layout(&layout).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(!root.exists());
         assert_eq!(
-            fs::read_dir(&parent)
-                .unwrap()
-                .map(|entry| entry.unwrap().file_name())
-                .collect::<Vec<_>>(),
-            vec![std::ffi::OsString::from("root")]
+            worker_parent_entry_snapshot(&parent_directory).unwrap(),
+            retained_before
+        );
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn deleted_worker_child_with_replayed_identity_remains_conflict_evidence() {
+        let principal = resolve_current_worker_principal().unwrap();
+        let parent = fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!(
+                "styrn-worker-provenance-identity-reuse-{}-{}",
+                std::process::id(),
+                uuid::Uuid::now_v7()
+            ));
+        fs::create_dir(&parent).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+        let root = parent.join("root");
+        let layout = crate::platform::resolve_worker_directory_layout(
+            crate::platform::InstallationScope::System,
+            &principal,
+            Some(&root),
+        )
+        .unwrap();
+
+        fs::create_dir(&root).unwrap();
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
+        for name in super::super::WorkerDirectoryLayout::child_names()
+            .into_iter()
+            .filter(|name| *name != "repos")
+        {
+            let child = root.join(name);
+            fs::create_dir(&child).unwrap();
+            fs::set_permissions(child, fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        let unbound_creation = create_worker_directory_layout(&layout).unwrap();
+        drop(unbound_creation);
+        let original = open_existing_worker_path(&root.join("repos")).unwrap();
+        let replayed_identity = worker_directory_identity(&original).unwrap();
+        drop(original);
+        fs::remove_dir(root.join("repos")).unwrap();
+        fs::create_dir(root.join("repos")).unwrap();
+        fs::set_permissions(root.join("repos"), fs::Permissions::from_mode(0o700)).unwrap();
+        let replacement = open_existing_worker_path(&root.join("repos")).unwrap();
+        let replacement_identity = worker_directory_identity(&replacement).unwrap();
+        let parent_directory = open_existing_worker_path(&parent).unwrap();
+        let retained_before = worker_parent_entry_snapshot(&parent_directory).unwrap();
+        set_worker_recovery_identity_override(Some((b"repos".to_vec(), replayed_identity)));
+
+        let result = create_worker_directory_layout(&layout);
+        set_worker_recovery_identity_override(None);
+        let error = result.unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            worker_directory_identity(&open_existing_worker_path(&root.join("repos")).unwrap())
+                .unwrap(),
+            replacement_identity
+        );
+        assert_eq!(
+            worker_parent_entry_snapshot(&parent_directory).unwrap(),
+            retained_before
         );
         fs::remove_dir_all(parent).unwrap();
     }

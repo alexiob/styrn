@@ -15,6 +15,8 @@ use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
+type WorkerPrivilegeCleanupHook = fn(io::Result<()>) -> io::Result<()>;
+
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PrivatePublicationPhase {
@@ -35,6 +37,10 @@ thread_local! {
     static BEFORE_WORKER_MUTEX_WAIT_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         const { std::cell::RefCell::new(None) };
     static WORKER_PRIVILEGE_TEST_PLAN: std::cell::Cell<Option<WorkerPrivilegeTestPlan>> =
+        const { std::cell::Cell::new(None) };
+    static WORKER_NATIVE_CREATE_FAILURE_AFTER: std::cell::Cell<Option<usize>> =
+        const { std::cell::Cell::new(None) };
+    static AFTER_REAL_WORKER_PRIVILEGE_CLEANUP_HOOK: std::cell::Cell<Option<WorkerPrivilegeCleanupHook>> =
         const { std::cell::Cell::new(None) };
 }
 
@@ -98,11 +104,50 @@ struct WorkerPrivilegeTestPlan {
     fail_after_created: Option<usize>,
 }
 
+#[derive(Clone, Copy)]
+struct WorkerMutationThreadTestPlan {
+    privilege: Option<WorkerPrivilegeTestPlan>,
+    native_create_failure_after: Option<usize>,
+    after_real_cleanup: Option<WorkerPrivilegeCleanupHook>,
+}
+
 #[cfg(test)]
 fn set_worker_privilege_test_plan(plan: WorkerPrivilegeTestPlan) {
     WORKER_PRIVILEGE_TEST_PLAN.with(|slot| {
         assert!(slot.replace(Some(plan)).is_none());
     });
+}
+
+#[cfg(test)]
+fn set_worker_native_create_failure_after(created: Option<usize>) {
+    WORKER_NATIVE_CREATE_FAILURE_AFTER.with(|slot| slot.set(created));
+}
+
+#[cfg(test)]
+fn take_worker_native_create_failure_after() -> Option<usize> {
+    WORKER_NATIVE_CREATE_FAILURE_AFTER.with(std::cell::Cell::take)
+}
+
+#[cfg(not(test))]
+fn take_worker_native_create_failure_after() -> Option<usize> {
+    None
+}
+
+#[cfg(test)]
+fn set_after_real_worker_privilege_cleanup_hook(hook: WorkerPrivilegeCleanupHook) {
+    AFTER_REAL_WORKER_PRIVILEGE_CLEANUP_HOOK.with(|slot| {
+        assert!(slot.replace(Some(hook)).is_none());
+    });
+}
+
+#[cfg(test)]
+fn take_after_real_worker_privilege_cleanup_hook() -> Option<WorkerPrivilegeCleanupHook> {
+    AFTER_REAL_WORKER_PRIVILEGE_CLEANUP_HOOK.with(std::cell::Cell::take)
+}
+
+#[cfg(not(test))]
+fn take_after_real_worker_privilege_cleanup_hook() -> Option<WorkerPrivilegeCleanupHook> {
+    None
 }
 
 #[cfg(test)]
@@ -490,6 +535,13 @@ unsafe extern "system" {
     ) -> i32;
     fn EqualSid(first: *const c_void, second: *const c_void) -> i32;
     fn OpenProcessToken(process: *mut c_void, access: u32, token: *mut *mut c_void) -> i32;
+    #[cfg(test)]
+    fn OpenThreadToken(
+        thread: *mut c_void,
+        access: u32,
+        open_as_self: i32,
+        token: *mut *mut c_void,
+    ) -> i32;
     fn LookupPrivilegeValueW(system_name: *const u16, name: *const u16, luid: *mut Luid) -> i32;
     fn AdjustTokenPrivileges(
         token: *mut c_void,
@@ -771,8 +823,15 @@ pub(super) fn create_worker_directory_layout(
     let owner_matches_current = worker_owner_matches_current(&owner_sid)?;
     let mutation_anchor = lock_anchor.directory.try_clone()?;
     let root = layout.root().to_path_buf();
-    let test_plan = take_worker_privilege_test_plan();
-    let resolution = if owner_matches_current && test_plan.is_none() {
+    let test_plan = WorkerMutationThreadTestPlan {
+        privilege: take_worker_privilege_test_plan(),
+        native_create_failure_after: take_worker_native_create_failure_after(),
+        after_real_cleanup: take_after_real_worker_privilege_cleanup_hook(),
+    };
+    let resolution = if owner_matches_current
+        && test_plan.privilege.is_none()
+        && test_plan.after_real_cleanup.is_none()
+    {
         let security = WorkerCreationSecurity::new(&verified_principal)?;
         super::reconcile_windows_privileged_worker_mutation(
             perform_worker_directory_mutation(
@@ -782,7 +841,7 @@ pub(super) fn create_worker_directory_layout(
                 allow_untrusted_parent_create,
                 mutation_anchor,
                 &security,
-                WorkerMutationControl::new(None),
+                WorkerMutationControl::new(None, test_plan.native_create_failure_after),
             ),
             Ok(()),
         )
@@ -812,6 +871,7 @@ fn perform_worker_directory_mutation(
     let mut created = CreatedWorkerDirectoryEvidence::default();
     let operation = (|| -> io::Result<WorkerMutationEvidence> {
         control.fail_if_requested(0)?;
+        control.fail_after_native_create_if_requested(0)?;
         let prepared = prepare_worker_root_from_anchor(
             anchor,
             root_path,
@@ -828,16 +888,16 @@ fn perform_worker_directory_mutation(
         {
             let component_index = prepared.next_component + index;
             let is_root = component_index + 1 == root_path.components.len();
-            let opened =
-                open_or_create_worker_directory_at(&directory, component, true, security, is_root)?;
+            let node_path = worker_path_prefix(root, root_path.components.len(), component_index);
+            let opened = open_or_create_worker_directory_at(
+                &directory, component, true, security, is_root, node_path,
+            )?;
+            let opened = created.retain_for_continuation(opened, security, control)?;
             let disposition = opened.disposition;
             if is_root {
                 root_disposition = Some(disposition);
             }
-            let node_path = worker_path_prefix(root, root_path.components.len(), component_index);
-            directory = created
-                .retain_created_for_continuation(opened, node_path)?
-                .directory;
+            directory = opened.directory;
             if is_root && disposition == super::WorkerDirectoryNodeDisposition::Created {
                 canonical_created += 1;
                 control.fail_if_requested(canonical_created)?;
@@ -871,11 +931,17 @@ fn perform_worker_directory_mutation(
             if child.is_none() {
                 let child_name = super::WorkerDirectoryLayout::child_names()[index];
                 let name = child_name.encode_utf16().collect::<Vec<_>>();
-                let opened =
-                    open_or_create_worker_directory_at(&directory, &name, true, security, true)?;
+                let opened = open_or_create_worker_directory_at(
+                    &directory,
+                    &name,
+                    true,
+                    security,
+                    true,
+                    root.join(child_name),
+                )?;
+                let opened = created.retain_for_continuation(opened, security, control)?;
                 let disposition = opened.disposition;
-                *child =
-                    Some(created.retain_created_for_continuation(opened, root.join(child_name))?);
+                *child = Some(opened);
                 if disposition == super::WorkerDirectoryNodeDisposition::Created {
                     canonical_created += 1;
                     control.fail_if_requested(canonical_created)?;
@@ -927,6 +993,7 @@ fn perform_worker_directory_mutation(
                 children,
                 nodes: [directory, repos, jobs, cache, artifacts, logs],
                 owner_sid: security.owner_sid.clone(),
+                created: std::mem::take(&mut created),
             },
         )))
     })();
@@ -949,17 +1016,20 @@ fn run_worker_mutation_on_privileged_thread(
     allow_untrusted_parent_create: bool,
     anchor: std::fs::File,
     principal: WorkerPrincipal,
-    test_plan: Option<WorkerPrivilegeTestPlan>,
+    test_plan: WorkerMutationThreadTestPlan,
 ) -> io::Result<super::WindowsPrivilegedWorkerMutationResolution<WorkerMutationEvidence>> {
     std::thread::scope(|scope| {
         scope
             .spawn(move || {
-                if test_plan.is_some_and(|plan| plan.enable_not_assigned) {
+                if test_plan
+                    .privilege
+                    .is_some_and(|plan| plan.enable_not_assigned)
+                {
                     super::validate_windows_restore_privilege_result(false, true, 1300)?;
                     unreachable!("not-assigned privilege validation always fails");
                 }
                 let security = WorkerCreationSecurity::new(&principal)?;
-                if let Some(plan) = test_plan {
+                if let Some(plan) = test_plan.privilege {
                     let mutation = perform_worker_directory_mutation(
                         &root,
                         &root_path,
@@ -967,7 +1037,10 @@ fn run_worker_mutation_on_privileged_thread(
                         allow_untrusted_parent_create,
                         anchor,
                         &security,
-                        WorkerMutationControl::new(plan.fail_after_created),
+                        WorkerMutationControl::new(
+                            plan.fail_after_created,
+                            test_plan.native_create_failure_after,
+                        ),
                     );
                     let cleanup = plan
                         .cleanup_error
@@ -984,9 +1057,13 @@ fn run_worker_mutation_on_privileged_thread(
                     allow_untrusted_parent_create,
                     anchor,
                     &security,
-                    WorkerMutationControl::new(None),
+                    WorkerMutationControl::new(None, test_plan.native_create_failure_after),
                 );
                 let cleanup = privilege.restore_and_revert();
+                let cleanup = match test_plan.after_real_cleanup {
+                    Some(hook) => hook(cleanup),
+                    None => cleanup,
+                };
                 Ok(super::reconcile_windows_privileged_worker_mutation(
                     mutation, cleanup,
                 ))
@@ -1034,8 +1111,7 @@ fn finish_worker_directory_mutation(
 enum WorkerMutationEvidence {
     Complete(Box<CompleteWorkerMutationEvidence>),
     Partial {
-        observations: Vec<super::WorkerDirectoryNodeObservation>,
-        nodes: Vec<std::fs::File>,
+        created: CreatedWorkerDirectoryEvidence,
         owner_sid: Vec<u8>,
     },
 }
@@ -1045,6 +1121,7 @@ struct CompleteWorkerMutationEvidence {
     children: [super::WorkerDirectoryNodeObservation; 5],
     nodes: [std::fs::File; 6],
     owner_sid: Vec<u8>,
+    created: CreatedWorkerDirectoryEvidence,
 }
 
 impl WorkerMutationEvidence {
@@ -1061,6 +1138,7 @@ impl WorkerMutationEvidence {
             children,
             nodes,
             owner_sid,
+            created: _,
         } = *complete;
         super::WorkerDirectoryCreation::new(
             root,
@@ -1079,92 +1157,139 @@ impl WorkerMutationEvidence {
         creation_lock: WorkerLayoutLock,
         lock_anchor: WorkerLockAnchor,
     ) -> WorkerDirectoryFailureEvidence {
-        let (observations, nodes, owner_sid) = match self {
+        let (created, owner_sid) = match self {
             Self::Complete(complete) => {
                 let CompleteWorkerMutationEvidence {
-                    root,
-                    children,
-                    nodes,
-                    owner_sid,
+                    owner_sid, created, ..
                 } = *complete;
-                let [repos, jobs, cache, artifacts, logs] = children;
-                (
-                    vec![root, repos, jobs, cache, artifacts, logs],
-                    Vec::from(nodes),
-                    owner_sid,
-                )
+                (created, owner_sid)
             }
-            Self::Partial {
-                observations,
-                nodes,
-                owner_sid,
-            } => (observations, nodes, owner_sid),
+            Self::Partial { created, owner_sid } => (created, owner_sid),
         };
+        created.into_failure(creation_lock, lock_anchor, owner_sid)
+    }
+}
+
+#[derive(Default)]
+struct CreatedWorkerDirectoryEvidence {
+    created: Vec<RetainedCreatedWorkerDirectory>,
+}
+
+impl CreatedWorkerDirectoryEvidence {
+    fn retain_for_continuation(
+        &mut self,
+        opened: OpenOrCreatedWorkerDirectory,
+        security: &WorkerCreationSecurity,
+        control: WorkerMutationControl,
+    ) -> io::Result<OpenedWorkerDirectory> {
+        let created = match opened {
+            OpenOrCreatedWorkerDirectory::Existing(opened) => return Ok(opened),
+            OpenOrCreatedWorkerDirectory::Created(created) => created,
+        };
+        self.created.push(created.into_retained());
+        control.fail_after_native_create_if_requested(self.created.len())?;
+        let retained = self
+            .created
+            .last_mut()
+            .expect("a just-retained worker creation is present");
+        let identity = reverify_retained_created_worker_directory(retained, &security.owner_sid)?;
+        retained.identity = Some(identity);
+        let directory = retained.directory.try_clone()?;
+        Ok(OpenedWorkerDirectory {
+            directory,
+            disposition: super::WorkerDirectoryNodeDisposition::Created,
+            identity,
+        })
+    }
+
+    fn into_partial(self, owner_sid: Vec<u8>) -> WorkerMutationEvidence {
+        WorkerMutationEvidence::Partial {
+            created: self,
+            owner_sid,
+        }
+    }
+
+    fn into_failure(
+        self,
+        creation_lock: WorkerLayoutLock,
+        lock_anchor: WorkerLockAnchor,
+        owner_sid: Vec<u8>,
+    ) -> WorkerDirectoryFailureEvidence {
         WorkerDirectoryFailureEvidence {
-            observations,
+            created: self,
             lease: WorkerDirectoryFailureLease {
                 _creation_lock: creation_lock,
                 lock_anchor,
-                nodes,
                 owner_sid,
             },
         }
     }
 }
 
-#[derive(Default)]
-struct CreatedWorkerDirectoryEvidence {
-    observations: Vec<super::WorkerDirectoryNodeObservation>,
-    nodes: Vec<std::fs::File>,
+// Fully prepared before FILE_CREATE so no allocation, handle clone, or name
+// derivation can separate a successful native create from its evidence.
+struct DescriptorRelativeWorkerPath {
+    parent: std::fs::File,
+    name: Vec<u16>,
+    path: PathBuf,
 }
 
-impl CreatedWorkerDirectoryEvidence {
-    fn retain_created_for_continuation(
-        &mut self,
-        opened: OpenedWorkerDirectory,
-        path: PathBuf,
-    ) -> io::Result<OpenedWorkerDirectory> {
-        if opened.disposition == super::WorkerDirectoryNodeDisposition::Existing {
-            return Ok(opened);
-        }
-        let continuation = opened.directory.try_clone();
-        self.observations
-            .push(super::WorkerDirectoryNodeObservation::new(
-                path,
-                super::WorkerDirectoryNodeDisposition::Created,
-                opened.identity,
-            ));
-        self.nodes.push(opened.directory);
-        continuation.map(|directory| OpenedWorkerDirectory {
-            directory,
-            disposition: opened.disposition,
-            identity: opened.identity,
-        })
-    }
+// NtCreateFile(FILE_CREATE) returns directly into this type. It must be moved
+// into CreatedWorkerDirectoryEvidence before any handle or security query.
+struct UnresolvedCreatedWorkerDirectory {
+    directory: std::fs::File,
+    intended: DescriptorRelativeWorkerPath,
+}
 
-    fn into_partial(self, owner_sid: Vec<u8>) -> WorkerMutationEvidence {
-        WorkerMutationEvidence::Partial {
-            observations: self.observations,
-            nodes: self.nodes,
-            owner_sid,
+impl UnresolvedCreatedWorkerDirectory {
+    fn into_retained(self) -> RetainedCreatedWorkerDirectory {
+        RetainedCreatedWorkerDirectory {
+            directory: self.directory,
+            intended: self.intended,
+            identity: None,
         }
     }
+}
+
+struct RetainedCreatedWorkerDirectory {
+    directory: std::fs::File,
+    intended: DescriptorRelativeWorkerPath,
+    identity: Option<super::WorkerDirectoryIdentity>,
+}
+
+enum OpenOrCreatedWorkerDirectory {
+    Existing(OpenedWorkerDirectory),
+    Created(UnresolvedCreatedWorkerDirectory),
 }
 
 #[derive(Clone, Copy)]
 struct WorkerMutationControl {
     fail_after_created: Option<usize>,
+    fail_after_native_created: Option<usize>,
 }
 
 impl WorkerMutationControl {
-    fn new(fail_after_created: Option<usize>) -> Self {
-        Self { fail_after_created }
+    fn new(fail_after_created: Option<usize>, fail_after_native_created: Option<usize>) -> Self {
+        Self {
+            fail_after_created,
+            fail_after_native_created,
+        }
     }
 
     fn fail_if_requested(self, created: usize) -> io::Result<()> {
         if self.fail_after_created == Some(created) {
             Err(io::Error::other(format!(
                 "injected worker mutation failure after {created} created canonical nodes"
+            )))
+        } else {
+            Ok(())
+        }
+    }
+
+    fn fail_after_native_create_if_requested(self, created: usize) -> io::Result<()> {
+        if self.fail_after_native_created == Some(created) {
+            Err(io::Error::other(format!(
+                "injected failure after retaining {created} native worker directory creations"
             )))
         } else {
             Ok(())
@@ -1200,20 +1325,28 @@ pub(super) struct WorkerDirectoryLease {
 }
 
 pub(super) struct WorkerDirectoryFailureEvidence {
-    observations: Vec<super::WorkerDirectoryNodeObservation>,
+    created: CreatedWorkerDirectoryEvidence,
     lease: WorkerDirectoryFailureLease,
 }
 
 struct WorkerDirectoryFailureLease {
     _creation_lock: WorkerLayoutLock,
     lock_anchor: WorkerLockAnchor,
-    nodes: Vec<std::fs::File>,
     owner_sid: Vec<u8>,
 }
 
 impl WorkerDirectoryFailureEvidence {
-    pub(super) fn observations(&self) -> &[super::WorkerDirectoryNodeObservation] {
-        &self.observations
+    pub(super) fn retained_count(&self) -> usize {
+        self.created.created.len()
+    }
+
+    #[cfg(test)]
+    pub(super) fn unresolved_count(&self) -> usize {
+        self.created
+            .created
+            .iter()
+            .filter(|created| created.identity.is_none())
+            .count()
     }
 }
 
@@ -1258,24 +1391,49 @@ pub(super) fn reverify_worker_directory_lease(
 
 pub(super) fn reverify_worker_directory_failure_evidence(
     evidence: &WorkerDirectoryFailureEvidence,
-) -> io::Result<()> {
+) -> io::Result<Vec<super::WorkerDirectoryNodeObservation>> {
     evidence.lease.lock_anchor.reverify_path_identity()?;
-    for (directory, observation) in evidence.lease.nodes.iter().zip(&evidence.observations) {
-        verify_worker_directory_security(directory, &evidence.lease.owner_sid)?;
-        if worker_directory_identity(directory)? != observation.identity() {
-            return Err(permission_denied(
-                "retained failed worker directory identity changed before evidence binding",
-            ));
-        }
-        let path = WindowsWorkerPath::parse(observation.path())?;
-        let reopened = open_existing_worker_path(&path)?;
-        if worker_directory_identity(&reopened)? != observation.identity() {
-            return Err(permission_denied(
-                "failed worker directory path changed before retained evidence binding",
-            ));
-        }
+    let mut observations = Vec::with_capacity(evidence.created.created.len());
+    for created in &evidence.created.created {
+        let identity =
+            reverify_retained_created_worker_directory(created, &evidence.lease.owner_sid)?;
+        observations.push(super::WorkerDirectoryNodeObservation::new(
+            created.intended.path.clone(),
+            super::WorkerDirectoryNodeDisposition::Created,
+            identity,
+        ));
     }
-    Ok(())
+    Ok(observations)
+}
+
+fn reverify_retained_created_worker_directory(
+    created: &RetainedCreatedWorkerDirectory,
+    owner_sid: &[u8],
+) -> io::Result<super::WorkerDirectoryIdentity> {
+    verify_worker_directory_security(&created.directory, owner_sid)?;
+    let identity = worker_directory_identity(&created.directory)?;
+    if created
+        .identity
+        .is_some_and(|expected| expected != identity)
+    {
+        return Err(permission_denied(
+            "retained native-created worker directory identity changed",
+        ));
+    }
+    let relative = open_worker_directory_at(&created.intended.parent, &created.intended.name)?;
+    if worker_directory_identity(&relative)? != identity {
+        return Err(permission_denied(
+            "native-created worker directory descriptor-relative path changed",
+        ));
+    }
+    let absolute_path = WindowsWorkerPath::parse(&created.intended.path)?;
+    let absolute = open_existing_worker_path(&absolute_path)?;
+    if worker_directory_identity(&absolute)? != identity {
+        return Err(permission_denied(
+            "native-created worker directory absolute path changed",
+        ));
+    }
+    Ok(identity)
 }
 
 pub(super) fn retire_worker_directory_authority(_lease: &WorkerDirectoryLease) -> io::Result<()> {
@@ -1456,6 +1614,23 @@ impl WorkerCreationSecurity {
 fn worker_owner_matches_current(owner_sid: &[u8]) -> io::Result<bool> {
     let current_sid = current_user_sid()?;
     Ok(unsafe { EqualSid(owner_sid.as_ptr().cast(), current_sid.as_ptr().cast()) } != 0)
+}
+
+#[cfg(test)]
+fn current_thread_has_impersonation_token() -> io::Result<bool> {
+    const ERROR_NO_TOKEN: i32 = 1008;
+
+    let mut token = std::ptr::null_mut();
+    if unsafe { OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, 1, &mut token) } != 0 {
+        drop(OwnedHandle(token));
+        return Ok(true);
+    }
+    let error = io::Error::last_os_error();
+    if error.raw_os_error() == Some(ERROR_NO_TOKEN) {
+        Ok(false)
+    } else {
+        Err(error)
+    }
 }
 
 struct ThreadRestorePrivilege {
@@ -1806,7 +1981,8 @@ fn open_or_create_worker_directory_at(
     may_create: bool,
     security: &WorkerCreationSecurity,
     existing_must_be_canonical: bool,
-) -> io::Result<OpenedWorkerDirectory> {
+    intended_path: PathBuf,
+) -> io::Result<OpenOrCreatedWorkerDirectory> {
     match open_worker_directory_at_with_security(parent, name, true) {
         Ok(directory) => {
             verify_existing_worker_directory(
@@ -1815,25 +1991,24 @@ fn open_or_create_worker_directory_at(
                 existing_must_be_canonical,
             )?;
             let identity = worker_directory_identity(&directory)?;
-            return Ok(OpenedWorkerDirectory {
-                directory,
-                disposition: super::WorkerDirectoryNodeDisposition::Existing,
-                identity,
-            });
+            return Ok(OpenOrCreatedWorkerDirectory::Existing(
+                OpenedWorkerDirectory {
+                    directory,
+                    disposition: super::WorkerDirectoryNodeDisposition::Existing,
+                    identity,
+                },
+            ));
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound && may_create => {}
         Err(error) => return Err(error),
     }
-    match nt_open_worker_directory_at(parent, name, FILE_CREATE, security.descriptor.0, false) {
-        Ok(directory) => {
-            verify_worker_directory_security(&directory, &security.owner_sid)?;
-            let identity = worker_directory_identity(&directory)?;
-            Ok(OpenedWorkerDirectory {
-                directory,
-                disposition: super::WorkerDirectoryNodeDisposition::Created,
-                identity,
-            })
-        }
+    let intended = DescriptorRelativeWorkerPath {
+        parent: parent.try_clone()?,
+        name: name.to_vec(),
+        path: intended_path,
+    };
+    match nt_create_worker_directory_at(intended, security.descriptor.0) {
+        Ok(created) => Ok(OpenOrCreatedWorkerDirectory::Created(created)),
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
             let directory = open_worker_directory_at_with_security(parent, name, true)?;
             verify_existing_worker_directory(
@@ -1842,11 +2017,13 @@ fn open_or_create_worker_directory_at(
                 existing_must_be_canonical,
             )?;
             let identity = worker_directory_identity(&directory)?;
-            Ok(OpenedWorkerDirectory {
-                directory,
-                disposition: super::WorkerDirectoryNodeDisposition::Existing,
-                identity,
-            })
+            Ok(OpenOrCreatedWorkerDirectory::Existing(
+                OpenedWorkerDirectory {
+                    directory,
+                    disposition: super::WorkerDirectoryNodeDisposition::Existing,
+                    identity,
+                },
+            ))
         }
         Err(error) => Err(error),
     }
@@ -1877,6 +2054,43 @@ fn open_worker_directory_at_with_security(
 }
 
 fn nt_open_worker_directory_at(
+    parent: &std::fs::File,
+    name: &[u16],
+    disposition: u32,
+    security_descriptor: *mut c_void,
+    read_security: bool,
+) -> io::Result<std::fs::File> {
+    let directory = nt_open_worker_directory_handle_at(
+        parent,
+        name,
+        disposition,
+        security_descriptor,
+        read_security,
+    )?;
+    worker_directory_identity(&directory)?;
+    Ok(directory)
+}
+
+fn nt_create_worker_directory_at(
+    intended: DescriptorRelativeWorkerPath,
+    security_descriptor: *mut c_void,
+) -> io::Result<UnresolvedCreatedWorkerDirectory> {
+    // The raw helper performs all fallible argument preparation before the
+    // syscall and performs no metadata/security query after a successful create.
+    let directory = nt_open_worker_directory_handle_at(
+        &intended.parent,
+        &intended.name,
+        FILE_CREATE,
+        security_descriptor,
+        false,
+    )?;
+    Ok(UnresolvedCreatedWorkerDirectory {
+        directory,
+        intended,
+    })
+}
+
+fn nt_open_worker_directory_handle_at(
     parent: &std::fs::File,
     name: &[u16],
     disposition: u32,
@@ -1941,7 +2155,6 @@ fn nt_open_worker_directory_at(
         ));
     }
     let directory = unsafe { std::fs::File::from_raw_handle(handle) };
-    worker_directory_identity(&directory)?;
     Ok(directory)
 }
 
@@ -2766,6 +2979,8 @@ unsafe extern "system" {
     fn MoveFileExW(existing: *const u16, replacement: *const u16, flags: u32) -> i32;
     fn CloseHandle(handle: *mut c_void) -> i32;
     fn GetCurrentProcess() -> *mut c_void;
+    #[cfg(test)]
+    fn GetCurrentThread() -> *mut c_void;
     fn GetLastError() -> u32;
     fn SetLastError(error: u32);
     fn WaitForSingleObject(handle: *mut c_void, milliseconds: u32) -> u32;
@@ -4838,10 +5053,7 @@ mod tests {
             let error = create_worker_directory_layout(&layout).unwrap_err();
 
             assert!(error.is_windows_privilege_cleanup_failure());
-            assert_eq!(
-                error.retained_creation_observation_count(),
-                expected_created
-            );
+            assert_eq!(error.retained_creation_evidence_count(), expected_created);
             let retained = error
                 .bind_retained_creation_evidence_after_reverify(|binding| {
                     Ok::<_, ()>(
@@ -4854,6 +5066,83 @@ mod tests {
                 })
                 .unwrap();
             assert_eq!(retained.len(), expected_created);
+            assert!(retained.iter().all(|(path, disposition)| {
+                path.is_dir()
+                    && *disposition == crate::platform::WorkerDirectoryNodeDisposition::Created
+            }));
+            drop(error);
+            std::fs::remove_dir_all(parent).unwrap();
+        }
+    }
+
+    #[test]
+    fn post_nt_create_failure_retains_exact_zero_some_and_all_paths() {
+        for (case, fail_after_native_created, expected_suffixes, unresolved) in [
+            ("zero", 0, &[][..], 0),
+            ("some", 3, &["", "repos", "jobs"][..], 1),
+            (
+                "all",
+                6,
+                &["", "repos", "jobs", "cache", "artifacts", "logs"][..],
+                1,
+            ),
+        ] {
+            let principal = test_principal();
+            let parent = std::env::temp_dir().join(format!(
+                "styrn-worker-native-create-evidence-{case}-{}-{}",
+                std::process::id(),
+                uuid::Uuid::now_v7()
+            ));
+            std::fs::create_dir(&parent).unwrap();
+            let root = parent.join("root");
+            let layout = crate::platform::resolve_worker_directory_layout(
+                crate::platform::InstallationScope::System,
+                &principal,
+                Some(&root),
+            )
+            .unwrap();
+            set_worker_native_create_failure_after(Some(fail_after_native_created));
+
+            let error = create_worker_directory_layout(&layout).unwrap_err();
+            set_worker_native_create_failure_after(None);
+
+            assert!(!error.is_windows_privilege_cleanup_failure());
+            assert_eq!(
+                error.retained_creation_evidence_count(),
+                expected_suffixes.len()
+            );
+            assert_eq!(
+                error.retained_unresolved_creation_evidence_count(),
+                unresolved
+            );
+            let retained = error
+                .bind_retained_creation_evidence_after_reverify(|binding| {
+                    Ok::<_, ()>(
+                        binding
+                            .observations()
+                            .iter()
+                            .map(|node| (node.path().to_path_buf(), node.disposition()))
+                            .collect::<Vec<_>>(),
+                    )
+                })
+                .unwrap();
+            let expected_paths = expected_suffixes
+                .iter()
+                .map(|suffix| {
+                    if suffix.is_empty() {
+                        root.clone()
+                    } else {
+                        root.join(suffix)
+                    }
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(
+                retained
+                    .iter()
+                    .map(|(path, _)| path.clone())
+                    .collect::<Vec<_>>(),
+                expected_paths
+            );
             assert!(retained.iter().all(|(path, disposition)| {
                 path.is_dir()
                     && *disposition == crate::platform::WorkerDirectoryNodeDisposition::Created
@@ -4902,6 +5191,51 @@ mod tests {
         ) {
             inspect_user_acl(path, &principal, AclKind::UserDirectory).unwrap();
         }
+        std::fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    #[ignore = "environmental: requires elevated native Windows and STYRN_TEST_DISTINCT_LOCAL_WORKER naming a disposable non-administrator local account"]
+    fn native_windows_real_cleanup_failure_retains_evidence_without_caller_impersonation() {
+        fn fail_after_real_cleanup(cleanup: io::Result<()>) -> io::Result<()> {
+            cleanup.expect("exact restoration and RevertToSelf must both run successfully");
+            assert!(!current_thread_has_impersonation_token().unwrap());
+            Err(io::Error::from_raw_os_error(995))
+        }
+
+        assert!(!current_thread_has_impersonation_token().unwrap());
+        let worker_name = std::env::var("STYRN_TEST_DISTINCT_LOCAL_WORKER")
+            .expect("STYRN_TEST_DISTINCT_LOCAL_WORKER must name a disposable local account");
+        let principal = resolve_named_worker_principal(&worker_name).unwrap();
+        assert_ne!(principal, test_principal());
+        let parent = std::env::temp_dir().join(format!(
+            "styrn-worker-real-cleanup-evidence-{}-{}",
+            std::process::id(),
+            uuid::Uuid::now_v7()
+        ));
+        std::fs::create_dir(&parent).unwrap();
+        let root = parent.join("root");
+        let layout = crate::platform::resolve_worker_directory_layout(
+            crate::platform::InstallationScope::System,
+            &principal,
+            Some(&root),
+        )
+        .unwrap();
+        set_after_real_worker_privilege_cleanup_hook(fail_after_real_cleanup);
+
+        let error = create_worker_directory_layout(&layout).unwrap_err();
+
+        assert!(error.is_windows_privilege_cleanup_failure());
+        assert_eq!(error.retained_creation_evidence_count(), 6);
+        assert!(!current_thread_has_impersonation_token().unwrap());
+        let retained = error
+            .bind_retained_creation_evidence_after_reverify(|binding| {
+                Ok::<_, ()>(binding.observations().len())
+            })
+            .unwrap();
+        assert_eq!(retained, 6);
+        assert!(!current_thread_has_impersonation_token().unwrap());
+        drop(error);
         std::fs::remove_dir_all(parent).unwrap();
     }
 
