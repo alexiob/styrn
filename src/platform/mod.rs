@@ -663,11 +663,11 @@ pub(crate) fn verify_setup_authorization_executable(executable: &Path) -> std::i
 
     let executable = std::fs::canonicalize(executable)?;
     let metadata = std::fs::symlink_metadata(&executable)?;
-    if !metadata.is_file()
-        || metadata.uid() != 0
-        || metadata.permissions().mode() & 0o111 == 0
-        || metadata.permissions().mode() & 0o022 != 0
-    {
+    if !unix_authorization_executable_metadata_is_safe(
+        metadata.is_file(),
+        metadata.uid(),
+        metadata.permissions().mode(),
+    ) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
             "setup authorization requires an immutable system-installed Styrn executable",
@@ -687,6 +687,11 @@ pub(crate) fn verify_setup_authorization_executable(executable: &Path) -> std::i
         current = ancestor.parent();
     }
     Ok(executable)
+}
+
+#[cfg(unix)]
+fn unix_authorization_executable_metadata_is_safe(is_file: bool, uid: u32, mode: u32) -> bool {
+    is_file && uid == 0 && mode & 0o111 != 0 && mode & 0o6000 == 0 && mode & 0o022 == 0
 }
 
 #[cfg(windows)]
@@ -983,6 +988,25 @@ mod setup_execution_tests {
                 ]
             );
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn authorization_executable_metadata_rejects_exec_time_privilege_gain() {
+        assert!(unix_authorization_executable_metadata_is_safe(
+            true, 0, 0o100755
+        ));
+        for mode in [0o104755, 0o102755, 0o100775, 0o100644] {
+            assert!(!unix_authorization_executable_metadata_is_safe(
+                true, 0, mode
+            ));
+        }
+        assert!(!unix_authorization_executable_metadata_is_safe(
+            true, 501, 0o100755
+        ));
+        assert!(!unix_authorization_executable_metadata_is_safe(
+            false, 0, 0o100755
+        ));
     }
 
     #[cfg(unix)]

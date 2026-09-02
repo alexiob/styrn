@@ -81,7 +81,7 @@ pub(super) fn test_user_execution_token(principal: &WorkerPrincipal) -> UserExec
     UserExecutionToken {
         uid: principal.unix_uid().unwrap(),
         gid: account.gid,
-        supplementary_groups: supplementary_groups(principal.name(), account.gid).unwrap(),
+        supplementary_groups: current_supplementary_groups().unwrap(),
         home: account.home,
         name: principal.name().to_owned(),
         requires_drop: false,
@@ -110,13 +110,18 @@ pub(super) fn capture_setup_execution_context() -> io::Result<SetupExecutionCont
             "sudo original uid, gid, and account name do not identify one native user",
         ));
     }
+    let supplementary_groups = if selected.privilege == SetupHostPrivilege::Root {
+        supplementary_groups(account.principal.name(), account.gid)?
+    } else {
+        current_supplementary_groups()?
+    };
     Ok(SetupExecutionContext::new(
         selected.privilege,
         account.principal.clone(),
         UserExecutionToken {
             uid: selected.uid,
             gid: selected.gid,
-            supplementary_groups: supplementary_groups(account.principal.name(), account.gid)?,
+            supplementary_groups,
             home: account.home,
             name: account.principal.name().to_owned(),
             requires_drop: selected.privilege == SetupHostPrivilege::Root,
@@ -305,12 +310,25 @@ fn supplementary_groups(name: &str, primary_gid: u32) -> io::Result<Vec<libc::gi
                 .map_err(|_| invalid_data("worker supplementary group is out of range"))
         })
         .collect::<io::Result<Vec<_>>>()?;
+    groups.retain(|group| *group != primary_gid);
     groups.sort_unstable();
     groups.dedup();
-    if !groups.contains(&primary_gid) {
-        groups.push(primary_gid);
-        groups.sort_unstable();
+    Ok(groups)
+}
+
+fn current_supplementary_groups() -> io::Result<Vec<libc::gid_t>> {
+    let count = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+    if !(0..=1024).contains(&count) {
+        return Err(permission_denied(
+            "current supplementary group set is invalid",
+        ));
     }
+    let mut groups = vec![0; count as usize];
+    if count != 0 && unsafe { libc::getgroups(count, groups.as_mut_ptr()) } != count {
+        return Err(io::Error::last_os_error());
+    }
+    groups.sort_unstable();
+    groups.dedup();
     Ok(groups)
 }
 
@@ -318,8 +336,7 @@ fn validate_user_execution_token(token: &UserExecutionToken) -> io::Result<()> {
     if token.uid == 0
         || token.name.is_empty()
         || !Path::new(&token.home).is_absolute()
-        || token.supplementary_groups.is_empty()
-        || !token.supplementary_groups.contains(&token.gid)
+        || token.supplementary_groups.len() > 1024
     {
         return Err(permission_denied(
             "original-user execution token is invalid",
@@ -339,27 +356,41 @@ fn configure_original_user_command(
     command.env("LOGNAME", &token.name);
     command.env("PATH", "/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin");
     command.current_dir(&token.home);
-    if token.requires_drop {
-        let uid = token.uid;
-        let gid = token.gid;
-        let groups = token.supplementary_groups.clone();
-        unsafe {
-            command.pre_exec(move || {
-                if libc::setgroups(groups.len() as i32, groups.as_ptr()) != 0
+    let uid = token.uid;
+    let gid = token.gid;
+    let groups = token.supplementary_groups.clone();
+    let requires_drop = token.requires_drop;
+    let mut observed_groups = vec![0; 1024];
+    unsafe {
+        command.pre_exec(move || {
+            if requires_drop
+                && (libc::setgroups(groups.len() as i32, groups.as_ptr()) != 0
                     || libc::setgid(gid) != 0
-                    || libc::setuid(uid) != 0
-                    || libc::getuid() != uid
-                    || libc::geteuid() != uid
-                    || libc::getgid() != gid
-                    || libc::getegid() != gid
-                    || libc::setegid(0) == 0
-                    || libc::seteuid(0) == 0
-                {
-                    return Err(io::Error::last_os_error());
-                }
-                Ok(())
-            });
-        }
+                    || libc::setuid(uid) != 0)
+            {
+                return Err(io::Error::last_os_error());
+            }
+            if libc::getuid() != uid
+                || libc::geteuid() != uid
+                || libc::getgid() != gid
+                || libc::getegid() != gid
+            {
+                return Err(io::Error::from_raw_os_error(libc::EPERM));
+            }
+            let group_count = libc::getgroups(1024, observed_groups.as_mut_ptr());
+            if group_count < 0 {
+                return Err(io::Error::last_os_error());
+            }
+            let observed = &mut observed_groups[..group_count as usize];
+            observed.sort_unstable();
+            if observed != groups.as_slice() {
+                return Err(io::Error::from_raw_os_error(libc::EPERM));
+            }
+            if requires_drop && libc::seteuid(0) == 0 {
+                return Err(io::Error::from_raw_os_error(libc::EPERM));
+            }
+            Ok(())
+        });
     }
     Ok(())
 }
