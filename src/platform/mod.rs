@@ -38,6 +38,7 @@ impl std::str::FromStr for InstallationScope {
 #[derive(Clone, Debug, Eq, PartialEq)]
 #[allow(dead_code)] // Consumed by the T0.14 setup action integration follow-up.
 pub(crate) struct WorkerDirectoryLayout {
+    scope: InstallationScope,
     root: PathBuf,
     repos: PathBuf,
     jobs: PathBuf,
@@ -46,6 +47,18 @@ pub(crate) struct WorkerDirectoryLayout {
     logs: PathBuf,
     creation_policy: WorkerRootCreationPolicy,
     principal: WorkerPrincipal,
+    #[cfg(test)]
+    principal_revalidation: Option<WorkerPrincipalRevalidationTest>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum WorkerPrincipalRevalidationTest {
+    Resolved {
+        principal: WorkerPrincipal,
+        current: Option<WorkerPrincipal>,
+    },
+    Deleted,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -83,7 +96,7 @@ impl WorkerDirectoryIdentity {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Debug, Eq, PartialEq)]
 pub(crate) struct WorkerDirectoryNodeObservation {
     path: PathBuf,
     disposition: WorkerDirectoryNodeDisposition,
@@ -92,7 +105,7 @@ pub(crate) struct WorkerDirectoryNodeObservation {
 
 #[allow(dead_code)] // Consumed by the deferred T0.14 receipt integration.
 impl WorkerDirectoryNodeObservation {
-    pub(super) fn new(
+    pub(in crate::platform) fn new(
         path: PathBuf,
         disposition: WorkerDirectoryNodeDisposition,
         identity: WorkerDirectoryIdentity,
@@ -117,36 +130,54 @@ impl WorkerDirectoryNodeObservation {
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
 pub(crate) struct WorkerDirectoryCreation {
     nodes: [WorkerDirectoryNodeObservation; 6],
+    lease: platform_impl::WorkerDirectoryLease,
+}
+
+impl std::fmt::Debug for WorkerDirectoryCreation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("WorkerDirectoryCreation")
+            .field("nodes", &self.nodes)
+            .finish_non_exhaustive()
+    }
 }
 
 #[allow(dead_code)] // Consumed by the deferred T0.14 receipt integration.
 impl WorkerDirectoryCreation {
-    pub(super) fn new(
+    pub(in crate::platform) fn new(
         root: WorkerDirectoryNodeObservation,
         children: [WorkerDirectoryNodeObservation; 5],
+        lease: platform_impl::WorkerDirectoryLease,
     ) -> Self {
         let [repos, jobs, cache, artifacts, logs] = children;
         Self {
             nodes: [root, repos, jobs, cache, artifacts, logs],
+            lease,
         }
     }
 
     pub(crate) fn nodes(&self) -> &[WorkerDirectoryNodeObservation; 6] {
         &self.nodes
     }
+
+    pub(crate) fn final_reverify(self) -> std::io::Result<[WorkerDirectoryNodeObservation; 6]> {
+        platform_impl::reverify_worker_directory_lease(&self.lease, &self.nodes)?;
+        Ok(self.nodes)
+    }
 }
 
 #[allow(dead_code)] // Consumed by the T0.14 setup action integration follow-up.
 impl WorkerDirectoryLayout {
     fn new(
+        scope: InstallationScope,
         root: PathBuf,
         creation_policy: WorkerRootCreationPolicy,
         principal: WorkerPrincipal,
     ) -> Self {
         Self {
+            scope,
             repos: root.join("repos"),
             jobs: root.join("jobs"),
             cache: root.join("cache"),
@@ -155,6 +186,8 @@ impl WorkerDirectoryLayout {
             root,
             creation_policy,
             principal,
+            #[cfg(test)]
+            principal_revalidation: None,
         }
     }
 
@@ -206,10 +239,67 @@ pub(crate) fn resolve_worker_directory_layout(
         platform_impl::default_worker_root(scope, principal)?
     };
     Ok(WorkerDirectoryLayout::new(
+        scope,
         root,
         creation_policy,
         principal.clone(),
     ))
+}
+
+fn validate_revalidated_worker_principal(
+    scope: InstallationScope,
+    expected: &WorkerPrincipal,
+    resolved: std::io::Result<WorkerPrincipal>,
+    current: Option<&WorkerPrincipal>,
+) -> std::io::Result<WorkerPrincipal> {
+    let resolved = resolved.map_err(|_error| {
+        std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "worker principal could not be revalidated before filesystem mutation",
+        )
+    })?;
+    if &resolved != expected {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "worker principal identity or name drifted before filesystem mutation",
+        ));
+    }
+    if scope == InstallationScope::User {
+        let current = current.ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "current user could not be revalidated before filesystem mutation",
+            )
+        })?;
+        validate_user_scope_principal(expected, current)?;
+    }
+    Ok(resolved)
+}
+
+#[cfg_attr(not(target_os = "windows"), allow(dead_code))]
+fn validate_windows_restore_privilege_result(
+    owner_matches_current: bool,
+    adjustment_succeeded: bool,
+    last_error: u32,
+) -> std::io::Result<bool> {
+    const ERROR_NOT_ALL_ASSIGNED: u32 = 1300;
+
+    if owner_matches_current {
+        return Ok(false);
+    }
+    if !adjustment_succeeded {
+        return Err(std::io::Error::from_raw_os_error(last_error as i32));
+    }
+    if last_error == ERROR_NOT_ALL_ASSIGNED {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "SeRestorePrivilege is unavailable for dedicated worker ownership",
+        ));
+    }
+    if last_error != 0 {
+        return Err(std::io::Error::from_raw_os_error(last_error as i32));
+    }
+    Ok(true)
 }
 
 /// Creates the fixed worker layout without enumerating or rewriting descendants.
@@ -1151,6 +1241,68 @@ mod principal_tests {
     }
 
     #[test]
+    fn worker_principal_revalidation_rejects_id_name_deletion_and_current_user_drift() {
+        let expected =
+            WorkerPrincipal::new(PrincipalKind::UnixUid, "501", "selected-worker").unwrap();
+        let reused = WorkerPrincipal::new(PrincipalKind::UnixUid, "501", "replacement").unwrap();
+        let renamed =
+            WorkerPrincipal::new(PrincipalKind::UnixUid, "501", "renamed-worker").unwrap();
+        let different =
+            WorkerPrincipal::new(PrincipalKind::UnixUid, "502", "different-worker").unwrap();
+
+        assert!(validate_revalidated_worker_principal(
+            InstallationScope::System,
+            &expected,
+            Ok(reused),
+            None,
+        )
+        .is_err());
+        assert!(validate_revalidated_worker_principal(
+            InstallationScope::System,
+            &expected,
+            Ok(renamed),
+            None,
+        )
+        .is_err());
+        assert!(validate_revalidated_worker_principal(
+            InstallationScope::System,
+            &expected,
+            Err(std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "account deleted",
+            )),
+            None,
+        )
+        .is_err());
+        assert!(validate_revalidated_worker_principal(
+            InstallationScope::User,
+            &expected,
+            Ok(expected.clone()),
+            Some(&different),
+        )
+        .is_err());
+        assert_eq!(
+            validate_revalidated_worker_principal(
+                InstallationScope::User,
+                &expected,
+                Ok(expected.clone()),
+                Some(&expected),
+            )
+            .unwrap(),
+            expected,
+        );
+    }
+
+    #[test]
+    fn windows_restore_privilege_policy_skips_current_owner_and_rejects_not_assigned() {
+        assert!(!validate_windows_restore_privilege_result(true, false, 1300).unwrap());
+        assert!(validate_windows_restore_privilege_result(false, true, 0).unwrap());
+        let error = validate_windows_restore_privilege_result(false, true, 1300).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(validate_windows_restore_privilege_result(false, false, 5).is_err());
+    }
+
+    #[test]
     fn native_caller_resolution_ignores_spoofable_identity_environment() {
         const CHILD: &str = "STYRN_NATIVE_CALLER_SPOOF_CHILD";
         if std::env::var_os(CHILD).is_none() {
@@ -1721,6 +1873,77 @@ mod worker_directory_tests {
     }
 
     #[test]
+    fn stale_principal_lookup_seam_fails_before_worker_filesystem_mutation() {
+        let expected = resolve_current_worker_principal().unwrap();
+        let renamed = WorkerPrincipal::new(
+            expected.principal_kind(),
+            expected.principal_id(),
+            "renamed-worker",
+        )
+        .unwrap();
+        #[cfg(unix)]
+        let replacement = WorkerPrincipal::new(
+            PrincipalKind::UnixUid,
+            if expected.principal_id() == "1" {
+                "2"
+            } else {
+                "1"
+            },
+            expected.name(),
+        )
+        .unwrap();
+        #[cfg(target_os = "windows")]
+        let replacement = WorkerPrincipal::new(
+            PrincipalKind::WindowsSid,
+            "S-1-5-21-1-2-3-1001",
+            expected.name(),
+        )
+        .unwrap();
+        let cases = [
+            (
+                InstallationScope::System,
+                WorkerPrincipalRevalidationTest::Resolved {
+                    principal: renamed,
+                    current: None,
+                },
+            ),
+            (
+                InstallationScope::System,
+                WorkerPrincipalRevalidationTest::Resolved {
+                    principal: replacement.clone(),
+                    current: None,
+                },
+            ),
+            (
+                InstallationScope::System,
+                WorkerPrincipalRevalidationTest::Deleted,
+            ),
+            (
+                InstallationScope::User,
+                WorkerPrincipalRevalidationTest::Resolved {
+                    principal: expected.clone(),
+                    current: Some(replacement),
+                },
+            ),
+        ];
+
+        for (index, (scope, revalidation)) in cases.into_iter().enumerate() {
+            let parent = unique_test_directory(&format!("stale-principal-{index}"));
+            std::fs::create_dir(&parent).unwrap();
+            let root = parent.join("chosen-root");
+            let mut layout =
+                resolve_worker_directory_layout(scope, &expected, Some(&root)).unwrap();
+            layout.principal_revalidation = Some(revalidation);
+
+            let error = create_worker_directory_layout(&layout).unwrap_err();
+
+            assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+            assert!(directory_entry_names(&parent).is_empty());
+            std::fs::remove_dir(parent).unwrap();
+        }
+    }
+
+    #[test]
     fn absolute_worker_root_override_is_the_exact_root_not_a_parent_prefix() {
         let principal = resolve_current_worker_principal().unwrap();
         let root = std::env::temp_dir().join(format!(
@@ -1855,8 +2078,14 @@ mod worker_directory_tests {
             resolve_worker_directory_layout(InstallationScope::System, &principal, Some(&root))
                 .unwrap();
 
-        let created = create_worker_directory_layout(&layout).unwrap();
-        let existing = create_worker_directory_layout(&layout).unwrap();
+        let created = create_worker_directory_layout(&layout)
+            .unwrap()
+            .final_reverify()
+            .unwrap();
+        let existing = create_worker_directory_layout(&layout)
+            .unwrap()
+            .final_reverify()
+            .unwrap();
 
         let expected_paths = std::iter::once(root.clone())
             .chain(
@@ -1865,13 +2094,10 @@ mod worker_directory_tests {
                     .map(|name| root.join(name)),
             )
             .collect::<Vec<_>>();
-        assert_eq!(created.nodes().len(), 6);
-        assert_eq!(existing.nodes().len(), 6);
-        for ((created, existing), expected_path) in created
-            .nodes()
-            .iter()
-            .zip(existing.nodes())
-            .zip(expected_paths)
+        assert_eq!(created.len(), 6);
+        assert_eq!(existing.len(), 6);
+        for ((created, existing), expected_path) in
+            created.iter().zip(&existing).zip(expected_paths)
         {
             assert_eq!(created.path(), expected_path);
             assert_eq!(
@@ -1886,6 +2112,26 @@ mod worker_directory_tests {
             assert_eq!(existing.identity(), created.identity());
         }
 
+        std::fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn retained_worker_creation_reverify_rejects_path_substitution_before_release() {
+        let principal = resolve_current_worker_principal().unwrap();
+        let parent = unique_test_directory("retained-layout-substitution");
+        std::fs::create_dir(&parent).unwrap();
+        let root = parent.join("chosen-root");
+        let displaced = parent.join("displaced-root");
+        let layout =
+            resolve_worker_directory_layout(InstallationScope::System, &principal, Some(&root))
+                .unwrap();
+        let creation = create_worker_directory_layout(&layout).unwrap();
+        std::fs::rename(&root, &displaced).unwrap();
+        std::fs::create_dir(&root).unwrap();
+
+        let error = creation.final_reverify().unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
         std::fs::remove_dir_all(parent).unwrap();
     }
 
@@ -2140,6 +2386,7 @@ mod worker_directory_tests {
         let root = profile.join("new/data/base/styrn");
         let principal = resolve_current_worker_principal().unwrap();
         let layout = WorkerDirectoryLayout::new(
+            InstallationScope::User,
             root.clone(),
             WorkerRootCreationPolicy::CreateMissingFrom(profile.clone()),
             principal,
@@ -2179,6 +2426,7 @@ mod worker_directory_tests {
         std::fs::set_permissions(&profile, std::fs::Permissions::from_mode(0o777)).unwrap();
         let root = profile.join("new/data/styrn");
         let layout = WorkerDirectoryLayout::new(
+            InstallationScope::User,
             root.clone(),
             WorkerRootCreationPolicy::CreateMissingFrom(profile.clone()),
             principal,

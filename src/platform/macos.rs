@@ -13,6 +13,31 @@ use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 
+use sha2::{Digest, Sha256};
+
+#[cfg(test)]
+type PostWorkerMkdirHook = fn(i32, &std::ffi::CStr);
+
+#[cfg(test)]
+thread_local! {
+    static POST_WORKER_MKDIR_HOOK: std::cell::Cell<Option<PostWorkerMkdirHook>> = const {
+        std::cell::Cell::new(None)
+    };
+    static WORKER_MKDIR_INTERRUPT_AFTER: std::cell::Cell<Option<usize>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
+#[cfg(test)]
+fn set_post_worker_mkdir_hook(hook: PostWorkerMkdirHook) {
+    POST_WORKER_MKDIR_HOOK.with(|slot| slot.set(Some(hook)));
+}
+
+#[cfg(test)]
+fn set_worker_mkdir_interrupt_after(remaining: Option<usize>) {
+    WORKER_MKDIR_INTERRUPT_AFTER.with(|slot| slot.set(remaining));
+}
+
 type Acl = *mut std::ffi::c_void;
 type AclEntry = *mut std::ffi::c_void;
 #[cfg(test)]
@@ -117,6 +142,38 @@ pub(super) fn validate_worker_root_principal(
     Ok(())
 }
 
+fn revalidate_worker_root_principal(
+    layout: &super::WorkerDirectoryLayout,
+) -> io::Result<WorkerPrincipal> {
+    #[cfg(test)]
+    if let Some(revalidation) = &layout.principal_revalidation {
+        let (resolved, current) = match revalidation {
+            super::WorkerPrincipalRevalidationTest::Resolved { principal, current } => {
+                (Ok(principal.clone()), current.as_ref())
+            }
+            super::WorkerPrincipalRevalidationTest::Deleted => (
+                Err(io::Error::new(io::ErrorKind::NotFound, "worker deleted")),
+                None,
+            ),
+        };
+        return super::validate_revalidated_worker_principal(
+            layout.scope,
+            &layout.principal,
+            resolved,
+            current,
+        );
+    }
+    let scope = layout.scope;
+    let principal = &layout.principal;
+    let resolved = principal_for_uid(principal.unix_uid()?);
+    let current = if scope == super::InstallationScope::User {
+        Some(resolve_current_worker_principal()?)
+    } else {
+        None
+    };
+    super::validate_revalidated_worker_principal(scope, principal, resolved, current.as_ref())
+}
+
 #[allow(dead_code)] // Consumed by the T0.14 setup action integration follow-up.
 pub(super) fn worker_root_path_is_normalized(path: &Path) -> bool {
     let bytes = path.as_os_str().as_bytes();
@@ -162,51 +219,38 @@ pub(super) fn create_worker_directory_layout(
     if unsafe { libc::flock(creation_lock.as_raw_fd(), libc::LOCK_EX) } == -1 {
         return Err(io::Error::last_os_error());
     }
-    let mut directory = creation_lock.try_clone()?;
-    let mut root_disposition = None;
-    for (index, component) in root_components[first_creatable..].iter().enumerate() {
-        let is_root = first_creatable + index + 1 == root_components.len();
-        let opened =
-            open_or_create_worker_directory_at(&directory, component, true, expected_uid, is_root)?;
-        if is_root {
-            root_disposition = Some(opened.disposition);
-        }
-        directory = opened.directory;
+    let verified_principal = revalidate_worker_root_principal(layout)?;
+    let expected_uid = verified_principal.unix_uid()?;
+    let mut root_parent = creation_lock.try_clone()?;
+    for component in &root_components[first_creatable..root_components.len() - 1] {
+        root_parent = open_or_create_worker_directory_at(
+            &root_parent,
+            &root_parent,
+            component,
+            true,
+            expected_uid,
+            false,
+        )?
+        .directory;
     }
+    let root_name = root_components
+        .last()
+        .expect("the normalized worker root has a leaf component");
+    let (root, staged_children) =
+        create_or_open_complete_worker_root(&root_parent, root_name, expected_uid)?;
+    let root_disposition = root.disposition;
+    let directory = root.directory;
     let root_identity = worker_directory_identity(&directory)?;
     let root_observation = super::WorkerDirectoryNodeObservation::new(
         layout.root().to_path_buf(),
-        root_disposition.expect("the normalized worker root has a leaf component"),
+        root_disposition,
         root_identity,
     );
 
-    let mut children = Vec::with_capacity(super::WorkerDirectoryLayout::child_names().len());
-    for name in super::WorkerDirectoryLayout::child_names() {
-        match open_worker_directory_at(&directory, name.as_bytes()) {
-            Ok(child) => {
-                verify_worker_directory_security(&child, expected_uid)?;
-                children.push(Some(OpenedWorkerDirectory {
-                    directory: child,
-                    disposition: super::WorkerDirectoryNodeDisposition::Existing,
-                }));
-            }
-            Err(error) if error.kind() == io::ErrorKind::NotFound => {
-                children.push(None);
-            }
-            Err(error) => return Err(error),
-        }
-    }
-    for (index, child) in children.iter_mut().enumerate() {
-        if child.is_none() {
-            *child = Some(open_or_create_worker_directory_at(
-                &directory,
-                super::WorkerDirectoryLayout::child_names()[index].as_bytes(),
-                true,
-                expected_uid,
-                true,
-            )?);
-        }
-    }
+    let children = match staged_children {
+        Some(children) => children,
+        None => open_or_create_worker_children(&root_parent, &directory, expected_uid)?,
+    };
 
     if worker_directory_identity(&directory)? != root_identity {
         return Err(permission_denied(
@@ -215,6 +259,7 @@ pub(super) fn create_worker_directory_layout(
     }
     verify_worker_path_identity(layout.root(), root_identity)?;
     let mut child_observations = Vec::with_capacity(children.len());
+    let mut child_handles = Vec::with_capacity(children.len());
     for (name, child) in super::WorkerDirectoryLayout::child_names()
         .into_iter()
         .zip(children)
@@ -232,18 +277,55 @@ pub(super) fn create_worker_directory_layout(
             child.disposition,
             identity,
         ));
+        child_handles.push(child.directory);
     }
+    let [repos, jobs, cache, artifacts, logs] = child_handles
+        .try_into()
+        .unwrap_or_else(|_| unreachable!("the worker layout always has exactly five children"));
+    let lease = WorkerDirectoryLease {
+        _creation_lock: creation_lock,
+        nodes: [directory, repos, jobs, cache, artifacts, logs],
+        expected_uid,
+    };
     Ok(super::WorkerDirectoryCreation::new(
         root_observation,
         child_observations
             .try_into()
             .unwrap_or_else(|_| unreachable!("the worker layout always has exactly five children")),
+        lease,
     ))
 }
 
 struct OpenedWorkerDirectory {
     directory: std::fs::File,
     disposition: super::WorkerDirectoryNodeDisposition,
+}
+
+pub(super) struct WorkerDirectoryLease {
+    _creation_lock: std::fs::File,
+    nodes: [std::fs::File; 6],
+    expected_uid: u32,
+}
+
+pub(super) fn reverify_worker_directory_lease(
+    lease: &WorkerDirectoryLease,
+    observations: &[super::WorkerDirectoryNodeObservation; 6],
+) -> io::Result<()> {
+    for (directory, observation) in lease.nodes.iter().zip(observations) {
+        verify_worker_directory_security(directory, lease.expected_uid)?;
+        if worker_directory_identity(directory)? != observation.identity() {
+            return Err(permission_denied(
+                "retained worker directory identity changed before release",
+            ));
+        }
+        let reopened = open_existing_worker_path(observation.path())?;
+        if worker_directory_identity(&reopened)? != observation.identity() {
+            return Err(permission_denied(
+                "worker directory path changed before retained evidence release",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn absolute_worker_components(path: &Path) -> io::Result<Vec<&[u8]>> {
@@ -294,6 +376,7 @@ fn verify_worker_path_identity(
 }
 
 fn open_or_create_worker_directory_at(
+    staging_parent: &std::fs::File,
     parent: &std::fs::File,
     name: &[u8],
     may_create: bool,
@@ -311,31 +394,460 @@ fn open_or_create_worker_directory_at(
         Err(error) if error.kind() == io::ErrorKind::NotFound && may_create => {}
         Err(error) => return Err(error),
     }
-    let name = CString::new(name)
-        .map_err(|_| invalid_data("worker directory component contains a NUL byte"))?;
-    let created = if unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700) } == -1 {
-        let error = io::Error::last_os_error();
-        if error.kind() != io::ErrorKind::AlreadyExists {
-            return Err(worker_directory_open_error(error));
+    let staged =
+        create_unpublished_worker_directory(staging_parent, parent, name, expected_uid, false)?;
+    harden_new_worker_directory(&staged.directory, expected_uid)?;
+    publish_staged_worker_directory(
+        staging_parent,
+        staged,
+        parent,
+        name,
+        expected_uid,
+        expected_uid,
+        existing_must_be_canonical,
+    )
+}
+
+fn create_or_open_complete_worker_root(
+    root_parent: &std::fs::File,
+    root_name: &[u8],
+    expected_uid: u32,
+) -> io::Result<(
+    OpenedWorkerDirectory,
+    Option<Vec<Option<OpenedWorkerDirectory>>>,
+)> {
+    match open_worker_directory_at(root_parent, root_name) {
+        Ok(directory) => {
+            verify_worker_directory_security(&directory, expected_uid)?;
+            return Ok((
+                OpenedWorkerDirectory {
+                    directory,
+                    disposition: super::WorkerDirectoryNodeDisposition::Existing,
+                },
+                None,
+            ));
         }
-        false
-    } else {
-        true
-    };
-    let directory = open_worker_directory_at(parent, name.to_bytes())?;
-    if created {
-        harden_new_worker_directory(&directory, expected_uid)?;
-    } else {
-        verify_existing_worker_directory(&directory, expected_uid, existing_must_be_canonical)?;
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
     }
+
+    let staged = create_unpublished_worker_directory(
+        root_parent,
+        root_parent,
+        root_name,
+        expected_uid,
+        true,
+    )?;
+    let children =
+        match open_or_create_worker_children(&staged.directory, &staged.directory, expected_uid) {
+            Ok(children) => children,
+            Err(error) => {
+                return fail_after_staged_tree_cleanup(error, root_parent, &staged);
+            }
+        };
+    if let Err(error) = harden_new_worker_directory(&staged.directory, expected_uid) {
+        return fail_after_staged_tree_cleanup(error, root_parent, &staged);
+    }
+    let destination_name = CString::new(root_name)
+        .map_err(|_| invalid_data("worker directory component contains a NUL byte"))?;
+    if unsafe {
+        libc::renameatx_np(
+            root_parent.as_raw_fd(),
+            staged.name.as_ptr(),
+            root_parent.as_raw_fd(),
+            destination_name.as_ptr(),
+            libc::RENAME_EXCL,
+        )
+    } == 0
+    {
+        let reopened = open_worker_directory_at(root_parent, destination_name.to_bytes())?;
+        if worker_directory_identity(&reopened)? != staged.identity {
+            return Err(permission_denied(
+                "published worker root identity changed before verification",
+            ));
+        }
+        verify_worker_directory_security(&staged.directory, expected_uid)?;
+        let children = children
+            .into_iter()
+            .map(|child| {
+                child.map(|child| OpenedWorkerDirectory {
+                    directory: child.directory,
+                    disposition: super::WorkerDirectoryNodeDisposition::Created,
+                })
+            })
+            .collect();
+        return Ok((
+            OpenedWorkerDirectory {
+                directory: staged.directory,
+                disposition: super::WorkerDirectoryNodeDisposition::Created,
+            },
+            Some(children),
+        ));
+    }
+
+    let error = io::Error::last_os_error();
+    remove_known_staged_worker_tree(root_parent, &staged)?;
+    if error.kind() != io::ErrorKind::AlreadyExists {
+        return Err(error);
+    }
+    let directory = open_worker_directory_at(root_parent, destination_name.to_bytes())?;
+    verify_worker_directory_security(&directory, expected_uid)?;
+    Ok((
+        OpenedWorkerDirectory {
+            directory,
+            disposition: super::WorkerDirectoryNodeDisposition::Existing,
+        },
+        None,
+    ))
+}
+
+fn fail_after_staged_tree_cleanup<T>(
+    original: io::Error,
+    parent: &std::fs::File,
+    staged: &StagedWorkerDirectory,
+) -> io::Result<T> {
+    match remove_known_staged_worker_tree(parent, staged) {
+        Ok(()) => Err(original),
+        Err(cleanup) => Err(cleanup),
+    }
+}
+
+fn open_or_create_worker_children(
+    staging_parent: &std::fs::File,
+    root: &std::fs::File,
+    expected_uid: u32,
+) -> io::Result<Vec<Option<OpenedWorkerDirectory>>> {
+    let mut children = Vec::with_capacity(super::WorkerDirectoryLayout::child_names().len());
+    for name in super::WorkerDirectoryLayout::child_names() {
+        match open_worker_directory_at(root, name.as_bytes()) {
+            Ok(child) => {
+                verify_worker_directory_security(&child, expected_uid)?;
+                children.push(Some(OpenedWorkerDirectory {
+                    directory: child,
+                    disposition: super::WorkerDirectoryNodeDisposition::Existing,
+                }));
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => children.push(None),
+            Err(error) => return Err(error),
+        }
+    }
+    for (index, child) in children.iter_mut().enumerate() {
+        if child.is_none() {
+            *child = Some(open_or_create_worker_directory_at(
+                staging_parent,
+                root,
+                super::WorkerDirectoryLayout::child_names()[index].as_bytes(),
+                true,
+                expected_uid,
+                true,
+            )?);
+        }
+    }
+    Ok(children)
+}
+
+fn remove_known_staged_worker_tree(
+    parent: &std::fs::File,
+    staged: &StagedWorkerDirectory,
+) -> io::Result<()> {
+    for name in super::WorkerDirectoryLayout::child_names() {
+        let canonical =
+            CString::new(name).expect("canonical worker child names contain no NUL bytes");
+        remove_known_empty_staging_child(&staged.directory, &canonical)?;
+        let internal = worker_staging_name(&staged.directory, name.as_bytes())?;
+        remove_known_empty_staging_child(&staged.directory, &internal)?;
+    }
+    remove_exact_empty_staged_worker_directory(parent, staged)
+}
+
+fn remove_known_empty_staging_child(parent: &std::fs::File, name: &CString) -> io::Result<()> {
+    match open_worker_directory_at(parent, name.to_bytes()) {
+        Ok(child) => {
+            let expected = worker_directory_identity(&child)?;
+            if worker_directory_identity_at(parent, name)? != expected {
+                return Err(permission_denied(
+                    "worker staging child changed before private cleanup",
+                ));
+            }
+            if unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) }
+                == -1
+            {
+                return Err(io::Error::last_os_error());
+            }
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    Ok(())
+}
+
+struct StagedWorkerDirectory {
+    name: CString,
+    directory: std::fs::File,
+    identity: super::WorkerDirectoryIdentity,
+}
+
+fn create_unpublished_worker_directory(
+    staging_parent: &std::fs::File,
+    destination_parent: &std::fs::File,
+    destination_name: &[u8],
+    expected_uid: u32,
+    allow_canonical_children: bool,
+) -> io::Result<StagedWorkerDirectory> {
+    let name = worker_staging_name(destination_parent, destination_name)?;
+    let created =
+        if unsafe { libc::mkdirat(staging_parent.as_raw_fd(), name.as_ptr(), 0o700) } == -1 {
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::AlreadyExists {
+                return Err(worker_directory_open_error(error));
+            }
+            false
+        } else {
+            true
+        };
+    let identity_before_open = if created {
+        let identity = worker_directory_identity_at(staging_parent, &name)?;
+        #[cfg(test)]
+        POST_WORKER_MKDIR_HOOK.with(|slot| {
+            if let Some(hook) = slot.take() {
+                hook(staging_parent.as_raw_fd(), &name);
+            }
+        });
+        #[cfg(test)]
+        WORKER_MKDIR_INTERRUPT_AFTER.with(|slot| {
+            if let Some(remaining) = slot.get() {
+                if remaining == 0 {
+                    slot.set(None);
+                    panic!("injected worker staging interruption");
+                }
+                slot.set(Some(remaining - 1));
+            }
+        });
+        Some(identity)
+    } else {
+        None
+    };
+    let directory = open_worker_directory_at(staging_parent, name.to_bytes())?;
+    let identity = worker_directory_identity(&directory)?;
+    if identity_before_open.is_some_and(|expected| expected != identity) {
+        return Err(permission_denied(
+            "new worker staging directory was substituted before it was opened",
+        ));
+    }
+    let creator_uid = unsafe { libc::geteuid() };
+    if created {
+        harden_new_worker_directory(&directory, creator_uid)?;
+    } else {
+        // User scope deliberately does not claim containment against hostile same-UID code.
+        // The fixed name still lets an interrupted run retain and validate exact inode state.
+        verify_staged_worker_directory_security(&directory, creator_uid, expected_uid)?;
+        verify_staged_worker_directory_entries(&directory, allow_canonical_children)?;
+    }
+    Ok(StagedWorkerDirectory {
+        name,
+        directory,
+        identity,
+    })
+}
+
+fn worker_staging_name(
+    destination_parent: &std::fs::File,
+    destination_name: &[u8],
+) -> io::Result<CString> {
+    use std::fmt::Write;
+
+    let identity = worker_directory_identity(destination_parent)?;
+    let mut digest = Sha256::new();
+    digest.update(identity.volume.to_le_bytes());
+    digest.update(identity.file_id);
+    digest.update(destination_name);
+    let digest = digest.finalize();
+    let mut name = String::from(".styrn-worker-stage-");
+    for byte in &digest[..16] {
+        write!(&mut name, "{byte:02x}").expect("writing a staging digest cannot fail");
+    }
+    CString::new(name).map_err(|_| invalid_data("worker staging name contains a NUL byte"))
+}
+
+fn verify_staged_worker_directory_security(
+    directory: &std::fs::File,
+    creator_uid: u32,
+    expected_uid: u32,
+) -> io::Result<()> {
+    let status = worker_directory_status(directory)?;
+    if !matches!(status.st_uid, uid if uid == creator_uid || uid == expected_uid)
+        || status.st_mode & 0o777 != 0o700
+    {
+        return Err(permission_denied(
+            "reserved worker staging directory has ambiguous ownership or mode",
+        ));
+    }
+    verify_no_extended_acl_fd(directory.as_raw_fd())
+}
+
+fn verify_staged_worker_directory_entries(
+    directory: &std::fs::File,
+    allow_canonical_children: bool,
+) -> io::Result<()> {
+    let canonical_names = super::WorkerDirectoryLayout::child_names();
+    let internal_names = canonical_names
+        .iter()
+        .map(|child| worker_staging_name(directory, child.as_bytes()))
+        .collect::<io::Result<Vec<_>>>()?;
+    let mut canonical_seen = [false; 5];
+    let mut internal_seen = [false; 5];
+    let duplicate = unsafe { libc::fcntl(directory.as_raw_fd(), libc::F_DUPFD_CLOEXEC, 0) };
+    if duplicate == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    let stream = unsafe { libc::fdopendir(duplicate) };
+    if stream.is_null() {
+        unsafe { libc::close(duplicate) };
+        return Err(io::Error::last_os_error());
+    }
+    let stream = OwnedDirectoryStream(stream);
+    loop {
+        unsafe { *libc::__error() = 0 };
+        let entry = unsafe { libc::readdir(stream.0) };
+        if entry.is_null() {
+            let error = unsafe { *libc::__error() };
+            if error != 0 {
+                return Err(io::Error::from_raw_os_error(error));
+            }
+            break;
+        }
+        let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+        if matches!(name, b"." | b"..") {
+            continue;
+        }
+        let canonical = canonical_names
+            .iter()
+            .position(|allowed| allowed.as_bytes() == name);
+        let internal = internal_names
+            .iter()
+            .position(|allowed| allowed.as_bytes() == name);
+        let Some((index, staged)) = canonical
+            .map(|index| (index, false))
+            .or_else(|| internal.map(|index| (index, true)))
+        else {
+            return Err(permission_denied(
+                "reserved worker staging directory contains an unrelated entry",
+            ));
+        };
+        if !allow_canonical_children || canonical_seen[index] || internal_seen[index] {
+            return Err(permission_denied(
+                "reserved worker staging directory has an ambiguous child state",
+            ));
+        }
+        if staged {
+            internal_seen[index] = true;
+        } else {
+            canonical_seen[index] = true;
+        }
+    }
+    Ok(())
+}
+
+struct OwnedDirectoryStream(*mut libc::DIR);
+
+impl Drop for OwnedDirectoryStream {
+    fn drop(&mut self) {
+        unsafe { libc::closedir(self.0) };
+    }
+}
+
+fn publish_staged_worker_directory(
+    staging_parent: &std::fs::File,
+    staged: StagedWorkerDirectory,
+    destination_parent: &std::fs::File,
+    destination_name: &[u8],
+    created_expected_uid: u32,
+    existing_expected_uid: u32,
+    existing_must_be_canonical: bool,
+) -> io::Result<OpenedWorkerDirectory> {
+    let destination_name = CString::new(destination_name)
+        .map_err(|_| invalid_data("worker directory component contains a NUL byte"))?;
+    if unsafe {
+        libc::renameatx_np(
+            staging_parent.as_raw_fd(),
+            staged.name.as_ptr(),
+            destination_parent.as_raw_fd(),
+            destination_name.as_ptr(),
+            libc::RENAME_EXCL,
+        )
+    } == 0
+    {
+        let reopened = open_worker_directory_at(destination_parent, destination_name.to_bytes())?;
+        if worker_directory_identity(&reopened)? != staged.identity {
+            return Err(permission_denied(
+                "published worker directory identity changed before verification",
+            ));
+        }
+        verify_worker_directory_security(&staged.directory, created_expected_uid)?;
+        return Ok(OpenedWorkerDirectory {
+            directory: staged.directory,
+            disposition: super::WorkerDirectoryNodeDisposition::Created,
+        });
+    }
+    let error = io::Error::last_os_error();
+    if error.kind() != io::ErrorKind::AlreadyExists {
+        return Err(error);
+    }
+    remove_exact_empty_staged_worker_directory(staging_parent, &staged)?;
+    let directory = open_worker_directory_at(destination_parent, destination_name.to_bytes())?;
+    verify_existing_worker_directory(
+        &directory,
+        existing_expected_uid,
+        existing_must_be_canonical,
+    )?;
     Ok(OpenedWorkerDirectory {
         directory,
-        disposition: if created {
-            super::WorkerDirectoryNodeDisposition::Created
-        } else {
-            super::WorkerDirectoryNodeDisposition::Existing
-        },
+        disposition: super::WorkerDirectoryNodeDisposition::Existing,
     })
+}
+
+fn worker_directory_identity_at(
+    parent: &std::fs::File,
+    name: &std::ffi::CStr,
+) -> io::Result<super::WorkerDirectoryIdentity> {
+    let mut status = unsafe { std::mem::zeroed::<libc::stat>() };
+    if unsafe {
+        libc::fstatat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            &mut status,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } == -1
+    {
+        return Err(io::Error::last_os_error());
+    }
+    if status.st_mode & libc::S_IFMT != libc::S_IFDIR {
+        return Err(permission_denied(
+            "worker staging path is not a real directory",
+        ));
+    }
+    Ok(super::WorkerDirectoryIdentity::from_unix(
+        u64::try_from(status.st_dev)
+            .map_err(|_| invalid_data("worker directory device identity is invalid"))?,
+        status.st_ino,
+    ))
+}
+
+fn remove_exact_empty_staged_worker_directory(
+    parent: &std::fs::File,
+    staged: &StagedWorkerDirectory,
+) -> io::Result<()> {
+    if worker_directory_identity_at(parent, &staged.name)? != staged.identity {
+        return Err(permission_denied(
+            "worker staging directory changed before private cleanup",
+        ));
+    }
+    if unsafe { libc::unlinkat(parent.as_raw_fd(), staged.name.as_ptr(), libc::AT_REMOVEDIR) } == -1
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 fn verify_existing_worker_directory(
@@ -1667,6 +2179,138 @@ mod tests {
     }
 
     #[test]
+    fn post_mkdir_substitution_is_never_reported_as_a_created_worker_node() {
+        fn substitute(parent: i32, name: &std::ffi::CStr) {
+            let displaced = c".styrn-test-displaced";
+            assert_eq!(
+                unsafe { libc::renameat(parent, name.as_ptr(), parent, displaced.as_ptr()) },
+                0,
+                "{}",
+                io::Error::last_os_error()
+            );
+            assert_eq!(
+                unsafe { libc::mkdirat(parent, name.as_ptr(), 0o700) },
+                0,
+                "{}",
+                io::Error::last_os_error()
+            );
+        }
+
+        let principal = test_principal();
+        for scope in [
+            crate::platform::InstallationScope::User,
+            crate::platform::InstallationScope::System,
+        ] {
+            let parent = fs::canonicalize(std::env::temp_dir())
+                .unwrap()
+                .join(format!(
+                    "styrn-worker-post-mkdir-swap-{scope:?}-{}-{}",
+                    std::process::id(),
+                    uuid::Uuid::now_v7()
+                ));
+            fs::create_dir(&parent).unwrap();
+            let root = parent.join("root");
+            let layout =
+                crate::platform::resolve_worker_directory_layout(scope, &principal, Some(&root))
+                    .unwrap();
+            set_post_worker_mkdir_hook(substitute);
+
+            let error = create_worker_directory_layout(&layout).unwrap_err();
+
+            assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+            assert!(!root.exists());
+            fs::remove_dir_all(parent).unwrap();
+        }
+    }
+
+    #[test]
+    fn interrupted_deterministic_worker_staging_is_validated_and_resumed() {
+        let principal = test_principal();
+        let parent = fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!(
+                "styrn-worker-staging-resume-{}-{}",
+                std::process::id(),
+                uuid::Uuid::now_v7()
+            ));
+        fs::create_dir(&parent).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+        let root = parent.join("root");
+        let layout = crate::platform::resolve_worker_directory_layout(
+            crate::platform::InstallationScope::System,
+            &principal,
+            Some(&root),
+        )
+        .unwrap();
+
+        set_worker_mkdir_interrupt_after(Some(1));
+        let interrupted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            create_worker_directory_layout(&layout)
+        }));
+        set_worker_mkdir_interrupt_after(None);
+        assert!(interrupted.is_err());
+        assert!(!root.exists());
+
+        let creation = create_worker_directory_layout(&layout).unwrap();
+        assert!(creation.nodes().iter().all(
+            |node| node.disposition() == super::super::WorkerDirectoryNodeDisposition::Created
+        ));
+        creation.final_reverify().unwrap();
+        assert_eq!(
+            fs::read_dir(&parent)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<Vec<_>>(),
+            vec![std::ffi::OsString::from("root")]
+        );
+        assert_eq!(fs::read_dir(&root).unwrap().count(), 5);
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn ambiguous_interrupted_worker_staging_is_rejected_without_cleanup_or_adoption() {
+        let principal = test_principal();
+        let parent = fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!(
+                "styrn-worker-staging-ambiguous-{}-{}",
+                std::process::id(),
+                uuid::Uuid::now_v7()
+            ));
+        fs::create_dir(&parent).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+        let root = parent.join("root");
+        let layout = crate::platform::resolve_worker_directory_layout(
+            crate::platform::InstallationScope::System,
+            &principal,
+            Some(&root),
+        )
+        .unwrap();
+
+        set_worker_mkdir_interrupt_after(Some(0));
+        let interrupted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            create_worker_directory_layout(&layout)
+        }));
+        set_worker_mkdir_interrupt_after(None);
+        assert!(interrupted.is_err());
+        let staged = fs::read_dir(&parent)
+            .unwrap()
+            .next()
+            .unwrap()
+            .unwrap()
+            .path();
+        let unrelated = staged.join("operator-entry");
+        fs::create_dir(&unrelated).unwrap();
+
+        let error = create_worker_directory_layout(&layout).unwrap_err();
+
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(!root.exists());
+        assert!(unrelated.is_dir());
+        fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
     fn existing_acl_bearing_canonical_worker_root_is_rejected_without_rewrite() {
         let principal = test_principal();
         let parent = fs::canonicalize(std::env::temp_dir())
@@ -1712,6 +2356,7 @@ mod tests {
         seed_current_user_acl(&profile, ACL_EXTENDED_ALLOW);
         let root = profile.join("Library/Application Support/Styrn");
         let layout = crate::platform::WorkerDirectoryLayout::new(
+            crate::platform::InstallationScope::User,
             root,
             crate::platform::WorkerRootCreationPolicy::CreateMissingFrom(profile.clone()),
             principal,
@@ -1752,6 +2397,7 @@ mod tests {
         fs::remove_dir(&inheritance_probe).unwrap();
         let root = profile.join("Library/Application Support/Styrn");
         let layout = crate::platform::WorkerDirectoryLayout::new(
+            crate::platform::InstallationScope::User,
             root.clone(),
             crate::platform::WorkerRootCreationPolicy::CreateMissingFrom(profile.clone()),
             principal,
