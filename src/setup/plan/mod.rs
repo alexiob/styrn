@@ -30,7 +30,11 @@ mod hostile_pending_projection;
 #[path = "hostile_completed_execution_construct.rs"]
 mod hostile_completed_execution_construct;
 
-#[cfg(plan_completed_execution_mutate_fixture)]
+#[cfg(any(
+    plan_completed_execution_mutate_fixture,
+    plan_completed_execution_clone_fixture,
+    plan_completed_execution_serialize_fixture
+))]
 #[path = "hostile_completed_execution_mutate.rs"]
 mod hostile_completed_execution_mutate;
 

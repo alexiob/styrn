@@ -829,6 +829,52 @@ fn pending_append_candidate_preserves_the_publication_checkpoint_prefix() {
 }
 
 #[test]
+fn execution_witness_binding_compares_scope_principal_and_normalized_path() {
+    let fixture = ReceiptFixture::new("execution-witness-binding");
+    let principal = fixture_worker_principal();
+    #[cfg(unix)]
+    let other_principal = crate::platform::WorkerPrincipal::new(
+        crate::platform::PrincipalKind::UnixUid,
+        if principal.principal_id() == "1" {
+            "2"
+        } else {
+            "1"
+        },
+        "other-worker",
+    )
+    .unwrap();
+    #[cfg(windows)]
+    let other_principal = crate::platform::WorkerPrincipal::new(
+        crate::platform::PrincipalKind::WindowsSid,
+        "S-1-5-18",
+        "other-worker",
+    )
+    .unwrap();
+    let base = ReceiptExecutionWitness {
+        installation_scope: InstallationScope::System,
+        worker_principal: principal,
+        receipt_path: normalized_path_text(fixture.receipt_path()).unwrap(),
+        receipt_entry_count: 1,
+        pending_publication_count: 2,
+        effective_receipt_sha256: Sha256Digest(
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
+        ),
+    };
+    let reopened = base.clone();
+    let mut cross_scope = base.clone();
+    cross_scope.installation_scope = InstallationScope::User;
+    let mut cross_principal = base.clone();
+    cross_principal.worker_principal = other_principal;
+    let mut cross_path = base.clone();
+    cross_path.receipt_path = normalized_path_text(&fixture.root.join("other.json")).unwrap();
+
+    assert!(base == reopened);
+    assert!(base != cross_scope);
+    assert!(base != cross_principal);
+    assert!(base != cross_path);
+}
+
+#[test]
 fn secure_store_atomically_appends_and_reads_one_complete_entry() {
     let fixture = ReceiptFixture::new("first-append");
     let store = ReceiptStore::new_for_test(fixture.receipt_path());

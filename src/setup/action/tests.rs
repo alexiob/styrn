@@ -3,7 +3,7 @@ use super::{
     ApplyOutcome, HumanInstructions, NeedsHuman, PendingSeverity, Privilege, ScriptFragment,
     TestMetrics,
 };
-use crate::setup::receipt::{ReceiptMetadataSource, ReceiptStore};
+use crate::setup::receipt::{ReceiptMetadataSource, ReceiptStore, ReceiptStoreError};
 use chrono::{TimeZone, Utc};
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
@@ -525,7 +525,7 @@ fn needs_human_journals_each_current_occurrence_once_and_recurrence_after_witnes
 
     let timestamp = Utc.with_ymd_and_hms(2026, 9, 2, 10, 0, 2).unwrap();
     let default_outcome = crate::setup::pending::PendingPolicy::default()
-        .evaluate(timestamp, report.pending())
+        .evaluate(timestamp, report.completion())
         .unwrap();
     assert_eq!(default_outcome.exit_code().as_i32(), 0);
     let default_json = serde_json::from_str::<serde_json::Value>(
@@ -542,7 +542,7 @@ fn needs_human_journals_each_current_occurrence_once_and_recurrence_after_witnes
     assert_eq!(default_json["data"]["pending"][0]["severity"], "info");
 
     let strict_outcome = crate::setup::pending::PendingPolicy::new(true)
-        .evaluate(timestamp, report.pending())
+        .evaluate(timestamp, report.completion())
         .unwrap();
     assert_eq!(strict_outcome.exit_code().as_i32(), 13);
     let strict_json = serde_json::from_str::<serde_json::Value>(
@@ -564,7 +564,7 @@ fn needs_human_journals_each_current_occurrence_once_and_recurrence_after_witnes
     assert!(!strict_json.to_string().contains("applied"));
 
     let mut human = Vec::new();
-    crate::setup::pending::render_human(&mut human, report.pending()).unwrap();
+    crate::setup::pending::render_human(&mut human, report.completion()).unwrap();
     let human = String::from_utf8(human).unwrap();
     assert_eq!(
         human
@@ -628,7 +628,7 @@ fn needs_human_journals_each_current_occurrence_once_and_recurrence_after_witnes
     assert_eq!(fs::read(&manifest_path).unwrap(), first_manifest);
     let rerun_default_json = crate::output::to_json(
         crate::setup::pending::PendingPolicy::default()
-            .evaluate(timestamp, rerun.pending())
+            .evaluate(timestamp, rerun.completion())
             .unwrap()
             .envelope(),
     )
@@ -639,7 +639,7 @@ fn needs_human_journals_each_current_occurrence_once_and_recurrence_after_witnes
     );
     let rerun_strict_json = crate::output::to_json(
         crate::setup::pending::PendingPolicy::new(true)
-            .evaluate(timestamp, rerun.pending())
+            .evaluate(timestamp, rerun.completion())
             .unwrap()
             .envelope(),
     )
@@ -753,6 +753,531 @@ fn needs_human_journals_each_current_occurrence_once_and_recurrence_after_witnes
     assert_eq!(recurring_metrics.mutation_calls(), 0);
     assert_eq!(first_metrics.mutation_calls(), 0);
     assert_eq!(second_metrics.mutation_calls(), 0);
+}
+
+#[test]
+fn unresolved_rerun_token_reuses_the_exact_current_pending_entry_id() {
+    let fixture = JournalFixture::new("pending-exact-rerun-occurrence");
+    let store = ReceiptStore::new_for_test(fixture.receipt_path());
+    let state = Arc::new(Mutex::new(Vec::new()));
+    let mut plan = vec![
+        Action::test_named_needs_human(
+            "test.local-approval",
+            Privilege::None,
+            state,
+            NeedsHuman::new(
+                HumanInstructions::new("Complete the local approval, then rerun setup.").unwrap(),
+                None,
+            ),
+        )
+        .0,
+    ];
+    let mut metadata = ReceiptMetadataSource::for_test([(
+        "019cafd0-5c00-7000-8000-000000000111",
+        "2026-09-02T10:20:00Z",
+    )]);
+
+    let first = apply_plan_with_journal(&mut plan, &store, &mut metadata).unwrap();
+    let rerun =
+        apply_plan_with_journal(&mut plan, &store, &mut ReceiptMetadataSource::for_test([]))
+            .unwrap();
+
+    assert!(first.completion().occurrences() == rerun.completion().occurrences());
+    let receipt: serde_json::Value =
+        serde_json::from_slice(&store.read_snapshot().unwrap().to_json().unwrap()).unwrap();
+    assert_eq!(receipt["entries"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        receipt["entries"][0]["entry_id"],
+        "019cafd0-5c00-7000-8000-000000000111"
+    );
+}
+
+#[test]
+fn empty_completed_execution_can_publish_a_resolution_epoch() {
+    let fixture = JournalFixture::new("pending-empty-completion-epoch");
+    let store = ReceiptStore::new_for_test(fixture.receipt_path());
+    let manifest_path = fixture.root.join("machine.toml");
+    let manifest_store = crate::manifest::MachineManifestStore::new_for_test(&manifest_path);
+    let mut plan = vec![
+        Action::test_named_needs_human(
+            "test.local-approval",
+            Privilege::None,
+            Arc::new(Mutex::new(Vec::new())),
+            NeedsHuman::new(
+                HumanInstructions::new("Complete the local approval, then rerun setup.").unwrap(),
+                None,
+            ),
+        )
+        .0,
+    ];
+    let pending = apply_plan_with_journal(
+        &mut plan,
+        &store,
+        &mut ReceiptMetadataSource::for_test([(
+            "019cafd0-5c00-7000-8000-000000000112",
+            "2026-09-02T10:20:01Z",
+        )]),
+    )
+    .unwrap();
+    let mut draft = pending_manifest_draft();
+    crate::setup::pending::publish_manifest(
+        &manifest_store,
+        &store,
+        &mut draft,
+        pending.completion(),
+        &mut ReceiptMetadataSource::for_test([(
+            "019cafd0-5c00-7000-8000-000000000113",
+            "2026-09-02T10:20:02Z",
+        )]),
+    )
+    .unwrap();
+    let receipt_before = store.read_snapshot().unwrap().to_json().unwrap();
+
+    let cleared =
+        apply_plan_with_journal(&mut [], &store, &mut ReceiptMetadataSource::for_test([])).unwrap();
+    assert!(cleared.completion().occurrences().is_empty());
+    crate::setup::pending::publish_manifest(
+        &manifest_store,
+        &store,
+        &mut draft,
+        cleared.completion(),
+        &mut ReceiptMetadataSource::for_test([(
+            "019cafd0-5c00-7000-8000-000000000114",
+            "2026-09-02T10:20:03Z",
+        )]),
+    )
+    .unwrap();
+
+    let before: serde_json::Value = serde_json::from_slice(&receipt_before).unwrap();
+    let after: serde_json::Value =
+        serde_json::from_slice(&store.read_snapshot().unwrap().to_json().unwrap()).unwrap();
+    assert_eq!(after["entries"], before["entries"]);
+    assert_eq!(after["pending_publications"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        after["pending_publications"][1]["pending"],
+        serde_json::json!([])
+    );
+    assert!(manifest_store
+        .read()
+        .unwrap()
+        .manifest
+        .pending_actions
+        .is_none());
+}
+
+#[test]
+fn completion_witness_treats_a_verified_prepared_publication_as_effective() {
+    let fixture = JournalFixture::new("pending-completion-effective-intent");
+    let store = ReceiptStore::new_for_test(fixture.receipt_path());
+    let manifest_path = fixture.root.join("machine.toml");
+    let mut plan = vec![
+        Action::test_named_needs_human(
+            "test.local-approval",
+            Privilege::None,
+            Arc::new(Mutex::new(Vec::new())),
+            NeedsHuman::new(
+                HumanInstructions::new("Complete the local approval, then rerun setup.").unwrap(),
+                None,
+            ),
+        )
+        .0,
+    ];
+    let first = apply_plan_with_journal(
+        &mut plan,
+        &store,
+        &mut ReceiptMetadataSource::for_test([(
+            "019cafd0-5c00-7000-8000-000000000115",
+            "2026-09-02T10:20:04Z",
+        )]),
+    )
+    .unwrap();
+    let mut draft = pending_manifest_draft();
+    crate::setup::pending::publish_manifest(
+        &crate::manifest::MachineManifestStore::new_with_failing_publication_replace(
+            &manifest_path,
+        ),
+        &store,
+        &mut draft,
+        first.completion(),
+        &mut ReceiptMetadataSource::for_test([(
+            "019cafd0-5c00-7000-8000-000000000116",
+            "2026-09-02T10:20:05Z",
+        )]),
+    )
+    .unwrap_err();
+    assert!(fixture.pending_publication_intent_path().exists());
+
+    let rerun =
+        apply_plan_with_journal(&mut plan, &store, &mut ReceiptMetadataSource::for_test([]))
+            .unwrap();
+    let _ = rerun.completion().receipt_witness();
+    assert!(first.completion().occurrences() == rerun.completion().occurrences());
+    crate::setup::pending::publish_manifest(
+        &crate::manifest::MachineManifestStore::new_for_test(&manifest_path),
+        &store,
+        &mut draft,
+        rerun.completion(),
+        &mut ReceiptMetadataSource::for_test([]),
+    )
+    .unwrap();
+
+    assert!(!fixture.pending_publication_intent_path().exists());
+    assert_eq!(store.read_snapshot().unwrap().entry_count(), 1);
+}
+
+#[test]
+fn completed_execution_rejects_an_equivalent_action_in_a_different_receipt_store() {
+    let first_fixture = JournalFixture::new("completed-cross-store-first");
+    let second_fixture = JournalFixture::new("completed-cross-store-second");
+    let first_store = ReceiptStore::new_for_test(first_fixture.receipt_path());
+    let second_store = ReceiptStore::new_for_test(second_fixture.receipt_path());
+    let needs_human = NeedsHuman::new(
+        HumanInstructions::new("Complete the local approval, then rerun setup.").unwrap(),
+        None,
+    );
+    let mut first_plan = vec![
+        Action::test_named_needs_human(
+            "test.local-approval",
+            Privilege::None,
+            Arc::new(Mutex::new(Vec::new())),
+            needs_human.clone(),
+        )
+        .0,
+    ];
+    let mut second_plan = vec![
+        Action::test_named_needs_human(
+            "test.local-approval",
+            Privilege::None,
+            Arc::new(Mutex::new(Vec::new())),
+            needs_human,
+        )
+        .0,
+    ];
+    let first = apply_plan_with_journal(
+        &mut first_plan,
+        &first_store,
+        &mut ReceiptMetadataSource::for_test([(
+            "019cafd0-5c00-7000-8000-000000000121",
+            "2026-09-02T10:21:00Z",
+        )]),
+    )
+    .unwrap();
+    let second = apply_plan_with_journal(
+        &mut second_plan,
+        &second_store,
+        &mut ReceiptMetadataSource::for_test([(
+            "019cafd0-5c00-7000-8000-000000000122",
+            "2026-09-02T10:21:01Z",
+        )]),
+    )
+    .unwrap();
+    let manifest_path = second_fixture.root.join("machine.toml");
+    let manifest_store = crate::manifest::MachineManifestStore::new_for_test(&manifest_path);
+    let mut draft = pending_manifest_draft();
+    let receipt_before = fs::read(second_fixture.receipt_path()).unwrap();
+    let mut publication_metadata = ReceiptMetadataSource::for_test([(
+        "019cafd0-5c00-7000-8000-000000000123",
+        "2026-09-02T10:21:02Z",
+    )]);
+
+    let error = crate::setup::pending::publish_manifest(
+        &manifest_store,
+        &second_store,
+        &mut draft,
+        first.completion(),
+        &mut publication_metadata,
+    )
+    .unwrap_err();
+
+    assert!(
+        matches!(
+            &error,
+            crate::setup::pending::PendingError::Receipt(ReceiptStoreError::IntentConflict)
+        ),
+        "{error:?}"
+    );
+    assert_eq!(error.error_code(), "setup.receipt_conflict");
+    assert_eq!(error.exit_code().as_i32(), 13);
+    assert!(draft.pending_actions.is_none());
+    assert_eq!(
+        fs::read(second_fixture.receipt_path()).unwrap(),
+        receipt_before
+    );
+    assert!(!manifest_path.exists());
+
+    crate::setup::pending::publish_manifest(
+        &manifest_store,
+        &second_store,
+        &mut draft,
+        second.completion(),
+        &mut publication_metadata,
+    )
+    .unwrap();
+    let receipt: serde_json::Value =
+        serde_json::from_slice(&second_store.read_snapshot().unwrap().to_json().unwrap()).unwrap();
+    assert_eq!(
+        receipt["pending_publications"][0]["publication_id"],
+        "019cafd0-5c00-7000-8000-000000000123"
+    );
+}
+
+#[test]
+fn completed_execution_rejects_cross_scope_and_principal_bindings() {
+    let fixture = JournalFixture::new("completed-cross-scope");
+    crate::platform::harden_manifest_directory(
+        &fixture.root,
+        crate::platform::ManifestOwner::User,
+        &crate::platform::resolve_current_worker_principal().unwrap(),
+    )
+    .unwrap();
+    crate::platform::harden_manifest_directory(
+        fixture.receipt_path().parent().unwrap(),
+        crate::platform::ManifestOwner::User,
+        &crate::platform::resolve_current_worker_principal().unwrap(),
+    )
+    .unwrap();
+    let store = ReceiptStore::new_user_for_test(fixture.receipt_path());
+    let mut plan = vec![
+        Action::test_named_needs_human(
+            "test.local-approval",
+            Privilege::None,
+            Arc::new(Mutex::new(Vec::new())),
+            NeedsHuman::new(
+                HumanInstructions::new("Complete the local approval, then rerun setup.").unwrap(),
+                None,
+            ),
+        )
+        .0,
+    ];
+    let report = apply_plan_with_journal(
+        &mut plan,
+        &store,
+        &mut ReceiptMetadataSource::for_test([(
+            "019cafd0-5c00-7000-8000-000000000124",
+            "2026-09-02T10:21:03Z",
+        )]),
+    )
+    .unwrap();
+    let manifest_path = fixture.root.join("machine.toml");
+    let manifest_store = crate::manifest::MachineManifestStore::new_for_test(&manifest_path);
+    let mut draft = pending_manifest_draft();
+    let receipt_before = fs::read(fixture.receipt_path()).unwrap();
+
+    let error = crate::setup::pending::publish_manifest(
+        &manifest_store,
+        &store,
+        &mut draft,
+        report.completion(),
+        &mut ReceiptMetadataSource::for_test([]),
+    )
+    .unwrap_err();
+
+    assert!(matches!(
+        &error,
+        crate::setup::pending::PendingError::Receipt(ReceiptStoreError::IntentConflict)
+    ));
+    assert_eq!(error.error_code(), "setup.receipt_conflict");
+    assert_eq!(error.exit_code().as_i32(), 13);
+    assert!(draft.pending_actions.is_none());
+    assert_eq!(fs::read(fixture.receipt_path()).unwrap(), receipt_before);
+    assert!(!manifest_path.exists());
+}
+
+#[test]
+fn stale_completed_execution_cannot_publish_after_a_resolved_then_recurring_occurrence() {
+    let fixture = JournalFixture::new("completed-stale-recurrence");
+    let store = ReceiptStore::new_for_test(fixture.receipt_path());
+    let manifest_path = fixture.root.join("machine.toml");
+    let manifest_store = crate::manifest::MachineManifestStore::new_for_test(&manifest_path);
+    let needs_human = NeedsHuman::new(
+        HumanInstructions::new("Complete the local approval, then rerun setup.").unwrap(),
+        None,
+    );
+    let mut initial_plan = vec![
+        Action::test_named_needs_human(
+            "test.local-approval",
+            Privilege::None,
+            Arc::new(Mutex::new(Vec::new())),
+            needs_human.clone(),
+        )
+        .0,
+    ];
+    let initial = apply_plan_with_journal(
+        &mut initial_plan,
+        &store,
+        &mut ReceiptMetadataSource::for_test([(
+            "019cafd0-5c00-7000-8000-000000000125",
+            "2026-09-02T10:21:04Z",
+        )]),
+    )
+    .unwrap();
+    let mut draft = pending_manifest_draft();
+    crate::setup::pending::publish_manifest(
+        &manifest_store,
+        &store,
+        &mut draft,
+        initial.completion(),
+        &mut ReceiptMetadataSource::for_test([(
+            "019cafd0-5c00-7000-8000-000000000126",
+            "2026-09-02T10:21:05Z",
+        )]),
+    )
+    .unwrap();
+    let cleared =
+        apply_plan_with_journal(&mut [], &store, &mut ReceiptMetadataSource::for_test([])).unwrap();
+    crate::setup::pending::publish_manifest(
+        &manifest_store,
+        &store,
+        &mut draft,
+        cleared.completion(),
+        &mut ReceiptMetadataSource::for_test([(
+            "019cafd0-5c00-7000-8000-000000000127",
+            "2026-09-02T10:21:06Z",
+        )]),
+    )
+    .unwrap();
+    let mut recurrence_plan = vec![
+        Action::test_named_needs_human(
+            "test.local-approval",
+            Privilege::None,
+            Arc::new(Mutex::new(Vec::new())),
+            needs_human,
+        )
+        .0,
+    ];
+    let recurrence = apply_plan_with_journal(
+        &mut recurrence_plan,
+        &store,
+        &mut ReceiptMetadataSource::for_test([(
+            "019cafd0-5c00-7000-8000-000000000128",
+            "2026-09-02T10:21:07Z",
+        )]),
+    )
+    .unwrap();
+    let receipt_before = fs::read(fixture.receipt_path()).unwrap();
+    let manifest_before = fs::read(&manifest_path).unwrap();
+    let mut publication_metadata = ReceiptMetadataSource::for_test([(
+        "019cafd0-5c00-7000-8000-000000000129",
+        "2026-09-02T10:21:08Z",
+    )]);
+
+    let error = crate::setup::pending::publish_manifest(
+        &manifest_store,
+        &store,
+        &mut draft,
+        initial.completion(),
+        &mut publication_metadata,
+    )
+    .unwrap_err();
+
+    assert!(matches!(
+        &error,
+        crate::setup::pending::PendingError::Receipt(ReceiptStoreError::IntentConflict)
+    ));
+    assert_eq!(error.error_code(), "setup.receipt_conflict");
+    assert_eq!(error.exit_code().as_i32(), 13);
+    assert!(draft.pending_actions.is_none());
+    assert_eq!(fs::read(fixture.receipt_path()).unwrap(), receipt_before);
+    assert_eq!(fs::read(&manifest_path).unwrap(), manifest_before);
+
+    crate::setup::pending::publish_manifest(
+        &manifest_store,
+        &store,
+        &mut draft,
+        recurrence.completion(),
+        &mut publication_metadata,
+    )
+    .unwrap();
+    let receipt: serde_json::Value =
+        serde_json::from_slice(&store.read_snapshot().unwrap().to_json().unwrap()).unwrap();
+    assert_eq!(
+        receipt["pending_publications"][2]["publication_id"],
+        "019cafd0-5c00-7000-8000-000000000129"
+    );
+    assert_eq!(
+        receipt["pending_publications"][2]["pending"][0]["entry_id"],
+        "019cafd0-5c00-7000-8000-000000000128"
+    );
+}
+
+#[test]
+fn completed_execution_rejects_a_missing_durable_occurrence() {
+    let fixture = JournalFixture::new("completed-missing-occurrence");
+    let store = ReceiptStore::new_for_test(fixture.receipt_path());
+    let mut plan = vec![
+        Action::test_named_needs_human(
+            "test.local-approval",
+            Privilege::None,
+            Arc::new(Mutex::new(Vec::new())),
+            NeedsHuman::new(
+                HumanInstructions::new("Complete the local approval, then rerun setup.").unwrap(),
+                None,
+            ),
+        )
+        .0,
+    ];
+    let report = apply_plan_with_journal(
+        &mut plan,
+        &store,
+        &mut ReceiptMetadataSource::for_test([(
+            "019cafd0-5c00-7000-8000-000000000130",
+            "2026-09-02T10:21:09Z",
+        )]),
+    )
+    .unwrap();
+    let original_receipt = fs::read(fixture.receipt_path()).unwrap();
+    let empty_fixture = JournalFixture::new("completed-empty-replacement");
+    let empty = ReceiptStore::new_for_test(empty_fixture.receipt_path())
+        .read_snapshot()
+        .unwrap()
+        .to_json()
+        .unwrap();
+    fs::write(fixture.receipt_path(), &empty).unwrap();
+    let manifest_path = fixture.root.join("machine.toml");
+    let manifest_store = crate::manifest::MachineManifestStore::new_for_test(&manifest_path);
+    let mut draft = pending_manifest_draft();
+    let mut publication_metadata = ReceiptMetadataSource::for_test([(
+        "019cafd0-5c00-7000-8000-000000000131",
+        "2026-09-02T10:21:10Z",
+    )]);
+
+    let error = crate::setup::pending::publish_manifest(
+        &manifest_store,
+        &store,
+        &mut draft,
+        report.completion(),
+        &mut publication_metadata,
+    )
+    .unwrap_err();
+
+    assert!(
+        matches!(
+            &error,
+            crate::setup::pending::PendingError::Receipt(ReceiptStoreError::IntentConflict)
+        ),
+        "{error:?}"
+    );
+    assert_eq!(error.error_code(), "setup.receipt_conflict");
+    assert_eq!(error.exit_code().as_i32(), 13);
+    assert!(draft.pending_actions.is_none());
+    assert_eq!(fs::read(fixture.receipt_path()).unwrap(), empty);
+    assert!(!manifest_path.exists());
+
+    fs::write(fixture.receipt_path(), original_receipt).unwrap();
+    crate::setup::pending::publish_manifest(
+        &manifest_store,
+        &store,
+        &mut draft,
+        report.completion(),
+        &mut publication_metadata,
+    )
+    .unwrap();
+    let receipt: serde_json::Value =
+        serde_json::from_slice(&store.read_snapshot().unwrap().to_json().unwrap()).unwrap();
+    assert_eq!(
+        receipt["pending_publications"][0]["publication_id"],
+        "019cafd0-5c00-7000-8000-000000000131"
+    );
 }
 
 #[test]
@@ -1000,11 +1525,18 @@ fn manifest_parent_sync_precedes_checkpoint_and_exact_after_recovery_resyncs_wit
         serde_json::from_slice(&receipt_store.read_snapshot().unwrap().to_json().unwrap()).unwrap();
     assert!(receipt_after_sync_failure["pending_publications"].is_null());
 
+    let recovery = apply_plan_with_journal(
+        &mut plan,
+        &receipt_store,
+        &mut ReceiptMetadataSource::for_test([]),
+    )
+    .unwrap();
+
     let recovery_error = crate::setup::pending::publish_manifest(
         &failing_sync,
         &receipt_store,
         &mut draft,
-        report.completion(),
+        recovery.completion(),
         &mut ReceiptMetadataSource::for_test([]),
     )
     .unwrap_err();
@@ -1023,7 +1555,7 @@ fn manifest_parent_sync_precedes_checkpoint_and_exact_after_recovery_resyncs_wit
         ),
         &receipt_store,
         &mut draft,
-        report.completion(),
+        recovery.completion(),
         &mut ReceiptMetadataSource::for_test([]),
     )
     .unwrap();
@@ -1414,6 +1946,12 @@ fn unix_pending_publication_recovery_removes_only_the_bound_orphan_temporary_lin
     .unwrap_err();
 
     assert_eq!(error.error_code(), "setup.receipt_conflict");
+    let repair = apply_plan_with_journal(
+        &mut plan,
+        &receipt_store,
+        &mut ReceiptMetadataSource::for_test([]),
+    )
+    .unwrap();
     let intent_path = fixture.pending_publication_intent_path();
     let temporary_path = fixture.pending_publication_temporary_path(publication_id);
     // Reproduce the exact Unix power-loss state after the final link's
@@ -1435,7 +1973,7 @@ fn unix_pending_publication_recovery_removes_only_the_bound_orphan_temporary_lin
         &crate::manifest::MachineManifestStore::new_for_test(&manifest_path),
         &receipt_store,
         &mut draft,
-        report.completion(),
+        repair.completion(),
         &mut ReceiptMetadataSource::for_test([]),
     )
     .unwrap_err();
@@ -1454,7 +1992,7 @@ fn unix_pending_publication_recovery_removes_only_the_bound_orphan_temporary_lin
         &crate::manifest::MachineManifestStore::new_for_test(&manifest_path),
         &receipt_store,
         &mut draft,
-        report.completion(),
+        repair.completion(),
         &mut ReceiptMetadataSource::for_test([]),
     )
     .unwrap();
@@ -1719,11 +2257,18 @@ fn applied_append_preserves_a_prepared_publication_prefix_until_recovery() {
     )
     .unwrap();
 
+    let recovery = apply_plan_with_journal(
+        &mut pending_plan,
+        &receipt_store,
+        &mut ReceiptMetadataSource::for_test([]),
+    )
+    .unwrap();
+
     crate::setup::pending::publish_manifest(
         &manifest_store,
         &receipt_store,
         &mut draft,
-        pending.completion(),
+        recovery.completion(),
         &mut ReceiptMetadataSource::for_test([]),
     )
     .unwrap();
@@ -1739,7 +2284,7 @@ fn applied_append_preserves_a_prepared_publication_prefix_until_recovery() {
 }
 
 #[test]
-fn concurrent_pending_publications_select_one_occurrence_checkpoint() {
+fn concurrent_publication_of_one_token_allows_one_checkpoint_and_rejects_stale_reuse() {
     let fixture = JournalFixture::new("pending-publication-race");
     let receipt_path = fixture.receipt_path().to_path_buf();
     let receipt_store = ReceiptStore::new_for_test(&receipt_path);
@@ -1763,13 +2308,14 @@ fn concurrent_pending_publications_select_one_occurrence_checkpoint() {
     let report = apply_plan_with_journal(&mut plan, &receipt_store, &mut entry_metadata).unwrap();
     let barrier = Arc::new(std::sync::Barrier::new(2));
 
-    std::thread::scope(|scope| {
+    let results = std::thread::scope(|scope| {
+        let mut handles = Vec::new();
         for sequence in 32..=33 {
             let barrier = Arc::clone(&barrier);
             let receipt_path = receipt_path.clone();
             let manifest_path = manifest_path.clone();
             let completed = report.completion();
-            scope.spawn(move || {
+            handles.push(scope.spawn(move || {
                 let mut draft = pending_manifest_draft();
                 let checkpoint = if sequence == 32 {
                     (
@@ -1791,10 +2337,29 @@ fn concurrent_pending_publications_select_one_occurrence_checkpoint() {
                     completed,
                     &mut metadata,
                 )
-                .unwrap();
-            });
+            }));
         }
+        handles
+            .into_iter()
+            .map(|handle| handle.join().unwrap())
+            .collect::<Vec<_>>()
     });
+
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    assert_eq!(
+        results
+            .iter()
+            .filter(|result| {
+                matches!(
+                    result,
+                    Err(crate::setup::pending::PendingError::Receipt(
+                        ReceiptStoreError::IntentConflict
+                    ))
+                )
+            })
+            .count(),
+        1
+    );
 
     let receipt: serde_json::Value =
         serde_json::from_slice(&receipt_store.read_snapshot().unwrap().to_json().unwrap()).unwrap();
@@ -1833,8 +2398,13 @@ fn pending_projection_rejects_duplicate_ids_without_partial_state_and_empty_poli
     assert_eq!(error.exit_code().as_i32(), 13);
     assert!(draft.pending_actions.is_none());
 
+    let empty =
+        apply_plan_with_journal(&mut [], &store, &mut ReceiptMetadataSource::for_test([])).unwrap();
     let outcome = crate::setup::pending::PendingPolicy::default()
-        .evaluate(Utc.with_ymd_and_hms(2026, 9, 2, 10, 3, 1).unwrap(), &[])
+        .evaluate(
+            Utc.with_ymd_and_hms(2026, 9, 2, 10, 3, 1).unwrap(),
+            empty.completion(),
+        )
         .unwrap();
     assert_eq!(outcome.exit_code().as_i32(), 0);
     let json: serde_json::Value =
@@ -2685,7 +3255,7 @@ fn setup_plan_cannot_construct_a_completed_execution_token() {
         &["plan_completed_execution_construct_fixture"],
         FixtureExpectation::new(
             "E0451",
-            "field `pending` of struct `CompletedExecutionToken` is private",
+            "fields `pending`, `occurrences` and `receipt` of struct `CompletedExecutionToken` are private",
             3,
             Some("private field"),
             "hostile_completed_execution_construct.rs",
@@ -2701,8 +3271,38 @@ fn setup_plan_cannot_modify_a_completed_execution_token() {
         FixtureExpectation::new(
             "E0616",
             "field `pending` of struct `CompletedExecutionToken` is private",
-            2,
+            3,
             Some("private field"),
+            "hostile_completed_execution_mutate.rs",
+        ),
+    );
+}
+
+#[test]
+fn setup_plan_cannot_clone_a_completed_execution_token() {
+    assert_fixture_fails_with_cfg(
+        "pending_publication_forge.rs",
+        &["plan_completed_execution_clone_fixture"],
+        FixtureExpectation::new(
+            "E0599",
+            "no method named `clone` found for struct `CompletedExecutionToken` in the current scope",
+            8,
+            Some("method not found in `CompletedExecutionToken`"),
+            "hostile_completed_execution_mutate.rs",
+        ),
+    );
+}
+
+#[test]
+fn setup_plan_cannot_serialize_a_completed_execution_token() {
+    assert_fixture_fails_with_cfg(
+        "pending_publication_forge.rs",
+        &["plan_completed_execution_serialize_fixture"],
+        FixtureExpectation::new(
+            "E0277",
+            "the trait bound `CompletedExecutionToken: serde::Serialize` is not satisfied",
+            13,
+            Some("unsatisfied trait bound"),
             "hostile_completed_execution_mutate.rs",
         ),
     );

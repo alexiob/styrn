@@ -20,11 +20,12 @@ impl PendingPolicy {
         Self { fail_on_pending }
     }
 
-    pub(crate) fn evaluate(
+    pub(in crate::setup) fn evaluate(
         self,
         timestamp: DateTime<Utc>,
-        pending: &[PendingAction],
+        completed: &CompletedExecutionToken,
     ) -> Result<PendingOutcome, PendingError> {
+        let pending = completed.pending();
         let data = json!({"pending": pending_wire(pending)});
         let warnings = pending
             .iter()
@@ -137,18 +138,37 @@ pub(in crate::setup) fn publish_manifest(
     validate_unique_pending(pending)?;
     let authority = PendingPublicationAuthority(());
     let session = receipt_store.begin_pending_publication(&authority)?;
+    session.validate_completed_execution(
+        completed.receipt_witness(),
+        completed.occurrences(),
+        pending,
+    )?;
+    {
+        let manifest_session = manifest_store
+            .begin_pending_publication()
+            .map_err(super::receipt::PendingPublicationProtocolError::from)?;
+        session.validate_manifest_binding(completed.receipt_witness(), &manifest_session)?;
+    }
     let mut candidate = draft.clone();
     project_manifest(&mut candidate, pending)?;
-    let machine_id =
-        session.publish_manifest(manifest_store, &candidate, pending, metadata, &authority)?;
+    let machine_id = session.publish_manifest(
+        manifest_store,
+        &candidate,
+        pending,
+        completed.occurrences(),
+        completed.receipt_witness(),
+        metadata,
+        &authority,
+    )?;
     *draft = candidate;
     Ok(machine_id)
 }
 
-pub(crate) fn render_human(
+pub(in crate::setup) fn render_human(
     mut writer: impl Write,
-    pending: &[PendingAction],
+    completed: &CompletedExecutionToken,
 ) -> Result<(), PendingError> {
+    let pending = completed.pending();
     if pending.is_empty() {
         return Ok(());
     }

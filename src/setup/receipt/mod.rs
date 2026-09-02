@@ -259,6 +259,31 @@ pub(crate) struct ReceiptApplySession<'a> {
     _lock: fs::File,
 }
 
+#[derive(Clone, PartialEq, Eq)]
+pub(in crate::setup) struct PendingReceiptOccurrence {
+    action_id: ActionIdentifier,
+    entry_id: ReceiptEntryId,
+}
+
+impl PendingReceiptOccurrence {
+    pub(in crate::setup) fn matches_action(
+        &self,
+        action: &crate::setup::action::ActionName,
+    ) -> bool {
+        self.action_id.0 == action.as_str()
+    }
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(in crate::setup) struct ReceiptExecutionWitness {
+    installation_scope: InstallationScope,
+    worker_principal: WorkerPrincipal,
+    receipt_path: String,
+    receipt_entry_count: usize,
+    pending_publication_count: usize,
+    effective_receipt_sha256: Sha256Digest,
+}
+
 #[cfg(not(any(action_core_fixture, action_compile_fixture)))]
 pub(in crate::setup) struct ReceiptPendingPublicationSession<'a> {
     store: &'a ReceiptStore,
@@ -1638,21 +1663,26 @@ impl ReceiptApplySession<'_> {
         action: &crate::setup::action::ActionName,
         metadata: &mut ReceiptMetadataSource,
         _authority: &crate::setup::action::JournalAuthority,
-    ) -> Result<bool, ReceiptStoreError> {
+    ) -> Result<PendingReceiptOccurrence, ReceiptStoreError> {
         let existing = self.store.read_locked()?;
         let publication_intent = self.store.read_pending_publication_intent(&existing)?;
-        if pending_entry_is_current_or_unpublished(
+        if let Some(occurrence) = current_pending_occurrence(
             &existing,
             action.as_str(),
             publication_intent.as_ref().map(|intent| &intent.document),
         ) {
-            return Ok(false);
+            return Ok(occurrence);
         }
 
+        let metadata = metadata.next()?;
+        let occurrence = PendingReceiptOccurrence {
+            action_id: ActionIdentifier(action.as_str().to_owned()),
+            entry_id: metadata.entry_id.clone(),
+        };
         let mut candidate = existing.clone();
         candidate
             .entries
-            .push(ReceiptEntry::pending(action, metadata.next()?)?);
+            .push(ReceiptEntry::pending(action, metadata)?);
         validate_pending_append_candidate(
             &existing,
             &candidate,
@@ -1662,7 +1692,42 @@ impl ReceiptApplySession<'_> {
             &candidate,
             publication_intent.as_ref().map(|intent| &intent.document),
         )?;
-        Ok(true)
+        Ok(occurrence)
+    }
+
+    pub(in crate::setup) fn complete_execution(
+        &self,
+        occurrences: &[PendingReceiptOccurrence],
+        _authority: &crate::setup::action::JournalAuthority,
+    ) -> Result<ReceiptExecutionWitness, ReceiptStoreError> {
+        let receipt = self.store.read_locked()?;
+        let publication_intent = self.store.read_pending_publication_intent(&receipt)?;
+        let intent_document = publication_intent.as_ref().map(|intent| &intent.document);
+        let mut action_ids = HashSet::with_capacity(occurrences.len());
+        let mut entry_ids = HashSet::with_capacity(occurrences.len());
+        for occurrence in occurrences {
+            if !action_ids.insert(occurrence.action_id.0.as_str())
+                || !entry_ids.insert(occurrence.entry_id.as_str())
+            {
+                return Err(ReceiptStoreError::PrefixConflict);
+            }
+            if current_pending_occurrence(&receipt, &occurrence.action_id.0, intent_document)
+                .as_ref()
+                != Some(occurrence)
+            {
+                return Err(ReceiptStoreError::IntentConflict);
+            }
+        }
+
+        let effective = effective_receipt_document(&receipt, intent_document)?;
+        Ok(ReceiptExecutionWitness {
+            installation_scope: self.store.scope,
+            worker_principal: self.store.worker.clone(),
+            receipt_path: normalized_path_text(&self.store.path)?,
+            receipt_entry_count: effective.entries.len(),
+            pending_publication_count: effective.pending_publications.len(),
+            effective_receipt_sha256: receipt_document_digest(&effective)?,
+        })
     }
 
     pub(in crate::setup) fn interruption_after_prepare(
@@ -1979,18 +2044,87 @@ impl ReceiptApplySession<'_> {
 
 #[cfg(not(any(action_core_fixture, action_compile_fixture)))]
 impl ReceiptPendingPublicationSession<'_> {
+    pub(in crate::setup) fn validate_completed_execution(
+        &self,
+        witness: &ReceiptExecutionWitness,
+        occurrences: &[PendingReceiptOccurrence],
+        pending: &[crate::setup::action::PendingAction],
+    ) -> Result<(), ReceiptStoreError> {
+        if witness.installation_scope != self.store.scope
+            || witness.worker_principal != self.store.worker
+            || witness.receipt_path != normalized_path_text(&self.store.path)?
+        {
+            return Err(ReceiptStoreError::IntentConflict);
+        }
+
+        let receipt = self.store.read_locked()?;
+        let publication_intent = self.store.read_verified_pending_publication_intent()?;
+        if let Some(intent) = &publication_intent {
+            intent
+                .document
+                .validate_receipt_binding(self.store, &receipt)?;
+        }
+        let intent_document = publication_intent.as_ref().map(|intent| &intent.document);
+        let effective = effective_receipt_document(&receipt, intent_document)?;
+        if witness.receipt_entry_count != effective.entries.len()
+            || witness.pending_publication_count != effective.pending_publications.len()
+            || witness.effective_receipt_sha256 != receipt_document_digest(&effective)?
+            || pending.len() != occurrences.len()
+        {
+            return Err(ReceiptStoreError::IntentConflict);
+        }
+
+        let mut action_ids = HashSet::with_capacity(occurrences.len());
+        let mut entry_ids = HashSet::with_capacity(occurrences.len());
+        for (action, occurrence) in pending.iter().zip(occurrences) {
+            if !occurrence.matches_action(action.id())
+                || !action_ids.insert(action.id().as_str())
+                || !entry_ids.insert(occurrence.entry_id.as_str())
+            {
+                return Err(ReceiptStoreError::PrefixConflict);
+            }
+            if !effective.entries.iter().any(|entry| {
+                entry.entry_id == occurrence.entry_id
+                    && entry.status == ReceiptStatus::Pending
+                    && entry.action.action_id() == occurrence.action_id.0
+            }) || current_pending_occurrence(&receipt, &occurrence.action_id.0, intent_document)
+                .as_ref()
+                != Some(occurrence)
+            {
+                return Err(ReceiptStoreError::IntentConflict);
+            }
+        }
+        Ok(())
+    }
+
+    pub(in crate::setup) fn validate_manifest_binding(
+        &self,
+        witness: &ReceiptExecutionWitness,
+        manifest_session: &crate::manifest::PendingManifestPublicationSession<'_>,
+    ) -> Result<(), ReceiptStoreError> {
+        if manifest_session.installation_scope() != witness.installation_scope
+            || manifest_session.worker_principal() != &witness.worker_principal
+        {
+            return Err(ReceiptStoreError::IntentConflict);
+        }
+        Ok(())
+    }
+
     pub(in crate::setup) fn publish_manifest(
         &self,
         manifest_store: &crate::manifest::MachineManifestStore,
         draft: &crate::manifest::MachineManifestDraft,
         pending: &[crate::setup::action::PendingAction],
+        occurrences: &[PendingReceiptOccurrence],
+        witness: &ReceiptExecutionWitness,
         metadata: &mut ReceiptMetadataSource,
         _authority: &crate::setup::pending::PendingPublicationAuthority,
     ) -> Result<uuid::Uuid, PendingPublicationProtocolError> {
         self.recover_pending_publication(manifest_store)?;
 
         let manifest_session = manifest_store.begin_pending_publication()?;
-        let manifest_candidate = manifest_session.candidate(draft)?;
+        self.validate_completed_execution(witness, occurrences, pending)?;
+        self.validate_manifest_binding(witness, &manifest_session)?;
         let existing = self.store.read_locked()?;
         if self
             .store
@@ -1999,26 +2133,14 @@ impl ReceiptPendingPublicationSession<'_> {
         {
             return Err(ReceiptStoreError::IntentConflict.into());
         }
-        let mut action_ids = HashSet::with_capacity(pending.len());
-        let mut links = Vec::with_capacity(pending.len());
-        for action in pending {
-            if !action_ids.insert(action.id().as_str()) {
-                return Err(ReceiptStoreError::PrefixConflict.into());
-            }
-            let entry = existing
-                .entries
-                .iter()
-                .rev()
-                .find(|entry| {
-                    entry.status == ReceiptStatus::Pending
-                        && entry.action.action_id() == action.id().as_str()
-                })
-                .ok_or(ReceiptStoreError::PrefixConflict)?;
-            links.push(PendingPublicationLink {
-                action_id: ActionIdentifier(action.id().as_str().to_owned()),
-                entry_id: entry.entry_id.clone(),
-            });
-        }
+        let manifest_candidate = manifest_session.candidate(draft)?;
+        let links = occurrences
+            .iter()
+            .map(|occurrence| PendingPublicationLink {
+                action_id: occurrence.action_id.clone(),
+                entry_id: occurrence.entry_id.clone(),
+            })
+            .collect::<Vec<_>>();
 
         if existing
             .pending_publications
@@ -2232,11 +2354,8 @@ fn validate_pending_append_candidate(
         || candidate.pending_publications != existing.pending_publications
         || appended.map(|entry| entry.status) != Some(ReceiptStatus::Pending)
         || appended.is_some_and(|entry| {
-            pending_entry_is_current_or_unpublished(
-                existing,
-                entry.action.action_id(),
-                publication_intent,
-            )
+            current_pending_occurrence(existing, entry.action.action_id(), publication_intent)
+                .is_some()
         })
     {
         return Err(ReceiptStoreError::PrefixConflict);
@@ -2271,28 +2390,63 @@ fn validate_pending_intent_prefix(
     Ok(())
 }
 
-fn pending_entry_is_current_or_unpublished(
+fn current_pending_occurrence(
     document: &ReceiptDocument,
     action_id: &str,
     publication_intent: Option<&PendingPublicationIntentDocument>,
-) -> bool {
+) -> Option<PendingReceiptOccurrence> {
     let latest = publication_intent
         .map(|intent| &intent.publication)
         .or_else(|| document.pending_publications.last());
     let Some(latest) = latest else {
-        return document.entries.iter().any(|entry| {
-            entry.status == ReceiptStatus::Pending && entry.action.action_id() == action_id
+        return document.entries.iter().find_map(|entry| {
+            (entry.status == ReceiptStatus::Pending && entry.action.action_id() == action_id).then(
+                || PendingReceiptOccurrence {
+                    action_id: ActionIdentifier(action_id.to_owned()),
+                    entry_id: entry.entry_id.clone(),
+                },
+            )
         });
     };
-    latest
+
+    if let Some(link) = latest
         .pending
         .iter()
-        .any(|link| link.action_id.0 == action_id)
-        || document.entries[latest.receipt_entry_count..]
-            .iter()
-            .any(|entry| {
-                entry.status == ReceiptStatus::Pending && entry.action.action_id() == action_id
-            })
+        .find(|link| link.action_id.0 == action_id)
+    {
+        return Some(PendingReceiptOccurrence {
+            action_id: link.action_id.clone(),
+            entry_id: link.entry_id.clone(),
+        });
+    }
+
+    document.entries[latest.receipt_entry_count..]
+        .iter()
+        .find_map(|entry| {
+            (entry.status == ReceiptStatus::Pending && entry.action.action_id() == action_id).then(
+                || PendingReceiptOccurrence {
+                    action_id: ActionIdentifier(action_id.to_owned()),
+                    entry_id: entry.entry_id.clone(),
+                },
+            )
+        })
+}
+
+fn effective_receipt_document(
+    document: &ReceiptDocument,
+    publication_intent: Option<&PendingPublicationIntentDocument>,
+) -> Result<ReceiptDocument, ReceiptStoreError> {
+    document.validate_with_pending_publication_intent(publication_intent)?;
+    let mut effective = document.clone();
+    if let Some(intent) = publication_intent {
+        if effective.pending_publications.len() == intent.pending_publication_count {
+            effective
+                .pending_publications
+                .push(intent.publication.clone());
+        }
+    }
+    effective.validate()?;
+    Ok(effective)
 }
 
 fn validate_pending_publication_append_candidate(

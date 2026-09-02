@@ -1,28 +1,65 @@
 //! Action-owned setup execution and receipt orchestration.
 
 use super::{Action, ActionCheck, ActionEffect, ActionError, JournalAuthority, PendingAction};
+use crate::setup::receipt::{PendingReceiptOccurrence, ReceiptExecutionWitness, ReceiptStoreError};
+use std::collections::HashSet;
 use thiserror::Error;
 
-#[derive(Debug, PartialEq, Eq)]
 pub(in crate::setup) struct CompletedExecutionToken {
     pending: Vec<PendingAction>,
+    occurrences: Vec<PendingReceiptOccurrence>,
+    receipt: ReceiptExecutionWitness,
 }
 
 impl CompletedExecutionToken {
     pub(in crate::setup) fn pending(&self) -> &[PendingAction] {
         &self.pending
     }
+
+    pub(in crate::setup) fn occurrences(&self) -> &[PendingReceiptOccurrence] {
+        &self.occurrences
+    }
+
+    pub(in crate::setup) fn receipt_witness(&self) -> &ReceiptExecutionWitness {
+        &self.receipt
+    }
+
+    fn new(
+        pending: Vec<PendingAction>,
+        occurrences: Vec<PendingReceiptOccurrence>,
+        receipt: ReceiptExecutionWitness,
+    ) -> Result<Self, ReceiptStoreError> {
+        if pending.len() != occurrences.len()
+            || pending
+                .iter()
+                .zip(&occurrences)
+                .any(|(action, occurrence)| !occurrence.matches_action(action.id()))
+        {
+            return Err(ReceiptStoreError::IntentConflict);
+        }
+        let mut action_ids = HashSet::with_capacity(pending.len());
+        if pending
+            .iter()
+            .any(|action| !action_ids.insert(action.id().as_str()))
+        {
+            return Err(ReceiptStoreError::PrefixConflict);
+        }
+        Ok(Self {
+            pending,
+            occurrences,
+            receipt,
+        })
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub(crate) struct ApplyReport {
+pub(in crate::setup) struct ApplySummary {
     applied_count: usize,
     recovered_count: usize,
     noop_count: usize,
-    completion: CompletedExecutionToken,
 }
 
-impl ApplyReport {
+impl ApplySummary {
     pub(crate) fn applied_count(&self) -> usize {
         self.applied_count
     }
@@ -33,6 +70,39 @@ impl ApplyReport {
 
     pub(crate) fn noop_count(&self) -> usize {
         self.noop_count
+    }
+
+    pub(crate) fn is_nothing_to_do(&self, has_pending: bool) -> bool {
+        self.applied_count == 0 && self.recovered_count == 0 && !has_pending
+    }
+}
+
+pub(crate) struct ApplyReport {
+    summary: ApplySummary,
+    completion: CompletedExecutionToken,
+}
+
+impl std::fmt::Debug for ApplyReport {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("ApplyReport")
+            .field("summary", &self.summary)
+            .field("pending_count", &self.completion.pending().len())
+            .finish()
+    }
+}
+
+impl ApplyReport {
+    pub(crate) fn applied_count(&self) -> usize {
+        self.summary.applied_count()
+    }
+
+    pub(crate) fn recovered_count(&self) -> usize {
+        self.summary.recovered_count()
+    }
+
+    pub(crate) fn noop_count(&self) -> usize {
+        self.summary.noop_count()
     }
 
     pub(crate) fn pending_count(&self) -> usize {
@@ -48,19 +118,24 @@ impl ApplyReport {
     }
 
     pub(crate) fn is_nothing_to_do(&self) -> bool {
-        self.applied_count == 0 && self.recovered_count == 0 && self.completion.pending().is_empty()
+        self.summary
+            .is_nothing_to_do(!self.completion.pending().is_empty())
     }
 
     pub(crate) fn message(&self) -> &'static str {
         if self.is_nothing_to_do() {
             "nothing to do"
-        } else if self.applied_count == 0 && !self.completion.pending().is_empty() {
+        } else if self.summary.applied_count == 0 && !self.completion.pending().is_empty() {
             "setup actions need human attention"
-        } else if self.applied_count == 0 && self.recovered_count != 0 {
+        } else if self.summary.applied_count == 0 && self.summary.recovered_count != 0 {
             "receipt recovered"
         } else {
             "setup actions applied"
         }
+    }
+
+    fn into_parts(self) -> (ApplySummary, CompletedExecutionToken) {
+        (self.summary, self.completion)
     }
 }
 
@@ -147,19 +222,18 @@ pub(super) fn apply_plan_with_runner<R: PreparedActionRunner>(
     }
     let authority = JournalAuthority(());
     let session = store.begin_apply(&authority)?;
-    let mut report = ApplyReport {
+    let mut summary = ApplySummary {
         applied_count: 0,
         recovered_count: 0,
         noop_count: 0,
-        completion: CompletedExecutionToken {
-            pending: Vec::new(),
-        },
     };
+    let mut pending = Vec::new();
+    let mut occurrences = Vec::new();
     for intent in session.pending_intents(&authority)? {
         match session.intent_phase(&intent, &authority) {
             crate::setup::receipt::ReceiptIntentPhase::Succeeded => {
                 session.finalize_intent(&intent, &authority)?;
-                report.recovered_count += 1;
+                summary.recovered_count += 1;
             }
             crate::setup::receipt::ReceiptIntentPhase::Prepared => {
                 let action_id = session.intent_action_id(&intent, &authority);
@@ -188,7 +262,7 @@ pub(super) fn apply_plan_with_runner<R: PreparedActionRunner>(
                         let mut intent = intent;
                         session.mark_intent_succeeded(&mut intent, &authority)?;
                         session.finalize_intent(&intent, &authority)?;
-                        report.applied_count += 1;
+                        summary.applied_count += 1;
                     }
                     ActionCheck::Done | ActionCheck::NeedsHuman(_) => {
                         return Err(crate::setup::receipt::ReceiptStoreError::IntentConflict.into());
@@ -199,7 +273,7 @@ pub(super) fn apply_plan_with_runner<R: PreparedActionRunner>(
     }
     for action in plan {
         match action.check()? {
-            ActionCheck::Done => report.noop_count += 1,
+            ActionCheck::Done => summary.noop_count += 1,
             ActionCheck::Todo => {
                 let prepared = action.prepare_effect()?;
                 let mut intent = session.prepare_intent(
@@ -216,16 +290,18 @@ pub(super) fn apply_plan_with_runner<R: PreparedActionRunner>(
                 }
                 session.mark_intent_succeeded(&mut intent, &authority)?;
                 session.finalize_intent(&intent, &authority)?;
-                report.applied_count += 1;
+                summary.applied_count += 1;
             }
             ActionCheck::NeedsHuman(needs_human) => {
-                session.record_pending(action.name(), metadata, &authority)?;
-                report
-                    .completion
-                    .pending
-                    .push(PendingAction::new(action.name().clone(), needs_human));
+                let occurrence = session.record_pending(action.name(), metadata, &authority)?;
+                pending.push(PendingAction::new(action.name().clone(), needs_human));
+                occurrences.push(occurrence);
             }
         }
     }
-    Ok(report)
+    let receipt = session.complete_execution(&occurrences, &authority)?;
+    Ok(ApplyReport {
+        summary,
+        completion: CompletedExecutionToken::new(pending, occurrences, receipt)?,
+    })
 }
