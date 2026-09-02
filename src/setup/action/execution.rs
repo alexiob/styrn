@@ -78,6 +78,22 @@ pub(super) fn apply_plan_with_journal(
     apply_plan_with_runner(plan, store, metadata, &mut DirectPreparedActionRunner)
 }
 
+pub(super) fn record_pending_observations(
+    pending: &[PendingAction],
+    store: &crate::setup::receipt::ReceiptStore,
+    metadata: &mut crate::setup::receipt::ReceiptMetadataSource,
+) -> Result<(), ApplyPlanError> {
+    if pending.is_empty() {
+        return Ok(());
+    }
+    let authority = JournalAuthority(());
+    let session = store.begin_apply(&authority)?;
+    for action in pending {
+        session.record_pending(action.id(), metadata, &authority)?;
+    }
+    Ok(())
+}
+
 pub(super) trait PreparedActionRunner {
     fn execute_prepared(
         &mut self,

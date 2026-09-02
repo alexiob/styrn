@@ -2,7 +2,7 @@ use super::*;
 use crate::setup::{
     action::{
         execution::PreparedActionRunner, Action, ActionEffect, ActionError, HumanInstructions,
-        NeedsHuman, Privilege,
+        NeedsHuman, PendingSeverity, Privilege,
     },
     receipt::{ReceiptMetadataSource, ReceiptStore},
 };
@@ -102,11 +102,13 @@ fn production_native_entrypoint_applies_user_plan_without_authorization() {
         &mut plan,
         &store,
         &mut metadata,
-        "host-019cb047",
-        fixture.request_path().to_owned(),
-        crate::platform::resolve_current_worker_principal().unwrap(),
-        SystemAuthorizationPolicy::NotGranted,
-        false,
+        NativeAuthorizationInput::new(
+            "host-019cb047",
+            fixture.request_path().to_owned(),
+            crate::platform::resolve_current_worker_principal().unwrap(),
+            SystemAuthorizationPolicy::NotGranted,
+            false,
+        ),
     )
     .unwrap();
 
@@ -336,11 +338,12 @@ fn already_converged_privileged_actions_do_not_prompt_or_become_pending() {
 }
 
 #[test]
-fn privileged_needs_human_does_not_prompt_and_is_not_reported_ready() {
+fn privileged_needs_human_is_journaled_and_exposed_without_prompt() {
     let fixture = AuthorizationFixture::new("privileged-needs-human");
     let store = ReceiptStore::new_user_for_test(fixture.user_receipt());
     let state = Arc::new(Mutex::new(Vec::new()));
-    let (action, metrics) = Action::test_needs_human(
+    let (action, metrics) = Action::test_named_needs_human(
+        "test.needs-human",
         host_privilege(),
         Arc::clone(&state),
         NeedsHuman::new(
@@ -349,7 +352,10 @@ fn privileged_needs_human_does_not_prompt_and_is_not_reported_ready() {
         ),
     );
     let mut plan = vec![action];
-    let mut metadata = receipt_metadata(&[]);
+    let mut metadata = receipt_metadata(&[(
+        "019cb047-3c00-7000-8000-000000000001",
+        "2026-09-02T12:00:00Z",
+    )]);
     let mut invoker = SpyInvoker::default();
 
     let report = execute_with_authorization(
@@ -366,9 +372,96 @@ fn privileged_needs_human_does_not_prompt_and_is_not_reported_ready() {
         report.privileged_status(),
         PrivilegedStatus::NeedsHuman { count: 1 }
     );
+    assert_eq!(report.pending().len(), 1);
+    assert_eq!(report.pending()[0].id().as_str(), "test.needs-human");
+    assert_eq!(report.pending()[0].severity(), PendingSeverity::Warning);
+    assert_eq!(
+        report.pending()[0].needs_human().instructions().as_str(),
+        "Approve the operating-system setting."
+    );
     assert!(!report.everything_ready());
     assert_eq!(invoker.calls(), 0);
     assert_eq!(metrics.mutation_calls(), 0);
+    let receipt = serde_json::from_slice::<serde_json::Value>(
+        &store.read_snapshot().unwrap().to_json().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(receipt["entries"].as_array().unwrap().len(), 1);
+    assert_eq!(
+        receipt["entries"][0]["action"]["parameters"]["action_id"],
+        "test.needs-human"
+    );
+    assert_eq!(receipt["entries"][0]["status"], "pending");
+    assert_eq!(receipt["entries"][0]["privilege_used"], "none");
+    for field in [
+        "files_created",
+        "files_modified",
+        "services",
+        "accounts",
+        "registry_keys",
+        "firewall_rules",
+    ] {
+        assert!(receipt["entries"][0][field].as_array().unwrap().is_empty());
+    }
+    assert!(receipt["entries"][0]["download_provenance"].is_null());
+}
+
+#[test]
+fn mixed_needs_human_report_preserves_the_displayed_plan_order() {
+    let fixture = AuthorizationFixture::new("mixed-needs-human-order");
+    let store = ReceiptStore::new_user_for_test(fixture.user_receipt());
+    let state = Arc::new(Mutex::new(Vec::new()));
+    let (system, _) = Action::test_named_needs_human(
+        "test.system-approval",
+        host_privilege(),
+        Arc::clone(&state),
+        NeedsHuman::new(
+            HumanInstructions::new("Approve the system setting.").unwrap(),
+            None,
+        ),
+    );
+    let (user, _) = Action::test_named_needs_human(
+        "test.user-approval",
+        Privilege::None,
+        Arc::clone(&state),
+        NeedsHuman::new(
+            HumanInstructions::new("Approve the user setting.").unwrap(),
+            None,
+        ),
+    );
+    let mut plan = vec![system, user];
+    let mut metadata = receipt_metadata(&[
+        (
+            "019cb047-3c00-7000-8000-000000000001",
+            "2026-09-02T12:00:00Z",
+        ),
+        (
+            "019cb047-3c00-7000-8000-000000000002",
+            "2026-09-02T12:00:01Z",
+        ),
+    ]);
+    let mut invoker = SpyInvoker::default();
+
+    let report = execute_with_authorization(
+        &mut plan,
+        &store,
+        &mut metadata,
+        &fixture.context(),
+        AuthorizationOptions::interactive_decline(),
+        &mut invoker,
+    )
+    .unwrap();
+
+    assert_eq!(
+        report
+            .pending()
+            .iter()
+            .map(|pending| pending.id().as_str())
+            .collect::<Vec<_>>(),
+        ["test.system-approval", "test.user-approval"]
+    );
+    assert_eq!(invoker.calls(), 0);
+    assert!(state.lock().unwrap().is_empty());
 }
 
 #[test]

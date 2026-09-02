@@ -4,7 +4,7 @@
 //! request. The parent process can ask one native adapter to launch the exact
 //! current executable, but it never dispatches a privileged action itself.
 
-use super::{execution::ApplyReport, Action, ActionCheck, PlanOperation, Privilege};
+use super::{execution::ApplyReport, Action, ActionCheck, PendingAction, PlanOperation, Privilege};
 #[cfg(test)]
 use super::{execution::PreparedActionRunner, ActionEffect, ActionError};
 #[cfg(test)]
@@ -17,7 +17,7 @@ use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs,
     io::{Read, Write},
     path::{Component, Path, PathBuf},
@@ -89,6 +89,34 @@ pub(in crate::setup) enum SystemAuthorizationPolicy {
     NotGranted,
     InteractiveConsent,
     ExplicitNoninteractive,
+}
+
+#[allow(dead_code)] // T0.20 builds this from the setup command's validated inputs.
+pub(in crate::setup) struct NativeAuthorizationInput {
+    host_id: String,
+    request_path: PathBuf,
+    principal: WorkerPrincipal,
+    policy: SystemAuthorizationPolicy,
+    no_elevate: bool,
+}
+
+impl NativeAuthorizationInput {
+    #[allow(dead_code)] // T0.20 is the first production caller.
+    pub(in crate::setup) fn new(
+        host_id: impl Into<String>,
+        request_path: PathBuf,
+        principal: WorkerPrincipal,
+        policy: SystemAuthorizationPolicy,
+        no_elevate: bool,
+    ) -> Self {
+        Self {
+            host_id: host_id.into(),
+            request_path,
+            principal,
+            policy,
+            no_elevate,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -278,6 +306,7 @@ pub(in crate::setup) enum PrivilegedStatus {
 
 pub(in crate::setup) struct AuthorizedExecutionReport {
     ordinary: ApplyReport,
+    pending: Vec<PendingAction>,
     privileged_status: PrivilegedStatus,
 }
 
@@ -290,9 +319,12 @@ impl AuthorizedExecutionReport {
         self.privileged_status
     }
 
+    pub(in crate::setup) fn pending(&self) -> &[PendingAction] {
+        &self.pending
+    }
+
     pub(in crate::setup) fn everything_ready(&self) -> bool {
-        self.ordinary.pending_count() == 0
-            && matches!(self.privileged_status, PrivilegedStatus::NotNeeded)
+        self.pending.is_empty() && matches!(self.privileged_status, PrivilegedStatus::NotNeeded)
     }
 }
 
@@ -450,7 +482,7 @@ pub(super) fn execute_with_authorization<I: AuthorizationInvoker>(
     let ordinary = ordinary_result?;
 
     let mut requested_privileged = Vec::new();
-    let mut privileged_needs_human = 0;
+    let mut privileged_pending = Vec::new();
     for action in plan
         .iter()
         .filter(|action| action.privilege() != Privilege::None)
@@ -461,10 +493,31 @@ pub(super) fn execute_with_authorization<I: AuthorizationInvoker>(
         {
             ActionCheck::Todo => requested_privileged.push(requested_action(action)),
             ActionCheck::Done => {}
-            ActionCheck::NeedsHuman(_) => privileged_needs_human += 1,
+            ActionCheck::NeedsHuman(needs_human) => {
+                privileged_pending.push(PendingAction::new(action.name().clone(), needs_human))
+            }
         }
     }
     let privileged_count = requested_privileged.len();
+    let privileged_needs_human = privileged_pending.len();
+    super::execution::record_pending_observations(
+        &privileged_pending,
+        ordinary_store,
+        ordinary_metadata,
+    )?;
+    let mut pending = ordinary.pending().to_vec();
+    pending.extend(privileged_pending);
+    let action_order = plan
+        .iter()
+        .enumerate()
+        .map(|(index, action)| (action.name().as_str(), index))
+        .collect::<HashMap<_, _>>();
+    pending.sort_by_key(|action| {
+        action_order
+            .get(action.id().as_str())
+            .copied()
+            .unwrap_or(usize::MAX)
+    });
 
     let privileged_status = if privileged_count == 0 && privileged_needs_human == 0 {
         PrivilegedStatus::NotNeeded
@@ -494,6 +547,7 @@ pub(super) fn execute_with_authorization<I: AuthorizationInvoker>(
 
     Ok(AuthorizedExecutionReport {
         ordinary,
+        pending,
         privileged_status,
     })
 }
@@ -506,14 +560,11 @@ pub(in crate::setup) fn execute_with_native_authorization(
     plan: &mut Vec<Action>,
     ordinary_store: &ReceiptStore,
     ordinary_metadata: &mut ReceiptMetadataSource,
-    host_id: &str,
-    request_path: PathBuf,
-    principal: WorkerPrincipal,
-    policy: SystemAuthorizationPolicy,
-    no_elevate: bool,
+    input: NativeAuthorizationInput,
 ) -> Result<AuthorizedExecutionReport, AuthorizationError> {
-    let context = AuthorizationContext::capture(host_id, request_path, principal)?;
-    let options = AuthorizationOptions::from_policy(policy, no_elevate)?;
+    let context =
+        AuthorizationContext::capture(&input.host_id, input.request_path, input.principal)?;
+    let options = AuthorizationOptions::from_policy(input.policy, input.no_elevate)?;
     execute_with_authorization(
         plan,
         ordinary_store,
