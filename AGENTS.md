@@ -10,7 +10,7 @@ project-build-system dependency to the core design.
 Work from the most specific applicable source, in this order:
 
 1. The user's request and security constraints.
-2. [`docs/design.md`](docs/design.md), revision G: the canonical, binding
+2. [`docs/design.md`](docs/design.md), revision H: the canonical, binding
    architecture and protocol specification. Cite its Part numbers in design
    discussions. If it conflicts with the plan, the design wins.
 3. [`docs/implementation-plan.md`](docs/implementation-plan.md): ordered work,
@@ -60,16 +60,15 @@ project workflows; project-specific build knowledge belongs in `.styrn.toml`.
   generated/rendered setup scripts, command payloads/envelopes, or diagnostics
   a private key, auth/API key, token, password, or secret-shaped value. Secret
   rejection must occur before a write and must not echo the secret in an error.
-- Machine manifests are root/Administrator-owned and readable but not writable
-  by the resolved worker principal. Never hardcode or require an account named
-  `styrn`: current-user is the frictionless default; an optionally dedicated,
-  configurable non-administrator account is the stronger isolation mode.
-  Current-user mode must state that it cannot isolate jobs from that user's
-  ambient files or credentials. Untrusted job code is otherwise confined by
-  convention and filesystem permissions to its job-scoped workspace/output
-  reach. The worker control plane may write registry, locks, audit,
-  maintenance, cache, repos, and artifacts under its designated Styrn-owned
-  tree, but it must not gain controller credentials or policy-editing authority.
+- Default user scope runs entirely without root/Administrator, writes only the
+  invoking user's standard config/state/data directories, and never invokes an
+  elevation mechanism. Its manifest, receipt, registry, locks, and authorized
+  keys are user-owned and therefore **not** a containment boundary against
+  hostile same-user code; preserve atomic/no-follow/corruption checks without
+  claiming worker non-writability. Explicit system scope retains root/Admin-
+  owned state readable but not writable by an unprivileged worker principal.
+  Never require an account named `styrn`: current-user is the default and a
+  configurable dedicated account is optional system-scope hardening.
 - A controller role is not job eligibility, and a worker role is not admin
   authority. The worker makes atomic resource-admission decisions. Agent jobs
   may modify source; validation runs use a clean worktree at an exact commit and

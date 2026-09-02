@@ -102,11 +102,14 @@ The worker—not the controller or coding agent—makes the final admission deci
 ## Design principles
 
 - **Frictionless by default:** autodetect what can be discovered, provide useful defaults, and prefer one convergent command over setup rituals.
+- **Rootless first:** the primary user-scope installation runs entirely as the
+  invoking account and never asks for sudo/UAC; system/dedicated provisioning
+  is explicit optional hardening.
 - **Native and cross-platform:** support macOS, Linux, and native Windows without requiring WSL or a language runtime.
 - **Persistent by design:** worker-owned job supervisors outlive controller connections; where Herdr is registered, agent sessions do too.
 - **Generic, not abstract:** provide durable fleet primitives while leaving Cargo or other build-system knowledge in the project profile.
 - **Automation is a contract:** finite commands have a versioned JSON envelope, documented error codes, and stable exit semantics.
-- **Security boundaries are explicit:** current-user mode is the frictionless default and creates no account; optional dedicated mode adds OS-account isolation under any configured valid name. MCP profiles improve least-privilege ergonomics but are not treated as containment from a process that already has controller shell access.
+- **Security boundaries are explicit:** current-user/user scope is the frictionless default and creates no account or privilege prompt. Same-user code can alter user-owned Styrn state, so that mode is not advertised as containment; optional system/dedicated mode adds protected state and OS-account isolation under any configured valid name.
 - **Secrets stay out of manifests:** machine manifests, job records, logs, and command payloads must not contain private keys, auth keys, API keys, tokens, or passwords.
 
 ## Planned integrations

@@ -34,7 +34,7 @@ The design specifies what gets built: a **single cross-platform Rust binary** (`
 
 | File | What it is |
 |---|---|
-| `docs/design.md` | **Canonical spec (revision G).** Organized into Parts 0–19, with a 40-issue register (`S-01`…`S-40`, Part 18), a decision log (`D-1`…`D-9`, Part 19 — all decided), a phase plan (Part 16.3), and Appendix A. Cite **Part numbers**. |
+| `docs/design.md` | **Canonical spec (revision H).** Organized into Parts 0–19, with a 40-issue register (`S-01`…`S-40`, Part 18), a decision log (`D-1`…`D-9`, Part 19 — all decided), a phase plan (Part 16.3), and Appendix A. Cite **Part numbers**. |
 | `docs/implementation-plan.md` | 125 implementation tasks across Phases 0–8, each with a positive and a negative test checkbox, plus continuous testing obligations (C1–C11) and open items (O1–O5). Tick a task only when both tests pass. |
 | `docs/design-review-D.md` | Independent adversarial review of rev. D, focused on proportionality. Its proposed v1 cut line was **consciously not adopted** — correctness fixes were applied with nothing cut (Part 18 preamble). Useful if scope is revisited; not a description of the current design. |
 | `README.md` | Public-facing overview. States plainly that Styrn is not yet usable software and that its command examples describe the intended interface — keep both accurate as code lands. |

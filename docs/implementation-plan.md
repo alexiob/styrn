@@ -1,6 +1,6 @@
 # Styrn implementation plan
 
-Derived from `docs/design.md` revision G (Part 16.3 phases, Part 16.6 testing strategy, Part 16.1 layout).
+Derived from `docs/design.md` revision H (Part 16.3 phases, Part 16.6 testing strategy, Part 16.1 layout).
 Every task cites the design Part that specifies it. If a task and the design disagree, **the design wins** — fix the plan.
 
 ## How to use this document
@@ -77,9 +77,9 @@ passing negative test.
 ## 0.B Manifest
 
 - [ ] **T0.5** — Machine manifest: schema, parse, validate, `machine_id` minting (2.4)
-      TOML canonical, JSON renderable via `styrn machine manifest --json`. Mint a UUID at first write (this was S-25: no bootstrap script ever minted one). Worker manifests bind transport to a schema-backed stable worker identity: mode, uid/SID, login name, and disclosed isolation posture.
-  - [ ] + positive: a manifest round-trips TOML→struct→JSON and validates against `schemas/machine-v1.schema.json`; `machine_id` and `worker_identity.principal_id` are stable across re-runs, while current-user mode accepts any valid invoking principal.
-  - [ ] − negative: a manifest missing `machine_id`, `schema_version`, or the required worker-identity record is rejected with a schema error (exit 8), not silently defaulted. A transport-user/name mismatch or renamed/deleted uid/SID is drift, never permission to switch accounts. A second `setup` run does **not** mint a new id.
+      TOML canonical, JSON renderable via `styrn machine manifest --json`. Mint a UUID at first write. Manifests record required `installation.scope = user|system` plus schema-backed stable worker identity (mode, uid/SID, login name, isolation posture).
+  - [ ] + positive: a manifest round-trips/validates; machine/principal IDs remain stable; a non-admin user-scope manifest uses the native standard path, while current-user accepts any valid invoking principal.
+  - [ ] − negative: missing scope/machine/schema/required worker identity is rejected. Scope/path mismatch, transport/name mismatch, or renamed/deleted uid/SID is drift, never cross-scope fallback or account switching. A second setup run does not mint a new id.
 
 - [ ] **T0.6** — Manifest secret rejection (2.4, 4.2)
       No private key, API key, auth key, token, or password may be serialized into a manifest.
@@ -87,9 +87,9 @@ passing negative test.
   - [ ] − negative: attempting to write a manifest containing a field from the forbidden set fails at serialization time (a deny-list test over key names plus a heuristic scan for PEM/JWT-shaped values), rather than being caught by review.
 
 - [ ] **T0.7** — Manifest ownership and permissions (4.5)
-      Root/Administrator-owned and read-only to the resolved worker principal, so a job cannot rewrite its own policy. No literal account name is assumed.
-  - [ ] + positive: after setup, the manifest is root/Administrator-owned with the specified mode/ACL on each OS.
-  - [ ] − negative: a process running as an explicitly selected real worker principal cannot modify the manifest; the attempt fails with a permission error.
+      Scope-aware secure storage with no literal account assumption. Default user scope is current-user owned/restricted and requires no privilege; optional system scope is root/Administrator-owned and read-only to the resolved worker principal.
+  - [ ] + positive: an ordinary non-admin user can create/read/atomically replace the user manifest in the native standard config directory; explicit system scope has the protected mode/ACL on each OS.
+  - [ ] − negative: user scope rejects links, special files, insecure cross-user paths, and malformed state but does not claim same-user non-writability. In system scope an explicitly selected real worker principal cannot modify/replace/delete the manifest.
 
 ## 0.C Setup engine
 
@@ -109,14 +109,14 @@ passing negative test.
   - [ ] − negative: after `--dry-run`, a subsequent probe shows byte-identical system state; no receipt entry was written.
 
 - [ ] **T0.11** — Receipt journal (15.6)
-      Append-only record of every applied action with provenance (url, version, digest) per the 15.7.6 supply-chain bar.
-  - [ ] + positive: a completed run produces a receipt listing every action, and a second run reads it and prints "nothing to do".
-  - [ ] − negative: a run interrupted mid-apply leaves a receipt describing exactly the durably acknowledged actions — no entry for the action that failed or was only prepared. `succeeded`-before-append recovers automatically; `prepared` plus already-`Done` refuses with `setup.receipt_conflict` rather than guessing ownership.
+      Scope-aware append-only record of every applied action with provenance. User scope is the no-elevation default and provides crash/concurrency integrity, not same-user containment; system scope preserves worker non-writability.
+  - [ ] + positive: a non-admin user completes a journaled run in the native user-state directory; a second converged run prints "nothing to do". System scope retains protected ACLs. `NeedsHuman` is reported distinctly, never as a no-op.
+  - [ ] − negative: interruption leaves exactly the durably acknowledged prefix. `succeeded`-before-append recovers from its stored finalized entry even when pre-state cannot be recomputed or the action left the current plan; `prepared` plus already-`Done` refuses ownership. Private intent reads are opened no-follow and verified by handle.
 
 - [ ] **T0.12** — Elevation strategy (15.5)
-      Per the decided protected-state coordinator model. Probe/dry-run/no-op are unprivileged; any mutation uses one root/Administrator publisher for the private intent journal, public receipt, and manifest, while `Privilege::None` actions execute as the captured original uid/token.
-  - [ ] + positive: unprivileged probing and no-op runs need no elevation; a mutating run elevates once, journals protected state, and demonstrably executes user-level installers as the original principal rather than root/Administrator.
-  - [ ] − negative: `--no-elevate` on any mutating plan produces a clear plan and exact resume command, exits 13, and dispatches no action. An unprivileged process cannot forge the journal or manifest, and an elevated launch with no trustworthy original principal refuses current-user mode.
+      User scope is rootless by construction and Styrn never acquires privilege. Explicit system scope is accepted only from an already-root/Administrator process; dedicated mode implies it.
+  - [ ] + positive: an ordinary non-admin user probes, plans, applies, journals, and reruns a user installation without any sudo/UAC/helper query or prompt. Independent user actions still apply when a system prerequisite is `NeedsHuman`.
+  - [ ] − negative: an unelevated `--scope system` mutates nothing, exits 13, and prints an operator-controlled rerun instruction that Styrn never executes. No self-reexec/resume plan or detached UAC path exists; an elevated current-user system launch without a trustworthy original principal refuses before mutation.
 
 - [ ] **T0.13** — `NeedsHuman` pending actions (15.2.4, 3.4)
       Non-automatable residue (macOS Sharing toggle, Tailscale login, Codex/Claude first login) reported as structured pending actions, never as false success.
@@ -126,14 +126,14 @@ passing negative test.
 ## 0.D Component actions
 
 - [ ] **T0.14** — Directory tree and worker identity (15.7, 4.1)
-      `repos/ jobs/ cache/ artifacts/ logs/` under the per-OS root. Current-user mode is the no-account-creation default; optional dedicated mode accepts a configurable non-administrator account name (suggested `styrn`, never required).
-  - [ ] + positive: the tree exists with correct ownership on each OS in current-user mode without creating an account; dedicated mode creates or adopts the configured account and owns only the intended tree.
+      `repos/ jobs/ cache/ artifacts/ logs/` under the scope-selected per-OS root. User/current-user is the no-account, no-elevation default; optional dedicated mode accepts a configurable non-administrator account and implies system scope.
+  - [ ] + positive: an ordinary user gets the tree in XDG data / Application Support / LocalAppData without privilege or account creation; system/dedicated mode creates or adopts the configured account and owns only the intended tree.
   - [ ] − negative: no implementation or native test requires a literal username. Dedicated mode cannot read controller key material or write outside `paths.root`; current-user mode reports that it provides no such OS-account isolation. Re-running never recursively resets ownership of pre-existing files.
 
 - [ ] **T0.15** — sshd component (15.7)
-      Windows: `Add-WindowsCapability` + service automatic + account-specific protected `AuthorizedKeysFile` + DefaultShell registry key. Linux/macOS: `openssh-server` / Remote Login with the same protected-key ownership rule.
-  - [ ] + positive: key-based login as the resolved worker identity succeeds from a controller on every OS, including a current Windows user who belongs to Administrators, without authorizing any other account.
-  - [ ] − negative: the Windows ACL trap is asserted directly — Styrn never places its key in shared `administrators_authorized_keys`; a wrongly ACL'd or unsupported account-specific override yields correction or `NeedsHuman`, not broadened access. A same-identity job cannot modify its protected key file. Password auth must be refused.
+      User scope probes existing sshd and uses the ordinary per-user key path without elevation; missing machine configuration is `NeedsHuman`. System scope owns OpenSSH install/service/config plus protected account-specific key files.
+  - [ ] + positive: a non-admin user with working sshd can authorize and log in without privilege. System scope succeeds for ordinary and Administrators-member Windows principals without authorizing any other account.
+  - [ ] − negative: user scope never edits machine sshd/firewall/service config or shared `administrators_authorized_keys`; it reports the exact missing capability. System scope detects/corrects protected-key ACLs, and a same-identity unprivileged job cannot modify them. Password auth is refused where Styrn manages configuration.
 
 - [ ] **T0.16** — Tailscale component (15.7)
       Per-OS unattended operation; interactive browser flow vs. `--auth-key`/`TS_AUTHKEY` chosen by interactivity.
@@ -158,8 +158,8 @@ passing negative test.
   - [ ] − negative: an unknown key or type error in the config fails fast with exit 2 naming the offending key and line; no partial apply.
 
 - [ ] **T0.20** — Three invocation modes and the zero-argument path (15.4, 15.4.1)
-      `--install a,b --role both`, `--account current-user|dedicated[:NAME]`, `--config <toml>`, `--interactive`, and bare `styrn setup`. Zero-arg = probe → plan → one confirmation → apply, with current-user as the cross-platform default.
-  - [ ] + positive: bare `styrn setup` on a fresh machine creates no account and reaches an enrollable worker as the invoking non-elevated principal; the dedicated flag accepts a non-literal configured name.
+      `--scope user|system`, `--install a,b --role both`, `--account current-user|dedicated[:NAME]`, config, interactive, and bare setup. Zero-arg = rootless user-scope probe → plan → one confirmation → apply.
+  - [ ] + positive: bare setup as a non-admin creates no account, never prompts for privilege, and yields a useful local worker plus an enrollment card when existing transport is ready; the dedicated flag accepts a non-literal configured name.
   - [ ] − negative: with no TTY and no `--yes`, it prints the plan and exits 13 rather than guessing consent. `--install` naming an unknown component exits 2 listing valid components.
 
 - [ ] **T0.21** — `--interactive` wizard (15.4.2)
@@ -421,14 +421,14 @@ passing negative test.
   - [ ] − negative: on a Herdr-less fleet selftest **passes**, with the agent leg reported `skipped (substrate: none)` per host. Absence is never a selftest failure (16.6 item 6).
 
 - [ ] **T3.12** — `styrnd`: service install and maintenance executor (15.9)
-      Per-worker, no listening network socket. Unix maintenance runs as the selected principal. Windows keeps maintenance distinct from the credential-free LocalSystem spawn broker and uses a selected-principal mechanism when safe, otherwise the opportunistic path.
-  - [ ] + positive: installed per OS where the selected-principal mechanism is safe; ticks execute under that principal and journal to the audit log. No current-user password is captured or stored.
-  - [ ] − negative: with the maintenance executor stopped or unavailable, maintenance degrades to opportunistic execution at admission and doctor — the documented degraded mode is tested, not assumed. Assert every context opens no network listener and the Windows broker cannot execute maintenance.
+      Per-worker, no network socket. Default installs a rootless systemd user unit / LaunchAgent / per-user Windows logon task. Optional system scope adds boot/logout guarantees and keeps Windows maintenance distinct from the LocalSystem broker.
+  - [ ] + positive: a non-admin installs and runs ticks under the current principal with no password capture; manifest/doctor accurately reports login-session versus boot persistence.
+  - [ ] − negative: logout-survival is never claimed when the user manager cannot provide it. With maintenance stopped/unavailable, work degrades opportunistically; every context opens no network listener and the system broker cannot execute maintenance.
 
 - [ ] **T3.13** — `styrnd`: Windows spawn broker (15.9)
-      Credential-free LocalSystem broker with a named pipe ACL'd to the resolved worker SID and SYSTEM, plus private one-use pending-spawn admission; no literal account lookup and no general privileged execution.
-  - [ ] + positive: the broker validates client PID/token, installed-binary identity, sshd ancestry, Job-Object condition, and one-use admitted job before constructing a fixed `styrn job supervise <id>` spawn outside sshd's Job Object.
-  - [ ] − negative: an unauthorized account and a hostile process running under the *same* worker SID cannot spawn without the private pending record. Replay, malformed ids, arbitrary executable/argv, and unadmitted job requests are rejected without spawning anything.
+      User scope uses a credential-free per-user broker with login-session guarantees; optional system scope uses the LocalSystem broker and protected one-use admission. Neither performs general execution or literal account lookup.
+  - [ ] + positive: each broker validates client PID/token, installed-binary identity, expected ancestry/Job-Object condition, and one-use admitted job before constructing fixed `styrn job supervise <id>` argv. Capabilities distinguish login-session from boot persistence.
+  - [ ] − negative: replay, malformed ids, arbitrary executable/argv, and unadmitted requests are rejected. System scope rejects unauthorized and same-SID callers lacking the protected pending record. User scope makes no containment claim against malicious same-user code, which already has equivalent process authority.
 
 - [ ] **T3.14** — Maintenance commands: `clean plan/run`, `cache status/trim` (10.5, 6.8)
   - [ ] + positive: plan lists exactly what run will delete; trim honours the cache quota.
