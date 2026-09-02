@@ -590,6 +590,7 @@ enum IntentReadInterruption {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PendingPublicationIntentInterruptionPoint {
+    AfterCreate,
     DuringWrite,
     BeforePublish,
     AfterPublish,
@@ -790,6 +791,22 @@ impl ReceiptStore {
             PendingPublicationIntentInterruption::Fail(
                 PendingPublicationIntentInterruptionPoint::DuringWrite,
             ),
+        )
+    }
+
+    #[cfg(test)]
+    pub(in crate::setup) fn new_for_test_pausing_pending_intent_after_create(
+        path: impl Into<PathBuf>,
+        entered: std::sync::Arc<std::sync::Barrier>,
+        resume: std::sync::Arc<std::sync::Barrier>,
+    ) -> Self {
+        Self::new_for_test_with_pending_intent_interruption(
+            path,
+            PendingPublicationIntentInterruption::Pause {
+                point: PendingPublicationIntentInterruptionPoint::AfterCreate,
+                entered,
+                resume,
+            },
         )
     }
 
@@ -1397,130 +1414,59 @@ impl ReceiptStore {
     ) -> Result<PendingPublicationIntent, ReceiptStoreError> {
         let serialized = document.to_json()?;
         let path = self.pending_publication_intent_path();
-        let directory = path.parent().ok_or(ReceiptStoreError::InvalidDestination)?;
         let temporary =
             self.pending_publication_temporary_path(&document.publication.publication_id);
-        let mut file = crate::platform::create_private_file(&temporary, self.owner, &self.worker)
-            .map_err(|error| {
-            if error.kind() == std::io::ErrorKind::AlreadyExists {
-                ReceiptStoreError::IntentConflict
+        let mut publication =
+            crate::platform::create_private_publication_file(&temporary, self.owner, &self.worker)
+                .map_err(|error| {
+                    if error.kind() == std::io::ErrorKind::AlreadyExists {
+                        ReceiptStoreError::IntentConflict
+                    } else {
+                        ReceiptStoreError::Write(error)
+                    }
+                })?;
+        self.inject_pending_publication_intent_interruption(
+            PendingPublicationIntentInterruptionPoint::AfterCreate,
+        )?;
+        let midpoint = serialized.len() / 2;
+        publication
+            .write_all(&serialized[..midpoint])
+            .map_err(ReceiptStoreError::Write)?;
+        self.inject_pending_publication_intent_interruption(
+            PendingPublicationIntentInterruptionPoint::DuringWrite,
+        )?;
+        publication
+            .write_all(&serialized[midpoint..])
+            .map_err(ReceiptStoreError::Write)?;
+        let complete = publication.complete_exact(&serialized).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::PermissionDenied {
+                ReceiptStoreError::Security(error)
             } else {
                 ReceiptStoreError::Write(error)
             }
         })?;
-        let identity = crate::platform::private_file_identity(&temporary)
-            .map_err(ReceiptStoreError::Security)?;
-        let mut published = false;
-        let result = (|| {
-            let preparation: Result<(), ReceiptStoreError> = (|| {
-                let midpoint = serialized.len() / 2;
-                file.write_all(&serialized[..midpoint])
-                    .map_err(ReceiptStoreError::Write)?;
-                self.inject_pending_publication_intent_interruption(
-                    PendingPublicationIntentInterruptionPoint::DuringWrite,
-                )?;
-                file.write_all(&serialized[midpoint..])
-                    .map_err(ReceiptStoreError::Write)?;
-                file.flush().map_err(ReceiptStoreError::Write)?;
-                file.sync_all().map_err(ReceiptStoreError::Write)?;
-                crate::platform::verify_private_file_security(&temporary, self.owner, &self.worker)
-                    .map_err(ReceiptStoreError::Security)?;
-                let mut verified = crate::platform::open_verified_private_file_for_read(
-                    &temporary,
-                    self.owner,
-                    &self.worker,
-                    identity,
-                )
-                .map_err(ReceiptStoreError::Security)?;
-                let mut verified_bytes = Vec::new();
-                verified
-                    .read_to_end(&mut verified_bytes)
-                    .map_err(ReceiptStoreError::Read)?;
-                if verified_bytes != serialized
-                    || PendingPublicationIntentDocument::from_json(&verified_bytes)? != document
-                {
-                    return Err(ReceiptStoreError::IntentConflict);
-                }
-                Ok(())
-            })();
-            drop(file);
-            preparation?;
-            match crate::platform::private_file_identity(&path) {
-                Ok(_) => return Err(ReceiptStoreError::IntentConflict),
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => return Err(ReceiptStoreError::Security(error)),
+        self.inject_pending_publication_intent_interruption(
+            PendingPublicationIntentInterruptionPoint::BeforePublish,
+        )?;
+        let published = complete.publish_no_replace(&path).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                ReceiptStoreError::IntentConflict
+            } else if error.kind() == std::io::ErrorKind::PermissionDenied {
+                ReceiptStoreError::Security(error)
+            } else {
+                ReceiptStoreError::Write(error)
             }
-            self.inject_pending_publication_intent_interruption(
-                PendingPublicationIntentInterruptionPoint::BeforePublish,
-            )?;
-            // A same-directory hard link publishes the already-fsynced inode
-            // atomically without replacing evidence that appeared after the
-            // absence check. The receipt lock excludes cooperating writers;
-            // system scope additionally excludes the selected worker.
-            fs::hard_link(&temporary, &path).map_err(|error| {
-                if error.kind() == std::io::ErrorKind::AlreadyExists {
-                    ReceiptStoreError::IntentConflict
-                } else {
-                    ReceiptStoreError::Write(error)
-                }
-            })?;
-            published = true;
-            self.inject_pending_publication_intent_interruption(
-                PendingPublicationIntentInterruptionPoint::AfterPublish,
-            )?;
-            // Make the final link durable before removing the deterministic
-            // temporary link. A crash between these operations leaves two
-            // names for the same complete, verified inode.
-            crate::platform::sync_parent_directory(directory).map_err(ReceiptStoreError::Write)?;
-            let mut verified = crate::platform::open_verified_private_file_for_read(
-                &path,
-                self.owner,
-                &self.worker,
-                identity,
-            )
-            .map_err(ReceiptStoreError::Security)?;
-            let mut verified_bytes = Vec::new();
-            verified
-                .read_to_end(&mut verified_bytes)
-                .map_err(ReceiptStoreError::Read)?;
-            if verified_bytes != serialized
-                || PendingPublicationIntentDocument::from_json(&verified_bytes)? != document
-            {
-                return Err(ReceiptStoreError::IntentConflict);
-            }
-            drop(verified);
-            self.inject_pending_publication_intent_interruption(
-                PendingPublicationIntentInterruptionPoint::AfterDurablePublish,
-            )?;
-            self.remove_created_private_file(&temporary, identity)?;
-            Ok(())
-        })();
-        if let Err(error) = result {
-            let preserve_for_recovery = {
-                #[cfg(test)]
-                {
-                    matches!(
-                        self.pending_publication_intent_interruption,
-                        Some(PendingPublicationIntentInterruption::CrashAfterDurablePublish)
-                    )
-                }
-                #[cfg(not(test))]
-                {
-                    false
-                }
-            };
-            if !preserve_for_recovery {
-                if published {
-                    let _ = self.remove_created_private_file(&path, identity);
-                }
-                let _ = self.remove_created_private_file(&temporary, identity);
-            }
-            return Err(error);
-        }
+        })?;
+        self.inject_pending_publication_intent_interruption(
+            PendingPublicationIntentInterruptionPoint::AfterPublish,
+        )?;
+        self.inject_pending_publication_intent_interruption(
+            PendingPublicationIntentInterruptionPoint::AfterDurablePublish,
+        )?;
         Ok(PendingPublicationIntent {
             document,
-            path,
-            identity,
+            path: published.path().to_path_buf(),
+            identity: published.identity(),
         })
     }
 

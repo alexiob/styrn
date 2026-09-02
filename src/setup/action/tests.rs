@@ -1039,24 +1039,30 @@ fn manifest_parent_sync_precedes_checkpoint_and_exact_after_recovery_resyncs_wit
 }
 
 #[test]
-fn pending_publication_intent_faults_leave_no_partial_final_or_temporary() {
+fn pending_publication_intent_faults_retain_only_unambiguous_evidence() {
     type FailingStore = fn(PathBuf) -> ReceiptStore;
-    let cases: [(&str, FailingStore); 3] = [
+    let cases: [(&str, FailingStore, bool, bool); 3] = [
         (
             "during-write",
             ReceiptStore::new_for_test_failing_pending_intent_during_write,
+            false,
+            false,
         ),
         (
             "before-publish",
             ReceiptStore::new_for_test_failing_pending_intent_before_publish,
+            false,
+            true,
         ),
         (
             "after-publish",
             ReceiptStore::new_for_test_failing_pending_intent_after_publish,
+            true,
+            false,
         ),
     ];
 
-    for (name, failing_store) in cases {
+    for (name, failing_store, final_exists, temporary_is_complete) in cases {
         let fixture = JournalFixture::new(&format!("pending-intent-{name}"));
         let receipt_store = ReceiptStore::new_for_test(fixture.receipt_path());
         let manifest_path = fixture.root.join("machine.toml");
@@ -1083,16 +1089,14 @@ fn pending_publication_intent_faults_leave_no_partial_final_or_temporary() {
         )
         .unwrap();
         let mut draft = pending_manifest_draft();
+        let publication_id = "019cafd0-5c00-7000-8000-000000000082";
 
         let error = crate::setup::pending::publish_manifest(
             &crate::manifest::MachineManifestStore::new_for_test(&manifest_path),
             &failing_store(fixture.receipt_path().to_path_buf()),
             &mut draft,
             report.pending(),
-            &mut ReceiptMetadataSource::for_test([(
-                "019cafd0-5c00-7000-8000-000000000082",
-                "2026-09-02T10:10:01Z",
-            )]),
+            &mut ReceiptMetadataSource::for_test([(publication_id, "2026-09-02T10:10:01Z")]),
         )
         .unwrap_err();
 
@@ -1104,16 +1108,20 @@ fn pending_publication_intent_faults_leave_no_partial_final_or_temporary() {
                 .unwrap();
         assert!(receipt["pending_publications"].is_null());
         let intent = fixture.pending_publication_intent_path();
-        if intent.exists() {
+        assert_eq!(intent.exists(), final_exists);
+        if final_exists {
             serde_json::from_slice::<serde_json::Value>(&fs::read(&intent).unwrap()).unwrap();
         }
-        assert!(fs::read_dir(fixture.receipt_path().parent().unwrap())
-            .unwrap()
-            .all(|entry| {
-                let name = entry.unwrap().file_name();
-                let name = name.to_string_lossy();
-                !(name.starts_with(".receipt.json.pending-publication.") && name.ends_with(".tmp"))
-            }));
+        let temporary = fixture.pending_publication_temporary_path(publication_id);
+        assert_eq!(temporary.exists(), !final_exists);
+        if temporary_is_complete {
+            serde_json::from_slice::<serde_json::Value>(&fs::read(&temporary).unwrap()).unwrap();
+        } else if temporary.exists() {
+            assert!(
+                serde_json::from_slice::<serde_json::Value>(&fs::read(&temporary).unwrap())
+                    .is_err()
+            );
+        }
     }
 }
 
@@ -1182,14 +1190,98 @@ fn pending_publication_intent_reader_observes_only_absent_or_complete_documents(
             });
             entered.wait();
             let intent_visible = fixture.pending_publication_intent_path().exists();
+            let temporary_visible = fixture
+                .pending_publication_temporary_path("019cafd0-5c00-7000-8000-000000000092")
+                .exists();
+            let manifest_visible = manifest_path.exists();
+            let intent_bytes =
+                intent_visible.then(|| fs::read(fixture.pending_publication_intent_path()));
             let observed = receipt_store.read_snapshot();
             resume.wait();
             writer.join().unwrap().unwrap();
 
             assert_eq!(intent_visible, after_publish);
+            assert_eq!(temporary_visible, !after_publish);
+            assert!(!manifest_visible);
+            if let Some(intent_bytes) = intent_bytes {
+                serde_json::from_slice::<serde_json::Value>(&intent_bytes.unwrap()).unwrap();
+            }
             observed.unwrap();
         });
     }
+}
+
+#[test]
+fn pending_publication_displaced_temporary_after_create_retains_all_evidence() {
+    let fixture = JournalFixture::new("pending-intent-displaced-temporary");
+    let receipt_store = ReceiptStore::new_for_test(fixture.receipt_path());
+    let manifest_path = fixture.root.join("machine.toml");
+    let mut plan = vec![
+        Action::test_named_needs_human(
+            "test.local-approval",
+            Privilege::None,
+            Arc::new(Mutex::new(Vec::new())),
+            NeedsHuman::new(
+                HumanInstructions::new("Complete the local approval, then rerun setup.").unwrap(),
+                None,
+            ),
+        )
+        .0,
+    ];
+    let report = apply_plan_with_journal(
+        &mut plan,
+        &receipt_store,
+        &mut ReceiptMetadataSource::for_test([(
+            "019cafd0-5c00-7000-8000-0000000000a1",
+            "2026-09-02T10:11:30Z",
+        )]),
+    )
+    .unwrap();
+    let publication_id = "019cafd0-5c00-7000-8000-0000000000a2";
+    let temporary = fixture.pending_publication_temporary_path(publication_id);
+    let displaced = temporary.with_extension("created-by-styrn");
+    let victim = b"unrelated temporary evidence";
+    let entered = Arc::new(Barrier::new(2));
+    let resume = Arc::new(Barrier::new(2));
+    let paused_store = ReceiptStore::new_for_test_pausing_pending_intent_after_create(
+        fixture.receipt_path(),
+        Arc::clone(&entered),
+        Arc::clone(&resume),
+    );
+
+    let publication = std::thread::scope(|scope| {
+        let writer = scope.spawn(|| {
+            crate::setup::pending::publish_manifest(
+                &crate::manifest::MachineManifestStore::new_for_test(&manifest_path),
+                &paused_store,
+                &mut pending_manifest_draft(),
+                report.pending(),
+                &mut ReceiptMetadataSource::for_test([(publication_id, "2026-09-02T10:11:31Z")]),
+            )
+        });
+        entered.wait();
+        let displacement = (|| -> std::io::Result<()> {
+            fs::rename(&temporary, &displaced)?;
+            fs::write(&temporary, victim)?;
+            make_private(&temporary);
+            Ok(())
+        })();
+        resume.wait();
+        let publication = writer.join().unwrap();
+        displacement.unwrap();
+        publication
+    });
+    let error = publication.unwrap_err();
+
+    assert_eq!(error.error_code(), "setup.receipt_conflict");
+    assert_eq!(error.exit_code().as_i32(), 13);
+    assert_eq!(fs::read(&temporary).unwrap(), victim);
+    serde_json::from_slice::<serde_json::Value>(&fs::read(&displaced).unwrap()).unwrap();
+    assert!(!fixture.pending_publication_intent_path().exists());
+    assert!(!manifest_path.exists());
+    let receipt: serde_json::Value =
+        serde_json::from_slice(&receipt_store.read_snapshot().unwrap().to_json().unwrap()).unwrap();
+    assert!(receipt["pending_publications"].is_null());
 }
 
 #[test]
@@ -1258,6 +1350,9 @@ fn pending_publication_conflict_retains_raced_preexisting_evidence() {
         fs::read(fixture.pending_publication_intent_path()).unwrap(),
         b"{\"incomplete\":"
     );
+    let retained_temporary =
+        fixture.pending_publication_temporary_path("019cafd0-5c00-7000-8000-000000000102");
+    serde_json::from_slice::<serde_json::Value>(&fs::read(&retained_temporary).unwrap()).unwrap();
     assert!(!manifest_path.exists());
 
     let preexisting_error = crate::setup::pending::publish_manifest(
@@ -1273,11 +1368,13 @@ fn pending_publication_conflict_retains_raced_preexisting_evidence() {
         fs::read(fixture.pending_publication_intent_path()).unwrap(),
         b"{\"incomplete\":"
     );
+    serde_json::from_slice::<serde_json::Value>(&fs::read(&retained_temporary).unwrap()).unwrap();
     assert!(!manifest_path.exists());
 }
 
+#[cfg(not(target_os = "windows"))]
 #[test]
-fn pending_publication_recovery_removes_only_the_bound_orphan_temporary_link() {
+fn unix_pending_publication_recovery_removes_only_the_bound_orphan_temporary_link() {
     let fixture = JournalFixture::new("pending-intent-orphan-link");
     let receipt_store = ReceiptStore::new_for_test(fixture.receipt_path());
     let manifest_path = fixture.root.join("machine.toml");
@@ -1319,6 +1416,9 @@ fn pending_publication_recovery_removes_only_the_bound_orphan_temporary_link() {
     assert_eq!(error.error_code(), "setup.receipt_conflict");
     let intent_path = fixture.pending_publication_intent_path();
     let temporary_path = fixture.pending_publication_temporary_path(publication_id);
+    // Reproduce the exact Unix power-loss state after the final link's
+    // directory fsync and before verified retirement of the temporary link.
+    fs::hard_link(&intent_path, &temporary_path).unwrap();
     assert_eq!(
         crate::platform::private_file_identity(&intent_path).unwrap(),
         crate::platform::private_file_identity(&temporary_path).unwrap()
