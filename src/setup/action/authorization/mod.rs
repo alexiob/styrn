@@ -184,6 +184,29 @@ pub(super) struct AuthorizationContext {
 }
 
 impl AuthorizationContext {
+    #[allow(dead_code)] // T0.20 captures this after probe/plan and before mutation.
+    pub(super) fn capture(
+        host_id: &str,
+        request_path: PathBuf,
+        principal: WorkerPrincipal,
+    ) -> Result<Self, AuthorizationError> {
+        let privilege_class = if cfg!(target_os = "windows") {
+            HostPrivilegeClass::WindowsAdministrator
+        } else {
+            HostPrivilegeClass::UnixRoot
+        };
+        let context = Self {
+            host_id: host_id.to_owned(),
+            executable: std::env::current_exe().map_err(|_| AuthorizationError::RequestInvalid)?,
+            request_path,
+            principal,
+            privilege_class,
+            now: Utc::now(),
+        };
+        context.validate()?;
+        Ok(context)
+    }
+
     #[cfg(test)]
     fn new_for_test(
         host_id: &str,

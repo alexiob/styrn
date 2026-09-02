@@ -72,6 +72,20 @@ fn authorization_policy_has_only_interactive_or_explicit_noninteractive_grants()
 }
 
 #[test]
+fn production_authorization_context_captures_the_exact_current_executable() {
+    let fixture = AuthorizationFixture::new("production-context");
+    let principal = crate::platform::resolve_current_worker_principal().unwrap();
+    let context = AuthorizationContext::capture(
+        "host-01",
+        fixture.request_path().to_owned(),
+        principal.clone(),
+    )
+    .unwrap();
+    assert_eq!(context.executable(), std::env::current_exe().unwrap());
+    assert_eq!(context.principal, principal);
+}
+
+#[test]
 fn ordinary_user_plan_applies_and_reruns_without_authorization() {
     let fixture = AuthorizationFixture::new("ordinary-only");
     let store = ReceiptStore::new_user_for_test(fixture.user_receipt());
