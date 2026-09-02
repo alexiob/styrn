@@ -5,9 +5,16 @@
 //! current executable, but it never dispatches a privileged action itself.
 
 use super::{execution::ApplyReport, Action, ActionCheck, PlanOperation, Privilege};
+#[cfg(test)]
+use super::{execution::PreparedActionRunner, ActionEffect, ActionError};
 use crate::{
     platform::{ManifestOwner, WorkerPrincipal},
     setup::receipt::{ReceiptMetadataSource, ReceiptStore},
+};
+#[cfg(test)]
+use crate::{
+    platform::{SetupExecutionContext, SetupHostPrivilege},
+    setup::receipt::InstallationScope,
 };
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
@@ -600,6 +607,77 @@ pub(super) fn run_privileged_request(
     retained.sort_unstable_by_key(|(index, _)| *index);
     recomputed_plan.extend(retained.into_iter().map(|(_, action)| action));
     Ok(result?)
+}
+
+/// Applies a mixed system-scope plan after the native authorization boundary.
+///
+/// Receipt preparation and publication remain in this process. Only the
+/// prepared mutation is dispatched: ordinary actions go through the original
+/// user's sealed runner, while host actions stay in the authorized process.
+#[cfg(test)]
+fn execute_system_plan_with_test_user_runner<U: PreparedActionRunner>(
+    plan: &mut [Action],
+    system_store: &ReceiptStore,
+    metadata: &mut ReceiptMetadataSource,
+    context: &SetupExecutionContext,
+    user_runner: &mut U,
+) -> Result<ApplyReport, AuthorizationError> {
+    if system_store.installation_scope() != InstallationScope::System
+        || system_store.worker_principal() != context.original_principal()
+    {
+        return Err(AuthorizationError::PrincipalInvalid);
+    }
+    crate::platform::verify_worker_principal(context.original_principal())
+        .map_err(|_| AuthorizationError::PrincipalInvalid)?;
+
+    let privilege_class = match context.host_privilege() {
+        #[cfg(not(target_os = "windows"))]
+        SetupHostPrivilege::Root => HostPrivilegeClass::UnixRoot,
+        #[cfg(target_os = "windows")]
+        SetupHostPrivilege::Administrator => HostPrivilegeClass::WindowsAdministrator,
+        SetupHostPrivilege::Ordinary => return Err(AuthorizationError::RequestInvalid),
+        #[cfg(not(target_os = "windows"))]
+        SetupHostPrivilege::Administrator => return Err(AuthorizationError::RequestInvalid),
+        #[cfg(target_os = "windows")]
+        SetupHostPrivilege::Root => return Err(AuthorizationError::RequestInvalid),
+    };
+    validate_plan(plan, privilege_class)?;
+
+    struct SplitRunner<'a, U> {
+        user: &'a mut U,
+        host_privilege: Privilege,
+    }
+
+    impl<U: PreparedActionRunner> PreparedActionRunner for SplitRunner<'_, U> {
+        fn execute_prepared(
+            &mut self,
+            action: &mut Action,
+            expected: &ActionEffect,
+        ) -> Result<ActionEffect, ActionError> {
+            if action.privilege() == Privilege::None {
+                self.user.execute_prepared(action, expected)
+            } else if action.privilege() == self.host_privilege {
+                action.execute_prepared()
+            } else {
+                Err(ActionError::apply_failed(action.name().clone()))
+            }
+        }
+    }
+
+    let host_privilege = match privilege_class {
+        HostPrivilegeClass::UnixRoot => Privilege::Root,
+        HostPrivilegeClass::WindowsAdministrator => Privilege::Admin,
+    };
+    let mut runner = SplitRunner {
+        user: user_runner,
+        host_privilege,
+    };
+    Ok(super::execution::apply_plan_with_runner(
+        plan,
+        system_store,
+        metadata,
+        &mut runner,
+    )?)
 }
 
 fn read_request(

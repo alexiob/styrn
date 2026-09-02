@@ -614,6 +614,8 @@ enum SetupInternalCommand {
         #[arg(long)]
         digest: String,
     },
+    #[command(name = "user-phase", hide = true)]
+    UserPhase,
 }
 
 #[derive(Clone, Debug, ValueEnum)]
@@ -799,7 +801,7 @@ mod tests {
     }
 
     #[test]
-    fn privileged_setup_phase_is_hidden_and_accepts_only_its_fixed_request_shape() {
+    fn setup_internal_phases_are_hidden_and_accept_only_their_fixed_shapes() {
         let parsed = Cli::try_parse_with_terminals(
             args([
                 "styrn",
@@ -840,15 +842,32 @@ mod tests {
         )
         .is_err());
 
+        let parsed =
+            Cli::try_parse_with_terminals(args(["styrn", "setup", "user-phase"]), false, false)
+                .unwrap();
+        let super::RootCommand::Setup(setup) = parsed.cli.command else {
+            panic!("setup command expected")
+        };
+        assert!(matches!(
+            setup.internal,
+            Some(super::SetupInternalCommand::UserPhase)
+        ));
+        assert!(Cli::try_parse_with_terminals(
+            args(["styrn", "setup", "user-phase", "unexpected"]),
+            false,
+            false,
+        )
+        .is_err());
+
         let failure =
             Cli::try_parse_with_terminals(args(["styrn", "setup", "--help"]), false, false)
                 .unwrap_err();
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
         render_parse_failure(&failure, &mut stdout, &mut stderr).unwrap();
-        assert!(!String::from_utf8(stdout)
-            .unwrap()
-            .contains("privileged-phase"));
+        let stdout = String::from_utf8(stdout).unwrap();
+        assert!(!stdout.contains("privileged-phase"));
+        assert!(!stdout.contains("user-phase"));
     }
 
     fn args<const N: usize>(values: [&str; N]) -> Vec<OsString> {

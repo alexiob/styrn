@@ -28,6 +28,15 @@ pub(super) struct UserExecutionToken {
     gid: u32,
 }
 
+#[cfg(test)]
+pub(super) fn test_user_execution_token(principal: &WorkerPrincipal) -> UserExecutionToken {
+    let (_, gid) = account_for_uid(principal.unix_uid().unwrap()).unwrap();
+    UserExecutionToken {
+        uid: principal.unix_uid().unwrap(),
+        gid,
+    }
+}
+
 pub(super) fn capture_setup_execution_context() -> io::Result<SetupExecutionContext> {
     let caller = UnixCallerIds::new(
         unsafe { libc::getuid() },
@@ -101,10 +110,9 @@ pub(super) fn verify_setup_authorization_path_security(path: &Path) -> io::Resul
     }
 }
 
-pub(super) fn run_as_original(
+pub(super) fn run_user_phase(
     _token: &UserExecutionToken,
-    _executable: &Path,
-    _arguments: &[std::ffi::OsString],
+    _request: &[u8],
 ) -> io::Result<std::process::ExitStatus> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,

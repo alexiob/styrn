@@ -207,6 +207,14 @@ enum IntentReadInterruption {
 }
 
 impl ReceiptStore {
+    pub(in crate::setup) fn installation_scope(&self) -> InstallationScope {
+        self.scope
+    }
+
+    pub(in crate::setup) fn worker_principal(&self) -> &WorkerPrincipal {
+        &self.worker
+    }
+
     fn new_system(
         path: impl Into<PathBuf>,
         worker: WorkerPrincipal,

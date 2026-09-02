@@ -260,6 +260,17 @@ pub(super) fn resolve_current_worker_principal() -> io::Result<WorkerPrincipal> 
 #[allow(dead_code)]
 pub(super) struct UserExecutionToken(OwnedHandle);
 
+#[cfg(test)]
+pub(super) fn test_user_execution_token(_principal: &WorkerPrincipal) -> UserExecutionToken {
+    let mut token = std::ptr::null_mut();
+    assert_ne!(
+        unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) },
+        0,
+        "the current Windows process token must be available to tests"
+    );
+    UserExecutionToken(OwnedHandle(token))
+}
+
 pub(super) fn capture_setup_execution_context() -> io::Result<SetupExecutionContext> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
@@ -295,10 +306,9 @@ pub(super) fn verify_setup_authorization_executable(
     ))
 }
 
-pub(super) fn run_as_original(
+pub(super) fn run_user_phase(
     _token: &UserExecutionToken,
-    _executable: &Path,
-    _arguments: &[std::ffi::OsString],
+    _request: &[u8],
 ) -> io::Result<std::process::ExitStatus> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,

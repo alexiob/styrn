@@ -1,6 +1,6 @@
 //! Action-owned setup execution and receipt orchestration.
 
-use super::{Action, ActionCheck, ActionError, JournalAuthority, NeedsHuman};
+use super::{Action, ActionCheck, ActionEffect, ActionError, JournalAuthority, NeedsHuman};
 use thiserror::Error;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -75,6 +75,35 @@ pub(super) fn apply_plan_with_journal(
     store: &crate::setup::receipt::ReceiptStore,
     metadata: &mut crate::setup::receipt::ReceiptMetadataSource,
 ) -> Result<ApplyReport, ApplyPlanError> {
+    apply_plan_with_runner(plan, store, metadata, &mut DirectPreparedActionRunner)
+}
+
+pub(super) trait PreparedActionRunner {
+    fn execute_prepared(
+        &mut self,
+        action: &mut Action,
+        expected: &ActionEffect,
+    ) -> Result<ActionEffect, ActionError>;
+}
+
+struct DirectPreparedActionRunner;
+
+impl PreparedActionRunner for DirectPreparedActionRunner {
+    fn execute_prepared(
+        &mut self,
+        action: &mut Action,
+        _expected: &ActionEffect,
+    ) -> Result<ActionEffect, ActionError> {
+        action.execute_prepared()
+    }
+}
+
+pub(super) fn apply_plan_with_runner<R: PreparedActionRunner>(
+    plan: &mut [Action],
+    store: &crate::setup::receipt::ReceiptStore,
+    metadata: &mut crate::setup::receipt::ReceiptMetadataSource,
+    runner: &mut R,
+) -> Result<ApplyReport, ApplyPlanError> {
     let mut action_names = std::collections::HashSet::with_capacity(plan.len());
     if plan
         .iter()
@@ -117,7 +146,7 @@ pub(super) fn apply_plan_with_journal(
                 }
                 match action.check()? {
                     ActionCheck::Todo => {
-                        let finalized = action.execute_prepared()?;
+                        let finalized = runner.execute_prepared(action, &prepared)?;
                         if finalized != prepared {
                             return Err(
                                 crate::setup::receipt::ReceiptStoreError::IntentConflict.into()
@@ -148,7 +177,7 @@ pub(super) fn apply_plan_with_journal(
                     &authority,
                 )?;
                 session.interruption_after_prepare(&authority)?;
-                let finalized = action.execute_prepared()?;
+                let finalized = runner.execute_prepared(action, &prepared)?;
                 if finalized != prepared {
                     return Err(crate::setup::receipt::ReceiptStoreError::IntentConflict.into());
                 }

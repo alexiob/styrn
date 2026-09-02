@@ -1,6 +1,9 @@
 use super::*;
 use crate::setup::{
-    action::{Action, HumanInstructions, NeedsHuman, Privilege},
+    action::{
+        execution::PreparedActionRunner, Action, ActionEffect, ActionError, HumanInstructions,
+        NeedsHuman, Privilege,
+    },
     receipt::{ReceiptMetadataSource, ReceiptStore},
 };
 use std::{
@@ -383,6 +386,165 @@ fn privileged_runner_accepts_an_exact_subset_once_and_journals_real_actions() {
 }
 
 #[test]
+fn system_execution_seam_routes_user_and_host_actions_once() {
+    let fixture = AuthorizationFixture::new("elevated-split-execution");
+    let principal = crate::platform::resolve_current_worker_principal().unwrap();
+    let context =
+        crate::platform::SetupExecutionContext::new_for_test(host_setup_privilege(), principal);
+    let store = ReceiptStore::new_for_test(fixture.system_receipt());
+    let state = Arc::new(Mutex::new(Vec::new()));
+    let (ordinary, ordinary_metrics) =
+        Action::test_journaled_state("test.user-action", 1, Privilege::None, Arc::clone(&state));
+    let (privileged, privileged_metrics) = Action::test_journaled_state(
+        "test.system-action",
+        2,
+        host_privilege(),
+        Arc::clone(&state),
+    );
+    let mut plan = vec![ordinary, privileged];
+    let mut metadata = receipt_metadata(&[
+        (
+            "019cb047-3c00-7000-8000-000000000021",
+            "2026-09-02T12:00:01Z",
+        ),
+        (
+            "019cb047-3c00-7000-8000-000000000022",
+            "2026-09-02T12:00:02Z",
+        ),
+    ]);
+    let mut user_runner = SpyPreparedRunner::new(Privilege::None);
+
+    let report = execute_system_plan_with_test_user_runner(
+        &mut plan,
+        &store,
+        &mut metadata,
+        &context,
+        &mut user_runner,
+    )
+    .unwrap();
+
+    assert_eq!(report.applied_count(), 2);
+    assert_eq!(user_runner.calls, 1);
+    assert_eq!(ordinary_metrics.mutation_calls(), 1);
+    assert_eq!(privileged_metrics.mutation_calls(), 1);
+    assert_eq!(*state.lock().unwrap(), vec![1, 2]);
+    assert_eq!(store.read_snapshot().unwrap().entry_count(), 2);
+
+    let mut no_metadata = receipt_metadata(&[]);
+    let second = execute_system_plan_with_test_user_runner(
+        &mut plan,
+        &store,
+        &mut no_metadata,
+        &context,
+        &mut user_runner,
+    )
+    .unwrap();
+    assert!(second.is_nothing_to_do());
+    assert_eq!(user_runner.calls, 1);
+}
+
+#[test]
+fn elevated_system_execution_rejects_scope_identity_and_privilege_before_mutation() {
+    for case in ["user-store", "different-worker", "ordinary-host"] {
+        let fixture = AuthorizationFixture::new(&format!("elevated-preflight-{case}"));
+        let current = crate::platform::resolve_current_worker_principal().unwrap();
+        let context = match case {
+            "different-worker" => crate::platform::SetupExecutionContext::new_for_test(
+                host_setup_privilege(),
+                current,
+            )
+            .with_original_principal_for_test(different_principal()),
+            "ordinary-host" => crate::platform::SetupExecutionContext::new_for_test(
+                crate::platform::SetupHostPrivilege::Ordinary,
+                current,
+            ),
+            _ => crate::platform::SetupExecutionContext::new_for_test(
+                host_setup_privilege(),
+                current,
+            ),
+        };
+        let store = if case == "user-store" {
+            ReceiptStore::new_user_for_test(fixture.user_receipt())
+        } else {
+            ReceiptStore::new_for_test(fixture.system_receipt())
+        };
+        let state = Arc::new(Mutex::new(Vec::new()));
+        let (action, metrics) = Action::test_journaled_state(
+            "test.system-action",
+            1,
+            host_privilege(),
+            Arc::clone(&state),
+        );
+        let mut plan = vec![action];
+        let mut metadata = receipt_metadata(&[]);
+        let mut user_runner = SpyPreparedRunner::new(Privilege::None);
+
+        let error = execute_system_plan_with_test_user_runner(
+            &mut plan,
+            &store,
+            &mut metadata,
+            &context,
+            &mut user_runner,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.exit_code(), 13, "{case}");
+        assert_eq!(metrics.mutation_calls(), 0, "{case}");
+        assert_eq!(user_runner.calls, 0, "{case}");
+        assert!(state.lock().unwrap().is_empty(), "{case}");
+        assert!(!fixture.user_receipt().exists(), "{case}");
+        assert!(!fixture.system_receipt().exists(), "{case}");
+    }
+}
+
+#[test]
+fn prepared_user_action_failure_retries_only_through_the_user_runner() {
+    let fixture = AuthorizationFixture::new("user-runner-retry");
+    let principal = crate::platform::resolve_current_worker_principal().unwrap();
+    let context =
+        crate::platform::SetupExecutionContext::new_for_test(host_setup_privilege(), principal);
+    let store = ReceiptStore::new_for_test(fixture.system_receipt());
+    let state = Arc::new(Mutex::new(Vec::new()));
+    let (action, metrics) =
+        Action::test_journaled_state("test.user-action", 1, Privilege::None, Arc::clone(&state));
+    let mut plan = vec![action];
+    let mut metadata = receipt_metadata(&[(
+        "019cb047-3c00-7000-8000-000000000023",
+        "2026-09-02T12:00:03Z",
+    )]);
+    let mut runner = FailOncePreparedRunner::default();
+
+    let error = execute_system_plan_with_test_user_runner(
+        &mut plan,
+        &store,
+        &mut metadata,
+        &context,
+        &mut runner,
+    )
+    .unwrap_err();
+    assert_eq!(error.error_code(), "setup.apply_failed");
+    assert_eq!(runner.calls, 1);
+    assert_eq!(metrics.mutation_calls(), 0);
+    assert!(state.lock().unwrap().is_empty());
+    assert_eq!(store.read_snapshot().unwrap().entry_count(), 0);
+
+    let mut no_metadata = receipt_metadata(&[]);
+    let report = execute_system_plan_with_test_user_runner(
+        &mut plan,
+        &store,
+        &mut no_metadata,
+        &context,
+        &mut runner,
+    )
+    .unwrap();
+    assert_eq!(report.applied_count(), 1);
+    assert_eq!(runner.calls, 2);
+    assert_eq!(metrics.mutation_calls(), 1);
+    assert_eq!(*state.lock().unwrap(), vec![1]);
+    assert_eq!(store.read_snapshot().unwrap().entry_count(), 1);
+}
+
+#[test]
 fn privileged_runner_rejects_a_self_consistent_request_replacement_not_bound_to_consent() {
     let fixture = AuthorizationFixture::new("request-digest-replacement");
     let context = fixture.context();
@@ -748,7 +910,13 @@ fn receipt_metadata(values: &[(&str, &str)]) -> ReceiptMetadataSource {
     match values {
         [] => ReceiptMetadataSource::for_test([]),
         [(id, timestamp)] => ReceiptMetadataSource::for_test([(*id, *timestamp)]),
-        _ => panic!("test helper supports zero or one receipt metadata value"),
+        [(first_id, first_timestamp), (second_id, second_timestamp)] => {
+            ReceiptMetadataSource::for_test([
+                (*first_id, *first_timestamp),
+                (*second_id, *second_timestamp),
+            ])
+        }
+        _ => panic!("test helper supports up to two receipt metadata values"),
     }
 }
 
@@ -760,6 +928,66 @@ fn host_privilege() -> Privilege {
     #[cfg(not(target_os = "windows"))]
     {
         Privilege::Root
+    }
+}
+
+fn host_setup_privilege() -> crate::platform::SetupHostPrivilege {
+    #[cfg(target_os = "windows")]
+    {
+        crate::platform::SetupHostPrivilege::Administrator
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        crate::platform::SetupHostPrivilege::Root
+    }
+}
+
+struct SpyPreparedRunner {
+    expected_privilege: Privilege,
+    calls: usize,
+}
+
+impl SpyPreparedRunner {
+    fn new(expected_privilege: Privilege) -> Self {
+        Self {
+            expected_privilege,
+            calls: 0,
+        }
+    }
+}
+
+impl PreparedActionRunner for SpyPreparedRunner {
+    fn execute_prepared(
+        &mut self,
+        action: &mut Action,
+        expected: &ActionEffect,
+    ) -> Result<ActionEffect, ActionError> {
+        assert_eq!(action.privilege(), self.expected_privilege);
+        self.calls += 1;
+        let finalized = action.execute_prepared()?;
+        assert_eq!(&finalized, expected);
+        Ok(finalized)
+    }
+}
+
+#[derive(Default)]
+struct FailOncePreparedRunner {
+    calls: usize,
+}
+
+impl PreparedActionRunner for FailOncePreparedRunner {
+    fn execute_prepared(
+        &mut self,
+        action: &mut Action,
+        expected: &ActionEffect,
+    ) -> Result<ActionEffect, ActionError> {
+        self.calls += 1;
+        if self.calls == 1 {
+            return Err(ActionError::apply_failed(action.name().clone()));
+        }
+        let finalized = action.execute_prepared()?;
+        assert_eq!(&finalized, expected);
+        Ok(finalized)
     }
 }
 

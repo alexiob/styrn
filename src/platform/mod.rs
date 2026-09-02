@@ -209,12 +209,11 @@ pub(crate) struct UserExecutionToken(platform_impl::UserExecutionToken);
 
 #[allow(dead_code)]
 impl UserExecutionToken {
-    pub(crate) fn run_as_original(
+    pub(crate) fn run_user_phase(
         &self,
-        executable: &Path,
-        arguments: &[std::ffi::OsString],
+        request: &[u8],
     ) -> std::io::Result<std::process::ExitStatus> {
-        platform_impl::run_as_original(&self.0, executable, arguments)
+        platform_impl::run_user_phase(&self.0, request)
     }
 }
 
@@ -222,6 +221,29 @@ impl UserExecutionToken {
 impl SetupExecutionContext {
     pub(crate) fn capture() -> std::io::Result<Self> {
         platform_impl::capture_setup_execution_context()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_for_test(
+        host_privilege: SetupHostPrivilege,
+        original_principal: WorkerPrincipal,
+    ) -> Self {
+        assert_eq!(
+            original_principal,
+            resolve_current_worker_principal().unwrap(),
+            "test execution tokens may only represent the actual current principal"
+        );
+        let user_token = platform_impl::test_user_execution_token(&original_principal);
+        Self::new(host_privilege, original_principal, user_token)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_original_principal_for_test(
+        mut self,
+        original_principal: WorkerPrincipal,
+    ) -> Self {
+        self.original_principal = original_principal;
+        self
     }
 
     fn new(
@@ -1007,12 +1029,9 @@ mod setup_execution_tests {
 
     #[cfg(unix)]
     #[test]
-    fn original_user_spawn_seam_fails_closed_until_native_identity_restoration_exists() {
+    fn fixed_user_phase_seam_fails_closed_until_native_identity_restoration_exists() {
         let context = SetupExecutionContext::capture().unwrap();
-        let error = context
-            .user_token()
-            .run_as_original(Path::new("/does/not/run"), &[])
-            .unwrap_err();
+        let error = context.user_token().run_user_phase(b"{}").unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::Unsupported);
     }
 
