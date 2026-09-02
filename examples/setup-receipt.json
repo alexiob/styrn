@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "entries": [
+    {
+      "entry_id": "019cafd0-5c00-7000-8000-000000000001",
+      "action": {
+        "type": "foundation",
+        "parameters": {
+          "action_id": "foundation.install-tool"
+        }
+      },
+      "timestamp": "2026-09-02T10:00:00Z",
+      "privilege_used": "root",
+      "files_created": [
+        {
+          "path": "/opt/styrn/bin/tool",
+          "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      ],
+      "files_modified": [],
+      "services": [],
+      "accounts": [],
+      "registry_keys": [],
+      "firewall_rules": [],
+      "download_provenance": {
+        "url": "https://downloads.example.test/styrn/tool-1.2.3",
+        "version": "1.2.3",
+        "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
+      },
+      "status": "applied"
+    }
+  ]
+}

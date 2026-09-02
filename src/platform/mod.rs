@@ -67,8 +67,19 @@ pub(crate) fn open_manifest_lock(
     platform_impl::open_manifest_lock(path, owner)
 }
 
-pub(crate) fn create_manifest_temporary(path: &Path) -> std::io::Result<std::fs::File> {
-    platform_impl::create_manifest_temporary(path)
+#[allow(dead_code)] // Source-including manifest tests do not include receipt recovery.
+pub(crate) fn verify_private_file_security(
+    path: &Path,
+    owner: ManifestOwner,
+) -> std::io::Result<()> {
+    platform_impl::verify_private_file_security(path, owner)
+}
+
+pub(crate) fn create_private_file(
+    path: &Path,
+    owner: ManifestOwner,
+) -> std::io::Result<std::fs::File> {
+    platform_impl::create_private_file(path, owner)
 }
 
 pub(crate) fn verify_manifest_security(
@@ -78,6 +89,16 @@ pub(crate) fn verify_manifest_security(
     trusted_root: &Path,
 ) -> std::io::Result<()> {
     platform_impl::verify_manifest_security(path, owner, worker, trusted_root)
+}
+
+#[allow(dead_code)] // Source-including manifest tests do not include receipt reads.
+pub(crate) fn open_verified_manifest_file_for_read(
+    path: &Path,
+    owner: ManifestOwner,
+    worker: &str,
+    trusted_root: &Path,
+) -> std::io::Result<std::fs::File> {
+    platform_impl::open_verified_manifest_file_for_read(path, owner, worker, trusted_root)
 }
 
 pub(crate) fn verify_manifest_ancestors(
@@ -126,6 +147,22 @@ pub(crate) fn replace_file(temporary: &Path, destination: &Path) -> std::io::Res
     #[cfg(target_os = "windows")]
     {
         windows::replace_file(temporary, destination)
+    }
+}
+
+/// Makes a completed atomic directory-entry replacement durable where the
+/// host requires an explicit parent-directory flush. Windows publication uses
+/// `MOVEFILE_WRITE_THROUGH` in `replace_file`.
+#[allow(dead_code)] // Source-including contract tests do not include receipt publication.
+pub(crate) fn sync_parent_directory(directory: &Path) -> std::io::Result<()> {
+    #[cfg(not(target_os = "windows"))]
+    {
+        std::fs::File::open(directory)?.sync_all()
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let _ = directory;
+        Ok(())
     }
 }
 

@@ -1400,6 +1400,8 @@ mod tests {
         command
             .arg("--edition=2021")
             .arg("--error-format=json")
+            .arg("--cfg")
+            .arg("action_core_fixture")
             .arg(&fixture)
             .arg("-L")
             .arg(format!("dependency={}", artifacts.deps_dir.display()));

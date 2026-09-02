@@ -4,8 +4,14 @@
 //! `apply` method always checks first; the mutation hook is deliberately
 //! confined to this module so callers cannot bypass that gate.
 
+#![allow(unexpected_cfgs)] // Exact rustc compile-boundary fixtures use private cfg names.
+
 use std::fmt;
 use thiserror::Error;
+
+/// Unforgeable authority required by receipt mutation sessions. Its field is
+/// private to this module, so read-only plan descendants cannot mint one.
+pub(crate) struct JournalAuthority(());
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ActionCheck {
@@ -21,10 +27,143 @@ pub(crate) enum ApplyOutcome {
     NeedsHuman(NeedsHuman),
 }
 
-/// An intentionally narrow, in-memory placeholder until T0.11 owns receipts.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ActionEffect {
-    Changed,
+/// The finalized, typed description of one successful action mutation.
+///
+/// Fields are private and construction stays behind the action mutation gate;
+/// receipt publication may inspect them but plan/dry-run code cannot forge one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ActionEffect {
+    files_created: Vec<CreatedFileEffect>,
+    files_modified: Vec<ModifiedFileEffect>,
+    services: Vec<String>,
+    accounts: Vec<String>,
+    registry_keys: Vec<String>,
+    firewall_rules: Vec<String>,
+    download_provenance: Option<DownloadProvenanceEffect>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CreatedFileEffect {
+    path: String,
+    sha256: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ModifiedFileEffect {
+    path: String,
+    before_sha256: String,
+    backup_path: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DownloadProvenanceEffect {
+    url: String,
+    version: String,
+    sha256: String,
+}
+
+impl ActionEffect {
+    pub(in crate::setup) fn files_created(&self) -> &[CreatedFileEffect] {
+        &self.files_created
+    }
+
+    pub(in crate::setup) fn files_modified(&self) -> &[ModifiedFileEffect] {
+        &self.files_modified
+    }
+
+    pub(in crate::setup) fn services(&self) -> &[String] {
+        &self.services
+    }
+
+    pub(in crate::setup) fn accounts(&self) -> &[String] {
+        &self.accounts
+    }
+
+    pub(in crate::setup) fn registry_keys(&self) -> &[String] {
+        &self.registry_keys
+    }
+
+    pub(in crate::setup) fn firewall_rules(&self) -> &[String] {
+        &self.firewall_rules
+    }
+
+    pub(in crate::setup) fn download_provenance(&self) -> Option<&DownloadProvenanceEffect> {
+        self.download_provenance.as_ref()
+    }
+
+    #[cfg(test)]
+    fn test_fixture(marker: u8) -> Self {
+        #[cfg(not(target_os = "windows"))]
+        let (created_path, modified_path, backup_path) = (
+            format!("/opt/styrn/test/{marker}"),
+            format!("/etc/styrn/test/{marker}.toml"),
+            format!("/var/lib/styrn/backups/{marker}.toml"),
+        );
+        #[cfg(target_os = "windows")]
+        let (created_path, modified_path, backup_path) = (
+            format!(r"C:\ProgramData\Styrn\test\{marker}"),
+            format!(r"C:\ProgramData\Styrn\test\{marker}.toml"),
+            format!(r"C:\ProgramData\Styrn\backups\{marker}.toml"),
+        );
+        Self {
+            files_created: vec![CreatedFileEffect {
+                path: created_path,
+                sha256: format!("{marker:064}"),
+            }],
+            files_modified: vec![ModifiedFileEffect {
+                path: modified_path,
+                before_sha256: "a".repeat(64),
+                backup_path,
+            }],
+            services: vec![format!("styrn-test-{marker}")],
+            accounts: vec![format!("styrn-test-{marker}")],
+            registry_keys: vec![format!(r"HKLM\Software\Styrn\Test{marker}")],
+            firewall_rules: vec![format!("Styrn Test {marker}")],
+            download_provenance: Some(DownloadProvenanceEffect {
+                url: format!("https://downloads.example.test/test/{marker}"),
+                version: format!("1.0.{marker}"),
+                sha256: "b".repeat(64),
+            }),
+        }
+    }
+}
+
+impl CreatedFileEffect {
+    pub(in crate::setup) fn path(&self) -> &str {
+        &self.path
+    }
+
+    pub(in crate::setup) fn sha256(&self) -> &str {
+        &self.sha256
+    }
+}
+
+impl ModifiedFileEffect {
+    pub(in crate::setup) fn path(&self) -> &str {
+        &self.path
+    }
+
+    pub(in crate::setup) fn before_sha256(&self) -> &str {
+        &self.before_sha256
+    }
+
+    pub(in crate::setup) fn backup_path(&self) -> &str {
+        &self.backup_path
+    }
+}
+
+impl DownloadProvenanceEffect {
+    pub(in crate::setup) fn url(&self) -> &str {
+        &self.url
+    }
+
+    pub(in crate::setup) fn version(&self) -> &str {
+        &self.version
+    }
+
+    pub(in crate::setup) fn sha256(&self) -> &str {
+        &self.sha256
+    }
 }
 
 #[cfg(test)]
@@ -224,6 +363,8 @@ pub(crate) struct TestAction {
     state: Arc<Mutex<Vec<u8>>>,
     metrics: TestMetrics,
     behavior: TestBehavior,
+    marker: u8,
+    effect: Box<ActionEffect>,
 }
 
 #[cfg(test)]
@@ -271,7 +412,44 @@ mod gate {
             privilege: Privilege,
             state: Arc<Mutex<Vec<u8>>>,
         ) -> (Self, TestMetrics) {
-            Self::test_action(privilege, state, TestBehavior::StateDriven)
+            Self::test_action("test.state", 1, privilege, state, TestBehavior::StateDriven)
+        }
+
+        #[cfg(test)]
+        pub(super) fn test_journaled_state(
+            name: &str,
+            marker: u8,
+            privilege: Privilege,
+            state: Arc<Mutex<Vec<u8>>>,
+        ) -> (Self, TestMetrics) {
+            Self::test_action(name, marker, privilege, state, TestBehavior::StateDriven)
+        }
+
+        #[cfg(test)]
+        pub(super) fn test_journaled_failure(
+            name: &str,
+            marker: u8,
+            privilege: Privilege,
+            state: Arc<Mutex<Vec<u8>>>,
+        ) -> (Self, TestMetrics) {
+            Self::test_action(name, marker, privilege, state, TestBehavior::ApplyFailure)
+        }
+
+        #[cfg(test)]
+        pub(super) fn test_journaled_with_effect(
+            name: &str,
+            marker: u8,
+            privilege: Privilege,
+            state: Arc<Mutex<Vec<u8>>>,
+            effect: ActionEffect,
+        ) -> (Self, TestMetrics) {
+            let (mut wrapped, metrics) =
+                Self::test_action(name, marker, privilege, state, TestBehavior::StateDriven);
+            let Self::Test(action) = &mut wrapped else {
+                unreachable!("test action constructor must return the test variant")
+            };
+            *action.effect = effect;
+            (wrapped, metrics)
         }
 
         #[cfg(test)]
@@ -280,7 +458,13 @@ mod gate {
             state: Arc<Mutex<Vec<u8>>>,
             needs_human: NeedsHuman,
         ) -> (Self, TestMetrics) {
-            Self::test_action(privilege, state, TestBehavior::NeedsHuman(needs_human))
+            Self::test_action(
+                "test.state",
+                1,
+                privilege,
+                state,
+                TestBehavior::NeedsHuman(needs_human),
+            )
         }
 
         #[cfg(test)]
@@ -288,7 +472,13 @@ mod gate {
             privilege: Privilege,
             state: Arc<Mutex<Vec<u8>>>,
         ) -> (Self, TestMetrics) {
-            Self::test_action(privilege, state, TestBehavior::CheckFailure)
+            Self::test_action(
+                "test.state",
+                1,
+                privilege,
+                state,
+                TestBehavior::CheckFailure,
+            )
         }
 
         #[cfg(test)]
@@ -296,11 +486,19 @@ mod gate {
             privilege: Privilege,
             state: Arc<Mutex<Vec<u8>>>,
         ) -> (Self, TestMetrics) {
-            Self::test_action(privilege, state, TestBehavior::ApplyFailure)
+            Self::test_action(
+                "test.state",
+                1,
+                privilege,
+                state,
+                TestBehavior::ApplyFailure,
+            )
         }
 
         #[cfg(test)]
         fn test_action(
+            name: &str,
+            marker: u8,
             privilege: Privilege,
             state: Arc<Mutex<Vec<u8>>>,
             behavior: TestBehavior,
@@ -310,13 +508,15 @@ mod gate {
                 mutation_calls: Arc::new(AtomicUsize::new(0)),
             };
             let action = TestAction {
-                name: ActionName::parse("test.state").expect("test action name must be valid"),
+                name: ActionName::parse(name).expect("test action name must be valid"),
                 description: ActionDescription::new("Converge test state")
                     .expect("test description must be valid"),
                 privilege,
                 state,
                 metrics: metrics.clone(),
                 behavior,
+                marker,
+                effect: Box::new(ActionEffect::test_fixture(marker)),
             };
             (Self::Test(action), metrics)
         }
@@ -337,7 +537,7 @@ mod gate {
                     action.metrics.check_calls.fetch_add(1, Ordering::SeqCst);
                     match &action.behavior {
                         TestBehavior::StateDriven | TestBehavior::ApplyFailure => {
-                            if action.state.lock().unwrap().as_slice() == [1] {
+                            if action.state.lock().unwrap().contains(&action.marker) {
                                 Ok(ActionCheck::Done)
                             } else {
                                 Ok(ActionCheck::Todo)
@@ -386,6 +586,20 @@ mod gate {
             }
         }
 
+        pub(in crate::setup::action) fn prepare_effect(&self) -> Result<ActionEffect, ActionError> {
+            match self {
+                Self::Foundation(action) => Err(ActionError::apply_failed(action.name.clone())),
+                #[cfg(test)]
+                Self::Test(action) => Ok((*action.effect).clone()),
+            }
+        }
+
+        pub(in crate::setup::action) fn execute_prepared(
+            &mut self,
+        ) -> Result<ActionEffect, ActionError> {
+            execute(self)
+        }
+
         pub(crate) fn revert(&mut self, _effect: &ActionEffect) -> Result<(), ActionError> {
             Err(ActionError::UnsupportedUntilPhase7 {
                 action: self.name().clone(),
@@ -417,12 +631,18 @@ mod gate {
                 if matches!(action.behavior, TestBehavior::ApplyFailure) {
                     return Err(ActionError::apply_failed(action.name.clone()));
                 }
-                *action.state.lock().unwrap() = vec![1];
-                Ok(ActionEffect::Changed)
+                action.state.lock().unwrap().push(action.marker);
+                Ok((*action.effect).clone())
             }
         }
     }
 }
+
+#[cfg(not(action_core_fixture))]
+mod execution;
+#[cfg(not(action_core_fixture))]
+#[allow(unused_imports)] // Private canonical route; T0.20 adds its authorized frontend.
+use execution::apply_plan_with_journal;
 
 fn checked_text(value: &str, error: ActionError) -> Result<String, ActionError> {
     if super::validate_probe_static_text(value) {

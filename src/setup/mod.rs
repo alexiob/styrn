@@ -1,3 +1,5 @@
+#![allow(unexpected_cfgs)] // Exact rustc compile-boundary fixtures use private cfg names.
+
 #[allow(dead_code)]
 pub(crate) mod action;
 #[allow(dead_code)]
@@ -8,6 +10,9 @@ pub(crate) mod probe;
 mod probe_values;
 #[allow(dead_code)]
 mod probe_wire;
+#[allow(dead_code)]
+#[cfg(not(action_core_fixture))]
+pub(crate) mod receipt;
 
 #[allow(unused_imports)]
 pub(crate) use probe_wire::{DoctorFinding, DoctorFindingState, ObservedState, ProbeObservation};

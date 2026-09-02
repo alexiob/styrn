@@ -27,6 +27,8 @@ unsafe extern "C" {
     fn acl_init(count: i32) -> Acl;
     fn acl_free(object: *mut std::ffi::c_void) -> i32;
     fn acl_get_file(path: *const i8, kind: i32) -> Acl;
+    #[allow(dead_code)]
+    fn acl_get_fd_np(fd: i32, kind: i32) -> Acl;
     fn acl_set_file(path: *const i8, kind: i32, acl: Acl) -> i32;
     fn acl_get_entry(acl: Acl, entry_id: i32, entry: *mut AclEntry) -> i32;
     #[cfg(test)]
@@ -80,35 +82,27 @@ pub(super) fn harden_manifest_file(
     verify_file(path, owner, 0o644, "manifest")
 }
 
-pub(super) fn harden_manifest_lock(path: &Path, owner: ManifestOwner) -> io::Result<()> {
-    require_regular_file(path)?;
-    clear_extended_acl(path)?;
-    apply_owner(path, owner)?;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
-    verify_file(path, owner, 0o600, "manifest lock")
-}
-
 pub(super) fn open_manifest_lock(path: &Path, owner: ManifestOwner) -> io::Result<fs::File> {
-    let created = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path);
+    let created = create_private_file(path, owner);
     let file = match created {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-            harden_manifest_lock(path, owner)?;
+            verify_private_file_security(path, owner)?;
             fs::OpenOptions::new().read(true).write(true).open(path)?
         }
         Err(error) => return Err(error),
     };
-    harden_manifest_lock(path, owner)?;
+    verify_private_file_security(path, owner)?;
     Ok(file)
 }
 
-pub(super) fn create_manifest_temporary(path: &Path) -> io::Result<fs::File> {
+pub(super) fn verify_private_file_security(path: &Path, owner: ManifestOwner) -> io::Result<()> {
+    verify_file(path, owner, 0o600, "private store file")
+}
+
+pub(super) fn create_private_file(path: &Path, _owner: ManifestOwner) -> io::Result<fs::File> {
     fs::OpenOptions::new()
+        .read(true)
         .write(true)
         .create_new(true)
         .mode(0o600)
@@ -143,6 +137,48 @@ pub(super) fn verify_manifest_security(
         directory_mode: directory.mode() & 0o777,
     })?;
     verify_manifest_ancestors(parent, owner, worker, trusted_root)
+}
+
+#[allow(dead_code)] // Source-including manifest tests do not include receipt reads.
+pub(super) fn open_verified_manifest_file_for_read(
+    path: &Path,
+    owner: ManifestOwner,
+    worker: &str,
+    trusted_root: &Path,
+) -> io::Result<fs::File> {
+    use std::os::fd::AsRawFd;
+
+    let parent = path
+        .parent()
+        .ok_or_else(|| invalid_data("manifest path has no parent directory"))?;
+    require_real_directory(parent)?;
+    verify_no_extended_acl(parent)?;
+    verify_manifest_ancestors(parent, owner, worker, trusted_root)?;
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(path)?;
+    let file_metadata = file.metadata()?;
+    if !file_metadata.is_file() {
+        return Err(permission_denied("manifest target is not a regular file"));
+    }
+    verify_no_extended_acl_fd(file.as_raw_fd())?;
+    let directory = fs::metadata(parent)?;
+    let expected_uid = match owner {
+        ManifestOwner::System => 0,
+        #[cfg(test)]
+        ManifestOwner::CurrentProcess | ManifestOwner::CurrentProcessWorker => file_metadata.uid(),
+    };
+    validate_manifest_inspection(&UnixManifestInspection {
+        expected_uid,
+        file_uid: file_metadata.uid(),
+        file_mode: file_metadata.mode() & 0o777,
+        directory_uid: directory.uid(),
+        directory_mode: directory.mode() & 0o777,
+    })?;
+    verify_no_extended_acl(parent)?;
+    verify_manifest_ancestors(parent, owner, worker, trusted_root)?;
+    Ok(file)
 }
 
 pub(super) fn verify_manifest_file_target(path: &Path) -> io::Result<()> {
@@ -288,11 +324,13 @@ fn validate_ancestor_access(
 ) -> io::Result<()> {
     if require_worker_traversal && mode & 0o001 == 0 {
         return Err(permission_denied(
-            "manifest ancestor is not traversable by the styrn worker",
+            "manifest ancestor is not traversable by the configured worker",
         ));
     }
     if worker_uid == Some(uid) {
-        return Err(permission_denied("styrn worker owns a manifest ancestor"));
+        return Err(permission_denied(
+            "configured worker owns a manifest ancestor",
+        ));
     }
     Ok(())
 }
@@ -318,7 +356,7 @@ fn lookup_worker_uid(worker: &str) -> io::Result<u32> {
     if result.is_null() {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
-            "styrn worker account is unavailable",
+            "configured worker account is unavailable",
         ));
     }
     Ok(entry.pw_uid)
@@ -400,8 +438,16 @@ fn verify_no_extended_acl(path: &Path) -> io::Result<()> {
     verify_no_extended_acl_c_path(&c_path(path)?)
 }
 
+#[allow(dead_code)] // Source-including manifest tests do not include receipt reads.
+fn verify_no_extended_acl_fd(fd: i32) -> io::Result<()> {
+    verify_no_extended_acl_value(unsafe { acl_get_fd_np(fd, ACL_TYPE_EXTENDED) })
+}
+
 fn verify_no_extended_acl_c_path(path: &std::ffi::CString) -> io::Result<()> {
-    let acl = unsafe { acl_get_file(path.as_ptr(), ACL_TYPE_EXTENDED) };
+    verify_no_extended_acl_value(unsafe { acl_get_file(path.as_ptr(), ACL_TYPE_EXTENDED) })
+}
+
+fn verify_no_extended_acl_value(acl: Acl) -> io::Result<()> {
     if acl.is_null() {
         let error = io::Error::last_os_error();
         return if error.kind() == io::ErrorKind::NotFound {

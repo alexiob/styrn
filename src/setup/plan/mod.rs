@@ -433,3 +433,7 @@ mod fixture_support {
     #[path = "hostile_apply.rs"]
     mod hostile_apply;
 }
+
+#[cfg(plan_receipt_forge_fixture)]
+#[path = "hostile_receipt.rs"]
+mod hostile_receipt;

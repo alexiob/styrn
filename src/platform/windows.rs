@@ -26,7 +26,17 @@ const OBJECT_INHERIT_ACE: u8 = 0x01;
 const CONTAINER_INHERIT_ACE: u8 = 0x02;
 const INHERIT_ONLY_ACE: u8 = 0x08;
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0000_0010;
 const INVALID_FILE_ATTRIBUTES: u32 = 0xffff_ffff;
+const GENERIC_READ: u32 = 0x8000_0000;
+const GENERIC_WRITE: u32 = 0x4000_0000;
+const FILE_SHARE_READ: u32 = 0x0000_0001;
+const FILE_SHARE_WRITE: u32 = 0x0000_0002;
+const FILE_SHARE_DELETE: u32 = 0x0000_0004;
+const CREATE_NEW: u32 = 1;
+const OPEN_EXISTING: u32 = 3;
+const FILE_ATTRIBUTE_NORMAL: u32 = 0x0000_0080;
+const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
 const PARENT_TAKEOVER_ACCESS: u32 =
     0x0000_0040 | 0x0001_0000 | 0x0004_0000 | 0x0008_0000 | 0x4000_0000 | 0x1000_0000;
 
@@ -90,6 +100,27 @@ struct SecurityAttributes {
     inherit_handle: i32,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct FileTime {
+    low_date_time: u32,
+    high_date_time: u32,
+}
+
+#[repr(C)]
+struct ByHandleFileInformation {
+    file_attributes: u32,
+    creation_time: FileTime,
+    last_access_time: FileTime,
+    last_write_time: FileTime,
+    volume_serial_number: u32,
+    file_size_high: u32,
+    file_size_low: u32,
+    number_of_links: u32,
+    file_index_high: u32,
+    file_index_low: u32,
+}
+
 #[link(name = "advapi32")]
 unsafe extern "system" {
     fn ConvertStringSecurityDescriptorToSecurityDescriptorW(
@@ -115,6 +146,16 @@ unsafe extern "system" {
     fn ConvertSidToStringSidW(sid: *const c_void, string_sid: *mut *mut u16) -> i32;
     fn GetNamedSecurityInfoW(
         object_name: *mut u16,
+        object_type: u32,
+        security_information: u32,
+        owner: *mut *mut c_void,
+        group: *mut *mut c_void,
+        dacl: *mut *mut Acl,
+        sacl: *mut *mut Acl,
+        security_descriptor: *mut *mut c_void,
+    ) -> u32;
+    fn GetSecurityInfo(
+        handle: *mut c_void,
         object_type: u32,
         security_information: u32,
         owner: *mut *mut c_void,
@@ -159,7 +200,6 @@ unsafe extern "system" {
         path_name: *const u16,
         security_attributes: *const SecurityAttributes,
     ) -> i32;
-    #[cfg(test)]
     fn CreateFileW(
         file_name: *const u16,
         desired_access: u32,
@@ -169,6 +209,10 @@ unsafe extern "system" {
         flags_and_attributes: u32,
         template_file: *mut c_void,
     ) -> *mut c_void;
+    fn GetFileInformationByHandle(
+        file: *mut c_void,
+        information: *mut ByHandleFileInformation,
+    ) -> i32;
     fn MoveFileExW(existing: *const u16, replacement: *const u16, flags: u32) -> i32;
     #[cfg(test)]
     fn CloseHandle(handle: *mut c_void) -> i32;
@@ -290,25 +334,16 @@ pub(super) fn harden_manifest_file(
     inspect_acl(path, worker, AclKind::Manifest)
 }
 
-pub(super) fn harden_manifest_lock(path: &Path, owner: ManifestOwner) -> io::Result<()> {
-    require_kind(path, false)?;
-    if is_test_owner(owner) {
-        return Ok(());
-    }
-    apply_acl(path, "styrn", AclKind::Lock)?;
-    inspect_acl(path, "styrn", AclKind::Lock)
-}
-
 pub(super) fn open_manifest_lock(path: &Path, owner: ManifestOwner) -> io::Result<std::fs::File> {
-    let created = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create_new(true)
-        .open(path);
+    let created = create_private_file_with_sharing(
+        path,
+        owner,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+    );
     let file = match created {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-            harden_manifest_lock(path, owner)?;
+            verify_private_file_security(path, owner)?;
             std::fs::OpenOptions::new()
                 .read(true)
                 .write(true)
@@ -316,15 +351,77 @@ pub(super) fn open_manifest_lock(path: &Path, owner: ManifestOwner) -> io::Resul
         }
         Err(error) => return Err(error),
     };
-    harden_manifest_lock(path, owner)?;
+    verify_private_file_security(path, owner)?;
     Ok(file)
 }
 
-pub(super) fn create_manifest_temporary(path: &Path) -> io::Result<std::fs::File> {
-    std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(path)
+pub(super) fn verify_private_file_security(path: &Path, owner: ManifestOwner) -> io::Result<()> {
+    require_kind(path, false)?;
+    if is_test_owner(owner) {
+        return Ok(());
+    }
+    inspect_private_acl(path, AclKind::Lock)
+}
+
+pub(super) fn create_private_file(path: &Path, owner: ManifestOwner) -> io::Result<std::fs::File> {
+    create_private_file_with_sharing(
+        path,
+        owner,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+    )
+}
+
+fn create_private_file_with_sharing(
+    path: &Path,
+    owner: ManifestOwner,
+    share_mode: u32,
+) -> io::Result<std::fs::File> {
+    if is_test_owner(owner) {
+        use std::os::windows::fs::OpenOptionsExt;
+        return std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .share_mode(share_mode)
+            .open(path);
+    }
+
+    let wide_sddl = wide(&acl_sddl("unused", AclKind::Lock));
+    let mut descriptor = std::ptr::null_mut();
+    if unsafe {
+        ConvertStringSecurityDescriptorToSecurityDescriptorW(
+            wide_sddl.as_ptr(),
+            1,
+            &mut descriptor,
+            std::ptr::null_mut(),
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    let descriptor = LocalAllocation(descriptor);
+    let attributes = SecurityAttributes {
+        length: std::mem::size_of::<SecurityAttributes>() as u32,
+        security_descriptor: descriptor.0,
+        inherit_handle: 0,
+    };
+    let path = wide_os(path);
+    let handle = unsafe {
+        CreateFileW(
+            path.as_ptr(),
+            GENERIC_READ | GENERIC_WRITE,
+            share_mode,
+            &attributes,
+            CREATE_NEW,
+            FILE_ATTRIBUTE_NORMAL,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle as isize == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    use std::os::windows::io::FromRawHandle;
+    Ok(unsafe { std::fs::File::from_raw_handle(handle) })
 }
 
 pub(super) fn verify_manifest_security(
@@ -344,6 +441,54 @@ pub(super) fn verify_manifest_security(
     verify_manifest_ancestors(parent, owner, worker, trusted_root)?;
     inspect_acl(parent, worker, AclKind::Directory)?;
     inspect_acl(path, worker, AclKind::Manifest)
+}
+
+pub(super) fn open_verified_manifest_file_for_read(
+    path: &Path,
+    owner: ManifestOwner,
+    worker: &str,
+    trusted_root: &Path,
+) -> io::Result<std::fs::File> {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle};
+
+    let parent = path
+        .parent()
+        .ok_or_else(|| invalid_data("manifest path has no parent directory"))?;
+    require_kind(parent, true)?;
+    verify_manifest_ancestors(parent, owner, worker, trusted_root)?;
+    if !is_test_owner(owner) {
+        inspect_acl(parent, worker, AclKind::Directory)?;
+    }
+    let path = wide_os(path);
+    let handle = unsafe {
+        CreateFileW(
+            path.as_ptr(),
+            GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            FILE_FLAG_OPEN_REPARSE_POINT,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle as isize == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    let file = unsafe { std::fs::File::from_raw_handle(handle) };
+    let mut information = unsafe { std::mem::zeroed::<ByHandleFileInformation>() };
+    if unsafe { GetFileInformationByHandle(file.as_raw_handle(), &mut information) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if information.file_attributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY) != 0
+    {
+        return Err(permission_denied("manifest target is not a regular file"));
+    }
+    if !is_test_owner(owner) {
+        inspect_handle_acl(&file, worker, AclKind::Manifest)?;
+        verify_manifest_ancestors(parent, owner, worker, trusted_root)?;
+        inspect_acl(parent, worker, AclKind::Directory)?;
+    }
+    Ok(file)
 }
 
 pub(super) fn verify_manifest_file_target(path: &Path) -> io::Result<()> {
@@ -473,6 +618,18 @@ fn acl_sddl(worker_sid: &str, kind: AclKind) -> String {
 }
 
 fn inspect_acl(path: &Path, worker: &str, kind: AclKind) -> io::Result<()> {
+    let worker = lookup_account_sid(worker)?;
+    inspect_acl_with_worker(path, &worker, kind)
+}
+
+fn inspect_private_acl(path: &Path, kind: AclKind) -> io::Result<()> {
+    // Private lock/temporary/intent ACLs contain only SYSTEM and
+    // Administrators, so verification must not depend on any worker identity.
+    let non_worker = well_known_sid(WIN_LOCAL_SYSTEM_SID)?;
+    inspect_acl_with_worker(path, &non_worker, kind)
+}
+
+fn inspect_acl_with_worker(path: &Path, worker: &[u8], kind: AclKind) -> io::Result<()> {
     let mut path = wide_os(path);
     let mut owner = std::ptr::null_mut();
     let mut dacl = std::ptr::null_mut();
@@ -493,6 +650,42 @@ fn inspect_acl(path: &Path, worker: &str, kind: AclKind) -> io::Result<()> {
         return Err(io::Error::from_raw_os_error(status as i32));
     }
     let descriptor = LocalAllocation(descriptor);
+    inspect_security_descriptor(owner, dacl, descriptor.0, worker, kind)
+}
+
+fn inspect_handle_acl(file: &std::fs::File, worker: &str, kind: AclKind) -> io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+
+    let worker = lookup_account_sid(worker)?;
+    let mut owner = std::ptr::null_mut();
+    let mut dacl = std::ptr::null_mut();
+    let mut descriptor = std::ptr::null_mut();
+    let status = unsafe {
+        GetSecurityInfo(
+            file.as_raw_handle(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            &mut owner,
+            std::ptr::null_mut(),
+            &mut dacl,
+            std::ptr::null_mut(),
+            &mut descriptor,
+        )
+    };
+    if status != 0 {
+        return Err(io::Error::from_raw_os_error(status as i32));
+    }
+    let descriptor = LocalAllocation(descriptor);
+    inspect_security_descriptor(owner, dacl, descriptor.0, &worker, kind)
+}
+
+fn inspect_security_descriptor(
+    owner: *mut c_void,
+    dacl: *mut Acl,
+    descriptor: *mut c_void,
+    worker: &[u8],
+    kind: AclKind,
+) -> io::Result<()> {
     if dacl.is_null() || owner.is_null() {
         return Err(permission_denied(
             "manifest security descriptor is incomplete",
@@ -501,16 +694,15 @@ fn inspect_acl(path: &Path, worker: &str, kind: AclKind) -> io::Result<()> {
 
     let administrators = well_known_sid(WIN_BUILTIN_ADMINISTRATORS_SID)?;
     let system = well_known_sid(WIN_LOCAL_SYSTEM_SID)?;
-    let worker = lookup_account_sid(worker)?;
     let mut control = 0;
     let mut revision = 0;
-    if unsafe { GetSecurityDescriptorControl(descriptor.0, &mut control, &mut revision) } == 0 {
+    if unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) } == 0 {
         return Err(io::Error::last_os_error());
     }
     let inspection = AclInspection {
         owner_is_administrators: unsafe { EqualSid(owner, administrators.as_ptr().cast()) } != 0,
         dacl_is_protected: control & SE_DACL_PROTECTED != 0,
-        entries: inspect_aces(dacl, &system, &administrators, &worker)?,
+        entries: inspect_aces(dacl, &system, &administrators, worker)?,
     };
     validate_acl_contract(&inspection, kind)
 }
@@ -552,7 +744,9 @@ fn inspect_ancestor_acl(path: &Path, worker: &str) -> io::Result<()> {
 
 fn validate_ancestor_entries(worker_is_owner: bool, entries: &[AceInspection]) -> io::Result<()> {
     if worker_is_owner {
-        return Err(permission_denied("styrn worker owns a manifest ancestor"));
+        return Err(permission_denied(
+            "configured worker owns a manifest ancestor",
+        ));
     }
     for entry in entries {
         let applies_here = entry.flags & INHERIT_ONLY_ACE == 0;
@@ -823,6 +1017,10 @@ mod tests {
             acl_sddl("S-1-5-21-1-2-3-1001", AclKind::Staging),
             "O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)"
         );
+        assert_eq!(
+            acl_sddl("worker-is-deliberately-unused", AclKind::Lock),
+            "O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)"
+        );
     }
 
     #[test]
@@ -949,6 +1147,31 @@ mod tests {
         .is_ok());
     }
 
+    #[test]
+    fn private_file_can_be_atomically_published_while_its_handle_remains_open() {
+        let root = std::env::temp_dir().join(format!(
+            "styrn-private-file-publication-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir(&root).unwrap();
+        let temporary = root.join("temporary");
+        let destination = root.join("destination");
+        let mut file = create_private_file(&temporary, ManifestOwner::CurrentProcess).unwrap();
+        std::io::Write::write_all(&mut file, b"complete").unwrap();
+        file.sync_all().unwrap();
+
+        replace_file(&temporary, &destination).unwrap();
+
+        assert_eq!(std::fs::read(&destination).unwrap(), b"complete");
+        drop(file);
+        std::fs::remove_file(destination).unwrap();
+        std::fs::remove_dir(root).unwrap();
+    }
+
     fn manifest_entries() -> Vec<AceInspection> {
         vec![
             AceInspection {
@@ -973,8 +1196,10 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "environmental: elevated Windows, real styrn account, and STYRN_WINDOWS_TEST_PASSWORD"]
-    fn real_windows_worker_can_read_but_cannot_write_delete_rename_or_replace() {
+    #[ignore = "environmental: elevated Windows plus STYRN_WINDOWS_TEST_WORKER and STYRN_WINDOWS_TEST_PASSWORD"]
+    fn real_windows_worker_can_read_but_cannot_mutate_or_take_over_manifest_and_receipt() {
+        let worker = std::env::var("STYRN_WINDOWS_TEST_WORKER")
+            .expect("STYRN_WINDOWS_TEST_WORKER must select a real unprivileged account");
         let password = std::env::var("STYRN_WINDOWS_TEST_PASSWORD")
             .expect("STYRN_WINDOWS_TEST_PASSWORD is required for worker impersonation");
         let public = std::path::PathBuf::from(
@@ -989,11 +1214,18 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir(&directory).unwrap();
-        harden_manifest_directory(&directory, ManifestOwner::System, "styrn").unwrap();
+        harden_manifest_directory(&directory, ManifestOwner::System, &worker).unwrap();
         let manifest = directory.join("machine.toml");
         std::fs::write(&manifest, "schema_version = 1\n").unwrap();
-        harden_manifest_file(&manifest, ManifestOwner::System, "styrn").unwrap();
-        verify_manifest_security(&manifest, ManifestOwner::System, "styrn", &directory).unwrap();
+        harden_manifest_file(&manifest, ManifestOwner::System, &worker).unwrap();
+        verify_manifest_security(&manifest, ManifestOwner::System, &worker, &directory).unwrap();
+        let receipt = directory.join("receipt.json");
+        std::fs::write(&receipt, "{\"schema_version\":1,\"entries\":[]}\n").unwrap();
+        harden_manifest_file(&receipt, ManifestOwner::System, &worker).unwrap();
+        verify_manifest_security(&receipt, ManifestOwner::System, &worker, &directory).unwrap();
+        let receipt_lock = directory.join(".receipt.json.lock");
+        drop(create_private_file(&receipt_lock, ManifestOwner::System).unwrap());
+        inspect_private_acl(&receipt_lock, AclKind::Lock).unwrap();
 
         let replacement_directory = public.join(format!(
             "styrn-acl-replacement-{}-{}",
@@ -1004,7 +1236,7 @@ mod tests {
                 .as_nanos()
         ));
         std::fs::create_dir(&replacement_directory).unwrap();
-        let worker_sid = lookup_account_sid("styrn").unwrap();
+        let worker_sid = lookup_account_sid(&worker).unwrap();
         let worker_sid = sid_to_string(worker_sid.as_ptr().cast()).unwrap();
         apply_sddl(
             &replacement_directory,
@@ -1019,7 +1251,7 @@ mod tests {
         )
         .unwrap();
 
-        let username = wide("styrn");
+        let username = wide(&worker);
         let domain = wide(".");
         let mut password = wide(&password);
         let mut token = std::ptr::null_mut();
@@ -1047,17 +1279,49 @@ mod tests {
         assert_access_denied(std::fs::remove_file(&manifest));
         assert_access_denied(std::fs::rename(&manifest, directory.join("renamed.toml")));
         assert_access_denied(replace_file(&replacement, &manifest));
+        assert_access_denied(apply_sddl(
+            &manifest,
+            &format!("O:BAD:P(A;;FA;;;{worker_sid})"),
+        ));
+
+        assert!(std::fs::read_to_string(&receipt).is_ok());
+        assert_access_denied(std::fs::OpenOptions::new().write(true).open(&receipt));
+        assert_access_denied(std::fs::remove_file(&receipt));
+        assert_access_denied(std::fs::rename(
+            &receipt,
+            directory.join("renamed-receipt.json"),
+        ));
+        assert_access_denied(replace_file(&replacement, &receipt));
+        assert_access_denied(apply_sddl(
+            &receipt,
+            &format!("O:BAD:P(A;;FA;;;{worker_sid})"),
+        ));
+        assert_access_denied(std::fs::File::open(&receipt_lock));
+        assert_access_denied(std::fs::OpenOptions::new().write(true).open(&receipt_lock));
+        assert_access_denied(std::fs::remove_file(&receipt_lock));
+        assert_access_denied(std::fs::rename(
+            &receipt_lock,
+            directory.join("renamed-receipt-lock"),
+        ));
+        assert_access_denied(apply_sddl(
+            &receipt_lock,
+            &format!("O:BAD:P(A;;FA;;;{worker_sid})"),
+        ));
 
         drop(impersonation);
         std::fs::remove_file(manifest).unwrap();
+        std::fs::remove_file(receipt).unwrap();
+        std::fs::remove_file(receipt_lock).unwrap();
         std::fs::remove_dir(directory).unwrap();
         std::fs::remove_file(replacement).unwrap();
         std::fs::remove_dir(replacement_directory).unwrap();
     }
 
     #[test]
-    #[ignore = "environmental: elevated Windows, real styrn account, and STYRN_WINDOWS_TEST_PASSWORD"]
-    fn real_windows_worker_cannot_access_private_staging_before_hardening() {
+    #[ignore = "environmental: elevated Windows plus STYRN_WINDOWS_TEST_WORKER and STYRN_WINDOWS_TEST_PASSWORD"]
+    fn real_windows_worker_cannot_access_private_staging_or_files_before_publication() {
+        let worker = std::env::var("STYRN_WINDOWS_TEST_WORKER")
+            .expect("STYRN_WINDOWS_TEST_WORKER must select a real unprivileged account");
         let password = std::env::var("STYRN_WINDOWS_TEST_PASSWORD")
             .expect("STYRN_WINDOWS_TEST_PASSWORD is required for worker impersonation");
         let public = std::path::PathBuf::from(
@@ -1073,16 +1337,22 @@ mod tests {
         );
         let parent = public.join(format!("styrn-staging-parent-{nonce}"));
         std::fs::create_dir(&parent).unwrap();
-        harden_manifest_directory(&parent, ManifestOwner::System, "styrn").unwrap();
+        harden_manifest_directory(&parent, ManifestOwner::System, &worker).unwrap();
 
         let staging = parent.join("staging");
         create_private_manifest_staging_directory(&staging, ManifestOwner::System).unwrap();
-        inspect_acl(&staging, "styrn", AclKind::Staging).unwrap();
+        inspect_private_acl(&staging, AclKind::Staging).unwrap();
         assert_eq!(std::fs::read_dir(&staging).unwrap().count(), 0);
+        let private_file = parent.join("receipt-intent.json");
+        let mut private = create_private_file(&private_file, ManifestOwner::System).unwrap();
+        std::io::Write::write_all(&mut private, b"private receipt intent").unwrap();
+        private.sync_all().unwrap();
+        drop(private);
+        inspect_private_acl(&private_file, AclKind::Lock).unwrap();
 
         let replacement = public.join(format!("styrn-staging-replacement-{nonce}"));
         std::fs::create_dir(&replacement).unwrap();
-        let worker_sid = lookup_account_sid("styrn").unwrap();
+        let worker_sid = lookup_account_sid(&worker).unwrap();
         let worker_sid = sid_to_string(worker_sid.as_ptr().cast()).unwrap();
         apply_sddl(
             &replacement,
@@ -1104,7 +1374,7 @@ mod tests {
         let control_marker = control_replacement.join("replacement-marker");
         std::fs::write(&control_marker, b"replacement reached").unwrap();
 
-        let username = wide("styrn");
+        let username = wide(&worker);
         let domain = wide(".");
         let mut password = wide(&password);
         let mut token = std::ptr::null_mut();
@@ -1154,6 +1424,23 @@ mod tests {
             std::fs::rename(&staging, parent.join("renamed")),
         );
         assert_access_denied_for("delete staging directory", std::fs::remove_dir(&staging));
+        assert_access_denied_for("read private receipt file", std::fs::read(&private_file));
+        assert_access_denied_for(
+            "write private receipt file",
+            std::fs::OpenOptions::new().write(true).open(&private_file),
+        );
+        assert_access_denied_for(
+            "delete private receipt file",
+            std::fs::remove_file(&private_file),
+        );
+        assert_access_denied_for(
+            "rename private receipt file",
+            std::fs::rename(&private_file, parent.join("renamed-intent.json")),
+        );
+        assert_access_denied_for(
+            "replace private receipt file",
+            replace_file(&worker_control, &private_file),
+        );
         match attempt_delete_then_rename_directory_swap(&replacement, &staging) {
             DirectorySwapOutcome::Blocked { step, error } => {
                 assert_eq!(step, DirectorySwapStep::DeleteDestination);
@@ -1187,8 +1474,11 @@ mod tests {
         );
         assert!(!staging.join("worker-created").exists());
         assert!(!parent.join("renamed").exists());
+        assert!(private_file.is_file());
+        assert!(!parent.join("renamed-intent.json").exists());
 
         std::fs::remove_dir(staging).unwrap();
+        std::fs::remove_file(private_file).unwrap();
         std::fs::remove_dir(parent).unwrap();
         std::fs::remove_file(worker_control).unwrap();
         std::fs::remove_dir(replacement).unwrap();

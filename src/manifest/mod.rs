@@ -948,8 +948,8 @@ impl MachineManifestStore {
             Uuid::now_v7()
         ));
         let result = (|| {
-            let mut file =
-                platform::create_manifest_temporary(&temporary).map_err(ManifestError::Write)?;
+            let mut file = platform::create_private_file(&temporary, self.platform_owner())
+                .map_err(ManifestError::Write)?;
             file.write_all(manifest.to_toml()?.as_bytes())
                 .map_err(ManifestError::Write)?;
             file.flush().map_err(ManifestError::Write)?;
