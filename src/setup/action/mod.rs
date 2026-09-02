@@ -217,6 +217,7 @@ pub(crate) enum PlanOperation {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct NeedsHuman {
+    severity: PendingSeverity,
     instructions: HumanInstructions,
     fragment: Option<ScriptFragment>,
 }
@@ -227,9 +228,19 @@ impl NeedsHuman {
         fragment: Option<ScriptFragment>,
     ) -> Self {
         Self {
+            severity: PendingSeverity::Warning,
             instructions,
             fragment,
         }
+    }
+
+    pub(in crate::setup::action) fn with_severity(mut self, severity: PendingSeverity) -> Self {
+        self.severity = severity;
+        self
+    }
+
+    pub(crate) fn severity(&self) -> PendingSeverity {
+        self.severity
     }
 
     pub(crate) fn instructions(&self) -> &HumanInstructions {
@@ -238,6 +249,45 @@ impl NeedsHuman {
 
     pub(crate) fn fragment(&self) -> Option<&ScriptFragment> {
         self.fragment.as_ref()
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum PendingSeverity {
+    Info,
+    Warning,
+    Error,
+}
+
+/// One current unresolved action, preserving its stable plan identity.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PendingAction {
+    id: ActionName,
+    needs_human: NeedsHuman,
+}
+
+impl PendingAction {
+    pub(super) fn new(id: ActionName, needs_human: NeedsHuman) -> Self {
+        Self { id, needs_human }
+    }
+
+    pub(crate) fn id(&self) -> &ActionName {
+        &self.id
+    }
+
+    pub(crate) fn severity(&self) -> PendingSeverity {
+        self.needs_human.severity()
+    }
+
+    pub(crate) fn needs_human(&self) -> &NeedsHuman {
+        &self.needs_human
+    }
+
+    pub(crate) fn fragment_action_id(&self) -> Option<&str> {
+        match self.needs_human.fragment() {
+            Some(ScriptFragment::DeferredAction(action)) => Some(action.as_str()),
+            None => None,
+        }
     }
 }
 
@@ -405,6 +455,7 @@ mod gate {
                 }
                 PlanOperation::Done | PlanOperation::Skipped => ActionCheck::Done,
                 PlanOperation::NeedsHuman => ActionCheck::NeedsHuman(NeedsHuman {
+                    severity: PendingSeverity::Warning,
                     instructions: HumanInstructions(description.as_str().to_owned()),
                     fragment: None,
                 }),
@@ -738,6 +789,8 @@ mod execution;
 #[cfg(not(action_core_fixture))]
 #[allow(unused_imports)] // Private canonical route; T0.20 adds its authorized frontend.
 use execution::apply_plan_with_journal;
+#[cfg(not(any(action_core_fixture, action_compile_fixture)))]
+pub(in crate::setup) use execution::ApplyReport;
 
 fn checked_text(value: &str, error: ActionError) -> Result<String, ActionError> {
     if super::validate_probe_static_text(value) {

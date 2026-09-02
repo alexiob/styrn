@@ -3,6 +3,9 @@
 #[allow(dead_code)]
 pub(crate) mod action;
 #[allow(dead_code)]
+#[cfg(not(any(action_core_fixture, action_compile_fixture)))]
+pub(crate) mod pending;
+#[allow(dead_code)]
 pub(crate) mod plan;
 #[allow(dead_code)]
 pub(crate) mod probe;

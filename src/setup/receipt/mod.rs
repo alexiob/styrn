@@ -846,6 +846,31 @@ impl ReceiptStore {
 }
 
 impl ReceiptApplySession<'_> {
+    /// Records the first observation of a human-owned action. Pending entries
+    /// are immutable history, carry no effects, and are deduplicated by the
+    /// action's stable identity while this receipt lock is held.
+    pub(in crate::setup) fn record_pending(
+        &self,
+        action: &crate::setup::action::ActionName,
+        metadata: &mut ReceiptMetadataSource,
+        _authority: &crate::setup::action::JournalAuthority,
+    ) -> Result<bool, ReceiptStoreError> {
+        let existing = self.store.read_locked()?;
+        if existing.entries.iter().any(|entry| {
+            entry.status == ReceiptStatus::Pending && entry.action.action_id() == action.as_str()
+        }) {
+            return Ok(false);
+        }
+
+        let mut candidate = existing.clone();
+        candidate
+            .entries
+            .push(ReceiptEntry::pending(action, metadata.next()?)?);
+        validate_pending_append_candidate(&existing, &candidate)?;
+        self.store.write_document(&candidate)?;
+        Ok(true)
+    }
+
     pub(in crate::setup) fn interruption_after_prepare(
         &self,
         _authority: &crate::setup::action::JournalAuthority,
@@ -1227,6 +1252,28 @@ fn validate_append_candidate(
     Ok(())
 }
 
+fn validate_pending_append_candidate(
+    existing: &ReceiptDocument,
+    candidate: &ReceiptDocument,
+) -> Result<(), ReceiptStoreError> {
+    candidate.validate()?;
+    let appended = candidate.entries.last();
+    if candidate.entries.len() != existing.entries.len() + 1
+        || candidate.installation_scope != existing.installation_scope
+        || !candidate.entries.starts_with(&existing.entries)
+        || appended.map(|entry| entry.status) != Some(ReceiptStatus::Pending)
+        || appended.is_some_and(|entry| {
+            existing.entries.iter().any(|existing_entry| {
+                existing_entry.status == ReceiptStatus::Pending
+                    && existing_entry.action.action_id() == entry.action.action_id()
+            })
+        })
+    {
+        return Err(ReceiptStoreError::PrefixConflict);
+    }
+    Ok(())
+}
+
 fn canonical_receipt_path(scope: InstallationScope) -> Result<PathBuf, ReceiptStoreError> {
     match scope {
         InstallationScope::System => {
@@ -1342,6 +1389,30 @@ struct ReceiptEntry {
 }
 
 impl ReceiptEntry {
+    fn pending(
+        action: &crate::setup::action::ActionName,
+        metadata: ReceiptMetadata,
+    ) -> Result<Self, ReceiptError> {
+        let entry = Self {
+            entry_id: metadata.entry_id,
+            action: ReceiptAction::Foundation(FoundationActionParameters {
+                action_id: ActionIdentifier(action.as_str().to_owned()),
+            }),
+            timestamp: metadata.timestamp,
+            privilege_used: ReceiptPrivilege::None,
+            files_created: Vec::new(),
+            files_modified: Vec::new(),
+            services: Vec::new(),
+            accounts: Vec::new(),
+            registry_keys: Vec::new(),
+            firewall_rules: Vec::new(),
+            download_provenance: DownloadProvenanceSlot(None),
+            status: ReceiptStatus::Pending,
+        };
+        entry.validate()?;
+        Ok(entry)
+    }
+
     fn applied(
         action: &crate::setup::action::ActionName,
         privilege: crate::setup::action::Privilege,

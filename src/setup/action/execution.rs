@@ -1,6 +1,6 @@
 //! Action-owned setup execution and receipt orchestration.
 
-use super::{Action, ActionCheck, ActionEffect, ActionError, JournalAuthority, NeedsHuman};
+use super::{Action, ActionCheck, ActionEffect, ActionError, JournalAuthority, PendingAction};
 use thiserror::Error;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -8,7 +8,7 @@ pub(crate) struct ApplyReport {
     applied_count: usize,
     recovered_count: usize,
     noop_count: usize,
-    pending: Vec<NeedsHuman>,
+    pending: Vec<PendingAction>,
 }
 
 impl ApplyReport {
@@ -28,7 +28,7 @@ impl ApplyReport {
         self.pending.len()
     }
 
-    pub(crate) fn pending(&self) -> &[NeedsHuman] {
+    pub(crate) fn pending(&self) -> &[PendingAction] {
         &self.pending
     }
 
@@ -185,7 +185,12 @@ pub(super) fn apply_plan_with_runner<R: PreparedActionRunner>(
                 session.finalize_intent(&intent, &authority)?;
                 report.applied_count += 1;
             }
-            ActionCheck::NeedsHuman(needs_human) => report.pending.push(needs_human),
+            ActionCheck::NeedsHuman(needs_human) => {
+                session.record_pending(action.name(), metadata, &authority)?;
+                report
+                    .pending
+                    .push(PendingAction::new(action.name().clone(), needs_human));
+            }
         }
     }
     Ok(report)

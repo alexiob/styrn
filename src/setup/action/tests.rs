@@ -1,8 +1,10 @@
 use super::{
     apply_plan_with_journal, Action, ActionDescription, ActionEffect, ActionError, ActionName,
-    ApplyOutcome, HumanInstructions, NeedsHuman, Privilege, TestMetrics,
+    ApplyOutcome, HumanInstructions, NeedsHuman, PendingSeverity, Privilege, ScriptFragment,
+    TestMetrics,
 };
 use crate::setup::receipt::{ReceiptMetadataSource, ReceiptStore};
+use chrono::{TimeZone, Utc};
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc, Mutex,
@@ -420,14 +422,20 @@ fn succeeded_intent_recovers_stored_dynamic_before_hash_without_recomputation() 
 }
 
 #[test]
-fn all_needs_human_plan_preserves_safe_pending_instructions_without_receipt_or_noop() {
+fn all_needs_human_plan_journals_each_stable_identity_once_without_mutation_or_noop() {
     let fixture = JournalFixture::new("needs-human-report");
     let store = ReceiptStore::new_for_test(fixture.receipt_path());
     let state = Arc::new(Mutex::new(Vec::new()));
     let first = NeedsHuman::new(
-        HumanInstructions::new("Enable Remote Login, then rerun setup.").unwrap(),
-        None,
-    );
+        HumanInstructions::new(
+            "Open System Settings > General > Sharing, enable Remote Login, then rerun setup.",
+        )
+        .unwrap(),
+        Some(ScriptFragment::DeferredAction(
+            ActionName::parse("macos.remote-login").unwrap(),
+        )),
+    )
+    .with_severity(PendingSeverity::Info);
     let second = NeedsHuman::new(
         HumanInstructions::new("Sign in to the package provider, then rerun setup.").unwrap(),
         None,
@@ -445,7 +453,16 @@ fn all_needs_human_plan_preserves_safe_pending_instructions_without_receipt_or_n
         second.clone(),
     );
     let mut plan = vec![first_action, second_action];
-    let mut metadata = ReceiptMetadataSource::for_test([]);
+    let mut metadata = ReceiptMetadataSource::for_test([
+        (
+            "019cafd0-5c00-7000-8000-000000000001",
+            "2026-09-02T10:00:00Z",
+        ),
+        (
+            "019cafd0-5c00-7000-8000-000000000002",
+            "2026-09-02T10:00:01Z",
+        ),
+    ]);
 
     let report = apply_plan_with_journal(&mut plan, &store, &mut metadata).unwrap();
 
@@ -453,13 +470,303 @@ fn all_needs_human_plan_preserves_safe_pending_instructions_without_receipt_or_n
     assert_eq!(report.recovered_count(), 0);
     assert_eq!(report.noop_count(), 0);
     assert_eq!(report.pending_count(), 2);
-    assert_eq!(report.pending(), &[first, second]);
+    assert_eq!(report.pending()[0].id().as_str(), "test.remote-login");
+    assert_eq!(report.pending()[0].severity(), PendingSeverity::Info);
+    assert_eq!(report.pending()[0].needs_human(), &first);
+    assert_eq!(
+        report.pending()[0].fragment_action_id(),
+        Some("macos.remote-login")
+    );
+    assert_eq!(report.pending()[1].id().as_str(), "test.package-login");
+    assert_eq!(report.pending()[1].severity(), PendingSeverity::Warning);
+    assert_eq!(report.pending()[1].needs_human(), &second);
     assert!(!report.is_nothing_to_do());
     assert_eq!(report.message(), "setup actions need human attention");
     assert_eq!(first_metrics.mutation_calls(), 0);
     assert_eq!(second_metrics.mutation_calls(), 0);
+
+    let mut draft = crate::manifest::MachineManifest::parse_toml(include_str!(
+        "../../../examples/machine.controller-worker.toml"
+    ))
+    .unwrap()
+    .without_machine_id();
+    crate::setup::pending::project_manifest(&mut draft, report.pending()).unwrap();
+    let projected = draft.pending_actions.as_ref().unwrap();
+    assert_eq!(projected.len(), 2);
+    assert_eq!(projected[0].id, "test.remote-login");
+    assert_eq!(
+        projected[0].severity,
+        crate::manifest::PendingSeverity::Info
+    );
+    assert_eq!(
+        projected[0].message,
+        "Open System Settings > General > Sharing, enable Remote Login, then rerun setup."
+    );
+    assert_eq!(projected[1].id, "test.package-login");
+    assert_eq!(
+        projected[1].severity,
+        crate::manifest::PendingSeverity::Warning
+    );
+    let manifest_path = fixture.root.join("machine.toml");
+    let manifest_store = crate::manifest::MachineManifestStore::new_for_test(&manifest_path);
+    let machine_id =
+        crate::setup::pending::publish_manifest(&manifest_store, &mut draft, &report).unwrap();
+    let first_manifest = fs::read(&manifest_path).unwrap();
+
+    let timestamp = Utc.with_ymd_and_hms(2026, 9, 2, 10, 0, 2).unwrap();
+    let default_outcome = crate::setup::pending::PendingPolicy::default()
+        .evaluate(timestamp, report.pending())
+        .unwrap();
+    assert_eq!(default_outcome.exit_code().as_i32(), 0);
+    let default_json = serde_json::from_str::<serde_json::Value>(
+        &crate::output::to_json(default_outcome.envelope()).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(default_json["ok"], true);
+    assert_eq!(default_json["warnings"].as_array().unwrap().len(), 2);
+    assert_eq!(default_json["data"]["pending"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        default_json["data"]["pending"][0]["id"],
+        "test.remote-login"
+    );
+    assert_eq!(default_json["data"]["pending"][0]["severity"], "info");
+
+    let strict_outcome = crate::setup::pending::PendingPolicy::new(true)
+        .evaluate(timestamp, report.pending())
+        .unwrap();
+    assert_eq!(strict_outcome.exit_code().as_i32(), 13);
+    let strict_json = serde_json::from_str::<serde_json::Value>(
+        &crate::output::to_json(strict_outcome.envelope()).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(strict_json["ok"], false);
+    assert_eq!(strict_json["errors"][0]["code"], "setup.needs_human");
+    assert!(strict_json["data"].is_null());
+    assert_eq!(
+        strict_json["errors"][0]["details"]["pending"],
+        default_json["data"]["pending"]
+    );
+    let command_schema: serde_json::Value =
+        serde_json::from_str(include_str!("../../../schemas/command-v1.schema.json")).unwrap();
+    let command_validator = jsonschema::validator_for(&command_schema).unwrap();
+    assert!(command_validator.is_valid(&strict_json));
+    assert!(strict_json.to_string().contains("test.package-login"));
+    assert!(!strict_json.to_string().contains("applied"));
+
+    let mut human = Vec::new();
+    crate::setup::pending::render_human(&mut human, report.pending()).unwrap();
+    let human = String::from_utf8(human).unwrap();
+    assert_eq!(
+        human
+            .matches("Pending actions requiring your attention:")
+            .count(),
+        1
+    );
+    assert!(human.contains("[info] test.remote-login"));
+    assert!(human.contains("deferred action: macos.remote-login; not rendered or executed"));
+    assert!(!human.contains("sudo "));
     assert!(state.lock().unwrap().is_empty());
-    assert!(!fixture.receipt_path().exists());
+
+    let receipt = serde_json::from_slice::<serde_json::Value>(
+        &store.read_snapshot().unwrap().to_json().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(receipt["entries"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        receipt["entries"][0]["action"]["parameters"]["action_id"],
+        "test.remote-login"
+    );
+    assert_eq!(receipt["entries"][0]["status"], "pending");
+    assert_eq!(receipt["entries"][0]["privilege_used"], "none");
+    assert_eq!(
+        receipt["entries"][0]["files_created"],
+        serde_json::json!([])
+    );
+    assert_eq!(
+        receipt["entries"][0]["files_modified"],
+        serde_json::json!([])
+    );
+    assert_eq!(receipt["entries"][0]["services"], serde_json::json!([]));
+    assert_eq!(receipt["entries"][0]["accounts"], serde_json::json!([]));
+    assert_eq!(
+        receipt["entries"][0]["registry_keys"],
+        serde_json::json!([])
+    );
+    assert_eq!(
+        receipt["entries"][0]["firewall_rules"],
+        serde_json::json!([])
+    );
+    assert!(receipt["entries"][0]["download_provenance"].is_null());
+    assert_eq!(
+        receipt["entries"][1]["action"]["parameters"]["action_id"],
+        "test.package-login"
+    );
+
+    let mut no_metadata = ReceiptMetadataSource::for_test([]);
+    let rerun = apply_plan_with_journal(&mut plan, &store, &mut no_metadata).unwrap();
+    assert_eq!(rerun.pending_count(), 2);
+    assert_eq!(store.read_snapshot().unwrap().entry_count(), 2);
+    let rerun_machine_id =
+        crate::setup::pending::publish_manifest(&manifest_store, &mut draft, &rerun).unwrap();
+    assert_eq!(rerun_machine_id, machine_id);
+    assert_eq!(fs::read(&manifest_path).unwrap(), first_manifest);
+
+    let receipt_before_resolution = store.read_snapshot().unwrap().to_json().unwrap();
+    let (still_pending, still_pending_metrics) = Action::test_named_needs_human(
+        "test.package-login",
+        Privilege::None,
+        Arc::clone(&state),
+        second,
+    );
+    let mut resolved_plan = vec![still_pending];
+    let mut resolution_metadata = ReceiptMetadataSource::for_test([]);
+    let resolved =
+        apply_plan_with_journal(&mut resolved_plan, &store, &mut resolution_metadata).unwrap();
+    crate::setup::pending::publish_manifest(&manifest_store, &mut draft, &resolved).unwrap();
+    assert_eq!(resolved.pending_count(), 1);
+    assert_eq!(resolved.pending()[0].id().as_str(), "test.package-login");
+    assert_eq!(still_pending_metrics.mutation_calls(), 0);
+    assert_eq!(
+        store.read_snapshot().unwrap().to_json().unwrap(),
+        receipt_before_resolution
+    );
+    let current = manifest_store.read().unwrap().manifest;
+    let current_pending = current.pending_actions.unwrap();
+    assert_eq!(current_pending.len(), 1);
+    assert_eq!(current_pending[0].id, "test.package-login");
+    assert_eq!(first_metrics.mutation_calls(), 0);
+    assert_eq!(second_metrics.mutation_calls(), 0);
+}
+
+#[test]
+fn pending_receipt_failure_stops_before_manifest_or_mutation() {
+    let fixture = JournalFixture::new("pending-receipt-failure");
+    let receipt_store = ReceiptStore::new_for_test_failing_before_replace(fixture.receipt_path());
+    let manifest_path = fixture.root.join("machine.toml");
+    let state = Arc::new(Mutex::new(Vec::new()));
+    let needs_human = NeedsHuman::new(
+        HumanInstructions::new("Complete the local approval, then rerun setup.").unwrap(),
+        None,
+    );
+    let (action, metrics) = Action::test_named_needs_human(
+        "test.local-approval",
+        Privilege::None,
+        Arc::clone(&state),
+        needs_human,
+    );
+    let mut plan = vec![action];
+    let mut metadata = ReceiptMetadataSource::for_test([(
+        "019cafd0-5c00-7000-8000-000000000011",
+        "2026-09-02T10:01:00Z",
+    )]);
+
+    let error = apply_plan_with_journal(&mut plan, &receipt_store, &mut metadata).unwrap_err();
+
+    assert_eq!(error.error_code(), "setup.receipt_conflict");
+    assert_eq!(error.exit_code(), 13);
+    assert_eq!(metrics.mutation_calls(), 0);
+    assert!(state.lock().unwrap().is_empty());
+    assert!(receipt_store.read_snapshot().unwrap().is_empty());
+    assert!(!manifest_path.exists());
+}
+
+#[test]
+fn failed_manifest_publication_repairs_on_rerun_without_duplicate_pending_history() {
+    let fixture = JournalFixture::new("pending-manifest-recovery");
+    let receipt_store = ReceiptStore::new_for_test(fixture.receipt_path());
+    let manifest_path = fixture.root.join("machine.toml");
+    let state = Arc::new(Mutex::new(Vec::new()));
+    let needs_human = NeedsHuman::new(
+        HumanInstructions::new("Complete the local approval, then rerun setup.").unwrap(),
+        None,
+    );
+    let (action, metrics) = Action::test_named_needs_human(
+        "test.local-approval",
+        Privilege::None,
+        Arc::clone(&state),
+        needs_human,
+    );
+    let mut plan = vec![action];
+    let mut metadata = ReceiptMetadataSource::for_test([(
+        "019cafd0-5c00-7000-8000-000000000012",
+        "2026-09-02T10:02:00Z",
+    )]);
+    let report = apply_plan_with_journal(&mut plan, &receipt_store, &mut metadata).unwrap();
+    let receipt_before = receipt_store.read_snapshot().unwrap().to_json().unwrap();
+    let mut draft = pending_manifest_draft();
+
+    let error = crate::setup::pending::publish_manifest(
+        &crate::manifest::MachineManifestStore::new_with_failing_hardening(&manifest_path),
+        &mut draft,
+        &report,
+    )
+    .unwrap_err();
+
+    assert_eq!(error.error_code(), "setup.apply_failed");
+    assert_eq!(error.exit_code().as_i32(), 13);
+    assert!(draft.pending_actions.is_none());
+    assert!(!manifest_path.exists());
+    assert_eq!(metrics.mutation_calls(), 0);
+
+    let mut no_metadata = ReceiptMetadataSource::for_test([]);
+    let rerun = apply_plan_with_journal(&mut plan, &receipt_store, &mut no_metadata).unwrap();
+    crate::setup::pending::publish_manifest(
+        &crate::manifest::MachineManifestStore::new_for_test(&manifest_path),
+        &mut draft,
+        &rerun,
+    )
+    .unwrap();
+    assert_eq!(
+        receipt_store.read_snapshot().unwrap().to_json().unwrap(),
+        receipt_before
+    );
+    assert_eq!(
+        crate::manifest::MachineManifestStore::new_for_test(&manifest_path)
+            .read()
+            .unwrap()
+            .manifest
+            .pending_actions
+            .unwrap()[0]
+            .id,
+        "test.local-approval"
+    );
+}
+
+#[test]
+fn pending_projection_rejects_duplicate_ids_without_partial_state_and_empty_policy_succeeds() {
+    let fixture = JournalFixture::new("pending-duplicate-projection");
+    let store = ReceiptStore::new_for_test(fixture.receipt_path());
+    let state = Arc::new(Mutex::new(Vec::new()));
+    let pending = NeedsHuman::new(
+        HumanInstructions::new("Complete the local approval, then rerun setup.").unwrap(),
+        None,
+    );
+    let mut plan = vec![
+        Action::test_named_needs_human("test.local-approval", Privilege::None, state, pending).0,
+    ];
+    let mut metadata = ReceiptMetadataSource::for_test([(
+        "019cafd0-5c00-7000-8000-000000000013",
+        "2026-09-02T10:03:00Z",
+    )]);
+    let report = apply_plan_with_journal(&mut plan, &store, &mut metadata).unwrap();
+    let duplicate = vec![report.pending()[0].clone(), report.pending()[0].clone()];
+    let mut draft = pending_manifest_draft();
+
+    let error = crate::setup::pending::project_manifest(&mut draft, &duplicate).unwrap_err();
+
+    assert_eq!(error.error_code(), "setup.plan_invalid");
+    assert_eq!(error.exit_code().as_i32(), 13);
+    assert!(draft.pending_actions.is_none());
+
+    let outcome = crate::setup::pending::PendingPolicy::default()
+        .evaluate(Utc.with_ymd_and_hms(2026, 9, 2, 10, 3, 1).unwrap(), &[])
+        .unwrap();
+    assert_eq!(outcome.exit_code().as_i32(), 0);
+    let json: serde_json::Value =
+        serde_json::from_str(&crate::output::to_json(outcome.envelope()).unwrap()).unwrap();
+    assert_eq!(json["ok"], true);
+    assert_eq!(json["data"]["pending"], serde_json::json!([]));
+    assert_eq!(json["warnings"], serde_json::json!([]));
 }
 
 #[cfg(unix)]
@@ -573,10 +880,16 @@ fn mixed_plan_reports_applied_recovered_noop_and_pending_outcomes_independently(
         pending.clone(),
     );
     let mut plan = vec![applied, noop, needs_human];
-    let mut metadata = ReceiptMetadataSource::for_test([(
-        "019cafd0-5c00-7000-8000-000000000002",
-        "2026-09-02T10:00:01Z",
-    )]);
+    let mut metadata = ReceiptMetadataSource::for_test([
+        (
+            "019cafd0-5c00-7000-8000-000000000002",
+            "2026-09-02T10:00:01Z",
+        ),
+        (
+            "019cafd0-5c00-7000-8000-000000000003",
+            "2026-09-02T10:00:02Z",
+        ),
+    ]);
 
     let report = apply_plan_with_journal(
         &mut plan,
@@ -589,7 +902,8 @@ fn mixed_plan_reports_applied_recovered_noop_and_pending_outcomes_independently(
     assert_eq!(report.recovered_count(), 1);
     assert_eq!(report.noop_count(), 1);
     assert_eq!(report.pending_count(), 1);
-    assert_eq!(report.pending(), &[pending]);
+    assert_eq!(report.pending()[0].id().as_str(), "test.pending");
+    assert_eq!(report.pending()[0].needs_human(), &pending);
     assert!(!report.is_nothing_to_do());
     assert_eq!(report.message(), "setup actions applied");
     assert_eq!(applied_metrics.mutation_calls(), 1);
@@ -601,7 +915,7 @@ fn mixed_plan_reports_applied_recovered_noop_and_pending_outcomes_independently(
             .read_snapshot()
             .unwrap()
             .entry_count(),
-        2
+        3
     );
 }
 
@@ -1361,6 +1675,8 @@ fn compile_fixture(name: &str, configurations: &[&str]) -> Output {
     );
     if !full_journal_fixture {
         command.arg("--cfg").arg("action_core_fixture");
+    } else {
+        command.arg("--cfg").arg("action_compile_fixture");
     }
     if configurations.contains(&"test") {
         command.arg("--test");
@@ -1514,6 +1830,14 @@ impl Drop for FixtureOutput {
     fn drop(&mut self) {
         let _ = fs::remove_file(&self.path);
     }
+}
+
+fn pending_manifest_draft() -> crate::manifest::MachineManifestDraft {
+    crate::manifest::MachineManifest::parse_toml(include_str!(
+        "../../../examples/machine.controller-worker.toml"
+    ))
+    .unwrap()
+    .without_machine_id()
 }
 
 struct JournalFixture {
