@@ -7,6 +7,7 @@ fn pending_receipt_value() -> serde_json::Value {
     pending["entries"][0]["status"] = serde_json::json!("pending");
     pending["entries"][0]["privilege_used"] = serde_json::json!("none");
     for field in [
+        "directories_created",
         "files_created",
         "files_modified",
         "services",
@@ -18,6 +19,58 @@ fn pending_receipt_value() -> serde_json::Value {
     }
     pending["entries"][0]["download_provenance"] = serde_json::Value::Null;
     pending
+}
+
+fn worker_directory_receipt_value() -> serde_json::Value {
+    #[cfg(not(target_os = "windows"))]
+    let (principal_kind, principal_id, root, path) = (
+        "unix-uid",
+        "501",
+        "/home/alex/.local/share/styrn",
+        "/home/alex/.local/share/styrn/jobs",
+    );
+    #[cfg(target_os = "windows")]
+    let (principal_kind, principal_id, root, path) = (
+        "windows-sid",
+        "S-1-5-21-1-2-3-1001",
+        r"C:\Users\alex\AppData\Local\Styrn",
+        r"C:\Users\alex\AppData\Local\Styrn\jobs",
+    );
+
+    serde_json::json!({
+        "schema_version": 1,
+        "installation_scope": "user",
+        "entries": [{
+            "entry_id": "019cafd0-5c00-7000-8000-000000000001",
+            "action": {
+                "type": "worker_directory",
+                "parameters": {
+                    "action_id": "identity.directory.jobs",
+                    "installation_scope": "user",
+                    "principal": {
+                        "account_policy": "current-user",
+                        "principal_kind": principal_kind,
+                        "principal_id": principal_id,
+                        "name": "alex"
+                    },
+                    "root": root,
+                    "node": { "type": "jobs" },
+                    "path": path
+                }
+            },
+            "timestamp": "2026-09-02T10:00:00Z",
+            "privilege_used": "none",
+            "directories_created": [{ "path": path }],
+            "files_created": [],
+            "files_modified": [],
+            "services": [],
+            "accounts": [],
+            "registry_keys": [],
+            "firewall_rules": [],
+            "download_provenance": null,
+            "status": "applied"
+        }]
+    })
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -35,6 +88,7 @@ const COMPLETE_RECEIPT: &str = r#"{
       },
       "timestamp": "2026-09-02T10:00:00Z",
       "privilege_used": "root",
+      "directories_created": [],
       "files_created": [
         {
           "path": "/opt/styrn/bin/tool",
@@ -85,6 +139,7 @@ const COMPLETE_RECEIPT: &str = r#"{
       },
       "timestamp": "2026-09-02T10:00:00Z",
       "privilege_used": "admin",
+      "directories_created": [],
       "files_created": [
         {
           "path": "C:\\ProgramData\\Styrn\\bin\\tool.exe",
@@ -137,6 +192,284 @@ fn complete_v1_document_validates_and_round_trips_deterministically() {
     assert_eq!(
         serde_json::from_slice::<serde_json::Value>(&first).unwrap(),
         serde_json::from_str::<serde_json::Value>(COMPLETE_RECEIPT).unwrap()
+    );
+}
+
+#[test]
+fn worker_directory_receipt_round_trips_closed_parameters_and_directory_effect() {
+    let value = worker_directory_receipt_value();
+
+    let document = ReceiptDocument::from_json(&serde_json::to_vec(&value).unwrap()).unwrap();
+    let serialized =
+        serde_json::from_slice::<serde_json::Value>(&document.to_json().unwrap()).unwrap();
+
+    assert_eq!(serialized, value);
+    assert_eq!(
+        serialized["entries"][0]["action"]["parameters"]["node"],
+        serde_json::json!({ "type": "jobs" })
+    );
+    assert_eq!(
+        serialized["entries"][0]["directories_created"],
+        serde_json::json!([{ "path": value["entries"][0]["action"]["parameters"]["path"] }])
+    );
+}
+
+#[cfg(not(target_os = "windows"))]
+#[test]
+fn worker_directory_support_node_retains_its_ordinal_and_exact_ancestor_path() {
+    let mut value = worker_directory_receipt_value();
+    value["entries"][0]["action"]["parameters"]["action_id"] =
+        serde_json::json!("identity.directory.support-0");
+    value["entries"][0]["action"]["parameters"]["node"] =
+        serde_json::json!({ "type": "support", "ordinal": 0 });
+    value["entries"][0]["action"]["parameters"]["path"] = serde_json::json!("/home/alex/.local");
+    value["entries"][0]["directories_created"][0]["path"] = serde_json::json!("/home/alex/.local");
+
+    let document = ReceiptDocument::from_json(&serde_json::to_vec(&value).unwrap()).unwrap();
+
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&document.to_json().unwrap()).unwrap(),
+        value
+    );
+}
+
+#[test]
+fn worker_directory_support_validation_accepts_only_exact_materialization_nodes() {
+    let principal = crate::platform::resolve_current_worker_principal().unwrap();
+    let layout =
+        crate::platform::resolve_worker_directory_layout(InstallationScope::User, &principal, None)
+            .unwrap();
+    let support_nodes = layout
+        .materialization_nodes()
+        .into_iter()
+        .filter(|node| matches!(node, crate::platform::WorkerDirectoryNode::Support { .. }))
+        .collect::<Vec<_>>();
+    assert!(
+        support_nodes.len() >= 2,
+        "native user layout must expose its standard support ancestors"
+    );
+
+    for node in &support_nodes {
+        let crate::platform::WorkerDirectoryNode::Support { ordinal } = node else {
+            unreachable!("support filter must retain only support nodes")
+        };
+        let path = layout.path_for_node(*node).unwrap();
+        let value = worker_directory_receipt_for_layout(&layout, &principal, *ordinal, &path);
+        let document = ReceiptDocument::from_json(&serde_json::to_vec(&value).unwrap()).unwrap();
+        document.validate_worker_directory_layout(&layout).unwrap();
+    }
+
+    let crate::platform::WorkerDirectoryNode::Support { ordinal } = support_nodes[0] else {
+        unreachable!("support filter must retain only support nodes")
+    };
+    let different_plausible_ancestor = layout.path_for_node(support_nodes[1]).unwrap();
+    let forged = worker_directory_receipt_for_layout(
+        &layout,
+        &principal,
+        ordinal,
+        &different_plausible_ancestor,
+    );
+    let document = ReceiptDocument::from_json(&serde_json::to_vec(&forged).unwrap()).unwrap();
+    assert_eq!(
+        document
+            .validate_worker_directory_layout(&layout)
+            .unwrap_err(),
+        ReceiptError::InvalidWorkerDirectoryAction
+    );
+}
+
+fn worker_directory_receipt_for_layout(
+    layout: &crate::platform::WorkerDirectoryLayout,
+    principal: &crate::platform::WorkerPrincipal,
+    ordinal: u16,
+    path: &std::path::Path,
+) -> serde_json::Value {
+    let mut value = worker_directory_receipt_value();
+    value["entries"][0]["action"]["parameters"]["action_id"] =
+        serde_json::json!(format!("identity.directory.support-{ordinal}"));
+    value["entries"][0]["action"]["parameters"]["principal"] = serde_json::json!({
+        "account_policy": "current-user",
+        "principal_kind": principal.principal_kind(),
+        "principal_id": principal.principal_id(),
+        "name": principal.name(),
+    });
+    value["entries"][0]["action"]["parameters"]["root"] =
+        serde_json::json!(layout.root().to_string_lossy());
+    value["entries"][0]["action"]["parameters"]["node"] =
+        serde_json::json!({ "type": "support", "ordinal": ordinal });
+    value["entries"][0]["action"]["parameters"]["path"] = serde_json::json!(path.to_string_lossy());
+    value["entries"][0]["directories_created"][0]["path"] =
+        serde_json::json!(path.to_string_lossy());
+    value
+}
+
+#[test]
+fn worker_directory_legacy_missing_directories_field_reads_empty_and_new_writes_include_it() {
+    let mut legacy = serde_json::from_str::<serde_json::Value>(COMPLETE_RECEIPT).unwrap();
+    legacy["entries"][0]
+        .as_object_mut()
+        .unwrap()
+        .remove("directories_created");
+
+    let document = ReceiptDocument::from_json(&serde_json::to_vec(&legacy).unwrap()).unwrap();
+    let serialized =
+        serde_json::from_slice::<serde_json::Value>(&document.to_json().unwrap()).unwrap();
+
+    assert_eq!(
+        serialized["entries"][0]["directories_created"],
+        serde_json::json!([])
+    );
+}
+
+#[test]
+fn worker_directory_receipt_rejects_detached_scope_policy_principal_node_and_effect_data() {
+    let base = worker_directory_receipt_value();
+    let mut cases = Vec::new();
+
+    let mut detached = base.clone();
+    #[cfg(not(target_os = "windows"))]
+    let detached_path = "/home/alex/.local/share/other/jobs";
+    #[cfg(target_os = "windows")]
+    let detached_path = r"C:\Users\alex\AppData\Local\Other\jobs";
+    detached["entries"][0]["action"]["parameters"]["path"] = serde_json::json!(detached_path);
+    detached["entries"][0]["directories_created"][0]["path"] = serde_json::json!(detached_path);
+    cases.push(("detached path", detached));
+
+    let mut wrong_scope = base.clone();
+    wrong_scope["entries"][0]["action"]["parameters"]["installation_scope"] =
+        serde_json::json!("system");
+    cases.push(("wrong scope", wrong_scope));
+
+    let mut wrong_policy = base.clone();
+    wrong_policy["entries"][0]["action"]["parameters"]["principal"]["account_policy"] =
+        serde_json::json!("dedicated");
+    cases.push(("wrong policy", wrong_policy));
+
+    let mut wrong_principal = base.clone();
+    wrong_principal["entries"][0]["action"]["parameters"]["principal"]["principal_id"] =
+        serde_json::json!("0");
+    cases.push(("wrong principal", wrong_principal));
+
+    let mut wrong_action_id = base.clone();
+    wrong_action_id["entries"][0]["action"]["parameters"]["action_id"] =
+        serde_json::json!("identity.directory.cache");
+    cases.push(("wrong action id", wrong_action_id));
+
+    let mut detached_effect = base;
+    detached_effect["entries"][0]["directories_created"][0]["path"] =
+        detached_effect["entries"][0]["action"]["parameters"]["root"].clone();
+    cases.push(("detached effect", detached_effect));
+
+    for (label, value) in cases {
+        assert!(
+            ReceiptDocument::from_json(&serde_json::to_vec(&value).unwrap()).is_err(),
+            "worker directory receipt accepted {label}"
+        );
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    let (principal_kind, principal_id) = (crate::platform::PrincipalKind::UnixUid, "501");
+    #[cfg(target_os = "windows")]
+    let (principal_kind, principal_id) = (
+        crate::platform::PrincipalKind::WindowsSid,
+        "S-1-5-21-1-2-3-1001",
+    );
+    let expected_principal = crate::platform::WorkerPrincipal::new(
+        principal_kind,
+        principal_id,
+        "alex",
+        crate::platform::WorkerAccountPolicy::CurrentUser,
+    )
+    .unwrap();
+    for (pointer, replacement) in [
+        (
+            "/entries/0/action/parameters/principal/principal_id",
+            #[cfg(not(target_os = "windows"))]
+            "502",
+            #[cfg(target_os = "windows")]
+            "S-1-5-21-1-2-3-1002",
+        ),
+        (
+            "/entries/0/action/parameters/principal/name",
+            "different-user",
+        ),
+    ] {
+        let mut mismatch = worker_directory_receipt_value();
+        *mismatch.pointer_mut(pointer).unwrap() = serde_json::json!(replacement);
+        let document = ReceiptDocument::from_json(&serde_json::to_vec(&mismatch).unwrap()).unwrap();
+        assert_eq!(
+            document
+                .validate_worker_principal(&expected_principal)
+                .unwrap_err(),
+            ReceiptError::InvalidWorkerPrincipal
+        );
+    }
+}
+
+#[test]
+fn worker_directory_receipt_rejects_duplicate_directories_secrets_and_unknown_fields() {
+    let base = worker_directory_receipt_value();
+
+    let mut duplicate = base.clone();
+    duplicate["entries"][0]["directories_created"]
+        .as_array_mut()
+        .unwrap()
+        .push(base["entries"][0]["directories_created"][0].clone());
+    assert_eq!(
+        ReceiptDocument::from_json(&serde_json::to_vec(&duplicate).unwrap()).unwrap_err(),
+        ReceiptError::ConflictingResources
+    );
+
+    let secret = "api_key=super-secret-value";
+    for pointer in [
+        "/entries/0/action/parameters/principal/name",
+        "/entries/0/action/parameters/root",
+        "/entries/0/action/parameters/path",
+        "/entries/0/directories_created/0/path",
+    ] {
+        let mut secret_bearing = base.clone();
+        *secret_bearing.pointer_mut(pointer).unwrap() = serde_json::json!(secret);
+        let error =
+            ReceiptDocument::from_json(&serde_json::to_vec(&secret_bearing).unwrap()).unwrap_err();
+        assert!(
+            !error.to_string().contains(secret),
+            "secret echoed for {pointer}"
+        );
+    }
+
+    for pointer in [
+        "/entries/0/action/parameters",
+        "/entries/0/action/parameters/principal",
+        "/entries/0/action/parameters/node",
+        "/entries/0/directories_created/0",
+    ] {
+        let mut forged = base.clone();
+        forged
+            .pointer_mut(pointer)
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .insert("forged".to_owned(), serde_json::json!(true));
+        assert!(
+            ReceiptDocument::from_json(&serde_json::to_vec(&forged).unwrap()).is_err(),
+            "unknown field at {pointer} was accepted"
+        );
+    }
+}
+
+#[test]
+fn worker_directory_pending_receipt_retains_parameters_but_requires_empty_effects() {
+    let mut pending = worker_directory_receipt_value();
+    pending["entries"][0]["status"] = serde_json::json!("pending");
+    pending["entries"][0]["directories_created"] = serde_json::json!([]);
+    ReceiptDocument::from_json(&serde_json::to_vec(&pending).unwrap()).unwrap();
+
+    pending["entries"][0]["directories_created"] = serde_json::json!([{
+        "path": pending["entries"][0]["action"]["parameters"]["path"].clone()
+    }]);
+    assert_eq!(
+        ReceiptDocument::from_json(&serde_json::to_vec(&pending).unwrap()).unwrap_err(),
+        ReceiptError::InvalidPendingEntry
     );
 }
 
@@ -257,6 +590,25 @@ fn checked_in_schema_example_and_canonical_serialization_stay_synchronized() {
         assert!(
             !validator.is_valid(&forged),
             "schema allowed unknown field at {pointer}"
+        );
+    }
+
+    for pointer in [
+        "/entries/0/action/parameters",
+        "/entries/0/action/parameters/principal",
+        "/entries/0/action/parameters/node",
+        "/entries/0/directories_created/0",
+    ] {
+        let mut forged = worker_directory_receipt_value();
+        forged
+            .pointer_mut(pointer)
+            .unwrap()
+            .as_object_mut()
+            .unwrap()
+            .insert("forged".to_owned(), serde_json::json!(true));
+        assert!(
+            !validator.is_valid(&forged),
+            "schema allowed worker directory unknown field at {pointer}"
         );
     }
 
@@ -480,6 +832,18 @@ fn pending_entries_must_describe_no_mutation_and_no_privilege_use() {
     privileged["entries"][0]["privilege_used"] = serde_json::json!("root");
     assert_eq!(
         ReceiptDocument::from_json(&serde_json::to_vec(&privileged).unwrap()).unwrap_err(),
+        ReceiptError::InvalidPendingEntry
+    );
+
+    let mut directory_mutation = pending.clone();
+    #[cfg(not(target_os = "windows"))]
+    let directory_path = "/opt/styrn/jobs";
+    #[cfg(target_os = "windows")]
+    let directory_path = r"C:\ProgramData\Styrn\jobs";
+    directory_mutation["entries"][0]["directories_created"] =
+        serde_json::json!([{ "path": directory_path }]);
+    assert_eq!(
+        ReceiptDocument::from_json(&serde_json::to_vec(&directory_mutation).unwrap()).unwrap_err(),
         ReceiptError::InvalidPendingEntry
     );
 
@@ -757,6 +1121,7 @@ fn append_candidate_cannot_delete_reorder_modify_or_publish_non_applied_entries(
     let mut non_applied = existing.clone();
     let mut pending = third;
     pending.privilege_used = ReceiptPrivilege::None;
+    pending.directories_created.clear();
     pending.files_created.clear();
     pending.files_modified.clear();
     pending.services.clear();

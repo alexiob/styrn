@@ -104,6 +104,11 @@
           "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]+)?Z$"
         },
         "privilege_used": { "enum": ["none", "root", "admin"] },
+        "directories_created": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/createdDirectory" }
+        },
         "files_created": {
           "type": "array",
           "uniqueItems": true,
@@ -151,6 +156,7 @@
           "then": {
             "properties": {
               "privilege_used": { "const": "none" },
+              "directories_created": { "maxItems": 0 },
               "files_created": { "maxItems": 0 },
               "files_modified": { "maxItems": 0 },
               "services": { "maxItems": 0 },
@@ -160,10 +166,53 @@
               "download_provenance": { "type": "null" }
             }
           }
+        },
+        {
+          "if": {
+            "properties": {
+              "action": {
+                "properties": { "type": { "const": "worker_directory" } },
+                "required": ["type"]
+              }
+            },
+            "required": ["action"]
+          },
+          "then": {
+            "properties": {
+              "privilege_used": { "const": "none" },
+              "files_created": { "maxItems": 0 },
+              "files_modified": { "maxItems": 0 },
+              "services": { "maxItems": 0 },
+              "accounts": { "maxItems": 0 },
+              "registry_keys": { "maxItems": 0 },
+              "firewall_rules": { "maxItems": 0 },
+              "download_provenance": { "type": "null" }
+            },
+            "allOf": [
+              {
+                "if": {
+                  "properties": { "status": { "const": "pending" } },
+                  "required": ["status"]
+                },
+                "else": {
+                  "required": ["directories_created"],
+                  "properties": {
+                    "directories_created": { "minItems": 1, "maxItems": 1 }
+                  }
+                }
+              }
+            ]
+          }
         }
       ]
     },
     "action": {
+      "oneOf": [
+        { "$ref": "#/$defs/foundationAction" },
+        { "$ref": "#/$defs/workerDirectoryAction" }
+      ]
+    },
+    "foundationAction": {
       "type": "object",
       "required": ["type", "parameters"],
       "additionalProperties": false,
@@ -174,13 +223,137 @@
           "required": ["action_id"],
           "additionalProperties": false,
           "properties": {
-            "action_id": {
-              "type": "string",
-              "pattern": "^[a-z](?:[a-z0-9-]*[a-z0-9])?(?:\\.[a-z](?:[a-z0-9-]*[a-z0-9])?)+$"
-            }
+            "action_id": { "$ref": "#/$defs/actionIdentifier" }
           }
         }
       }
+    },
+    "workerDirectoryAction": {
+      "type": "object",
+      "required": ["type", "parameters"],
+      "additionalProperties": false,
+      "properties": {
+        "type": { "const": "worker_directory" },
+        "parameters": {
+          "type": "object",
+          "required": [
+            "action_id",
+            "installation_scope",
+            "principal",
+            "root",
+            "node",
+            "path"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "action_id": { "$ref": "#/$defs/actionIdentifier" },
+            "installation_scope": { "const": "user" },
+            "principal": { "$ref": "#/$defs/workerPrincipal" },
+            "root": { "$ref": "#/$defs/absolutePath" },
+            "node": { "$ref": "#/$defs/workerDirectoryNode" },
+            "path": { "$ref": "#/$defs/absolutePath" }
+          }
+        }
+      }
+    },
+    "actionIdentifier": {
+      "type": "string",
+      "pattern": "^[a-z](?:[a-z0-9-]*[a-z0-9])?(?:\\.[a-z](?:[a-z0-9-]*[a-z0-9])?)+$"
+    },
+    "workerPrincipal": {
+      "type": "object",
+      "required": ["account_policy", "principal_kind", "principal_id", "name"],
+      "additionalProperties": false,
+      "properties": {
+        "account_policy": { "const": "current-user" },
+        "principal_kind": { "enum": ["unix-uid", "windows-sid"] },
+        "principal_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": { "principal_kind": { "const": "unix-uid" } },
+            "required": ["principal_kind"]
+          },
+          "then": {
+            "properties": { "principal_id": { "pattern": "^[1-9][0-9]*$" } }
+          },
+          "else": {
+            "properties": {
+              "principal_id": {
+                "pattern": "^S-1-[0-9]+(?:-[0-9]+){1,15}$"
+              }
+            }
+          }
+        }
+      ]
+    },
+    "workerDirectoryNode": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["type", "ordinal"],
+          "additionalProperties": false,
+          "properties": {
+            "type": { "const": "support" },
+            "ordinal": { "type": "integer", "minimum": 0, "maximum": 65535 }
+          }
+        },
+        { "$ref": "#/$defs/workerDirectoryRootNode" },
+        { "$ref": "#/$defs/workerDirectoryReposNode" },
+        { "$ref": "#/$defs/workerDirectoryJobsNode" },
+        { "$ref": "#/$defs/workerDirectoryCacheNode" },
+        { "$ref": "#/$defs/workerDirectoryArtifactsNode" },
+        { "$ref": "#/$defs/workerDirectoryLogsNode" }
+      ]
+    },
+    "workerDirectoryRootNode": {
+      "$ref": "#/$defs/workerDirectoryRootNodeShape"
+    },
+    "workerDirectoryRootNodeShape": {
+      "type": "object",
+      "required": ["type"],
+      "additionalProperties": false,
+      "properties": { "type": { "const": "root" } }
+    },
+    "workerDirectoryReposNode": {
+      "type": "object",
+      "required": ["type"],
+      "additionalProperties": false,
+      "properties": { "type": { "const": "repos" } }
+    },
+    "workerDirectoryJobsNode": {
+      "type": "object",
+      "required": ["type"],
+      "additionalProperties": false,
+      "properties": { "type": { "const": "jobs" } }
+    },
+    "workerDirectoryCacheNode": {
+      "type": "object",
+      "required": ["type"],
+      "additionalProperties": false,
+      "properties": { "type": { "const": "cache" } }
+    },
+    "workerDirectoryArtifactsNode": {
+      "type": "object",
+      "required": ["type"],
+      "additionalProperties": false,
+      "properties": { "type": { "const": "artifacts" } }
+    },
+    "workerDirectoryLogsNode": {
+      "type": "object",
+      "required": ["type"],
+      "additionalProperties": false,
+      "properties": { "type": { "const": "logs" } }
     },
     "absolutePath": {
       "type": "string",
@@ -208,6 +381,14 @@
       "properties": {
         "path": { "$ref": "#/$defs/absolutePath" },
         "sha256": { "$ref": "#/$defs/sha256" }
+      }
+    },
+    "createdDirectory": {
+      "type": "object",
+      "required": ["path"],
+      "additionalProperties": false,
+      "properties": {
+        "path": { "$ref": "#/$defs/absolutePath" }
       }
     },
     "modifiedFile": {

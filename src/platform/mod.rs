@@ -51,6 +51,33 @@ pub(crate) struct WorkerDirectoryLayout {
     principal_revalidation: Option<WorkerPrincipalRevalidationTest>,
 }
 
+/// Closed identity for one node in the native worker-directory layout.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum WorkerDirectoryNode {
+    Support { ordinal: u16 },
+    Root,
+    Repos,
+    Jobs,
+    Cache,
+    Artifacts,
+    Logs,
+}
+
+impl WorkerDirectoryNode {
+    #[allow(dead_code)] // Consumed by the T0.14 production Action integration.
+    pub(crate) fn action_id(self) -> String {
+        match self {
+            Self::Support { ordinal } => format!("identity.directory.support-{ordinal}"),
+            Self::Root => "identity.directory.root".to_owned(),
+            Self::Repos => "identity.directory.repos".to_owned(),
+            Self::Jobs => "identity.directory.jobs".to_owned(),
+            Self::Cache => "identity.directory.cache".to_owned(),
+            Self::Artifacts => "identity.directory.artifacts".to_owned(),
+            Self::Logs => "identity.directory.logs".to_owned(),
+        }
+    }
+}
+
 #[cfg(test)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum WorkerPrincipalRevalidationTest {
@@ -440,6 +467,64 @@ impl WorkerDirectoryLayout {
 
     pub(crate) fn logs(&self) -> &Path {
         &self.logs
+    }
+
+    /// Returns every path the native materializer may create, in exact
+    /// outer-to-inner creation order. Support ordinals are stable indexes into
+    /// the standard-directory ancestors between the retained anchor and root.
+    pub(crate) fn materialization_nodes(&self) -> Vec<WorkerDirectoryNode> {
+        let mut nodes = self
+            .support_paths()
+            .into_iter()
+            .enumerate()
+            .map(|(ordinal, _)| WorkerDirectoryNode::Support {
+                ordinal: u16::try_from(ordinal)
+                    .expect("native worker path cannot contain more than u16::MAX components"),
+            })
+            .collect::<Vec<_>>();
+        nodes.extend([
+            WorkerDirectoryNode::Root,
+            WorkerDirectoryNode::Repos,
+            WorkerDirectoryNode::Jobs,
+            WorkerDirectoryNode::Cache,
+            WorkerDirectoryNode::Artifacts,
+            WorkerDirectoryNode::Logs,
+        ]);
+        nodes
+    }
+
+    /// Resolves a closed node only when it belongs to this exact layout.
+    pub(crate) fn path_for_node(&self, node: WorkerDirectoryNode) -> Option<PathBuf> {
+        match node {
+            WorkerDirectoryNode::Support { ordinal } => {
+                self.support_paths().get(usize::from(ordinal)).cloned()
+            }
+            WorkerDirectoryNode::Root => Some(self.root.clone()),
+            WorkerDirectoryNode::Repos => Some(self.repos.clone()),
+            WorkerDirectoryNode::Jobs => Some(self.jobs.clone()),
+            WorkerDirectoryNode::Cache => Some(self.cache.clone()),
+            WorkerDirectoryNode::Artifacts => Some(self.artifacts.clone()),
+            WorkerDirectoryNode::Logs => Some(self.logs.clone()),
+        }
+    }
+
+    fn support_paths(&self) -> Vec<PathBuf> {
+        let WorkerRootCreationPolicy::CreateMissingFrom(anchor) = &self.creation_policy else {
+            return Vec::new();
+        };
+        let Ok(relative) = self.root.strip_prefix(anchor) else {
+            return Vec::new();
+        };
+        let components = relative.components().collect::<Vec<_>>();
+        let mut path = anchor.clone();
+        components
+            .iter()
+            .take(components.len().saturating_sub(1))
+            .map(|component| {
+                path.push(component.as_os_str());
+                path.clone()
+            })
+            .collect()
     }
 
     fn child_names() -> [&'static str; 5] {
@@ -2380,6 +2465,61 @@ mod worker_directory_tests {
         assert_eq!(layout.cache(), expected_root.join("cache"));
         assert_eq!(layout.artifacts(), expected_root.join("artifacts"));
         assert_eq!(layout.logs(), expected_root.join("logs"));
+    }
+
+    #[test]
+    fn worker_directory_materialization_nodes_are_closed_and_map_to_exact_paths() {
+        let principal = resolve_current_worker_principal().unwrap();
+        #[cfg(unix)]
+        let (anchor, root) = (
+            PathBuf::from("/native/profile"),
+            PathBuf::from("/native/profile/first/second/styrn"),
+        );
+        #[cfg(target_os = "windows")]
+        let (anchor, root) = (
+            PathBuf::from(r"C:\native\profile"),
+            PathBuf::from(r"C:\native\profile\first\second\Styrn"),
+        );
+        let layout = WorkerDirectoryLayout::new(
+            InstallationScope::User,
+            root.clone(),
+            WorkerRootCreationPolicy::CreateMissingFrom(anchor.clone()),
+            principal,
+        );
+
+        assert_eq!(
+            layout.materialization_nodes(),
+            vec![
+                WorkerDirectoryNode::Support { ordinal: 0 },
+                WorkerDirectoryNode::Support { ordinal: 1 },
+                WorkerDirectoryNode::Root,
+                WorkerDirectoryNode::Repos,
+                WorkerDirectoryNode::Jobs,
+                WorkerDirectoryNode::Cache,
+                WorkerDirectoryNode::Artifacts,
+                WorkerDirectoryNode::Logs,
+            ]
+        );
+        assert_eq!(
+            layout.path_for_node(WorkerDirectoryNode::Support { ordinal: 0 }),
+            Some(anchor.join("first"))
+        );
+        assert_eq!(
+            layout.path_for_node(WorkerDirectoryNode::Support { ordinal: 1 }),
+            Some(anchor.join("first").join("second"))
+        );
+        assert_eq!(
+            layout.path_for_node(WorkerDirectoryNode::Support { ordinal: 2 }),
+            None
+        );
+        assert_eq!(
+            layout.path_for_node(WorkerDirectoryNode::Root),
+            Some(root.clone())
+        );
+        assert_eq!(
+            layout.path_for_node(WorkerDirectoryNode::Jobs),
+            Some(root.join("jobs"))
+        );
     }
 
     #[test]

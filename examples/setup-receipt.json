@@ -12,6 +12,7 @@
       },
       "timestamp": "2026-09-02T10:00:00Z",
       "privilege_used": "none",
+      "directories_created": [],
       "files_created": [
         {
           "path": "/home/alex/.local/share/styrn/bin/tool",
@@ -28,6 +29,42 @@
         "version": "1.2.3",
         "sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc"
       },
+      "status": "applied"
+    },
+    {
+      "entry_id": "019cafd0-5c00-7000-8000-000000000002",
+      "action": {
+        "type": "worker_directory",
+        "parameters": {
+          "action_id": "identity.directory.jobs",
+          "installation_scope": "user",
+          "principal": {
+            "account_policy": "current-user",
+            "principal_kind": "unix-uid",
+            "principal_id": "501",
+            "name": "alex"
+          },
+          "root": "/home/alex/.local/share/styrn",
+          "node": {
+            "type": "jobs"
+          },
+          "path": "/home/alex/.local/share/styrn/jobs"
+        }
+      },
+      "timestamp": "2026-09-02T10:00:01Z",
+      "privilege_used": "none",
+      "directories_created": [
+        {
+          "path": "/home/alex/.local/share/styrn/jobs"
+        }
+      ],
+      "files_created": [],
+      "files_modified": [],
+      "services": [],
+      "accounts": [],
+      "registry_keys": [],
+      "firewall_rules": [],
+      "download_provenance": null,
       "status": "applied"
     }
   ]

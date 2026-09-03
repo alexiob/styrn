@@ -15,7 +15,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 pub(crate) use crate::platform::InstallationScope;
-use crate::platform::WorkerPrincipal;
+use crate::platform::{PrincipalKind, WorkerAccountPolicy, WorkerPrincipal};
 
 const SCHEMA_VERSION: u32 = 1;
 
@@ -121,6 +121,7 @@ impl ReceiptDocument {
         let mut ids = HashSet::with_capacity(self.entries.len());
         for entry in &self.entries {
             entry.validate()?;
+            entry.validate_scope(self.installation_scope)?;
             if self.installation_scope == InstallationScope::User
                 && entry.privilege_used != ReceiptPrivilege::None
             {
@@ -147,6 +148,29 @@ impl ReceiptDocument {
             }
         }
         Ok(())
+    }
+
+    fn validate_worker_principal(&self, worker: &WorkerPrincipal) -> Result<(), ReceiptError> {
+        for entry in &self.entries {
+            entry.validate_worker_principal(worker)?;
+        }
+        Ok(())
+    }
+
+    fn validate_worker_directory_layout(
+        &self,
+        layout: &crate::platform::WorkerDirectoryLayout,
+    ) -> Result<(), ReceiptError> {
+        for entry in &self.entries {
+            entry.validate_worker_directory_layout(layout)?;
+        }
+        Ok(())
+    }
+
+    fn has_worker_directory_action(&self) -> bool {
+        self.entries
+            .iter()
+            .any(|entry| entry.action.is_worker_directory())
     }
 
     fn validate_with_pending_publication_intent(
@@ -573,7 +597,8 @@ impl ReceiptIntentDocument {
         {
             return Err(ReceiptError::PrivilegeOutsideScope);
         }
-        self.entry.validate()
+        self.entry.validate()?;
+        self.entry.validate_scope(self.installation_scope)
     }
 
     fn to_json(&self) -> Result<Vec<u8>, ReceiptError> {
@@ -777,6 +802,15 @@ impl ReceiptStore {
     #[cfg(test)]
     pub(in crate::setup) fn new_for_test_failing_after_prepare(path: impl Into<PathBuf>) -> Self {
         let mut store = Self::new_for_test(path);
+        store.interrupt_after_prepare = true;
+        store
+    }
+
+    #[cfg(test)]
+    pub(in crate::setup) fn new_user_for_test_failing_after_prepare(
+        path: impl Into<PathBuf>,
+    ) -> Self {
+        let mut store = Self::new_user_for_test(path);
         store.interrupt_after_prepare = true;
         store
     }
@@ -1129,6 +1163,8 @@ impl ReceiptStore {
         if document.installation_scope != self.scope {
             return Err(ReceiptStoreError::ScopeMismatch);
         }
+        document.validate_worker_principal(&self.worker)?;
+        self.validate_worker_directory_document(&document)?;
         let publication_intent = self.read_pending_publication_intent(&document)?;
         document.validate_with_pending_publication_intent(
             publication_intent.as_ref().map(|intent| &intent.document),
@@ -1634,6 +1670,41 @@ impl ReceiptStore {
         Ok(())
     }
 
+    fn validate_worker_directory_document(
+        &self,
+        document: &ReceiptDocument,
+    ) -> Result<(), ReceiptStoreError> {
+        if !document.has_worker_directory_action() {
+            return Ok(());
+        }
+        let layout =
+            crate::platform::resolve_worker_directory_layout(self.scope, &self.worker, None)
+                .map_err(|_| ReceiptError::InvalidWorkerDirectoryAction)?;
+        document.validate_worker_directory_layout(&layout)?;
+        Ok(())
+    }
+
+    fn validate_worker_directory_entry(
+        &self,
+        entry: &ReceiptEntry,
+    ) -> Result<(), ReceiptStoreError> {
+        self.validate_worker_directory_action(&entry.action)
+    }
+
+    fn validate_worker_directory_action(
+        &self,
+        action: &ReceiptAction,
+    ) -> Result<(), ReceiptStoreError> {
+        if !action.is_worker_directory() {
+            return Ok(());
+        }
+        let layout =
+            crate::platform::resolve_worker_directory_layout(self.scope, &self.worker, None)
+                .map_err(|_| ReceiptError::InvalidWorkerDirectoryAction)?;
+        action.validate_worker_directory_layout(&layout)?;
+        Ok(())
+    }
+
     fn parse_for_scope_with_pending_publication_intent(
         &self,
         input: &[u8],
@@ -1643,6 +1714,8 @@ impl ReceiptStore {
         if document.installation_scope != self.scope {
             return Err(ReceiptStoreError::ScopeMismatch);
         }
+        document.validate_worker_principal(&self.worker)?;
+        self.validate_worker_directory_document(&document)?;
         if let Some(intent) = publication_intent {
             intent.document.validate_receipt_binding(self, &document)?;
         }
@@ -1660,23 +1733,37 @@ impl ReceiptApplySession<'_> {
     /// after a witnessed epoch no longer contained the stable action ID.
     pub(in crate::setup) fn record_pending(
         &self,
-        action: &crate::setup::action::ActionName,
+        action: &crate::setup::action::PendingAction,
         metadata: &mut ReceiptMetadataSource,
         _authority: &crate::setup::action::JournalAuthority,
     ) -> Result<PendingReceiptOccurrence, ReceiptStoreError> {
         let existing = self.store.read_locked()?;
         let publication_intent = self.store.read_pending_publication_intent(&existing)?;
+        let expected_action = ReceiptAction::from_action_parameters(action.parameters())?;
+        expected_action.validate()?;
+        expected_action.validate_scope(self.store.scope)?;
+        expected_action.validate_worker_principal(&self.store.worker)?;
+        self.store
+            .validate_worker_directory_action(&expected_action)?;
         if let Some(occurrence) = current_pending_occurrence(
             &existing,
-            action.as_str(),
+            action.id().as_str(),
             publication_intent.as_ref().map(|intent| &intent.document),
         ) {
+            if existing
+                .entries
+                .iter()
+                .find(|entry| entry.entry_id == occurrence.entry_id)
+                .is_none_or(|entry| entry.action != expected_action)
+            {
+                return Err(ReceiptStoreError::IntentConflict);
+            }
             return Ok(occurrence);
         }
 
         let metadata = metadata.next()?;
         let occurrence = PendingReceiptOccurrence {
-            action_id: ActionIdentifier(action.as_str().to_owned()),
+            action_id: ActionIdentifier(action.id().as_str().to_owned()),
             entry_id: metadata.entry_id.clone(),
         };
         let mut candidate = existing.clone();
@@ -1781,9 +1868,8 @@ impl ReceiptApplySession<'_> {
 
     pub(in crate::setup) fn prepare_intent(
         &self,
-        action: &crate::setup::action::ActionName,
         privilege: crate::setup::action::Privilege,
-        effect: &crate::setup::action::ActionEffect,
+        prepared: &crate::setup::action::PreparedAction,
         metadata: &mut ReceiptMetadataSource,
         _authority: &crate::setup::action::JournalAuthority,
     ) -> Result<ReceiptIntent, ReceiptStoreError> {
@@ -1792,7 +1878,10 @@ impl ReceiptApplySession<'_> {
         {
             return Err(ReceiptError::PrivilegeOutsideScope.into());
         }
-        let entry = ReceiptEntry::applied(action, privilege, effect, metadata.next()?)?;
+        let entry = ReceiptEntry::applied(prepared, privilege, metadata.next()?)?;
+        entry.validate_scope(self.store.scope)?;
+        entry.validate_worker_principal(&self.store.worker)?;
+        self.store.validate_worker_directory_entry(&entry)?;
         let path = self.transaction_path(&entry.entry_id);
         let document = ReceiptIntentDocument {
             schema_version: SCHEMA_VERSION,
@@ -1891,15 +1980,13 @@ impl ReceiptApplySession<'_> {
     pub(in crate::setup) fn intent_matches(
         &self,
         intent: &ReceiptIntent,
-        action: &crate::setup::action::ActionName,
         privilege: crate::setup::action::Privilege,
-        effect: &crate::setup::action::ActionEffect,
+        prepared: &crate::setup::action::PreparedAction,
         _authority: &crate::setup::action::JournalAuthority,
     ) -> Result<bool, ReceiptStoreError> {
         let comparison = ReceiptEntry::applied(
-            action,
+            prepared,
             privilege,
-            effect,
             ReceiptMetadata {
                 entry_id: intent.entry.entry_id.clone(),
                 timestamp: intent.entry.timestamp.clone(),
@@ -1954,6 +2041,11 @@ impl ReceiptApplySession<'_> {
         if document.installation_scope != self.store.scope {
             return Err(ReceiptStoreError::ScopeMismatch);
         }
+        document
+            .entry
+            .validate_worker_principal(&self.store.worker)?;
+        self.store
+            .validate_worker_directory_entry(&document.entry)?;
         let entry = document.entry;
         if self.transaction_path(&entry.entry_id) != path {
             return Err(ReceiptStoreError::IntentConflict);
@@ -2571,6 +2663,8 @@ struct ReceiptEntry {
     action: ReceiptAction,
     timestamp: ReceiptTimestamp,
     privilege_used: ReceiptPrivilege,
+    #[serde(default)]
+    directories_created: Vec<CreatedDirectory>,
     files_created: Vec<CreatedFile>,
     files_modified: Vec<ModifiedFile>,
     services: Vec<ServiceResource>,
@@ -2583,16 +2677,15 @@ struct ReceiptEntry {
 
 impl ReceiptEntry {
     fn pending(
-        action: &crate::setup::action::ActionName,
+        action: &crate::setup::action::PendingAction,
         metadata: ReceiptMetadata,
     ) -> Result<Self, ReceiptError> {
         let entry = Self {
             entry_id: metadata.entry_id,
-            action: ReceiptAction::Foundation(FoundationActionParameters {
-                action_id: ActionIdentifier(action.as_str().to_owned()),
-            }),
+            action: ReceiptAction::from_action_parameters(action.parameters())?,
             timestamp: metadata.timestamp,
             privilege_used: ReceiptPrivilege::None,
+            directories_created: Vec::new(),
             files_created: Vec::new(),
             files_modified: Vec::new(),
             services: Vec::new(),
@@ -2607,22 +2700,27 @@ impl ReceiptEntry {
     }
 
     fn applied(
-        action: &crate::setup::action::ActionName,
+        prepared: &crate::setup::action::PreparedAction,
         privilege: crate::setup::action::Privilege,
-        effect: &crate::setup::action::ActionEffect,
         metadata: ReceiptMetadata,
     ) -> Result<Self, ReceiptError> {
+        let effect = prepared.effect();
         let entry = Self {
             entry_id: metadata.entry_id,
-            action: ReceiptAction::Foundation(FoundationActionParameters {
-                action_id: ActionIdentifier(action.as_str().to_owned()),
-            }),
+            action: ReceiptAction::from_action_parameters(prepared.parameters())?,
             timestamp: metadata.timestamp,
             privilege_used: match privilege {
                 crate::setup::action::Privilege::None => ReceiptPrivilege::None,
                 crate::setup::action::Privilege::Root => ReceiptPrivilege::Root,
                 crate::setup::action::Privilege::Admin => ReceiptPrivilege::Admin,
             },
+            directories_created: effect
+                .directories_created()
+                .iter()
+                .map(|directory| CreatedDirectory {
+                    path: RecordedPath(directory.path().to_owned()),
+                })
+                .collect(),
             files_created: effect
                 .files_created()
                 .iter()
@@ -2690,6 +2788,12 @@ impl ReceiptEntry {
         self.action.validate()?;
         self.timestamp.validate()?;
         let mut file_paths = HashSet::new();
+        for directory in &self.directories_created {
+            directory.validate()?;
+            if !file_paths.insert(directory.path.0.as_str()) {
+                return Err(ReceiptError::ConflictingResources);
+            }
+        }
         for file in &self.files_created {
             file.validate()?;
             if !file_paths.insert(file.path.0.as_str()) {
@@ -2735,8 +2839,10 @@ impl ReceiptEntry {
         if let Some(provenance) = &self.download_provenance.0 {
             provenance.validate()?;
         }
+        self.validate_action_effect()?;
         if self.status == ReceiptStatus::Pending
             && (self.privilege_used != ReceiptPrivilege::None
+                || !self.directories_created.is_empty()
                 || !self.files_created.is_empty()
                 || !self.files_modified.is_empty()
                 || !self.services.is_empty()
@@ -2746,6 +2852,44 @@ impl ReceiptEntry {
                 || self.download_provenance.0.is_some())
         {
             return Err(ReceiptError::InvalidPendingEntry);
+        }
+        Ok(())
+    }
+
+    fn validate_scope(&self, scope: InstallationScope) -> Result<(), ReceiptError> {
+        self.action.validate_scope(scope)
+    }
+
+    fn validate_worker_principal(&self, worker: &WorkerPrincipal) -> Result<(), ReceiptError> {
+        self.action.validate_worker_principal(worker)
+    }
+
+    fn validate_worker_directory_layout(
+        &self,
+        layout: &crate::platform::WorkerDirectoryLayout,
+    ) -> Result<(), ReceiptError> {
+        self.action.validate_worker_directory_layout(layout)
+    }
+
+    fn validate_action_effect(&self) -> Result<(), ReceiptError> {
+        let ReceiptAction::WorkerDirectory(parameters) = &self.action else {
+            return Ok(());
+        };
+        if self.status == ReceiptStatus::Pending {
+            return Ok(());
+        }
+        if self.privilege_used != ReceiptPrivilege::None
+            || self.directories_created.len() != 1
+            || self.directories_created[0].path != parameters.path
+            || !self.files_created.is_empty()
+            || !self.files_modified.is_empty()
+            || !self.services.is_empty()
+            || !self.accounts.is_empty()
+            || !self.registry_keys.is_empty()
+            || !self.firewall_rules.is_empty()
+            || self.download_provenance.0.is_some()
+        {
+            return Err(ReceiptError::InvalidWorkerDirectoryAction);
         }
         Ok(())
     }
@@ -2760,19 +2904,98 @@ impl ReceiptEntry {
 )]
 enum ReceiptAction {
     Foundation(FoundationActionParameters),
+    WorkerDirectory(WorkerDirectoryActionParameters),
 }
 
 impl ReceiptAction {
+    fn is_worker_directory(&self) -> bool {
+        matches!(self, Self::WorkerDirectory(_))
+    }
+
+    fn from_action_parameters(
+        parameters: &crate::setup::action::ActionParameters,
+    ) -> Result<Self, ReceiptError> {
+        match parameters {
+            crate::setup::action::ActionParameters::Foundation(action_id) => {
+                Ok(Self::Foundation(FoundationActionParameters {
+                    action_id: ActionIdentifier(action_id.as_str().to_owned()),
+                }))
+            }
+            crate::setup::action::ActionParameters::WorkerDirectory(parameters) => {
+                Ok(Self::WorkerDirectory(WorkerDirectoryActionParameters {
+                    action_id: ActionIdentifier(parameters.action_id().as_str().to_owned()),
+                    installation_scope: parameters.installation_scope(),
+                    principal: ReceiptWorkerPrincipal::from_worker_principal(
+                        parameters.principal(),
+                    ),
+                    root: RecordedPath::from_path(parameters.root())?,
+                    node: ReceiptWorkerDirectoryNode::from(parameters.node()),
+                    path: RecordedPath::from_path(parameters.path())?,
+                }))
+            }
+        }
+    }
+
     fn action_id(&self) -> &str {
         match self {
             Self::Foundation(parameters) => &parameters.action_id.0,
+            Self::WorkerDirectory(parameters) => &parameters.action_id.0,
         }
     }
 
     fn validate(&self) -> Result<(), ReceiptError> {
         match self {
             Self::Foundation(parameters) => parameters.action_id.validate(),
+            Self::WorkerDirectory(parameters) => parameters.validate(),
         }
+    }
+
+    fn validate_scope(&self, scope: InstallationScope) -> Result<(), ReceiptError> {
+        match self {
+            Self::Foundation(_) => Ok(()),
+            Self::WorkerDirectory(parameters) => {
+                if scope == InstallationScope::User
+                    && parameters.installation_scope == InstallationScope::User
+                {
+                    Ok(())
+                } else {
+                    Err(ReceiptError::InvalidWorkerDirectoryAction)
+                }
+            }
+        }
+    }
+
+    fn validate_worker_principal(&self, worker: &WorkerPrincipal) -> Result<(), ReceiptError> {
+        match self {
+            Self::Foundation(_) => Ok(()),
+            Self::WorkerDirectory(parameters) => {
+                if parameters.principal.to_worker_principal()? == *worker {
+                    Ok(())
+                } else {
+                    Err(ReceiptError::InvalidWorkerPrincipal)
+                }
+            }
+        }
+    }
+
+    fn validate_worker_directory_layout(
+        &self,
+        layout: &crate::platform::WorkerDirectoryLayout,
+    ) -> Result<(), ReceiptError> {
+        let Self::WorkerDirectory(parameters) = self else {
+            return Ok(());
+        };
+        let node = parameters.node.platform_node()?;
+        let expected_path = layout
+            .path_for_node(node)
+            .ok_or(ReceiptError::InvalidWorkerDirectoryAction)?;
+        if Path::new(&parameters.root.0) != layout.root()
+            || Path::new(&parameters.path.0) != expected_path
+            || !layout.materialization_nodes().contains(&node)
+        {
+            return Err(ReceiptError::InvalidWorkerDirectoryAction);
+        }
+        Ok(())
     }
 }
 
@@ -2780,6 +3003,211 @@ impl ReceiptAction {
 #[serde(deny_unknown_fields)]
 struct FoundationActionParameters {
     action_id: ActionIdentifier,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkerDirectoryActionParameters {
+    action_id: ActionIdentifier,
+    installation_scope: InstallationScope,
+    principal: ReceiptWorkerPrincipal,
+    root: RecordedPath,
+    node: ReceiptWorkerDirectoryNode,
+    path: RecordedPath,
+}
+
+impl WorkerDirectoryActionParameters {
+    fn validate(&self) -> Result<(), ReceiptError> {
+        self.action_id.validate()?;
+        if self.installation_scope != InstallationScope::User
+            || self.principal.account_policy != WorkerAccountPolicy::CurrentUser
+        {
+            return Err(ReceiptError::InvalidWorkerDirectoryAction);
+        }
+        self.principal.validate()?;
+        self.root.validate()?;
+        self.path.validate()?;
+        if Path::new(&self.root.0).file_name().is_none()
+            || Path::new(&self.path.0).file_name().is_none()
+            || self.action_id.0 != self.node.action_id()
+            || !self.node.path_matches(&self.root, &self.path)
+        {
+            return Err(ReceiptError::InvalidWorkerDirectoryAction);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReceiptWorkerPrincipal {
+    account_policy: WorkerAccountPolicy,
+    principal_kind: PrincipalKind,
+    principal_id: String,
+    name: String,
+}
+
+impl ReceiptWorkerPrincipal {
+    fn from_worker_principal(principal: &WorkerPrincipal) -> Self {
+        Self {
+            account_policy: principal.account_policy(),
+            principal_kind: principal.principal_kind(),
+            principal_id: principal.principal_id().to_owned(),
+            name: principal.name().to_owned(),
+        }
+    }
+
+    fn validate(&self) -> Result<(), ReceiptError> {
+        self.to_worker_principal().map(|_| ())
+    }
+
+    fn to_worker_principal(&self) -> Result<WorkerPrincipal, ReceiptError> {
+        if !safe_text(&self.principal_id)
+            || !safe_text(&self.name)
+            || !principal_kind_is_native(self.principal_kind)
+        {
+            return Err(ReceiptError::InvalidWorkerPrincipal);
+        }
+        WorkerPrincipal::new(
+            self.principal_kind,
+            self.principal_id.clone(),
+            self.name.clone(),
+            self.account_policy,
+        )
+        .map_err(|_| ReceiptError::InvalidWorkerPrincipal)
+    }
+}
+
+fn principal_kind_is_native(kind: PrincipalKind) -> bool {
+    #[cfg(target_os = "windows")]
+    {
+        kind == PrincipalKind::WindowsSid
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        kind == PrincipalKind::UnixUid
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReceiptWorkerDirectoryNode {
+    #[serde(rename = "type")]
+    kind: ReceiptWorkerDirectoryNodeKind,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ordinal: Option<u16>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ReceiptWorkerDirectoryNodeKind {
+    Support,
+    Root,
+    Repos,
+    Jobs,
+    Cache,
+    Artifacts,
+    Logs,
+}
+
+impl ReceiptWorkerDirectoryNode {
+    fn action_id(self) -> String {
+        match (self.kind, self.ordinal) {
+            (ReceiptWorkerDirectoryNodeKind::Support, Some(ordinal)) => {
+                format!("identity.directory.support-{ordinal}")
+            }
+            (ReceiptWorkerDirectoryNodeKind::Root, None) => "identity.directory.root".to_owned(),
+            (ReceiptWorkerDirectoryNodeKind::Repos, None) => "identity.directory.repos".to_owned(),
+            (ReceiptWorkerDirectoryNodeKind::Jobs, None) => "identity.directory.jobs".to_owned(),
+            (ReceiptWorkerDirectoryNodeKind::Cache, None) => "identity.directory.cache".to_owned(),
+            (ReceiptWorkerDirectoryNodeKind::Artifacts, None) => {
+                "identity.directory.artifacts".to_owned()
+            }
+            (ReceiptWorkerDirectoryNodeKind::Logs, None) => "identity.directory.logs".to_owned(),
+            _ => String::new(),
+        }
+    }
+
+    fn path_matches(self, root: &RecordedPath, path: &RecordedPath) -> bool {
+        let root_path = Path::new(&root.0);
+        let path_path = Path::new(&path.0);
+        match (self.kind, self.ordinal) {
+            (ReceiptWorkerDirectoryNodeKind::Support, Some(_)) => {
+                path_path != root_path && root_path.starts_with(path_path)
+            }
+            (ReceiptWorkerDirectoryNodeKind::Root, None) => path == root,
+            (ReceiptWorkerDirectoryNodeKind::Repos, None) => path_path == root_path.join("repos"),
+            (ReceiptWorkerDirectoryNodeKind::Jobs, None) => path_path == root_path.join("jobs"),
+            (ReceiptWorkerDirectoryNodeKind::Cache, None) => path_path == root_path.join("cache"),
+            (ReceiptWorkerDirectoryNodeKind::Artifacts, None) => {
+                path_path == root_path.join("artifacts")
+            }
+            (ReceiptWorkerDirectoryNodeKind::Logs, None) => path_path == root_path.join("logs"),
+            _ => false,
+        }
+    }
+
+    fn platform_node(self) -> Result<crate::platform::WorkerDirectoryNode, ReceiptError> {
+        match (self.kind, self.ordinal) {
+            (ReceiptWorkerDirectoryNodeKind::Support, Some(ordinal)) => {
+                Ok(crate::platform::WorkerDirectoryNode::Support { ordinal })
+            }
+            (ReceiptWorkerDirectoryNodeKind::Root, None) => {
+                Ok(crate::platform::WorkerDirectoryNode::Root)
+            }
+            (ReceiptWorkerDirectoryNodeKind::Repos, None) => {
+                Ok(crate::platform::WorkerDirectoryNode::Repos)
+            }
+            (ReceiptWorkerDirectoryNodeKind::Jobs, None) => {
+                Ok(crate::platform::WorkerDirectoryNode::Jobs)
+            }
+            (ReceiptWorkerDirectoryNodeKind::Cache, None) => {
+                Ok(crate::platform::WorkerDirectoryNode::Cache)
+            }
+            (ReceiptWorkerDirectoryNodeKind::Artifacts, None) => {
+                Ok(crate::platform::WorkerDirectoryNode::Artifacts)
+            }
+            (ReceiptWorkerDirectoryNodeKind::Logs, None) => {
+                Ok(crate::platform::WorkerDirectoryNode::Logs)
+            }
+            _ => Err(ReceiptError::InvalidWorkerDirectoryAction),
+        }
+    }
+}
+
+impl From<crate::platform::WorkerDirectoryNode> for ReceiptWorkerDirectoryNode {
+    fn from(node: crate::platform::WorkerDirectoryNode) -> Self {
+        match node {
+            crate::platform::WorkerDirectoryNode::Support { ordinal } => Self {
+                kind: ReceiptWorkerDirectoryNodeKind::Support,
+                ordinal: Some(ordinal),
+            },
+            crate::platform::WorkerDirectoryNode::Root => Self {
+                kind: ReceiptWorkerDirectoryNodeKind::Root,
+                ordinal: None,
+            },
+            crate::platform::WorkerDirectoryNode::Repos => Self {
+                kind: ReceiptWorkerDirectoryNodeKind::Repos,
+                ordinal: None,
+            },
+            crate::platform::WorkerDirectoryNode::Jobs => Self {
+                kind: ReceiptWorkerDirectoryNodeKind::Jobs,
+                ordinal: None,
+            },
+            crate::platform::WorkerDirectoryNode::Cache => Self {
+                kind: ReceiptWorkerDirectoryNodeKind::Cache,
+                ordinal: None,
+            },
+            crate::platform::WorkerDirectoryNode::Artifacts => Self {
+                kind: ReceiptWorkerDirectoryNodeKind::Artifacts,
+                ordinal: None,
+            },
+            crate::platform::WorkerDirectoryNode::Logs => Self {
+                kind: ReceiptWorkerDirectoryNodeKind::Logs,
+                ordinal: None,
+            },
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -2872,6 +3300,18 @@ enum ReceiptStatus {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct CreatedDirectory {
+    path: RecordedPath,
+}
+
+impl CreatedDirectory {
+    fn validate(&self) -> Result<(), ReceiptError> {
+        self.path.validate()
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct CreatedFile {
     path: RecordedPath,
     sha256: Sha256Digest,
@@ -2905,6 +3345,12 @@ impl ModifiedFile {
 struct RecordedPath(String);
 
 impl RecordedPath {
+    fn from_path(path: &Path) -> Result<Self, ReceiptError> {
+        path.to_str()
+            .map(|path| Self(path.to_owned()))
+            .ok_or(ReceiptError::InvalidRecordedPath)
+    }
+
     fn validate(&self) -> Result<(), ReceiptError> {
         if !safe_text(&self.0) || !is_normalized_absolute_path(&self.0) {
             return Err(ReceiptError::InvalidRecordedPath);
@@ -3190,6 +3636,10 @@ pub(crate) enum ReceiptError {
     InvalidEntryId,
     #[error("setup receipt action identifier is invalid")]
     InvalidActionIdentifier,
+    #[error("setup receipt worker directory action is invalid")]
+    InvalidWorkerDirectoryAction,
+    #[error("setup receipt worker principal is invalid")]
+    InvalidWorkerPrincipal,
     #[error("setup receipt timestamp is not canonical UTC RFC 3339")]
     InvalidTimestamp,
     #[error("setup receipt contains an invalid absolute normalized path")]

@@ -213,7 +213,7 @@ pub(super) fn complete_authorized_execution(
         .zip(ordinary_occurrences)
         .collect::<Vec<_>>();
     for action in privileged_pending {
-        let occurrence = session.record_pending(action.id(), metadata, &authority)?;
+        let occurrence = session.record_pending(&action, metadata, &authority)?;
         pending_with_occurrences.push((action, occurrence));
     }
 
@@ -284,20 +284,14 @@ pub(super) fn apply_plan_with_runner<R: PreparedActionRunner>(
                     .iter_mut()
                     .find(|action| action.name().as_str() == action_id)
                     .ok_or(crate::setup::receipt::ReceiptStoreError::IntentConflict)?;
-                let prepared = action.prepare_effect()?;
-                if !session.intent_matches(
-                    &intent,
-                    action.name(),
-                    action.privilege(),
-                    &prepared,
-                    &authority,
-                )? {
+                let prepared = action.prepare()?;
+                if !session.intent_matches(&intent, action.privilege(), &prepared, &authority)? {
                     return Err(crate::setup::receipt::ReceiptStoreError::IntentConflict.into());
                 }
                 match action.check()? {
                     ActionCheck::Todo => {
-                        let finalized = runner.execute_prepared(action, &prepared)?;
-                        if finalized != prepared {
+                        let finalized = runner.execute_prepared(action, prepared.effect())?;
+                        if &finalized != prepared.effect() {
                             return Err(
                                 crate::setup::receipt::ReceiptStoreError::IntentConflict.into()
                             );
@@ -318,17 +312,12 @@ pub(super) fn apply_plan_with_runner<R: PreparedActionRunner>(
         match action.check()? {
             ActionCheck::Done => summary.noop_count += 1,
             ActionCheck::Todo => {
-                let prepared = action.prepare_effect()?;
-                let mut intent = session.prepare_intent(
-                    action.name(),
-                    action.privilege(),
-                    &prepared,
-                    metadata,
-                    &authority,
-                )?;
+                let prepared = action.prepare()?;
+                let mut intent =
+                    session.prepare_intent(action.privilege(), &prepared, metadata, &authority)?;
                 session.interruption_after_prepare(&authority)?;
-                let finalized = runner.execute_prepared(action, &prepared)?;
-                if finalized != prepared {
+                let finalized = runner.execute_prepared(action, prepared.effect())?;
+                if &finalized != prepared.effect() {
                     return Err(crate::setup::receipt::ReceiptStoreError::IntentConflict.into());
                 }
                 session.mark_intent_succeeded(&mut intent, &authority)?;
@@ -336,8 +325,9 @@ pub(super) fn apply_plan_with_runner<R: PreparedActionRunner>(
                 summary.applied_count += 1;
             }
             ActionCheck::NeedsHuman(needs_human) => {
-                let occurrence = session.record_pending(action.name(), metadata, &authority)?;
-                pending.push(PendingAction::new(action.name().clone(), needs_human));
+                let pending_action = PendingAction::from_action(action, needs_human);
+                let occurrence = session.record_pending(&pending_action, metadata, &authority)?;
+                pending.push(pending_action);
                 occurrences.push(occurrence);
             }
         }

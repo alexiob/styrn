@@ -6,7 +6,11 @@
 
 #![allow(unexpected_cfgs)] // Exact rustc compile-boundary fixtures use private cfg names.
 
+#[cfg(not(action_core_fixture))]
+pub(crate) use crate::platform::WorkerDirectoryNode;
 use std::fmt;
+#[cfg(not(action_core_fixture))]
+use std::path::PathBuf;
 use thiserror::Error;
 
 /// Unforgeable authority required by receipt mutation sessions. Its field is
@@ -33,6 +37,7 @@ pub(crate) enum ApplyOutcome {
 /// receipt publication may inspect them but plan/dry-run code cannot forge one.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ActionEffect {
+    directories_created: Vec<CreatedDirectoryEffect>,
     files_created: Vec<CreatedFileEffect>,
     files_modified: Vec<ModifiedFileEffect>,
     services: Vec<String>,
@@ -40,6 +45,11 @@ pub(crate) struct ActionEffect {
     registry_keys: Vec<String>,
     firewall_rules: Vec<String>,
     download_provenance: Option<DownloadProvenanceEffect>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CreatedDirectoryEffect {
+    path: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -63,6 +73,10 @@ pub(crate) struct DownloadProvenanceEffect {
 }
 
 impl ActionEffect {
+    pub(in crate::setup) fn directories_created(&self) -> &[CreatedDirectoryEffect] {
+        &self.directories_created
+    }
+
     pub(in crate::setup) fn files_created(&self) -> &[CreatedFileEffect] {
         &self.files_created
     }
@@ -106,6 +120,7 @@ impl ActionEffect {
             format!(r"C:\ProgramData\Styrn\backups\{marker}.toml"),
         );
         Self {
+            directories_created: Vec::new(),
             files_created: vec![CreatedFileEffect {
                 path: created_path,
                 sha256: format!("{marker:064}"),
@@ -125,6 +140,12 @@ impl ActionEffect {
                 sha256: "b".repeat(64),
             }),
         }
+    }
+}
+
+impl CreatedDirectoryEffect {
+    pub(in crate::setup) fn path(&self) -> &str {
+        &self.path
     }
 }
 
@@ -262,17 +283,31 @@ pub(crate) enum PendingSeverity {
 /// One current unresolved action, preserving its stable plan identity.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PendingAction {
-    id: ActionName,
+    parameters: ActionParameters,
     needs_human: NeedsHuman,
 }
 
 impl PendingAction {
     fn new(id: ActionName, needs_human: NeedsHuman) -> Self {
-        Self { id, needs_human }
+        Self {
+            parameters: ActionParameters::Foundation(id),
+            needs_human,
+        }
+    }
+
+    fn from_action(action: &Action, needs_human: NeedsHuman) -> Self {
+        Self {
+            parameters: action.parameters(),
+            needs_human,
+        }
     }
 
     pub(crate) fn id(&self) -> &ActionName {
-        &self.id
+        self.parameters.action_id()
+    }
+
+    pub(in crate::setup) fn parameters(&self) -> &ActionParameters {
+        &self.parameters
     }
 
     pub(crate) fn severity(&self) -> PendingSeverity {
@@ -288,6 +323,80 @@ impl PendingAction {
             Some(ScriptFragment::DeferredAction(action)) => Some(action.as_str()),
             None => None,
         }
+    }
+}
+
+/// Closed, typed receipt parameters retained before any action mutation.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum ActionParameters {
+    Foundation(ActionName),
+    #[cfg(not(action_core_fixture))]
+    WorkerDirectory(WorkerDirectoryActionParameters),
+}
+
+impl ActionParameters {
+    pub(in crate::setup) fn action_id(&self) -> &ActionName {
+        match self {
+            Self::Foundation(action_id) => action_id,
+            #[cfg(not(action_core_fixture))]
+            Self::WorkerDirectory(parameters) => parameters.action_id(),
+        }
+    }
+}
+
+#[cfg(not(action_core_fixture))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct WorkerDirectoryActionParameters {
+    action_id: ActionName,
+    installation_scope: crate::platform::InstallationScope,
+    principal: crate::platform::WorkerPrincipal,
+    root: PathBuf,
+    node: WorkerDirectoryNode,
+    path: PathBuf,
+}
+
+#[cfg(not(action_core_fixture))]
+impl WorkerDirectoryActionParameters {
+    pub(in crate::setup) fn action_id(&self) -> &ActionName {
+        &self.action_id
+    }
+
+    pub(in crate::setup) fn installation_scope(&self) -> crate::platform::InstallationScope {
+        self.installation_scope
+    }
+
+    pub(in crate::setup) fn principal(&self) -> &crate::platform::WorkerPrincipal {
+        &self.principal
+    }
+
+    pub(in crate::setup) fn root(&self) -> &std::path::Path {
+        &self.root
+    }
+
+    pub(in crate::setup) fn node(&self) -> WorkerDirectoryNode {
+        self.node
+    }
+
+    pub(in crate::setup) fn path(&self) -> &std::path::Path {
+        &self.path
+    }
+}
+
+/// One exact closed action plus its expected effect, retained durably before
+/// mutation and compared structurally during prepared-intent recovery.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PreparedAction {
+    parameters: ActionParameters,
+    effect: ActionEffect,
+}
+
+impl PreparedAction {
+    pub(in crate::setup) fn parameters(&self) -> &ActionParameters {
+        &self.parameters
+    }
+
+    pub(in crate::setup) fn effect(&self) -> &ActionEffect {
+        &self.effect
     }
 }
 
@@ -422,6 +531,7 @@ pub(crate) struct TestAction {
     behavior: TestBehavior,
     marker: u8,
     effect: Box<ActionEffect>,
+    parameters: ActionParameters,
 }
 
 #[cfg(test)]
@@ -607,8 +717,94 @@ mod gate {
                 behavior,
                 marker,
                 effect: Box::new(ActionEffect::test_fixture(marker)),
+                parameters: ActionParameters::Foundation(
+                    ActionName::parse(name).expect("test action name must be valid"),
+                ),
             };
             (Self::Test(action), metrics)
+        }
+
+        #[cfg(all(test, not(action_core_fixture)))]
+        pub(super) fn test_worker_directory(
+            installation_scope: crate::platform::InstallationScope,
+            principal: crate::platform::WorkerPrincipal,
+            root: PathBuf,
+            node: WorkerDirectoryNode,
+            path: PathBuf,
+            state: Arc<Mutex<Vec<u8>>>,
+        ) -> (Self, TestMetrics) {
+            Self::test_worker_directory_with_behavior(
+                installation_scope,
+                principal,
+                root,
+                node,
+                path,
+                state,
+                TestBehavior::StateDriven,
+            )
+        }
+
+        #[cfg(all(test, not(action_core_fixture)))]
+        pub(super) fn test_worker_directory_needs_human(
+            installation_scope: crate::platform::InstallationScope,
+            principal: crate::platform::WorkerPrincipal,
+            root: PathBuf,
+            node: WorkerDirectoryNode,
+            path: PathBuf,
+            state: Arc<Mutex<Vec<u8>>>,
+            needs_human: NeedsHuman,
+        ) -> (Self, TestMetrics) {
+            Self::test_worker_directory_with_behavior(
+                installation_scope,
+                principal,
+                root,
+                node,
+                path,
+                state,
+                TestBehavior::NeedsHuman(needs_human),
+            )
+        }
+
+        #[cfg(all(test, not(action_core_fixture)))]
+        fn test_worker_directory_with_behavior(
+            installation_scope: crate::platform::InstallationScope,
+            principal: crate::platform::WorkerPrincipal,
+            root: PathBuf,
+            node: WorkerDirectoryNode,
+            path: PathBuf,
+            state: Arc<Mutex<Vec<u8>>>,
+            behavior: TestBehavior,
+        ) -> (Self, TestMetrics) {
+            let action_id = ActionName::parse(&node.action_id())
+                .expect("worker directory action name must be valid");
+            let effect_path = path
+                .to_str()
+                .expect("worker directory receipt test path must be Unicode")
+                .to_owned();
+            let (mut action, metrics) =
+                Self::test_action(action_id.as_str(), 1, Privilege::None, state, behavior);
+            let Self::Test(test) = &mut action else {
+                unreachable!("test action constructor must return the test variant")
+            };
+            test.parameters = ActionParameters::WorkerDirectory(WorkerDirectoryActionParameters {
+                action_id,
+                installation_scope,
+                principal,
+                root,
+                node,
+                path,
+            });
+            *test.effect = ActionEffect {
+                directories_created: vec![CreatedDirectoryEffect { path: effect_path }],
+                files_created: Vec::new(),
+                files_modified: Vec::new(),
+                services: Vec::new(),
+                accounts: Vec::new(),
+                registry_keys: Vec::new(),
+                firewall_rules: Vec::new(),
+                download_provenance: None,
+            };
+            (action, metrics)
         }
 
         pub(crate) fn name(&self) -> &ActionName {
@@ -616,6 +812,14 @@ mod gate {
                 Self::Foundation(action) => &action.name,
                 #[cfg(test)]
                 Self::Test(action) => &action.name,
+            }
+        }
+
+        pub(in crate::setup::action) fn parameters(&self) -> ActionParameters {
+            match self {
+                Self::Foundation(action) => ActionParameters::Foundation(action.name.clone()),
+                #[cfg(test)]
+                Self::Test(action) => action.parameters.clone(),
             }
         }
 
@@ -685,8 +889,8 @@ mod gate {
             }
         }
 
-        pub(in crate::setup::action) fn prepare_effect(&self) -> Result<ActionEffect, ActionError> {
-            match self {
+        pub(in crate::setup::action) fn prepare(&self) -> Result<PreparedAction, ActionError> {
+            let effect = match self {
                 Self::Foundation(action) => Err(ActionError::apply_failed(action.name.clone())),
                 #[cfg(test)]
                 Self::Test(action) => {
@@ -697,7 +901,11 @@ mod gate {
                         _ => Ok((*action.effect).clone()),
                     }
                 }
-            }
+            }?;
+            Ok(PreparedAction {
+                parameters: self.parameters(),
+                effect,
+            })
         }
 
         pub(in crate::setup::action) fn execute_prepared(
@@ -762,6 +970,7 @@ mod gate {
             _ => return None,
         };
         Some(ActionEffect {
+            directories_created: Vec::new(),
             files_created: Vec::new(),
             files_modified: vec![ModifiedFileEffect {
                 path: path.to_string_lossy().into_owned(),

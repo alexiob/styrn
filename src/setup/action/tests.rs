@@ -1,7 +1,7 @@
 use super::{
     apply_plan_with_journal, Action, ActionDescription, ActionEffect, ActionError, ActionName,
     ApplyOutcome, HumanInstructions, NeedsHuman, PendingSeverity, Privilege, ScriptFragment,
-    TestMetrics,
+    TestMetrics, WorkerDirectoryNode,
 };
 use crate::setup::receipt::{ReceiptMetadataSource, ReceiptStore, ReceiptStoreError};
 use chrono::{TimeZone, Utc};
@@ -18,6 +18,50 @@ use std::{
 
 fn state_driven(state: Arc<Mutex<Vec<u8>>>) -> (Action, TestMetrics) {
     Action::test_state_driven(Privilege::None, state)
+}
+
+fn worker_directory_action(
+    root: &Path,
+    node: WorkerDirectoryNode,
+    path: &Path,
+    state: Arc<Mutex<Vec<u8>>>,
+) -> (Action, TestMetrics) {
+    Action::test_worker_directory(
+        crate::setup::receipt::InstallationScope::User,
+        crate::platform::resolve_current_worker_principal().unwrap(),
+        root.to_path_buf(),
+        node,
+        path.to_path_buf(),
+        state,
+    )
+}
+
+fn harden_user_journal_fixture(fixture: &JournalFixture) {
+    let principal = crate::platform::resolve_current_worker_principal().unwrap();
+    crate::platform::harden_manifest_directory(
+        &fixture.root,
+        crate::platform::ManifestOwner::User,
+        &principal,
+    )
+    .unwrap();
+    crate::platform::harden_manifest_directory(
+        fixture.receipt_path().parent().unwrap(),
+        crate::platform::ManifestOwner::User,
+        &principal,
+    )
+    .unwrap();
+}
+
+fn native_user_worker_root() -> PathBuf {
+    let principal = crate::platform::resolve_current_worker_principal().unwrap();
+    crate::platform::resolve_worker_directory_layout(
+        crate::setup::receipt::InstallationScope::User,
+        &principal,
+        None,
+    )
+    .unwrap()
+    .root()
+    .to_path_buf()
 }
 
 #[test]
@@ -74,6 +118,7 @@ fn three_todo_actions_append_complete_applied_entries_in_order_then_converge_wit
     );
     assert!(entries.iter().all(|entry| {
         entry["status"] == "applied"
+            && entry["directories_created"] == serde_json::json!([])
             && entry["files_created"].as_array().unwrap().len() == 1
             && entry["files_modified"].as_array().unwrap().len() == 1
             && entry["services"].as_array().unwrap().len() == 1
@@ -422,6 +467,231 @@ fn succeeded_intent_recovers_stored_dynamic_before_hash_without_recomputation() 
 }
 
 #[test]
+fn worker_directory_receipt_recovery_succeeded_is_plan_independent() {
+    let fixture = JournalFixture::new("worker-directory-succeeded-plan-independent");
+    harden_user_journal_fixture(&fixture);
+    let root = native_user_worker_root();
+    let path = root.join("jobs");
+    let state = Arc::new(Mutex::new(Vec::new()));
+    let (action, metrics) =
+        worker_directory_action(&root, WorkerDirectoryNode::Jobs, &path, Arc::clone(&state));
+    let mut interrupted = vec![action];
+    let mut metadata = ReceiptMetadataSource::for_test([(
+        "019cafd0-5c00-7000-8000-000000000001",
+        "2026-09-02T10:00:00Z",
+    )]);
+
+    let error = apply_plan_with_journal(
+        &mut interrupted,
+        &ReceiptStore::new_user_for_test_failing_before_replace(fixture.receipt_path()),
+        &mut metadata,
+    )
+    .unwrap_err();
+
+    assert_eq!(error.error_code(), "setup.receipt_conflict");
+    assert_eq!(metrics.mutation_calls(), 1);
+    assert_eq!(*state.lock().unwrap(), vec![1]);
+    let intent_before = fs::read(fixture.only_transaction_path()).unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&intent_before).unwrap()["phase"],
+        "succeeded"
+    );
+
+    let mut empty_plan = Vec::new();
+    let mut no_metadata = ReceiptMetadataSource::for_test([]);
+    let store = ReceiptStore::new_user_for_test(fixture.receipt_path());
+    let report = apply_plan_with_journal(&mut empty_plan, &store, &mut no_metadata).unwrap();
+
+    assert_eq!(report.recovered_count(), 1);
+    assert_eq!(report.applied_count(), 0);
+    let receipt = serde_json::from_slice::<serde_json::Value>(
+        &store.read_snapshot().unwrap().to_json().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(receipt["entries"][0]["action"]["type"], "worker_directory");
+    assert_eq!(
+        receipt["entries"][0]["action"]["parameters"]["action_id"],
+        "identity.directory.jobs"
+    );
+    assert_eq!(
+        receipt["entries"][0]["action"]["parameters"]["node"],
+        serde_json::json!({ "type": "jobs" })
+    );
+    assert_eq!(
+        receipt["entries"][0]["directories_created"],
+        serde_json::json!([{ "path": path.to_string_lossy() }])
+    );
+    assert!(fs::read_dir(fixture.receipt_path().parent().unwrap())
+        .unwrap()
+        .all(|entry| !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .contains("transaction")));
+}
+
+#[test]
+fn worker_directory_receipt_recovery_prepared_done_or_parameter_drift_retains_evidence() {
+    for kind in ["done", "parameter-drift"] {
+        let fixture = JournalFixture::new(&format!("worker-directory-prepared-{kind}"));
+        harden_user_journal_fixture(&fixture);
+        let root = native_user_worker_root();
+        let path = root.join("jobs");
+        let state = Arc::new(Mutex::new(Vec::new()));
+        let (action, initial_metrics) =
+            worker_directory_action(&root, WorkerDirectoryNode::Jobs, &path, Arc::clone(&state));
+        let mut interrupted = vec![action];
+        let mut metadata = ReceiptMetadataSource::for_test([(
+            "019cafd0-5c00-7000-8000-000000000001",
+            "2026-09-02T10:00:00Z",
+        )]);
+        apply_plan_with_journal(
+            &mut interrupted,
+            &ReceiptStore::new_user_for_test_failing_after_prepare(fixture.receipt_path()),
+            &mut metadata,
+        )
+        .unwrap_err();
+        assert_eq!(initial_metrics.mutation_calls(), 0);
+        let intent_path = fixture.only_transaction_path();
+        let intent_before = fs::read(&intent_path).unwrap();
+
+        let (retry, retry_metrics) = if kind == "done" {
+            state.lock().unwrap().push(1);
+            worker_directory_action(&root, WorkerDirectoryNode::Jobs, &path, Arc::clone(&state))
+        } else {
+            let drifted_root = fixture.root.join("other-worker-root");
+            let drifted_path = drifted_root.join("jobs");
+            worker_directory_action(
+                &drifted_root,
+                WorkerDirectoryNode::Jobs,
+                &drifted_path,
+                Arc::clone(&state),
+            )
+        };
+        let mut plan = vec![retry];
+        let mut no_metadata = ReceiptMetadataSource::for_test([]);
+
+        let error = apply_plan_with_journal(
+            &mut plan,
+            &ReceiptStore::new_user_for_test(fixture.receipt_path()),
+            &mut no_metadata,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.error_code(), "setup.receipt_conflict", "{kind}");
+        assert_eq!(error.exit_code(), 13, "{kind}");
+        assert_eq!(retry_metrics.mutation_calls(), 0, "{kind}");
+        assert_eq!(fs::read(&intent_path).unwrap(), intent_before, "{kind}");
+        assert!(ReceiptStore::new_user_for_test(fixture.receipt_path())
+            .read_snapshot()
+            .unwrap()
+            .is_empty());
+    }
+}
+
+#[test]
+fn worker_directory_receipt_recovery_pending_keeps_typed_parameters_and_safe_descriptor() {
+    let fixture = JournalFixture::new("worker-directory-pending-parameters");
+    harden_user_journal_fixture(&fixture);
+    let root = native_user_worker_root();
+    let path = root.join("jobs");
+    let state = Arc::new(Mutex::new(Vec::new()));
+    let needs_human = NeedsHuman::new(
+        HumanInstructions::new("Resolve the worker directory conflict, then rerun setup.").unwrap(),
+        None,
+    );
+    let (action, metrics) = Action::test_worker_directory_needs_human(
+        crate::setup::receipt::InstallationScope::User,
+        crate::platform::resolve_current_worker_principal().unwrap(),
+        root,
+        WorkerDirectoryNode::Jobs,
+        path.clone(),
+        Arc::clone(&state),
+        needs_human.clone(),
+    );
+    let mut plan = vec![action];
+    let mut metadata = ReceiptMetadataSource::for_test([(
+        "019cafd0-5c00-7000-8000-000000000001",
+        "2026-09-02T10:00:00Z",
+    )]);
+    let store = ReceiptStore::new_user_for_test(fixture.receipt_path());
+
+    let report = apply_plan_with_journal(&mut plan, &store, &mut metadata).unwrap();
+
+    assert_eq!(report.pending_count(), 1);
+    assert_eq!(report.pending()[0].id().as_str(), "identity.directory.jobs");
+    assert_eq!(report.pending()[0].needs_human(), &needs_human);
+    assert_eq!(metrics.mutation_calls(), 0);
+    assert!(state.lock().unwrap().is_empty());
+    let receipt = serde_json::from_slice::<serde_json::Value>(
+        &store.read_snapshot().unwrap().to_json().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(receipt["entries"][0]["action"]["type"], "worker_directory");
+    assert_eq!(
+        receipt["entries"][0]["action"]["parameters"]["path"],
+        path.to_string_lossy().as_ref()
+    );
+    assert_eq!(
+        receipt["entries"][0]["directories_created"],
+        serde_json::json!([])
+    );
+    assert_eq!(receipt["entries"][0]["status"], "pending");
+}
+
+#[test]
+fn worker_directory_receipt_recovery_pending_parameter_drift_is_a_conflict() {
+    let fixture = JournalFixture::new("worker-directory-pending-drift");
+    harden_user_journal_fixture(&fixture);
+    let root = native_user_worker_root();
+    let path = root.join("jobs");
+    let state = Arc::new(Mutex::new(Vec::new()));
+    let needs_human = NeedsHuman::new(
+        HumanInstructions::new("Resolve the worker directory conflict, then rerun setup.").unwrap(),
+        None,
+    );
+    let (action, _) = Action::test_worker_directory_needs_human(
+        crate::setup::receipt::InstallationScope::User,
+        crate::platform::resolve_current_worker_principal().unwrap(),
+        root,
+        WorkerDirectoryNode::Jobs,
+        path,
+        Arc::clone(&state),
+        needs_human.clone(),
+    );
+    let mut plan = vec![action];
+    let mut metadata = ReceiptMetadataSource::for_test([(
+        "019cafd0-5c00-7000-8000-000000000001",
+        "2026-09-02T10:00:00Z",
+    )]);
+    let store = ReceiptStore::new_user_for_test(fixture.receipt_path());
+    apply_plan_with_journal(&mut plan, &store, &mut metadata).unwrap();
+    let before = fs::read(fixture.receipt_path()).unwrap();
+
+    let drifted_root = fixture.root.join("other-worker-root");
+    let drifted_path = drifted_root.join("jobs");
+    let (drifted, metrics) = Action::test_worker_directory_needs_human(
+        crate::setup::receipt::InstallationScope::User,
+        crate::platform::resolve_current_worker_principal().unwrap(),
+        drifted_root,
+        WorkerDirectoryNode::Jobs,
+        drifted_path,
+        Arc::clone(&state),
+        needs_human,
+    );
+    let mut drifted_plan = vec![drifted];
+    let mut no_metadata = ReceiptMetadataSource::for_test([]);
+
+    let error = apply_plan_with_journal(&mut drifted_plan, &store, &mut no_metadata).unwrap_err();
+
+    assert_eq!(error.error_code(), "setup.receipt_conflict");
+    assert_eq!(error.exit_code(), 13);
+    assert_eq!(metrics.mutation_calls(), 0);
+    assert!(state.lock().unwrap().is_empty());
+    assert_eq!(fs::read(fixture.receipt_path()).unwrap(), before);
+}
+
+#[test]
 fn needs_human_journals_each_current_occurrence_once_and_recurrence_after_witnessed_resolution() {
     let fixture = JournalFixture::new("needs-human-report");
     let store = ReceiptStore::new_for_test(fixture.receipt_path());
@@ -588,6 +858,10 @@ fn needs_human_journals_each_current_occurrence_once_and_recurrence_after_witnes
     );
     assert_eq!(receipt["entries"][0]["status"], "pending");
     assert_eq!(receipt["entries"][0]["privilege_used"], "none");
+    assert_eq!(
+        receipt["entries"][0]["directories_created"],
+        serde_json::json!([])
+    );
     assert_eq!(
         receipt["entries"][0]["files_created"],
         serde_json::json!([])
@@ -3159,7 +3433,7 @@ fn callers_cannot_construct_forged_finalized_action_effects() {
         "forged_action_effect.rs",
         FixtureExpectation::new(
             "E0451",
-            "fields `files_created`, `files_modified`, `services`, `accounts`, `registry_keys`, `firewall_rules` and `download_provenance` of struct `action::ActionEffect` are private",
+            "fields `directories_created`, `files_created`, `files_modified`, `services`, `accounts`, `registry_keys`, `firewall_rules` and `download_provenance` of struct `action::ActionEffect` are private",
             10,
             Some("private field"),
             "forged_action_effect.rs",
