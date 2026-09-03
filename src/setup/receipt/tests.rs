@@ -73,6 +73,35 @@ fn worker_directory_receipt_value() -> serde_json::Value {
     })
 }
 
+fn dedicated_account_prerequisite_receipt_value() -> serde_json::Value {
+    serde_json::json!({
+        "schema_version": 1,
+        "installation_scope": "user",
+        "entries": [{
+            "entry_id": "019cafd0-5c00-7000-8000-000000000001",
+            "action": {
+                "type": "dedicated_account_prerequisite",
+                "parameters": {
+                    "action_id": "identity.account.dedicated.sha256-7f81291a9c35cb94e74c8794e4c1ea1c0966b92fc67a72490ef0df956320a394",
+                    "target_scope": "system",
+                    "selector": "build-agent"
+                }
+            },
+            "timestamp": "2026-09-02T10:00:00Z",
+            "privilege_used": "none",
+            "directories_created": [],
+            "files_created": [],
+            "files_modified": [],
+            "services": [],
+            "accounts": [],
+            "registry_keys": [],
+            "firewall_rules": [],
+            "download_provenance": null,
+            "status": "pending"
+        }]
+    })
+}
+
 fn succeeded_intent_fixture(
     store: &ReceiptStore,
     fixture: &ReceiptFixture,
@@ -294,6 +323,122 @@ fn worker_directory_receipt_round_trips_closed_parameters_and_directory_effect()
         serialized["entries"][0]["directories_created"],
         serde_json::json!([{ "path": value["entries"][0]["action"]["parameters"]["path"] }])
     );
+}
+
+#[test]
+fn dedicated_account_prerequisite_receipt_round_trips_only_as_current_user_pending() {
+    let value = dedicated_account_prerequisite_receipt_value();
+    let document = ReceiptDocument::from_json(&serde_json::to_vec(&value).unwrap()).unwrap();
+
+    document
+        .validate_worker_principal(&fixture_worker_principal())
+        .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&document.to_json().unwrap()).unwrap(),
+        value
+    );
+
+    let current = fixture_worker_principal();
+    let dedicated = crate::platform::WorkerPrincipal::new(
+        current.principal_kind(),
+        current.principal_id(),
+        current.name(),
+        crate::platform::WorkerAccountPolicy::Dedicated,
+    )
+    .unwrap();
+    assert_eq!(
+        document.validate_worker_principal(&dedicated).unwrap_err(),
+        ReceiptError::InvalidWorkerPrincipal
+    );
+}
+
+#[test]
+fn dedicated_account_prerequisite_receipt_rejects_scope_state_and_ownership_claims() {
+    let base = dedicated_account_prerequisite_receipt_value();
+    let mut hostile = Vec::new();
+
+    let mut system = base.clone();
+    system["installation_scope"] = serde_json::json!("system");
+    hostile.push(system);
+    for status in ["applied", "adopted"] {
+        let mut value = base.clone();
+        value["entries"][0]["status"] = serde_json::json!(status);
+        hostile.push(value);
+    }
+    let mut privileged = base.clone();
+    privileged["entries"][0]["privilege_used"] = serde_json::json!("root");
+    hostile.push(privileged);
+    let mut owns_account = base.clone();
+    owns_account["entries"][0]["accounts"] = serde_json::json!([{ "name": "build-agent" }]);
+    hostile.push(owns_account);
+    let mut owns_directory = base.clone();
+    owns_directory["entries"][0]["directories_created"] =
+        serde_json::json!([{ "path": "/home/build-agent" }]);
+    hostile.push(owns_directory);
+    let mut wrong_target = base.clone();
+    wrong_target["entries"][0]["action"]["parameters"]["target_scope"] = serde_json::json!("user");
+    hostile.push(wrong_target);
+    let mut ambiguous_selector = base.clone();
+    ambiguous_selector["entries"][0]["action"]["parameters"]["selector"] =
+        serde_json::json!("../build-agent");
+    hostile.push(ambiguous_selector);
+    let mut mismatched_digest = base.clone();
+    mismatched_digest["entries"][0]["action"]["parameters"]["action_id"] = serde_json::json!(
+        "identity.account.dedicated.sha256-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    );
+    hostile.push(mismatched_digest);
+    let mut principal_claim = base;
+    principal_claim["entries"][0]["action"]["parameters"]["principal_id"] =
+        serde_json::json!("2001");
+    hostile.push(principal_claim);
+
+    for value in hostile {
+        assert!(
+            ReceiptDocument::from_json(&serde_json::to_vec(&value).unwrap()).is_err(),
+            "hostile prerequisite receipt was accepted: {value}"
+        );
+    }
+}
+
+#[test]
+fn dedicated_account_prerequisite_schema_requires_user_pending_nonowning_shape() {
+    let schema: serde_json::Value = serde_json::from_str(include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/schemas/setup-receipt-v1.schema.json"
+    )))
+    .unwrap();
+    let validator = jsonschema::validator_for(&schema).unwrap();
+    let base = dedicated_account_prerequisite_receipt_value();
+    assert!(validator.is_valid(&base));
+
+    let mut hostile = Vec::new();
+    let mut system = base.clone();
+    system["installation_scope"] = serde_json::json!("system");
+    hostile.push(system);
+    let mut applied = base.clone();
+    applied["entries"][0]["status"] = serde_json::json!("applied");
+    hostile.push(applied);
+    let mut privileged = base.clone();
+    privileged["entries"][0]["privilege_used"] = serde_json::json!("root");
+    hostile.push(privileged);
+    let mut owns_account = base.clone();
+    owns_account["entries"][0]["accounts"] = serde_json::json!([{ "name": "build-agent" }]);
+    hostile.push(owns_account);
+    let mut wrong_target = base.clone();
+    wrong_target["entries"][0]["action"]["parameters"]["target_scope"] = serde_json::json!("user");
+    hostile.push(wrong_target);
+    let mut ambiguous = base.clone();
+    ambiguous["entries"][0]["action"]["parameters"]["selector"] =
+        serde_json::json!("../build-agent");
+    hostile.push(ambiguous);
+    let mut principal_claim = base;
+    principal_claim["entries"][0]["action"]["parameters"]["principal_id"] =
+        serde_json::json!("2001");
+    hostile.push(principal_claim);
+
+    for value in hostile {
+        assert!(!validator.is_valid(&value), "schema accepted {value}");
+    }
 }
 
 #[cfg(not(target_os = "windows"))]

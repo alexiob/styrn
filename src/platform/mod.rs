@@ -1540,6 +1540,64 @@ fn dedicated_account_observation_for_test(
     }
 }
 
+#[cfg(test)]
+#[allow(dead_code)] // Individual action tests select the required native posture.
+#[derive(Clone)]
+pub(crate) enum TestDedicatedAccountObservation {
+    Absent,
+    Healthy(WorkerPrincipal),
+    Broken,
+    Unknowable,
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) struct TestDedicatedAccountActionAuthority(());
+
+#[cfg(test)]
+#[allow(dead_code)]
+impl TestDedicatedAccountActionAuthority {
+    pub(crate) const fn for_test() -> Self {
+        Self(())
+    }
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+type DedicatedAccountActionAuthority = TestDedicatedAccountActionAuthority;
+
+#[cfg(not(test))]
+type DedicatedAccountActionAuthority = crate::setup::action::DedicatedAccountActionAuthority;
+
+#[cfg(test)]
+#[allow(dead_code)]
+impl TestDedicatedAccountObservation {
+    fn into_native(self) -> NativeDedicatedAccountObservation {
+        match self {
+            Self::Absent => NativeDedicatedAccountObservation::Absent,
+            Self::Healthy(principal) => {
+                NativeDedicatedAccountObservation::PresentHealthy(principal)
+            }
+            Self::Broken => NativeDedicatedAccountObservation::PresentBroken,
+            Self::Unknowable => NativeDedicatedAccountObservation::Unknowable,
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(dead_code)]
+pub(crate) fn dedicated_account_observation_for_action_test(
+    spec: DedicatedAccountSpec,
+    observation: TestDedicatedAccountObservation,
+    revalidation: TestDedicatedAccountObservation,
+) -> DedicatedAccountObservation {
+    dedicated_account_observation_for_test(
+        spec,
+        observation.into_native(),
+        Some(revalidation.into_native()),
+    )
+}
+
 fn established_dedicated_account_observation(
     spec: DedicatedAccountSpec,
     evidence: &EstablishedDedicatedAccountEvidence,
@@ -1613,6 +1671,14 @@ fn inspect_established_dedicated_account_for_test(
 }
 
 impl DedicatedAccountHandle {
+    #[allow(dead_code)] // Used only when the action graph owns the revalidation authority.
+    pub(crate) fn reverify_for_adoption(
+        &self,
+        _authority: &DedicatedAccountActionAuthority,
+    ) -> Result<(), DedicatedAccountIssue> {
+        self.reverify_and_bind(&DedicatedAccountFactoryAuthority(()), |_| ())
+    }
+
     #[allow(dead_code)] // Invoked by the later sealed dedicated factories.
     fn reverify_and_bind<Output>(
         &self,

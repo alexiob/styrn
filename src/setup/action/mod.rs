@@ -18,6 +18,26 @@ use thiserror::Error;
 /// private to this module, so read-only plan descendants cannot mint one.
 pub(crate) struct JournalAuthority(());
 
+/// Unforgeable action-owned authority for revalidating an opaque dedicated
+/// account handle. It conveys no native mutation or principal extraction.
+#[cfg(not(test))]
+pub(crate) struct DedicatedAccountActionAuthority(());
+
+#[cfg(test)]
+pub(crate) type DedicatedAccountActionAuthority =
+    crate::platform::TestDedicatedAccountActionAuthority;
+
+fn dedicated_account_action_authority() -> DedicatedAccountActionAuthority {
+    #[cfg(not(test))]
+    {
+        DedicatedAccountActionAuthority(())
+    }
+    #[cfg(test)]
+    {
+        crate::platform::TestDedicatedAccountActionAuthority::for_test()
+    }
+}
+
 #[cfg(test)]
 impl JournalAuthority {
     pub(in crate::setup) const fn for_test() -> Self {
@@ -391,6 +411,8 @@ impl PendingAction {
 pub(crate) enum ActionParameters {
     Foundation(ActionName),
     #[cfg(not(action_core_fixture))]
+    DedicatedAccountPrerequisite(DedicatedAccountPrerequisiteParameters),
+    #[cfg(not(action_core_fixture))]
     WorkerDirectory(WorkerDirectoryActionParameters),
 }
 
@@ -399,8 +421,33 @@ impl ActionParameters {
         match self {
             Self::Foundation(action_id) => action_id,
             #[cfg(not(action_core_fixture))]
+            Self::DedicatedAccountPrerequisite(parameters) => parameters.action_id(),
+            #[cfg(not(action_core_fixture))]
             Self::WorkerDirectory(parameters) => parameters.action_id(),
         }
+    }
+}
+
+#[cfg(not(action_core_fixture))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DedicatedAccountPrerequisiteParameters {
+    action_id: ActionName,
+    target_scope: crate::platform::InstallationScope,
+    selector: Box<str>,
+}
+
+#[cfg(not(action_core_fixture))]
+impl DedicatedAccountPrerequisiteParameters {
+    pub(in crate::setup) fn action_id(&self) -> &ActionName {
+        &self.action_id
+    }
+
+    pub(in crate::setup) fn target_scope(&self) -> crate::platform::InstallationScope {
+        self.target_scope
+    }
+
+    pub(in crate::setup) fn selector(&self) -> &str {
+        &self.selector
     }
 }
 
@@ -542,6 +589,8 @@ pub(crate) enum ActionError {
     InvalidInstructions,
     #[error("script fragment is invalid")]
     InvalidScriptFragment,
+    #[error("dedicated account selection is invalid")]
+    InvalidDedicatedAccountSelection,
     #[error("action `{action}` check failed")]
     CheckFailed { action: ActionName },
     #[error("action `{action}` apply failed")]
@@ -567,6 +616,8 @@ impl ActionError {
 /// enum; there is no open implementation trait or raw mutation entry point.
 pub(crate) enum Action {
     Foundation(FoundationAction),
+    #[cfg(not(action_core_fixture))]
+    DedicatedAccountPrerequisite(dedicated_account::DedicatedAccountPrerequisite),
     #[cfg(not(action_core_fixture))]
     WorkerDirectory(Box<worker_directory::WorkerDirectoryAction>),
     #[cfg(test)]
@@ -873,6 +924,8 @@ mod gate {
             match self {
                 Self::Foundation(action) => &action.name,
                 #[cfg(not(action_core_fixture))]
+                Self::DedicatedAccountPrerequisite(action) => action.name(),
+                #[cfg(not(action_core_fixture))]
                 Self::WorkerDirectory(action) => action.name(),
                 #[cfg(test)]
                 Self::Test(action) => &action.name,
@@ -883,6 +936,8 @@ mod gate {
             match self {
                 Self::Foundation(action) => ActionParameters::Foundation(action.name.clone()),
                 #[cfg(not(action_core_fixture))]
+                Self::DedicatedAccountPrerequisite(action) => action.parameters(),
+                #[cfg(not(action_core_fixture))]
                 Self::WorkerDirectory(action) => action.parameters(),
                 #[cfg(test)]
                 Self::Test(action) => action.parameters.clone(),
@@ -892,6 +947,8 @@ mod gate {
         pub(crate) fn check(&self) -> Result<ActionCheck, ActionError> {
             match self {
                 Self::Foundation(action) => Ok(action.check.clone()),
+                #[cfg(not(action_core_fixture))]
+                Self::DedicatedAccountPrerequisite(action) => Ok(action.check()),
                 #[cfg(not(action_core_fixture))]
                 Self::WorkerDirectory(action) => Ok(action.check()),
                 #[cfg(test)]
@@ -929,6 +986,8 @@ mod gate {
             match self {
                 Self::Foundation(action) => action.privilege,
                 #[cfg(not(action_core_fixture))]
+                Self::DedicatedAccountPrerequisite(_) => Privilege::None,
+                #[cfg(not(action_core_fixture))]
                 Self::WorkerDirectory(_) => Privilege::None,
                 #[cfg(test)]
                 Self::Test(action) => action.privilege,
@@ -939,6 +998,8 @@ mod gate {
             match self {
                 Self::Foundation(action) => action.operation,
                 #[cfg(not(action_core_fixture))]
+                Self::DedicatedAccountPrerequisite(action) => action.plan_operation(),
+                #[cfg(not(action_core_fixture))]
                 Self::WorkerDirectory(_) => PlanOperation::Create,
                 #[cfg(test)]
                 Self::Test(_) => PlanOperation::Reconfigure,
@@ -948,6 +1009,8 @@ mod gate {
         pub(crate) fn describe(&self) -> &ActionDescription {
             match self {
                 Self::Foundation(action) => &action.description,
+                #[cfg(not(action_core_fixture))]
+                Self::DedicatedAccountPrerequisite(action) => action.description(),
                 #[cfg(not(action_core_fixture))]
                 Self::WorkerDirectory(action) => action.description(),
                 #[cfg(test)]
@@ -970,6 +1033,10 @@ mod gate {
         pub(in crate::setup::action) fn prepare(&self) -> Result<PreparedAction, ActionError> {
             let effect = match self {
                 Self::Foundation(action) => Err(ActionError::apply_failed(action.name.clone())),
+                #[cfg(not(action_core_fixture))]
+                Self::DedicatedAccountPrerequisite(action) => {
+                    Err(ActionError::apply_failed(action.name().clone()))
+                }
                 #[cfg(not(action_core_fixture))]
                 Self::WorkerDirectory(action) => Ok(action.expected_effect()),
                 #[cfg(test)]
@@ -1035,6 +1102,10 @@ mod gate {
         match action {
             Action::Foundation(action) => Err(ActionError::apply_failed(action.name.clone())),
             #[cfg(not(action_core_fixture))]
+            Action::DedicatedAccountPrerequisite(action) => {
+                Err(ActionError::apply_failed(action.name().clone()))
+            }
+            #[cfg(not(action_core_fixture))]
             Action::WorkerDirectory(action) => {
                 Err(ActionError::apply_failed(action.name().clone()))
             }
@@ -1090,6 +1161,16 @@ mod gate {
     }
 }
 
+#[cfg(not(action_core_fixture))]
+mod dedicated_account;
+#[cfg(not(action_core_fixture))]
+#[allow(unused_imports)] // T0.20 adds configured dedicated-account orchestration.
+pub(in crate::setup) use dedicated_account::dedicated_account_prerequisite;
+#[cfg(not(action_core_fixture))]
+pub(in crate::setup) use dedicated_account::dedicated_account_prerequisite_action_id;
+#[cfg(not(action_core_fixture))]
+#[allow(unused_imports)] // T0.20 consumes the ready-or-fallback selection.
+pub(in crate::setup) use dedicated_account::select_dedicated_account;
 #[cfg(not(action_core_fixture))]
 mod worker_directory;
 #[cfg(not(action_core_fixture))]

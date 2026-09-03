@@ -1,6 +1,6 @@
 use super::{
     apply_plan_with_journal, current_user_worker_directory_plan,
-    current_user_worker_directory_plan_for_test,
+    current_user_worker_directory_plan_for_test, dedicated_account_prerequisite,
     execution::{
         apply_plan_with_runner, ApplyPlanError, DurableReceiptBinding, PreparedActionRunner,
     },
@@ -4132,6 +4132,213 @@ fn needs_human_journals_each_current_occurrence_once_and_recurrence_after_witnes
     assert_eq!(recurring_metrics.mutation_calls(), 0);
     assert_eq!(first_metrics.mutation_calls(), 0);
     assert_eq!(second_metrics.mutation_calls(), 0);
+}
+
+#[test]
+fn dedicated_account_prerequisite_uses_genuine_pending_publication_in_current_user_fallback() {
+    let fixture = JournalFixture::new("dedicated-account-prerequisite-publication");
+    harden_user_journal_fixture(&fixture);
+    let principal = crate::platform::resolve_current_worker_principal().unwrap();
+    let layout = crate::platform::worker_directory_layout_for_test(
+        crate::platform::InstallationScope::User,
+        principal.clone(),
+        fixture.root.join("worker-root"),
+        Some(fixture.root.clone()),
+    );
+    let receipt_store = ReceiptStore::new_user_for_test(fixture.receipt_path());
+    let manifest_path = fixture
+        .receipt_path()
+        .parent()
+        .unwrap()
+        .join("machine.toml");
+    let manifest_store =
+        crate::manifest::MachineManifestStore::new_user_with_worker_layout_for_test(
+            &manifest_path,
+            principal.clone(),
+            &layout,
+        )
+        .unwrap();
+    let mut plan = vec![dedicated_account_prerequisite(
+        crate::platform::DedicatedAccountSpec::new("build-agent").unwrap(),
+    )
+    .unwrap()];
+    let mut metadata = ReceiptMetadataSource::for_test([
+        (
+            "019cb090-3400-7000-8000-000000000201",
+            "2026-09-03T12:20:00Z",
+        ),
+        (
+            "019cb090-3400-7000-8000-000000000202",
+            "2026-09-03T12:20:01Z",
+        ),
+    ]);
+
+    let report = apply_plan_with_journal(&mut plan, &receipt_store, &mut metadata).unwrap();
+    let base = pending_manifest_draft();
+    let mut draft =
+        crate::manifest::CurrentUserWorkerManifestCandidate::derive_with_layout_for_test(
+            &base, &principal, &layout,
+        )
+        .unwrap()
+        .into_draft();
+    crate::setup::pending::publish_manifest(
+        &manifest_store,
+        &receipt_store,
+        &mut draft,
+        report.completion(),
+        &mut metadata,
+    )
+    .unwrap();
+
+    assert_eq!(report.pending_count(), 1);
+    assert_eq!(report.applied_count(), 0);
+    assert_eq!(report.pending()[0].fragment_action_id(), None);
+    let receipt: serde_json::Value =
+        serde_json::from_slice(&receipt_store.read_snapshot().unwrap().to_json().unwrap()).unwrap();
+    let entry = &receipt["entries"][0];
+    assert_eq!(entry["action"]["type"], "dedicated_account_prerequisite");
+    assert_eq!(entry["status"], "pending");
+    assert_eq!(entry["privilege_used"], "none");
+    assert_eq!(entry["accounts"], serde_json::json!([]));
+    assert_eq!(entry["directories_created"], serde_json::json!([]));
+    assert!(
+        receipt["pending_publications"][0]["pending"][0]["action_id"]
+            .as_str()
+            .unwrap()
+            .starts_with("identity.account.dedicated.sha256-")
+    );
+    let manifest =
+        crate::manifest::MachineManifest::parse_toml(&fs::read_to_string(&manifest_path).unwrap())
+            .unwrap();
+    assert_eq!(
+        manifest.installation.unwrap().scope,
+        crate::platform::InstallationScope::User
+    );
+    assert_eq!(
+        manifest.worker_identity.unwrap().mode,
+        crate::manifest::WorkerIdentityMode::CurrentUser
+    );
+    assert_eq!(manifest.pending_actions.unwrap().len(), 1);
+    assert!(!fs::read_to_string(&manifest_path)
+        .unwrap()
+        .contains("build-agent"));
+}
+
+#[test]
+fn dedicated_account_prerequisite_selector_supersession_keeps_history_and_projects_only_new_id() {
+    let fixture = JournalFixture::new("dedicated-account-selector-supersession");
+    harden_user_journal_fixture(&fixture);
+    let principal = crate::platform::resolve_current_worker_principal().unwrap();
+    let layout = crate::platform::worker_directory_layout_for_test(
+        crate::platform::InstallationScope::User,
+        principal.clone(),
+        fixture.root.join("worker-root"),
+        Some(fixture.root.clone()),
+    );
+    let receipt_store = ReceiptStore::new_user_for_test(fixture.receipt_path());
+    let manifest_path = fixture
+        .receipt_path()
+        .parent()
+        .unwrap()
+        .join("machine.toml");
+    let manifest_store =
+        crate::manifest::MachineManifestStore::new_user_with_worker_layout_for_test(
+            &manifest_path,
+            principal.clone(),
+            &layout,
+        )
+        .unwrap();
+    let base = pending_manifest_draft();
+    let mut draft =
+        crate::manifest::CurrentUserWorkerManifestCandidate::derive_with_layout_for_test(
+            &base, &principal, &layout,
+        )
+        .unwrap()
+        .into_draft();
+
+    let mut first_plan = vec![dedicated_account_prerequisite(
+        crate::platform::DedicatedAccountSpec::new("build-agent").unwrap(),
+    )
+    .unwrap()];
+    let mut first_metadata = ReceiptMetadataSource::for_test([
+        (
+            "019cb090-3400-7000-8000-000000000211",
+            "2026-09-03T12:21:00Z",
+        ),
+        (
+            "019cb090-3400-7000-8000-000000000212",
+            "2026-09-03T12:21:01Z",
+        ),
+    ]);
+    let first =
+        apply_plan_with_journal(&mut first_plan, &receipt_store, &mut first_metadata).unwrap();
+    let first_id = first.pending()[0].id().as_str().to_owned();
+    crate::setup::pending::publish_manifest(
+        &manifest_store,
+        &receipt_store,
+        &mut draft,
+        first.completion(),
+        &mut first_metadata,
+    )
+    .unwrap();
+
+    let mut second_plan = vec![dedicated_account_prerequisite(
+        crate::platform::DedicatedAccountSpec::new("release-agent").unwrap(),
+    )
+    .unwrap()];
+    let mut second_metadata = ReceiptMetadataSource::for_test([
+        (
+            "019cb090-3400-7000-8000-000000000213",
+            "2026-09-03T12:21:02Z",
+        ),
+        (
+            "019cb090-3400-7000-8000-000000000214",
+            "2026-09-03T12:21:03Z",
+        ),
+    ]);
+    let second =
+        apply_plan_with_journal(&mut second_plan, &receipt_store, &mut second_metadata).unwrap();
+    let second_id = second.pending()[0].id().as_str().to_owned();
+    crate::setup::pending::publish_manifest(
+        &manifest_store,
+        &receipt_store,
+        &mut draft,
+        second.completion(),
+        &mut second_metadata,
+    )
+    .unwrap();
+
+    assert_ne!(first_id, second_id);
+    let receipt: serde_json::Value =
+        serde_json::from_slice(&receipt_store.read_snapshot().unwrap().to_json().unwrap()).unwrap();
+    assert_eq!(receipt["entries"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        receipt["entries"][0]["action"]["parameters"]["selector"],
+        "build-agent"
+    );
+    assert_eq!(
+        receipt["entries"][1]["action"]["parameters"]["selector"],
+        "release-agent"
+    );
+    assert_eq!(receipt["pending_publications"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        receipt["pending_publications"][1]["pending"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+    assert_eq!(
+        receipt["pending_publications"][1]["pending"][0]["action_id"],
+        second_id
+    );
+    let manifest =
+        crate::manifest::MachineManifest::parse_toml(&fs::read_to_string(manifest_path).unwrap())
+            .unwrap();
+    let projected = manifest.pending_actions.unwrap();
+    assert_eq!(projected.len(), 1);
+    assert_eq!(projected[0].id, second_id);
+    assert_ne!(projected[0].id, first_id);
 }
 
 #[test]

@@ -66,6 +66,28 @@
       "firewall_rules": [],
       "download_provenance": null,
       "status": "applied"
+    },
+    {
+      "entry_id": "019cafd0-5c00-7000-8000-000000000003",
+      "action": {
+        "type": "dedicated_account_prerequisite",
+        "parameters": {
+          "action_id": "identity.account.dedicated.sha256-7f81291a9c35cb94e74c8794e4c1ea1c0966b92fc67a72490ef0df956320a394",
+          "target_scope": "system",
+          "selector": "build-agent"
+        }
+      },
+      "timestamp": "2026-09-02T10:00:02Z",
+      "privilege_used": "none",
+      "directories_created": [],
+      "files_created": [],
+      "files_modified": [],
+      "services": [],
+      "accounts": [],
+      "registry_keys": [],
+      "firewall_rules": [],
+      "download_provenance": null,
+      "status": "pending"
     }
   ]
 }

@@ -740,6 +740,9 @@ fn requested_action(action: &Action) -> RequestedAction {
                 PlanOperation::Remove => RequestedOperation::Remove,
             },
         },
+        Action::DedicatedAccountPrerequisite(_) => unreachable!(
+            "non-privileged dedicated-account prerequisites cannot enter authorization requests"
+        ),
         Action::WorkerDirectory(_) => {
             unreachable!("ordinary worker-directory actions cannot enter authorization requests")
         }

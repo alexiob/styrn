@@ -37,6 +37,30 @@
           }
         }
       }
+    },
+    {
+      "if": {
+        "properties": {
+          "entries": {
+            "contains": {
+              "properties": {
+                "action": {
+                  "properties": {
+                    "type": { "const": "dedicated_account_prerequisite" }
+                  },
+                  "required": ["type"]
+                }
+              },
+              "required": ["action"]
+            }
+          }
+        },
+        "required": ["entries"]
+      },
+      "then": {
+        "properties": { "installation_scope": { "const": "user" } },
+        "required": ["installation_scope"]
+      }
     }
   ],
   "$defs": {
@@ -203,12 +227,40 @@
               }
             ]
           }
+        },
+        {
+          "if": {
+            "properties": {
+              "action": {
+                "properties": {
+                  "type": { "const": "dedicated_account_prerequisite" }
+                },
+                "required": ["type"]
+              }
+            },
+            "required": ["action"]
+          },
+          "then": {
+            "properties": {
+              "status": { "const": "pending" },
+              "privilege_used": { "const": "none" },
+              "directories_created": { "maxItems": 0 },
+              "files_created": { "maxItems": 0 },
+              "files_modified": { "maxItems": 0 },
+              "services": { "maxItems": 0 },
+              "accounts": { "maxItems": 0 },
+              "registry_keys": { "maxItems": 0 },
+              "firewall_rules": { "maxItems": 0 },
+              "download_provenance": { "type": "null" }
+            }
+          }
         }
       ]
     },
     "action": {
       "oneOf": [
         { "$ref": "#/$defs/foundationAction" },
+        { "$ref": "#/$defs/dedicatedAccountPrerequisiteAction" },
         { "$ref": "#/$defs/workerDirectoryAction" }
       ]
     },
@@ -224,6 +276,32 @@
           "additionalProperties": false,
           "properties": {
             "action_id": { "$ref": "#/$defs/actionIdentifier" }
+          }
+        }
+      }
+    },
+    "dedicatedAccountPrerequisiteAction": {
+      "type": "object",
+      "required": ["type", "parameters"],
+      "additionalProperties": false,
+      "properties": {
+        "type": { "const": "dedicated_account_prerequisite" },
+        "parameters": {
+          "type": "object",
+          "required": ["action_id", "target_scope", "selector"],
+          "additionalProperties": false,
+          "properties": {
+            "action_id": {
+              "type": "string",
+              "pattern": "^identity\\.account\\.dedicated\\.sha256-[0-9a-f]{64}$"
+            },
+            "target_scope": { "const": "system" },
+            "selector": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 256,
+              "pattern": "^[A-Za-z0-9_](?:[A-Za-z0-9_.-]{0,254}[A-Za-z0-9_-])?$"
+            }
           }
         }
       }

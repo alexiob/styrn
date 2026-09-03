@@ -581,7 +581,7 @@ fn pending_publication_prefix_digest_matches(
     // documents which could have been written by that implementation.
     if document.schema_version != 1
         || document.entries.iter().any(|entry| {
-            entry.action.is_worker_directory() || !entry.directories_created.is_empty()
+            entry.action.requires_current_v1_digest() || !entry.directories_created.is_empty()
         })
     {
         return Ok(false);
@@ -3201,6 +3201,22 @@ impl ReceiptEntry {
     }
 
     fn validate_action_effect(&self) -> Result<(), ReceiptError> {
+        if matches!(self.action, ReceiptAction::DedicatedAccountPrerequisite(_)) {
+            if self.status != ReceiptStatus::Pending
+                || self.privilege_used != ReceiptPrivilege::None
+                || !self.directories_created.is_empty()
+                || !self.files_created.is_empty()
+                || !self.files_modified.is_empty()
+                || !self.services.is_empty()
+                || !self.accounts.is_empty()
+                || !self.registry_keys.is_empty()
+                || !self.firewall_rules.is_empty()
+                || self.download_provenance.0.is_some()
+            {
+                return Err(ReceiptError::InvalidDedicatedAccountPrerequisite);
+            }
+            return Ok(());
+        }
         let ReceiptAction::WorkerDirectory(parameters) = &self.action else {
             return Ok(());
         };
@@ -3233,12 +3249,20 @@ impl ReceiptEntry {
 )]
 enum ReceiptAction {
     Foundation(FoundationActionParameters),
+    DedicatedAccountPrerequisite(DedicatedAccountPrerequisiteParameters),
     WorkerDirectory(WorkerDirectoryActionParameters),
 }
 
 impl ReceiptAction {
     fn is_worker_directory(&self) -> bool {
         matches!(self, Self::WorkerDirectory(_))
+    }
+
+    fn requires_current_v1_digest(&self) -> bool {
+        matches!(
+            self,
+            Self::DedicatedAccountPrerequisite(_) | Self::WorkerDirectory(_)
+        )
     }
 
     fn from_action_parameters(
@@ -3250,6 +3274,13 @@ impl ReceiptAction {
                     action_id: ActionIdentifier(action_id.as_str().to_owned()),
                 }))
             }
+            crate::setup::action::ActionParameters::DedicatedAccountPrerequisite(parameters) => Ok(
+                Self::DedicatedAccountPrerequisite(DedicatedAccountPrerequisiteParameters {
+                    action_id: ActionIdentifier(parameters.action_id().as_str().to_owned()),
+                    target_scope: parameters.target_scope(),
+                    selector: parameters.selector().to_owned(),
+                }),
+            ),
             crate::setup::action::ActionParameters::WorkerDirectory(parameters) => {
                 Ok(Self::WorkerDirectory(WorkerDirectoryActionParameters {
                     action_id: ActionIdentifier(parameters.action_id().as_str().to_owned()),
@@ -3268,6 +3299,7 @@ impl ReceiptAction {
     fn action_id(&self) -> &str {
         match self {
             Self::Foundation(parameters) => &parameters.action_id.0,
+            Self::DedicatedAccountPrerequisite(parameters) => &parameters.action_id.0,
             Self::WorkerDirectory(parameters) => &parameters.action_id.0,
         }
     }
@@ -3275,6 +3307,7 @@ impl ReceiptAction {
     fn validate(&self) -> Result<(), ReceiptError> {
         match self {
             Self::Foundation(parameters) => parameters.action_id.validate(),
+            Self::DedicatedAccountPrerequisite(parameters) => parameters.validate(),
             Self::WorkerDirectory(parameters) => parameters.validate(),
         }
     }
@@ -3282,6 +3315,10 @@ impl ReceiptAction {
     fn validate_scope(&self, scope: InstallationScope) -> Result<(), ReceiptError> {
         match self {
             Self::Foundation(_) => Ok(()),
+            Self::DedicatedAccountPrerequisite(_) if scope == InstallationScope::User => Ok(()),
+            Self::DedicatedAccountPrerequisite(_) => {
+                Err(ReceiptError::InvalidDedicatedAccountPrerequisite)
+            }
             Self::WorkerDirectory(parameters) => {
                 if scope == InstallationScope::User
                     && parameters.installation_scope == InstallationScope::User
@@ -3297,6 +3334,12 @@ impl ReceiptAction {
     fn validate_worker_principal(&self, worker: &WorkerPrincipal) -> Result<(), ReceiptError> {
         match self {
             Self::Foundation(_) => Ok(()),
+            Self::DedicatedAccountPrerequisite(_)
+                if worker.account_policy() == WorkerAccountPolicy::CurrentUser =>
+            {
+                Ok(())
+            }
+            Self::DedicatedAccountPrerequisite(_) => Err(ReceiptError::InvalidWorkerPrincipal),
             Self::WorkerDirectory(parameters) => {
                 if parameters.principal.to_worker_principal()? == *worker {
                     Ok(())
@@ -3332,6 +3375,31 @@ impl ReceiptAction {
 #[serde(deny_unknown_fields)]
 struct FoundationActionParameters {
     action_id: ActionIdentifier,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DedicatedAccountPrerequisiteParameters {
+    action_id: ActionIdentifier,
+    target_scope: InstallationScope,
+    selector: String,
+}
+
+impl DedicatedAccountPrerequisiteParameters {
+    fn validate(&self) -> Result<(), ReceiptError> {
+        self.action_id.validate()?;
+        if self.target_scope != InstallationScope::System {
+            return Err(ReceiptError::InvalidDedicatedAccountPrerequisite);
+        }
+        let spec = crate::platform::DedicatedAccountSpec::new(&self.selector)
+            .map_err(|_| ReceiptError::InvalidDedicatedAccountPrerequisite)?;
+        let expected = crate::setup::action::dedicated_account_prerequisite_action_id(&spec)
+            .map_err(|_| ReceiptError::InvalidDedicatedAccountPrerequisite)?;
+        if self.action_id.0 != expected.as_str() {
+            return Err(ReceiptError::InvalidDedicatedAccountPrerequisite);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -3972,6 +4040,8 @@ pub(crate) enum ReceiptError {
     InvalidActionIdentifier,
     #[error("setup receipt worker directory action is invalid")]
     InvalidWorkerDirectoryAction,
+    #[error("setup receipt dedicated-account prerequisite is invalid")]
+    InvalidDedicatedAccountPrerequisite,
     #[error("setup receipt worker principal is invalid")]
     InvalidWorkerPrincipal,
     #[error("setup receipt timestamp is not canonical UTC RFC 3339")]
