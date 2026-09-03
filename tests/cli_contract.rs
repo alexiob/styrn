@@ -99,6 +99,25 @@ fn inactive_setup_orchestration_never_reports_false_success() {
 }
 
 #[test]
+fn styrn_json_environment_matches_global_json_flag_without_ansi() {
+    let environment = Command::new(env!("CARGO_BIN_EXE_styrn"))
+        .env("STYRN_JSON", "1")
+        .args(["setup", "--yes"])
+        .output()
+        .unwrap();
+    let explicit = run(&["--json", "setup", "--yes"]);
+
+    for output in [&environment, &explicit] {
+        assert_eq!(output.status.code(), Some(13));
+        assert!(output.stderr.is_empty());
+        assert!(!output.stdout.contains(&0x1b));
+        let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(value["schema"], "styrn.command.v1");
+        assert_eq!(value["ok"], false);
+    }
+}
+
+#[test]
 fn root_and_finite_help_advertise_the_global_machine_output_option() {
     for args in [
         &["--help"][..],

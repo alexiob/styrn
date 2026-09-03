@@ -1,0 +1,36 @@
+schema_version = 1
+role = "worker"
+# name = "optional-public-machine-name"
+
+[installation]
+scope = "user"
+
+[components]
+ssh-server = true
+tailscale = true
+git = true
+rust = false
+sccache = false
+herdr = false
+codex = false
+claude = false
+styrnd = true
+sleep-policy = true
+rdp = false
+cockpit = false
+
+[account]
+mode = "current-user"
+
+[dirs]
+root = ""
+
+[ssh]
+authorized_keys = []
+
+[tailscale]
+mode = ""
+auth_key_env = "TS_AUTHKEY"
+
+[pending_policy]
+fail_on_pending = false

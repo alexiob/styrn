@@ -5,6 +5,47 @@ use std::ffi::OsString;
 use std::io::{IsTerminal, Write};
 use std::path::PathBuf;
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CliFacts {
+    stdin_terminal: bool,
+    stdout_terminal: bool,
+    stderr_terminal: bool,
+    styrn_config_dir: Option<OsString>,
+    styrn_json: Option<OsString>,
+    styrn_log: Option<OsString>,
+    styrn_ssh: Option<OsString>,
+}
+
+impl CliFacts {
+    fn capture() -> Self {
+        Self {
+            stdin_terminal: std::io::stdin().is_terminal(),
+            stdout_terminal: std::io::stdout().is_terminal(),
+            stderr_terminal: std::io::stderr().is_terminal(),
+            styrn_config_dir: std::env::var_os("STYRN_CONFIG_DIR"),
+            styrn_json: std::env::var_os("STYRN_JSON"),
+            styrn_log: std::env::var_os("STYRN_LOG"),
+            styrn_ssh: std::env::var_os("STYRN_SSH"),
+        }
+    }
+
+    pub(crate) fn for_test(
+        stdin_terminal: bool,
+        stdout_terminal: bool,
+        stderr_terminal: bool,
+    ) -> Self {
+        Self {
+            stdin_terminal,
+            stdout_terminal,
+            stderr_terminal,
+            styrn_config_dir: None,
+            styrn_json: None,
+            styrn_log: None,
+            styrn_ssh: None,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct AnsiPolicy {
     pub(crate) stdout: bool,
@@ -36,6 +77,85 @@ impl AnsiPolicy {
 pub(crate) struct ParsedCli {
     cli: Cli,
     policy: AnsiPolicy,
+    facts: CliFacts,
+}
+
+/// Closed CLI input for the rootless setup composer.  The setup module receives
+/// this projection instead of the clap-derived command structure.
+#[derive(Clone, Debug)]
+pub(crate) struct SetupRequest {
+    scope: Option<crate::platform::InstallationScope>,
+    role: Option<String>,
+    name: Option<String>,
+    account: Option<String>,
+    install: Option<String>,
+    config: Option<PathBuf>,
+    interactive: bool,
+    yes: bool,
+    no_elevate: bool,
+    authorize_system: bool,
+    dry_run: bool,
+    emit_script: Option<String>,
+    uninstall: bool,
+    json: bool,
+    facts: CliFacts,
+}
+
+impl SetupRequest {
+    pub(crate) fn scope(&self) -> Option<crate::platform::InstallationScope> {
+        self.scope
+    }
+    pub(crate) fn role(&self) -> Option<&str> {
+        self.role.as_deref()
+    }
+    pub(crate) fn name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+    pub(crate) fn account(&self) -> Option<&str> {
+        self.account.as_deref()
+    }
+    pub(crate) fn install(&self) -> Option<&str> {
+        self.install.as_deref()
+    }
+    pub(crate) fn config(&self) -> Option<&std::path::Path> {
+        self.config.as_deref()
+    }
+    pub(crate) fn interactive(&self) -> bool {
+        self.interactive
+    }
+    pub(crate) fn yes(&self) -> bool {
+        self.yes
+    }
+    pub(crate) fn no_elevate(&self) -> bool {
+        self.no_elevate
+    }
+    pub(crate) fn authorize_system(&self) -> bool {
+        self.authorize_system
+    }
+    pub(crate) fn dry_run(&self) -> bool {
+        self.dry_run
+    }
+    pub(crate) fn emit_script(&self) -> Option<&str> {
+        self.emit_script.as_deref()
+    }
+    pub(crate) fn uninstall(&self) -> bool {
+        self.uninstall
+    }
+    pub(crate) fn json(&self) -> bool {
+        self.json
+    }
+    pub(crate) fn stdin_terminal(&self) -> bool {
+        self.facts.stdin_terminal
+    }
+    pub(crate) fn config_dir(&self) -> Option<&std::ffi::OsStr> {
+        self.facts.styrn_config_dir.as_deref()
+    }
+    pub(crate) fn log_filter(&self) -> Option<&std::ffi::OsStr> {
+        self.facts.styrn_log.as_deref()
+    }
+    pub(crate) fn ssh_client(&self) -> Option<&std::ffi::OsStr> {
+        self.facts.styrn_ssh.as_deref()
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -47,6 +167,32 @@ pub(crate) enum MachineAction {
 impl ParsedCli {
     pub(crate) fn is_setup_command(&self) -> bool {
         matches!(self.cli.command, RootCommand::Setup(_))
+    }
+
+    pub(crate) fn setup_request(&self) -> Option<SetupRequest> {
+        let RootCommand::Setup(setup) = &self.cli.command else {
+            return None;
+        };
+        if setup.internal.is_some() {
+            return None;
+        }
+        Some(SetupRequest {
+            scope: setup.scope,
+            role: setup.role.clone(),
+            name: setup.name.clone(),
+            account: setup.account.clone(),
+            install: setup.install.clone(),
+            config: setup.config.clone(),
+            interactive: setup.interactive,
+            yes: setup.yes,
+            no_elevate: setup.no_elevate,
+            authorize_system: setup.authorize_system,
+            dry_run: setup.dry_run,
+            emit_script: setup.emit_script.clone(),
+            uninstall: setup.uninstall,
+            json: self.cli.json,
+            facts: self.facts.clone(),
+        })
     }
 
     pub(crate) fn privileged_setup_request(&self) -> Option<&std::path::Path> {
@@ -106,11 +252,7 @@ pub(crate) struct Cli {
 
 impl Cli {
     pub(crate) fn try_parse_process() -> Result<ParsedCli, ParseFailure> {
-        Self::try_parse_with_terminals(
-            std::env::args_os().collect(),
-            std::io::stdout().is_terminal(),
-            std::io::stderr().is_terminal(),
-        )
+        Self::try_parse_with_facts(std::env::args_os().collect(), CliFacts::capture())
     }
 
     fn try_parse_with_terminals(
@@ -118,10 +260,20 @@ impl Cli {
         stdout_terminal: bool,
         stderr_terminal: bool,
     ) -> Result<ParsedCli, ParseFailure> {
+        Self::try_parse_with_facts(
+            args,
+            CliFacts::for_test(false, stdout_terminal, stderr_terminal),
+        )
+    }
+
+    pub(crate) fn try_parse_with_facts(
+        args: Vec<OsString>,
+        facts: CliFacts,
+    ) -> Result<ParsedCli, ParseFailure> {
         let args = normalize_harness_tail(args);
         let error_policy = AnsiPolicy::from_terminals(
-            stdout_terminal,
-            stderr_terminal,
+            facts.stdout_terminal,
+            facts.stderr_terminal,
             preparse_machine_mode(&args),
         );
         let matches = Self::command()
@@ -134,10 +286,32 @@ impl Cli {
             error,
             policy: error_policy,
         })?;
-        let policy =
-            AnsiPolicy::from_terminals(stdout_terminal, stderr_terminal, cli.uses_machine_output());
+        let env_json = match facts.styrn_json.as_deref() {
+            None => false,
+            Some(value) if value == std::ffi::OsStr::new("0") => false,
+            Some(value) if value == std::ffi::OsStr::new("1") => true,
+            Some(_) if cli.json => false,
+            Some(_) => {
+                return Err(ParseFailure {
+                    error: Self::command().error(
+                        clap::error::ErrorKind::InvalidValue,
+                        "STYRN_JSON must be exactly 0 or 1",
+                    ),
+                    policy: error_policy,
+                });
+            }
+        };
+        let cli = Cli {
+            json: cli.json || env_json,
+            ..cli
+        };
+        let policy = AnsiPolicy::from_terminals(
+            facts.stdout_terminal,
+            facts.stderr_terminal,
+            cli.uses_machine_output(),
+        );
 
-        Ok(ParsedCli { cli, policy })
+        Ok(ParsedCli { cli, policy, facts })
     }
 
     fn uses_machine_output(&self) -> bool {
@@ -585,11 +759,15 @@ struct SetupArgs {
     scope: Option<crate::platform::InstallationScope>,
     #[arg(long)]
     role: Option<String>,
+    #[arg(long, help = "Public machine name for the rootless worker")]
+    name: Option<String>,
+    #[arg(long, help = "Worker account mode (current-user or dedicated[:NAME])")]
+    account: Option<String>,
     #[arg(long)]
     install: Option<String>,
     #[arg(long)]
     config: Option<PathBuf>,
-    #[arg(long)]
+    #[arg(long, conflicts_with_all = ["config", "role", "scope", "name", "account", "install", "yes", "dry_run", "emit_script", "uninstall", "json"])]
     interactive: bool,
     #[arg(long)]
     yes: bool,
