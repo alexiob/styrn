@@ -234,7 +234,7 @@ fn worker_directory_support_node_retains_its_ordinal_and_exact_ancestor_path() {
 }
 
 #[test]
-fn worker_directory_support_validation_accepts_only_exact_materialization_nodes() {
+fn worker_directory_native_support_validation_accepts_every_available_node() {
     let principal = crate::platform::resolve_current_worker_principal().unwrap();
     let layout =
         crate::platform::resolve_worker_directory_layout(InstallationScope::User, &principal, None)
@@ -244,10 +244,6 @@ fn worker_directory_support_validation_accepts_only_exact_materialization_nodes(
         .into_iter()
         .filter(|node| matches!(node, crate::platform::WorkerDirectoryNode::Support { .. }))
         .collect::<Vec<_>>();
-    assert!(
-        support_nodes.len() >= 2,
-        "native user layout must expose its standard support ancestors"
-    );
 
     for node in &support_nodes {
         let crate::platform::WorkerDirectoryNode::Support { ordinal } = node else {
@@ -258,17 +254,71 @@ fn worker_directory_support_validation_accepts_only_exact_materialization_nodes(
         let document = ReceiptDocument::from_json(&serde_json::to_vec(&value).unwrap()).unwrap();
         document.validate_worker_directory_layout(&layout).unwrap();
     }
+}
 
-    let crate::platform::WorkerDirectoryNode::Support { ordinal } = support_nodes[0] else {
-        unreachable!("support filter must retain only support nodes")
-    };
-    let different_plausible_ancestor = layout.path_for_node(support_nodes[1]).unwrap();
-    let forged = worker_directory_receipt_for_layout(
-        &layout,
-        &principal,
-        ordinal,
-        &different_plausible_ancestor,
-    );
+#[test]
+fn worker_directory_support_validation_covers_zero_one_and_many_exact_nodes() {
+    let principal = crate::platform::resolve_current_worker_principal().unwrap();
+    #[cfg(unix)]
+    let cases = [
+        ("/native/existing/styrn", None, 0_usize),
+        ("/native/profile/first/styrn", Some("/native/profile"), 1),
+        (
+            "/native/profile/first/second/third/styrn",
+            Some("/native/profile"),
+            3,
+        ),
+    ];
+    #[cfg(target_os = "windows")]
+    let cases = [
+        (r"C:\native\existing\Styrn", None, 0_usize),
+        (
+            r"C:\native\profile\first\Styrn",
+            Some(r"C:\native\profile"),
+            1,
+        ),
+        (
+            r"C:\native\profile\first\second\third\Styrn",
+            Some(r"C:\native\profile"),
+            3,
+        ),
+    ];
+    let mut many = None;
+    for (root, anchor, expected_support_count) in cases {
+        let layout = crate::platform::worker_directory_layout_for_test(
+            InstallationScope::User,
+            principal.clone(),
+            PathBuf::from(root),
+            anchor.map(PathBuf::from),
+        );
+        let support_nodes = layout
+            .materialization_nodes()
+            .into_iter()
+            .filter(|node| matches!(node, crate::platform::WorkerDirectoryNode::Support { .. }))
+            .collect::<Vec<_>>();
+        assert_eq!(support_nodes.len(), expected_support_count);
+        for node in support_nodes {
+            let crate::platform::WorkerDirectoryNode::Support { ordinal } = node else {
+                unreachable!("support filter must retain only support nodes")
+            };
+            let path = layout.path_for_node(node).unwrap();
+            let value = worker_directory_receipt_for_layout(&layout, &principal, ordinal, &path);
+            ReceiptDocument::from_json(&serde_json::to_vec(&value).unwrap())
+                .unwrap()
+                .validate_worker_directory_layout(&layout)
+                .unwrap();
+        }
+        if expected_support_count == 3 {
+            many = Some(layout);
+        }
+    }
+
+    let layout = many.unwrap();
+    let different_plausible_ancestor = layout
+        .path_for_node(crate::platform::WorkerDirectoryNode::Support { ordinal: 1 })
+        .unwrap();
+    let forged =
+        worker_directory_receipt_for_layout(&layout, &principal, 0, &different_plausible_ancestor);
     let document = ReceiptDocument::from_json(&serde_json::to_vec(&forged).unwrap()).unwrap();
     assert_eq!(
         document
@@ -318,6 +368,41 @@ fn worker_directory_legacy_missing_directories_field_reads_empty_and_new_writes_
     assert_eq!(
         serialized["entries"][0]["directories_created"],
         serde_json::json!([])
+    );
+}
+
+#[test]
+fn legacy_v1_publication_digest_fallback_excludes_directory_actions_and_effects() {
+    let foundation = ReceiptDocument::from_json(COMPLETE_RECEIPT.as_bytes()).unwrap();
+    let old_foundation_digest = legacy_v1_receipt_document_digest(&foundation).unwrap();
+    assert!(
+        pending_publication_prefix_digest_matches(&foundation, &old_foundation_digest).unwrap()
+    );
+
+    let mut with_directory_effect = foundation;
+    #[cfg(not(target_os = "windows"))]
+    let directory_path = "/opt/styrn/support";
+    #[cfg(target_os = "windows")]
+    let directory_path = r"C:\ProgramData\Styrn\support";
+    with_directory_effect.entries[0]
+        .directories_created
+        .push(CreatedDirectory {
+            path: RecordedPath(directory_path.to_owned()),
+        });
+    assert!(!pending_publication_prefix_digest_matches(
+        &with_directory_effect,
+        &old_foundation_digest
+    )
+    .unwrap());
+
+    let mut worker_value = worker_directory_receipt_value();
+    worker_value["entries"][0]["status"] = serde_json::json!("pending");
+    worker_value["entries"][0]["directories_created"] = serde_json::json!([]);
+    let worker = ReceiptDocument::from_json(&serde_json::to_vec(&worker_value).unwrap()).unwrap();
+    let hypothetical_old_worker_digest = legacy_v1_receipt_document_digest(&worker).unwrap();
+    assert!(
+        !pending_publication_prefix_digest_matches(&worker, &hypothetical_old_worker_digest)
+            .unwrap()
     );
 }
 

@@ -462,7 +462,7 @@ impl PendingPublicationIntentDocument {
             self.receipt_entry_count,
             self.pending_publication_count,
         )?;
-        if receipt_document_digest(&prefix)? != self.receipt_prefix_sha256 {
+        if !pending_publication_prefix_digest_matches(&prefix, &self.receipt_prefix_sha256)? {
             return Err(ReceiptStoreError::IntentConflict);
         }
         // The target links are bounded by `receipt_entry_count`, while UUID
@@ -508,6 +508,93 @@ fn receipt_prefix(
 
 fn receipt_document_digest(document: &ReceiptDocument) -> Result<Sha256Digest, ReceiptStoreError> {
     Ok(manifest_digest(&document.to_json()?))
+}
+
+fn pending_publication_prefix_digest_matches(
+    document: &ReceiptDocument,
+    expected: &Sha256Digest,
+) -> Result<bool, ReceiptStoreError> {
+    if receipt_document_digest(document)? == *expected {
+        return Ok(true);
+    }
+    // T0.13 durable sidecars hash the same v1 entry shape before
+    // `directories_created` existed. Keep that migration path limited to
+    // documents which could have been written by that implementation.
+    if document.schema_version != 1
+        || document.entries.iter().any(|entry| {
+            entry.action.is_worker_directory() || !entry.directories_created.is_empty()
+        })
+    {
+        return Ok(false);
+    }
+    Ok(legacy_v1_receipt_document_digest(document)? == *expected)
+}
+
+fn legacy_v1_receipt_document_digest(
+    document: &ReceiptDocument,
+) -> Result<Sha256Digest, ReceiptStoreError> {
+    document.validate()?;
+    let legacy = LegacyReceiptDocumentV1 {
+        schema_version: document.schema_version,
+        installation_scope: document.installation_scope,
+        entries: document
+            .entries
+            .iter()
+            .map(LegacyReceiptEntryV1::from)
+            .collect(),
+        pending_publications: &document.pending_publications,
+    };
+    let mut bytes = serde_json::to_vec_pretty(&legacy).map_err(|_| ReceiptError::Serialize)?;
+    bytes.push(b'\n');
+    Ok(manifest_digest(&bytes))
+}
+
+#[derive(Serialize)]
+struct LegacyReceiptDocumentV1<'a> {
+    schema_version: u32,
+    installation_scope: InstallationScope,
+    entries: Vec<LegacyReceiptEntryV1<'a>>,
+    #[serde(skip_serializing_if = "referenced_slice_is_empty")]
+    pending_publications: &'a [PendingPublication],
+}
+
+fn referenced_slice_is_empty<T>(value: &&[T]) -> bool {
+    value.is_empty()
+}
+
+#[derive(Serialize)]
+struct LegacyReceiptEntryV1<'a> {
+    entry_id: &'a ReceiptEntryId,
+    action: &'a ReceiptAction,
+    timestamp: &'a ReceiptTimestamp,
+    privilege_used: &'a ReceiptPrivilege,
+    files_created: &'a [CreatedFile],
+    files_modified: &'a [ModifiedFile],
+    services: &'a [ServiceResource],
+    accounts: &'a [AccountResource],
+    registry_keys: &'a [RegistryKeyResource],
+    firewall_rules: &'a [FirewallRuleResource],
+    download_provenance: &'a DownloadProvenanceSlot,
+    status: &'a ReceiptStatus,
+}
+
+impl<'a> From<&'a ReceiptEntry> for LegacyReceiptEntryV1<'a> {
+    fn from(entry: &'a ReceiptEntry) -> Self {
+        Self {
+            entry_id: &entry.entry_id,
+            action: &entry.action,
+            timestamp: &entry.timestamp,
+            privilege_used: &entry.privilege_used,
+            files_created: &entry.files_created,
+            files_modified: &entry.files_modified,
+            services: &entry.services,
+            accounts: &entry.accounts,
+            registry_keys: &entry.registry_keys,
+            firewall_rules: &entry.firewall_rules,
+            download_provenance: &entry.download_provenance,
+            status: &entry.status,
+        }
+    }
 }
 
 fn manifest_digest(bytes: &[u8]) -> Sha256Digest {
@@ -2468,7 +2555,8 @@ fn validate_pending_intent_prefix(
             intent.receipt_entry_count,
             intent.pending_publication_count,
         )?;
-        if receipt_document_digest(&store_prefix)? != intent.receipt_prefix_sha256 {
+        if !pending_publication_prefix_digest_matches(&store_prefix, &intent.receipt_prefix_sha256)?
+        {
             return Err(ReceiptStoreError::PrefixConflict);
         }
         let candidate_prefix = receipt_prefix(
@@ -2476,7 +2564,10 @@ fn validate_pending_intent_prefix(
             intent.receipt_entry_count,
             intent.pending_publication_count,
         )?;
-        if receipt_document_digest(&candidate_prefix)? != intent.receipt_prefix_sha256 {
+        if !pending_publication_prefix_digest_matches(
+            &candidate_prefix,
+            &intent.receipt_prefix_sha256,
+        )? {
             return Err(ReceiptStoreError::PrefixConflict);
         }
     }

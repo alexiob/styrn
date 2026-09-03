@@ -5,6 +5,7 @@ use super::{
 };
 use crate::setup::receipt::{ReceiptMetadataSource, ReceiptStore, ReceiptStoreError};
 use chrono::{TimeZone, Utc};
+use sha2::{Digest as _, Sha256};
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc, Barrier, Mutex,
@@ -63,6 +64,33 @@ fn native_user_worker_root() -> PathBuf {
     .root()
     .to_path_buf()
 }
+
+const LEGACY_PENDING_PUBLICATION_RECEIPT: &str = r#"{
+  "schema_version": 1,
+  "installation_scope": "system",
+  "entries": [
+    {
+      "entry_id": "019cafd0-5c00-7000-8000-000000000121",
+      "action": {
+        "type": "foundation",
+        "parameters": {
+          "action_id": "test.legacy-publication"
+        }
+      },
+      "timestamp": "2026-09-02T10:21:00Z",
+      "privilege_used": "none",
+      "files_created": [],
+      "files_modified": [],
+      "services": [],
+      "accounts": [],
+      "registry_keys": [],
+      "firewall_rules": [],
+      "download_provenance": null,
+      "status": "pending"
+    }
+  ]
+}
+"#;
 
 #[test]
 fn three_todo_actions_append_complete_applied_entries_in_order_then_converge_without_mutation() {
@@ -1658,6 +1686,210 @@ fn failed_manifest_publication_repairs_on_rerun_without_duplicate_pending_histor
             .unwrap()[0]
             .id,
         "test.local-approval"
+    );
+}
+
+#[test]
+fn legacy_v1_pending_publication_prefix_recovers_and_checkpoints_current_receipt() {
+    let fixture = JournalFixture::new("legacy-v1-pending-publication-recovery");
+    let receipt_store = ReceiptStore::new_for_test(fixture.receipt_path());
+    let manifest_path = fixture.root.join("machine.toml");
+    let state = Arc::new(Mutex::new(Vec::new()));
+    let mut plan = vec![
+        Action::test_named_needs_human(
+            "test.legacy-publication",
+            Privilege::None,
+            Arc::clone(&state),
+            NeedsHuman::new(
+                HumanInstructions::new("Complete the legacy approval, then rerun setup.").unwrap(),
+                None,
+            ),
+        )
+        .0,
+    ];
+    let report = apply_plan_with_journal(
+        &mut plan,
+        &receipt_store,
+        &mut ReceiptMetadataSource::for_test([(
+            "019cafd0-5c00-7000-8000-000000000121",
+            "2026-09-02T10:21:00Z",
+        )]),
+    )
+    .unwrap();
+    let mut draft = pending_manifest_draft();
+    crate::setup::pending::publish_manifest(
+        &crate::manifest::MachineManifestStore::new_with_failing_publication_replace(
+            &manifest_path,
+        ),
+        &receipt_store,
+        &mut draft,
+        report.completion(),
+        &mut ReceiptMetadataSource::for_test([(
+            "019cafd0-5c00-7000-8000-000000000122",
+            "2026-09-02T10:21:01Z",
+        )]),
+    )
+    .unwrap_err();
+
+    fs::write(
+        fixture.receipt_path(),
+        LEGACY_PENDING_PUBLICATION_RECEIPT.as_bytes(),
+    )
+    .unwrap();
+    let intent_path = fixture.pending_publication_intent_path();
+    let mut intent: serde_json::Value =
+        serde_json::from_slice(&fs::read(&intent_path).unwrap()).unwrap();
+    let legacy_digest = Sha256::digest(LEGACY_PENDING_PUBLICATION_RECEIPT.as_bytes())
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    intent["receipt_prefix_sha256"] = serde_json::json!(legacy_digest);
+    let mut intent_bytes = serde_json::to_vec_pretty(&intent).unwrap();
+    intent_bytes.push(b'\n');
+    fs::write(&intent_path, &intent_bytes).unwrap();
+
+    let different_path = |name: &str| fixture.root.join(name).to_string_lossy().into_owned();
+    let mut tampered = Vec::new();
+    let mut wrong_scope = intent.clone();
+    wrong_scope["installation_scope"] = serde_json::json!("user");
+    tampered.push((
+        "scope",
+        LEGACY_PENDING_PUBLICATION_RECEIPT.as_bytes().to_vec(),
+        wrong_scope,
+    ));
+    let mut wrong_principal = intent.clone();
+    wrong_principal["worker_principal"]["name"] = serde_json::json!("other-worker");
+    tampered.push((
+        "principal",
+        LEGACY_PENDING_PUBLICATION_RECEIPT.as_bytes().to_vec(),
+        wrong_principal,
+    ));
+    let mut wrong_receipt_path = intent.clone();
+    wrong_receipt_path["receipt_path"] = serde_json::json!(different_path("other-receipt.json"));
+    tampered.push((
+        "receipt path",
+        LEGACY_PENDING_PUBLICATION_RECEIPT.as_bytes().to_vec(),
+        wrong_receipt_path,
+    ));
+    let mut wrong_count = intent.clone();
+    wrong_count["receipt_entry_count"] = serde_json::json!(0);
+    wrong_count["publication"]["receipt_entry_count"] = serde_json::json!(0);
+    tampered.push((
+        "entry count",
+        LEGACY_PENDING_PUBLICATION_RECEIPT.as_bytes().to_vec(),
+        wrong_count,
+    ));
+    let mut wrong_publication_count = intent.clone();
+    wrong_publication_count["pending_publication_count"] = serde_json::json!(1);
+    tampered.push((
+        "publication count",
+        LEGACY_PENDING_PUBLICATION_RECEIPT.as_bytes().to_vec(),
+        wrong_publication_count,
+    ));
+    let mut wrong_manifest_path = intent.clone();
+    wrong_manifest_path["manifest_path"] = serde_json::json!(different_path("other-machine.toml"));
+    tampered.push((
+        "manifest path",
+        LEGACY_PENDING_PUBLICATION_RECEIPT.as_bytes().to_vec(),
+        wrong_manifest_path,
+    ));
+    let mut wrong_manifest_digest = intent.clone();
+    wrong_manifest_digest["before_manifest_sha256"] =
+        serde_json::json!("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa");
+    tampered.push((
+        "manifest digest",
+        LEGACY_PENDING_PUBLICATION_RECEIPT.as_bytes().to_vec(),
+        wrong_manifest_digest,
+    ));
+    let mut wrong_manifest_principal = intent.clone();
+    wrong_manifest_principal["manifest_worker_principal"]["name"] =
+        serde_json::json!("other-worker");
+    tampered.push((
+        "manifest principal",
+        LEGACY_PENDING_PUBLICATION_RECEIPT.as_bytes().to_vec(),
+        wrong_manifest_principal,
+    ));
+    let mut wrong_publication_link = intent.clone();
+    wrong_publication_link["publication"]["pending"][0]["entry_id"] =
+        serde_json::json!("019cafd0-5c00-7000-8000-000000000129");
+    tampered.push((
+        "publication link",
+        LEGACY_PENDING_PUBLICATION_RECEIPT.as_bytes().to_vec(),
+        wrong_publication_link,
+    ));
+    let mut wrong_prefix: serde_json::Value =
+        serde_json::from_str(LEGACY_PENDING_PUBLICATION_RECEIPT).unwrap();
+    wrong_prefix["entries"][0]["timestamp"] = serde_json::json!("2026-09-02T10:21:09Z");
+    let mut wrong_prefix_bytes = serde_json::to_vec_pretty(&wrong_prefix).unwrap();
+    wrong_prefix_bytes.push(b'\n');
+    tampered.push(("receipt prefix", wrong_prefix_bytes, intent.clone()));
+
+    for (label, receipt_bytes, intent_document) in tampered {
+        fs::write(fixture.receipt_path(), &receipt_bytes).unwrap();
+        let mut tampered_intent_bytes = serde_json::to_vec_pretty(&intent_document).unwrap();
+        tampered_intent_bytes.push(b'\n');
+        fs::write(&intent_path, &tampered_intent_bytes).unwrap();
+
+        let error = crate::setup::pending::publish_manifest(
+            &crate::manifest::MachineManifestStore::new_for_test(&manifest_path),
+            &receipt_store,
+            &mut draft,
+            report.completion(),
+            &mut ReceiptMetadataSource::for_test([]),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.error_code(), "setup.receipt_conflict", "{label}");
+        assert_eq!(error.exit_code().as_i32(), 13, "{label}");
+        assert_eq!(
+            fs::read(fixture.receipt_path()).unwrap(),
+            receipt_bytes,
+            "{label}"
+        );
+        assert_eq!(
+            fs::read(&intent_path).unwrap(),
+            tampered_intent_bytes,
+            "{label}"
+        );
+        assert!(!manifest_path.exists(), "{label}");
+        assert!(state.lock().unwrap().is_empty(), "{label}");
+    }
+
+    fs::write(
+        fixture.receipt_path(),
+        LEGACY_PENDING_PUBLICATION_RECEIPT.as_bytes(),
+    )
+    .unwrap();
+    fs::write(&intent_path, intent_bytes).unwrap();
+
+    let rerun = apply_plan_with_journal(
+        &mut plan,
+        &receipt_store,
+        &mut ReceiptMetadataSource::for_test([]),
+    )
+    .unwrap();
+    crate::setup::pending::publish_manifest(
+        &crate::manifest::MachineManifestStore::new_for_test(&manifest_path),
+        &receipt_store,
+        &mut draft,
+        rerun.completion(),
+        &mut ReceiptMetadataSource::for_test([]),
+    )
+    .unwrap();
+
+    assert_eq!(state.lock().unwrap().len(), 0);
+    assert!(!intent_path.exists());
+    assert!(manifest_path.exists());
+    let checkpoint = fs::read(fixture.receipt_path()).unwrap();
+    assert_ne!(checkpoint, LEGACY_PENDING_PUBLICATION_RECEIPT.as_bytes());
+    let checkpoint: serde_json::Value = serde_json::from_slice(&checkpoint).unwrap();
+    assert_eq!(
+        checkpoint["entries"][0]["directories_created"],
+        serde_json::json!([])
+    );
+    assert_eq!(
+        checkpoint["pending_publications"][0]["publication_id"],
+        "019cafd0-5c00-7000-8000-000000000122"
     );
 }
 

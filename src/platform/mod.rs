@@ -532,6 +532,22 @@ impl WorkerDirectoryLayout {
     }
 }
 
+#[cfg(test)]
+pub(crate) fn worker_directory_layout_for_test(
+    scope: InstallationScope,
+    principal: WorkerPrincipal,
+    root: PathBuf,
+    creation_anchor: Option<PathBuf>,
+) -> WorkerDirectoryLayout {
+    let creation_policy = creation_anchor.map_or(
+        WorkerRootCreationPolicy::ExistingParent {
+            allow_untrusted_parent_create: false,
+        },
+        WorkerRootCreationPolicy::CreateMissingFrom,
+    );
+    WorkerDirectoryLayout::new(scope, root, creation_policy, principal)
+}
+
 #[allow(dead_code)] // Consumed by the T0.14 setup action integration follow-up.
 pub(crate) fn resolve_worker_directory_layout(
     scope: InstallationScope,
@@ -2468,58 +2484,88 @@ mod worker_directory_tests {
     }
 
     #[test]
-    fn worker_directory_materialization_nodes_are_closed_and_map_to_exact_paths() {
+    fn worker_directory_materialization_nodes_cover_zero_one_and_many_support_paths() {
         let principal = resolve_current_worker_principal().unwrap();
         #[cfg(unix)]
-        let (anchor, root) = (
-            PathBuf::from("/native/profile"),
-            PathBuf::from("/native/profile/first/second/styrn"),
-        );
+        let cases = [
+            (PathBuf::from("/native/existing/styrn"), None, vec![]),
+            (
+                PathBuf::from("/native/profile/first/styrn"),
+                Some(PathBuf::from("/native/profile")),
+                vec![PathBuf::from("/native/profile/first")],
+            ),
+            (
+                PathBuf::from("/native/profile/first/second/third/styrn"),
+                Some(PathBuf::from("/native/profile")),
+                vec![
+                    PathBuf::from("/native/profile/first"),
+                    PathBuf::from("/native/profile/first/second"),
+                    PathBuf::from("/native/profile/first/second/third"),
+                ],
+            ),
+        ];
         #[cfg(target_os = "windows")]
-        let (anchor, root) = (
-            PathBuf::from(r"C:\native\profile"),
-            PathBuf::from(r"C:\native\profile\first\second\Styrn"),
-        );
-        let layout = WorkerDirectoryLayout::new(
-            InstallationScope::User,
-            root.clone(),
-            WorkerRootCreationPolicy::CreateMissingFrom(anchor.clone()),
-            principal,
-        );
+        let cases = [
+            (PathBuf::from(r"C:\native\existing\Styrn"), None, vec![]),
+            (
+                PathBuf::from(r"C:\native\profile\first\Styrn"),
+                Some(PathBuf::from(r"C:\native\profile")),
+                vec![PathBuf::from(r"C:\native\profile\first")],
+            ),
+            (
+                PathBuf::from(r"C:\native\profile\first\second\third\Styrn"),
+                Some(PathBuf::from(r"C:\native\profile")),
+                vec![
+                    PathBuf::from(r"C:\native\profile\first"),
+                    PathBuf::from(r"C:\native\profile\first\second"),
+                    PathBuf::from(r"C:\native\profile\first\second\third"),
+                ],
+            ),
+        ];
 
-        assert_eq!(
-            layout.materialization_nodes(),
-            vec![
-                WorkerDirectoryNode::Support { ordinal: 0 },
-                WorkerDirectoryNode::Support { ordinal: 1 },
-                WorkerDirectoryNode::Root,
-                WorkerDirectoryNode::Repos,
-                WorkerDirectoryNode::Jobs,
-                WorkerDirectoryNode::Cache,
-                WorkerDirectoryNode::Artifacts,
-                WorkerDirectoryNode::Logs,
-            ]
-        );
-        assert_eq!(
-            layout.path_for_node(WorkerDirectoryNode::Support { ordinal: 0 }),
-            Some(anchor.join("first"))
-        );
-        assert_eq!(
-            layout.path_for_node(WorkerDirectoryNode::Support { ordinal: 1 }),
-            Some(anchor.join("first").join("second"))
-        );
-        assert_eq!(
-            layout.path_for_node(WorkerDirectoryNode::Support { ordinal: 2 }),
-            None
-        );
-        assert_eq!(
-            layout.path_for_node(WorkerDirectoryNode::Root),
-            Some(root.clone())
-        );
-        assert_eq!(
-            layout.path_for_node(WorkerDirectoryNode::Jobs),
-            Some(root.join("jobs"))
-        );
+        for (root, anchor, expected_support_paths) in cases {
+            let layout = worker_directory_layout_for_test(
+                InstallationScope::User,
+                principal.clone(),
+                root.clone(),
+                anchor,
+            );
+            let nodes = layout.materialization_nodes();
+            let support_count = expected_support_paths.len();
+            assert_eq!(nodes.len(), support_count + 6);
+            for (ordinal, expected_path) in expected_support_paths.into_iter().enumerate() {
+                let node = WorkerDirectoryNode::Support {
+                    ordinal: u16::try_from(ordinal).unwrap(),
+                };
+                assert_eq!(nodes[ordinal], node);
+                assert_eq!(layout.path_for_node(node), Some(expected_path));
+            }
+            assert_eq!(
+                &nodes[support_count..],
+                &[
+                    WorkerDirectoryNode::Root,
+                    WorkerDirectoryNode::Repos,
+                    WorkerDirectoryNode::Jobs,
+                    WorkerDirectoryNode::Cache,
+                    WorkerDirectoryNode::Artifacts,
+                    WorkerDirectoryNode::Logs,
+                ]
+            );
+            assert_eq!(
+                layout.path_for_node(WorkerDirectoryNode::Support {
+                    ordinal: u16::try_from(support_count).unwrap(),
+                }),
+                None
+            );
+            assert_eq!(
+                layout.path_for_node(WorkerDirectoryNode::Root),
+                Some(root.clone())
+            );
+            assert_eq!(
+                layout.path_for_node(WorkerDirectoryNode::Jobs),
+                Some(root.join("jobs"))
+            );
+        }
     }
 
     #[test]
