@@ -908,6 +908,14 @@ impl WorkerDirectoryLayout {
         &self.root
     }
 
+    pub(crate) const fn installation_scope(&self) -> InstallationScope {
+        self.scope
+    }
+
+    pub(crate) fn worker_principal(&self) -> &WorkerPrincipal {
+        &self.principal
+    }
+
     pub(crate) fn repos(&self) -> &Path {
         &self.repos
     }

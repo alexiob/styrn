@@ -151,6 +151,19 @@ pub(crate) struct MachineManifestDraft {
     pub(crate) pending_actions: Option<Vec<PendingAction>>,
 }
 
+const CURRENT_USER_WORKER_SECURITY_CAVEAT: &str =
+    "Current-user mode provides no OS-account isolation, no controller-credential isolation, and no same-user Styrn-state integrity boundary.";
+
+#[allow(dead_code)] // Task 2 consumes the projection through its opaque candidate.
+struct CurrentUserWorkerManifestProjection {
+    scope: platform::InstallationScope,
+    operating_system: OperatingSystem,
+    principal: platform::WorkerPrincipal,
+    worker_identity: WorkerIdentity,
+    transport_user: String,
+    paths: Paths,
+}
+
 macro_rules! manifest_types {
     ($($name:ident { $($field:ident : $type:ty),* $(,)? })*) => {$(
         #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -214,6 +227,158 @@ impl WorkerIdentity {
     }
 }
 
+#[allow(dead_code)] // Task 2 consumes the projection through its opaque candidate.
+impl CurrentUserWorkerManifestProjection {
+    fn derive(
+        base: &MachineManifestDraft,
+        principal: &platform::WorkerPrincipal,
+    ) -> Result<Self, ManifestError> {
+        validate_current_user_projection_base(base)?;
+        validate_current_native_principal(principal)?;
+        let layout = platform::resolve_worker_directory_layout(
+            platform::InstallationScope::User,
+            principal,
+            None,
+        )
+        .map_err(|_| projection_validation(PATH_REPRESENTATION_ERROR))?;
+        Self::derive_from_verified_layout(principal, &layout)
+    }
+
+    #[cfg(test)]
+    fn derive_with_layout_for_test(
+        base: &MachineManifestDraft,
+        principal: &platform::WorkerPrincipal,
+        layout: &platform::WorkerDirectoryLayout,
+    ) -> Result<Self, ManifestError> {
+        validate_current_user_projection_base(base)?;
+        validate_current_native_principal(principal)?;
+        Self::derive_from_verified_layout(principal, layout)
+    }
+
+    fn derive_from_verified_layout(
+        principal: &platform::WorkerPrincipal,
+        layout: &platform::WorkerDirectoryLayout,
+    ) -> Result<Self, ManifestError> {
+        if layout.installation_scope() != platform::InstallationScope::User {
+            return Err(projection_validation(USER_WORKER_DRAFT_ERROR));
+        }
+        if layout.worker_principal() != principal {
+            return Err(projection_validation(CURRENT_NATIVE_PRINCIPAL_ERROR));
+        }
+
+        Ok(Self {
+            scope: platform::InstallationScope::User,
+            operating_system: native_operating_system(),
+            principal: principal.clone(),
+            worker_identity: worker_identity_for(principal),
+            transport_user: principal.name().to_owned(),
+            paths: exact_manifest_paths(layout)?,
+        })
+    }
+}
+
+#[allow(dead_code)] // Task 2 consumes projection validation through its opaque candidate.
+const USER_WORKER_DRAFT_ERROR: &str =
+    "current-user worker manifest projection requires a user-scope worker draft";
+#[allow(dead_code)] // Task 2 consumes projection validation through its opaque candidate.
+const NATIVE_HOST_PLATFORM_ERROR: &str =
+    "current-user worker manifest projection requires the native host platform";
+#[allow(dead_code)] // Task 2 consumes projection validation through its opaque candidate.
+const EXISTING_TRANSPORT_ERROR: &str =
+    "current-user worker manifest projection requires an existing transport";
+#[allow(dead_code)] // Task 2 consumes projection validation through its opaque candidate.
+const CURRENT_NATIVE_PRINCIPAL_ERROR: &str =
+    "current-user worker manifest projection requires the current native principal";
+#[allow(dead_code)] // Task 2 consumes projection validation through its opaque candidate.
+const PATH_REPRESENTATION_ERROR: &str =
+    "worker directory paths cannot be represented exactly in the manifest";
+
+#[allow(dead_code)] // Task 2 consumes projection validation through its opaque candidate.
+fn validate_current_user_projection_base(base: &MachineManifestDraft) -> Result<(), ManifestError> {
+    if base
+        .installation
+        .as_ref()
+        .map(|installation| installation.scope)
+        != Some(platform::InstallationScope::User)
+        || !base.roles.contains(&MachineRole::Worker)
+    {
+        return Err(projection_validation(USER_WORKER_DRAFT_ERROR));
+    }
+    if base.platform.os != native_operating_system() {
+        return Err(projection_validation(NATIVE_HOST_PLATFORM_ERROR));
+    }
+    if base.transport.is_none() {
+        return Err(projection_validation(EXISTING_TRANSPORT_ERROR));
+    }
+    Ok(())
+}
+
+#[allow(dead_code)] // Task 2 consumes projection validation through its opaque candidate.
+fn validate_current_native_principal(
+    principal: &platform::WorkerPrincipal,
+) -> Result<(), ManifestError> {
+    if principal.account_policy() != platform::WorkerAccountPolicy::CurrentUser
+        || principal.isolation() != platform::WorkerIsolation::SharedUser
+        || platform::verify_worker_principal(principal).is_err()
+    {
+        return Err(projection_validation(CURRENT_NATIVE_PRINCIPAL_ERROR));
+    }
+    let current = platform::resolve_current_worker_principal()
+        .map_err(|_| projection_validation(CURRENT_NATIVE_PRINCIPAL_ERROR))?;
+    if &current != principal {
+        return Err(projection_validation(CURRENT_NATIVE_PRINCIPAL_ERROR));
+    }
+    Ok(())
+}
+
+#[allow(dead_code)] // Task 2 consumes projection validation through its opaque candidate.
+fn worker_identity_for(principal: &platform::WorkerPrincipal) -> WorkerIdentity {
+    let mode = match principal.account_policy() {
+        platform::WorkerAccountPolicy::CurrentUser => WorkerIdentityMode::CurrentUser,
+        platform::WorkerAccountPolicy::Dedicated => WorkerIdentityMode::Dedicated,
+    };
+    WorkerIdentity {
+        mode,
+        principal_kind: principal.principal_kind(),
+        principal_id: principal.principal_id().to_owned(),
+        name: principal.name().to_owned(),
+        isolation: principal.isolation(),
+    }
+}
+
+#[allow(dead_code)] // Task 2 consumes projection validation through its opaque candidate.
+fn exact_manifest_paths(layout: &platform::WorkerDirectoryLayout) -> Result<Paths, ManifestError> {
+    fn exact(path: &Path) -> Result<String, ManifestError> {
+        path.to_str()
+            .map(str::to_owned)
+            .ok_or_else(|| projection_validation(PATH_REPRESENTATION_ERROR))
+    }
+
+    Ok(Paths {
+        root: exact(layout.root())?,
+        repos: exact(layout.repos())?,
+        jobs: exact(layout.jobs())?,
+        cache: exact(layout.cache())?,
+        artifacts: exact(layout.artifacts())?,
+        logs: exact(layout.logs())?,
+    })
+}
+
+#[allow(dead_code)] // Task 2 consumes projection validation through its opaque candidate.
+fn native_operating_system() -> OperatingSystem {
+    #[cfg(target_os = "linux")]
+    return OperatingSystem::Linux;
+    #[cfg(target_os = "macos")]
+    return OperatingSystem::Macos;
+    #[cfg(target_os = "windows")]
+    return OperatingSystem::Windows;
+}
+
+#[allow(dead_code)] // Task 2 consumes projection validation through its opaque candidate.
+fn projection_validation(message: &'static str) -> ManifestError {
+    ManifestError::Validation(message.to_owned())
+}
+
 macro_rules! string_enum {
     ($name:ident { $($variant:ident => $value:literal),+ $(,)? }) => {
         #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -249,6 +414,16 @@ pub(crate) enum DesktopKind {
 }
 
 impl MachineManifest {
+    #[allow(dead_code)] // T0.20/T0.8 render it later.
+    pub(crate) fn worker_security_caveat(&self) -> Option<&'static str> {
+        let identity = self.worker_identity.as_ref()?;
+        let principal = identity.principal().ok()?;
+        (self.roles.contains(&MachineRole::Worker)
+            && principal.account_policy() == platform::WorkerAccountPolicy::CurrentUser
+            && principal.isolation() == platform::WorkerIsolation::SharedUser)
+            .then_some(CURRENT_USER_WORKER_SECURITY_CAVEAT)
+    }
+
     #[allow(dead_code)] // Kept as the typed parse entry point for callers beyond the CLI store.
     pub(crate) fn parse_toml(input: &str) -> Result<Self, ManifestError> {
         let raw = parse_raw(input)?;
@@ -1987,6 +2162,358 @@ pub(crate) enum ManifestError {
     Secret { path: String, reason: &'static str },
     #[error("invalid machine manifest: {0}")]
     Validation(String),
+}
+
+#[cfg(test)]
+mod projection_tests {
+    use super::*;
+
+    const EXPECTED_CAVEAT: &str = "Current-user mode provides no OS-account isolation, no controller-credential isolation, and no same-user Styrn-state integrity boundary.";
+
+    fn worker_draft() -> MachineManifestDraft {
+        let mut draft = MachineManifest::parse_toml(include_str!(
+            "../../examples/machine.controller-worker.toml"
+        ))
+        .unwrap()
+        .without_machine_id();
+        draft.installation = Some(Installation {
+            scope: platform::InstallationScope::User,
+        });
+        draft.roles = vec![MachineRole::Controller, MachineRole::Worker];
+        draft.platform.os = native_operating_system_for_test();
+        draft
+    }
+
+    fn native_operating_system_for_test() -> OperatingSystem {
+        #[cfg(target_os = "linux")]
+        return OperatingSystem::Linux;
+        #[cfg(target_os = "macos")]
+        return OperatingSystem::Macos;
+        #[cfg(target_os = "windows")]
+        return OperatingSystem::Windows;
+    }
+
+    fn validation_message(error: ManifestError) -> String {
+        let ManifestError::Validation(message) = error else {
+            panic!("expected static projection validation error, got {error:?}");
+        };
+        message
+    }
+
+    fn projection_error(
+        result: Result<CurrentUserWorkerManifestProjection, ManifestError>,
+    ) -> String {
+        match result {
+            Ok(_) => panic!("expected projection rejection"),
+            Err(error) => validation_message(error),
+        }
+    }
+
+    fn manifest_from_projection(
+        mut draft: MachineManifestDraft,
+        projection: CurrentUserWorkerManifestProjection,
+    ) -> MachineManifest {
+        draft.installation = Some(Installation {
+            scope: projection.scope,
+        });
+        draft.platform.os = projection.operating_system;
+        draft.worker_identity = Some(projection.worker_identity);
+        draft.transport.as_mut().unwrap().user = Some(projection.transport_user);
+        draft.paths = projection.paths;
+        draft.with_machine_id(Uuid::now_v7())
+    }
+
+    #[test]
+    fn current_user_worker_manifest_projection_is_one_exact_native_tuple() {
+        let principal = platform::resolve_current_worker_principal().unwrap();
+        let layout = platform::resolve_worker_directory_layout(
+            platform::InstallationScope::User,
+            &principal,
+            None,
+        )
+        .unwrap();
+        let projection =
+            CurrentUserWorkerManifestProjection::derive(&worker_draft(), &principal).unwrap();
+
+        assert_eq!(
+            layout.installation_scope(),
+            platform::InstallationScope::User
+        );
+        assert_eq!(layout.worker_principal(), &principal);
+        assert_eq!(projection.scope, platform::InstallationScope::User);
+        assert_eq!(
+            projection.operating_system,
+            native_operating_system_for_test()
+        );
+        assert_eq!(projection.principal, principal);
+        assert_eq!(
+            projection.worker_identity.mode,
+            WorkerIdentityMode::CurrentUser
+        );
+        assert_eq!(
+            projection.worker_identity.principal_kind,
+            projection.principal.principal_kind()
+        );
+        assert_eq!(
+            projection.worker_identity.principal_id,
+            projection.principal.principal_id()
+        );
+        assert_eq!(projection.worker_identity.name, projection.principal.name());
+        assert_eq!(
+            projection.worker_identity.isolation,
+            platform::WorkerIsolation::SharedUser
+        );
+        assert_eq!(projection.transport_user, projection.principal.name());
+
+        let projected_paths = [
+            projection.paths.root.as_str(),
+            projection.paths.repos.as_str(),
+            projection.paths.jobs.as_str(),
+            projection.paths.cache.as_str(),
+            projection.paths.artifacts.as_str(),
+            projection.paths.logs.as_str(),
+        ];
+        let expected_paths = [
+            layout.root(),
+            layout.repos(),
+            layout.jobs(),
+            layout.cache(),
+            layout.artifacts(),
+            layout.logs(),
+        ];
+        for (actual, expected) in projected_paths.into_iter().zip(expected_paths) {
+            assert_eq!(Some(actual), expected.to_str());
+        }
+        for node in layout.materialization_nodes() {
+            if matches!(node, platform::WorkerDirectoryNode::Support { .. }) {
+                let support = layout.path_for_node(node).unwrap();
+                assert!(expected_paths.iter().all(|path| *path != support));
+            }
+        }
+    }
+
+    #[test]
+    fn current_user_worker_manifest_projection_rejects_mismatched_or_nonunicode_layout() {
+        let draft = worker_draft();
+        let principal = platform::resolve_current_worker_principal().unwrap();
+        let canonical = platform::resolve_worker_directory_layout(
+            platform::InstallationScope::User,
+            &principal,
+            None,
+        )
+        .unwrap();
+
+        let mut system_draft = draft.clone();
+        system_draft.installation = Some(Installation {
+            scope: platform::InstallationScope::System,
+        });
+        assert_eq!(
+            projection_error(CurrentUserWorkerManifestProjection::derive(
+                &system_draft,
+                &principal,
+            )),
+            "current-user worker manifest projection requires a user-scope worker draft"
+        );
+
+        let mut controller_only = draft.clone();
+        controller_only.roles = vec![MachineRole::Controller];
+        assert_eq!(
+            projection_error(CurrentUserWorkerManifestProjection::derive(
+                &controller_only,
+                &principal,
+            )),
+            "current-user worker manifest projection requires a user-scope worker draft"
+        );
+
+        let mut nonnative = draft.clone();
+        nonnative.platform.os = match native_operating_system_for_test() {
+            OperatingSystem::Linux => OperatingSystem::Macos,
+            OperatingSystem::Macos | OperatingSystem::Windows => OperatingSystem::Linux,
+        };
+        assert_eq!(
+            projection_error(CurrentUserWorkerManifestProjection::derive(
+                &nonnative, &principal,
+            )),
+            "current-user worker manifest projection requires the native host platform"
+        );
+
+        let mut missing_transport = draft.clone();
+        missing_transport.transport = None;
+        assert_eq!(
+            projection_error(CurrentUserWorkerManifestProjection::derive(
+                &missing_transport,
+                &principal,
+            )),
+            "current-user worker manifest projection requires an existing transport"
+        );
+
+        let dedicated = platform::WorkerPrincipal::new(
+            principal.principal_kind(),
+            principal.principal_id(),
+            principal.name(),
+            platform::WorkerAccountPolicy::Dedicated,
+        )
+        .unwrap();
+        let dedicated_layout = platform::worker_directory_layout_for_test(
+            platform::InstallationScope::User,
+            dedicated.clone(),
+            canonical.root().to_path_buf(),
+            None,
+        );
+        assert_eq!(
+            projection_error(
+                CurrentUserWorkerManifestProjection::derive_with_layout_for_test(
+                    &draft,
+                    &dedicated,
+                    &dedicated_layout,
+                ),
+            ),
+            "current-user worker manifest projection requires the current native principal"
+        );
+        let different = platform::WorkerPrincipal::new(
+            principal.principal_kind(),
+            principal.principal_id(),
+            format!("{}-different", principal.name()),
+            platform::WorkerAccountPolicy::CurrentUser,
+        )
+        .unwrap();
+        let different_layout = platform::worker_directory_layout_for_test(
+            platform::InstallationScope::User,
+            different.clone(),
+            canonical.root().to_path_buf(),
+            None,
+        );
+        assert_eq!(
+            projection_error(
+                CurrentUserWorkerManifestProjection::derive_with_layout_for_test(
+                    &draft,
+                    &different,
+                    &different_layout,
+                ),
+            ),
+            "current-user worker manifest projection requires the current native principal"
+        );
+        assert_eq!(
+            projection_error(
+                CurrentUserWorkerManifestProjection::derive_with_layout_for_test(
+                    &draft,
+                    &principal,
+                    &different_layout,
+                ),
+            ),
+            "current-user worker manifest projection requires the current native principal"
+        );
+
+        let system_layout = platform::worker_directory_layout_for_test(
+            platform::InstallationScope::System,
+            principal.clone(),
+            canonical.root().to_path_buf(),
+            None,
+        );
+        assert_eq!(
+            projection_error(
+                CurrentUserWorkerManifestProjection::derive_with_layout_for_test(
+                    &draft,
+                    &principal,
+                    &system_layout,
+                ),
+            ),
+            "current-user worker manifest projection requires a user-scope worker draft"
+        );
+
+        let exact_test_layout = platform::worker_directory_layout_for_test(
+            platform::InstallationScope::User,
+            principal.clone(),
+            canonical
+                .root()
+                .with_file_name("styrn-projection-alternate"),
+            None,
+        );
+        let exact_test_projection =
+            CurrentUserWorkerManifestProjection::derive_with_layout_for_test(
+                &draft,
+                &principal,
+                &exact_test_layout,
+            )
+            .unwrap();
+        assert_eq!(
+            exact_test_projection.paths.root,
+            exact_test_layout.root().to_str().unwrap()
+        );
+
+        #[cfg(unix)]
+        let nonunicode_root = {
+            use std::ffi::OsString;
+            use std::os::unix::ffi::OsStringExt;
+            PathBuf::from(OsString::from_vec(vec![
+                b'/', b's', b't', b'y', b'r', b'n', 0xff,
+            ]))
+        };
+        #[cfg(windows)]
+        let nonunicode_root = {
+            use std::ffi::OsString;
+            use std::os::windows::ffi::OsStringExt;
+            PathBuf::from(OsString::from_wide(&[
+                b'C' as u16,
+                b':' as u16,
+                b'\\' as u16,
+                b's' as u16,
+                b't' as u16,
+                b'y' as u16,
+                b'r' as u16,
+                b'n' as u16,
+                0xd800,
+            ]))
+        };
+        let nonunicode_layout = platform::worker_directory_layout_for_test(
+            platform::InstallationScope::User,
+            principal.clone(),
+            nonunicode_root,
+            None,
+        );
+        assert_eq!(
+            projection_error(
+                CurrentUserWorkerManifestProjection::derive_with_layout_for_test(
+                    &draft,
+                    &principal,
+                    &nonunicode_layout,
+                ),
+            ),
+            "worker directory paths cannot be represented exactly in the manifest"
+        );
+    }
+
+    #[test]
+    fn worker_manifest_security_posture_is_static_and_policy_owned() {
+        let draft = worker_draft();
+        let principal = platform::resolve_current_worker_principal().unwrap();
+        let projection = CurrentUserWorkerManifestProjection::derive(&draft, &principal).unwrap();
+        let current_user = manifest_from_projection(draft, projection);
+        current_user.validate().unwrap();
+        assert_eq!(current_user.worker_security_caveat(), Some(EXPECTED_CAVEAT));
+
+        let toml = current_user.to_toml().unwrap();
+        let json = current_user.to_json_value().unwrap().to_string();
+        assert!(!toml.contains(EXPECTED_CAVEAT));
+        assert!(!json.contains(EXPECTED_CAVEAT));
+        assert!(!toml.contains("security_caveat"));
+        assert!(!json.contains("security_caveat"));
+
+        let mut dedicated = current_user.clone();
+        let identity = dedicated.worker_identity.as_mut().unwrap();
+        identity.mode = WorkerIdentityMode::Dedicated;
+        identity.isolation = platform::WorkerIsolation::DedicatedAccount;
+        assert_eq!(dedicated.worker_security_caveat(), None);
+
+        let mut incoherent = current_user.clone();
+        incoherent.worker_identity.as_mut().unwrap().isolation =
+            platform::WorkerIsolation::DedicatedAccount;
+        assert_eq!(incoherent.worker_security_caveat(), None);
+
+        let mut controller_only = current_user;
+        controller_only.roles = vec![MachineRole::Controller];
+        assert_eq!(controller_only.worker_security_caveat(), None);
+    }
 }
 
 #[cfg(test)]
