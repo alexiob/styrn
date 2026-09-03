@@ -17,6 +17,18 @@ use thiserror::Error;
 /// private to this module, so read-only plan descendants cannot mint one.
 pub(crate) struct JournalAuthority(());
 
+/// Unforgeable authority required by native setup mutation.
+///
+/// Production construction remains inside this closed action module. Tests use
+/// the platform-owned test token so source-including platform fixtures remain
+/// independent of the setup module graph.
+#[cfg(not(test))]
+#[allow(dead_code)] // Constructed by the T0.14 per-node execution gate.
+pub(crate) struct NativeMutationAuthority(());
+
+#[cfg(test)]
+pub(crate) type NativeMutationAuthority = crate::platform::TestNativeMutationAuthority;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ActionCheck {
     Done,

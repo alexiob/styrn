@@ -63,6 +63,21 @@ pub(crate) enum WorkerDirectoryNode {
     Logs,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum WorkerDirectoryInspectionIssue {
+    UnsafeOrConflictingState,
+    PrincipalDrift,
+    ObservationUnavailable,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum WorkerDirectoryNodeInspection {
+    Absent,
+    Healthy,
+    Conflict(WorkerDirectoryInspectionIssue),
+    Unknowable(WorkerDirectoryInspectionIssue),
+}
+
 impl WorkerDirectoryNode {
     #[allow(dead_code)] // Consumed by the T0.14 production Action integration.
     pub(crate) fn action_id(self) -> String {
@@ -160,6 +175,293 @@ impl WorkerDirectoryNodeObservation {
 pub(crate) struct WorkerDirectoryCreation {
     nodes: [WorkerDirectoryNodeObservation; 6],
     lease: platform_impl::WorkerDirectoryLease,
+}
+
+#[cfg(test)]
+pub(crate) struct TestNativeMutationAuthority(());
+
+#[cfg(test)]
+impl TestNativeMutationAuthority {
+    pub(crate) const fn for_test() -> Self {
+        Self(())
+    }
+}
+
+#[cfg(test)]
+type NativeMutationAuthority = TestNativeMutationAuthority;
+
+#[cfg(not(test))]
+type NativeMutationAuthority = crate::setup::action::NativeMutationAuthority;
+
+#[derive(Debug)]
+#[allow(dead_code)] // Consumed by the T0.14 per-node Action integration.
+pub(crate) enum WorkerDirectoryNodeCreateOutcome {
+    Existing,
+    Created(WorkerDirectoryNodeCreation),
+}
+
+#[allow(dead_code)] // Consumed by the T0.14 per-node Action integration.
+pub(crate) struct WorkerDirectoryNodeCreation {
+    observation: WorkerDirectoryNodeObservation,
+    lease: platform_impl::WorkerDirectoryNodeLease,
+}
+
+impl std::fmt::Debug for WorkerDirectoryNodeCreation {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("WorkerDirectoryNodeCreation")
+            .field("observation", &self.observation)
+            .finish_non_exhaustive()
+    }
+}
+
+#[allow(dead_code)] // Consumed by the T0.14 per-node Action integration.
+pub(crate) struct WorkerDirectoryNodeCreationError {
+    inner: Box<WorkerDirectoryNodeCreationErrorInner>,
+}
+
+enum WorkerDirectoryNodeCreationErrorInner {
+    Native(std::io::Error),
+    Retained {
+        primary: std::io::Error,
+        evidence: platform_impl::WorkerDirectoryNodeFailureEvidence,
+    },
+}
+
+#[allow(dead_code)] // Consumed by the T0.14 verified-effect receipt binder.
+pub(crate) struct VerifiedWorkerDirectoryNodeFailureBinding<'authority> {
+    observation: &'authority WorkerDirectoryNodeObservation,
+    _authority: &'authority platform_impl::WorkerDirectoryNodeFailureEvidence,
+}
+
+#[derive(Debug)]
+#[allow(dead_code)] // Consumed by the T0.14 verified-effect receipt binder.
+pub(crate) enum WorkerDirectoryNodeFailureBound<Value> {
+    Bound {
+        value: Value,
+        primary: std::io::Error,
+    },
+    BoundWithRetirementFailure {
+        value: Value,
+        primary: std::io::Error,
+        error: std::io::Error,
+    },
+}
+
+#[derive(Debug)]
+#[allow(dead_code)] // Consumed by the T0.14 verified-effect receipt binder.
+pub(crate) enum WorkerDirectoryNodeFailureBindingError<BindingError> {
+    NoRetainedEvidence(WorkerDirectoryNodeCreationError),
+    Reverification {
+        evidence: WorkerDirectoryNodeCreationError,
+        error: std::io::Error,
+    },
+    Binding {
+        evidence: WorkerDirectoryNodeCreationError,
+        error: BindingError,
+    },
+}
+
+#[allow(dead_code)] // Consumed by the T0.14 per-node Action integration.
+impl WorkerDirectoryNodeCreationError {
+    fn native(error: std::io::Error) -> Self {
+        Self {
+            inner: Box::new(WorkerDirectoryNodeCreationErrorInner::Native(error)),
+        }
+    }
+
+    pub(in crate::platform) fn with_retained_evidence(
+        primary: std::io::Error,
+        evidence: platform_impl::WorkerDirectoryNodeFailureEvidence,
+    ) -> Self {
+        Self {
+            inner: Box::new(WorkerDirectoryNodeCreationErrorInner::Retained { primary, evidence }),
+        }
+    }
+
+    pub(crate) fn kind(&self) -> std::io::ErrorKind {
+        match self.inner.as_ref() {
+            WorkerDirectoryNodeCreationErrorInner::Native(error) => error.kind(),
+            WorkerDirectoryNodeCreationErrorInner::Retained { primary, .. } => primary.kind(),
+        }
+    }
+
+    pub(crate) fn retained_creation_evidence_count(&self) -> usize {
+        match self.inner.as_ref() {
+            WorkerDirectoryNodeCreationErrorInner::Native(_) => 0,
+            WorkerDirectoryNodeCreationErrorInner::Retained { evidence, .. } => {
+                evidence.retained_count()
+            }
+        }
+    }
+
+    #[cfg(all(target_os = "windows", test))]
+    pub(crate) fn retained_unresolved_creation_evidence_count(&self) -> usize {
+        match self.inner.as_ref() {
+            WorkerDirectoryNodeCreationErrorInner::Native(_) => 0,
+            WorkerDirectoryNodeCreationErrorInner::Retained { evidence, .. } => {
+                evidence.unresolved_count()
+            }
+        }
+    }
+
+    pub(crate) fn bind_retained_creation_evidence_after_reverify<Value, BindingError>(
+        self,
+        bind: impl for<'authority> FnOnce(
+            VerifiedWorkerDirectoryNodeFailureBinding<'authority>,
+        ) -> Result<Value, BindingError>,
+    ) -> Result<
+        WorkerDirectoryNodeFailureBound<Value>,
+        WorkerDirectoryNodeFailureBindingError<BindingError>,
+    > {
+        let (primary, evidence) = match *self.inner {
+            WorkerDirectoryNodeCreationErrorInner::Native(error) => {
+                return Err(WorkerDirectoryNodeFailureBindingError::NoRetainedEvidence(
+                    Self::native(error),
+                ));
+            }
+            WorkerDirectoryNodeCreationErrorInner::Retained { primary, evidence } => {
+                (primary, evidence)
+            }
+        };
+        let observation =
+            match platform_impl::reverify_worker_directory_node_failure_evidence(&evidence) {
+                Ok(observation) => observation,
+                Err(error) => {
+                    return Err(WorkerDirectoryNodeFailureBindingError::Reverification {
+                        evidence: Self::with_retained_evidence(primary, evidence),
+                        error,
+                    });
+                }
+            };
+        let value = match bind(VerifiedWorkerDirectoryNodeFailureBinding {
+            observation: &observation,
+            _authority: &evidence,
+        }) {
+            Ok(value) => value,
+            Err(error) => {
+                return Err(WorkerDirectoryNodeFailureBindingError::Binding {
+                    evidence: Self::with_retained_evidence(primary, evidence),
+                    error,
+                });
+            }
+        };
+        Ok(
+            match platform_impl::retire_worker_directory_node_failure_authority(&evidence) {
+                Ok(()) => WorkerDirectoryNodeFailureBound::Bound { value, primary },
+                Err(error) => WorkerDirectoryNodeFailureBound::BoundWithRetirementFailure {
+                    value,
+                    primary,
+                    error,
+                },
+            },
+        )
+    }
+}
+
+impl From<std::io::Error> for WorkerDirectoryNodeCreationError {
+    fn from(error: std::io::Error) -> Self {
+        Self::native(error)
+    }
+}
+
+impl std::fmt::Debug for WorkerDirectoryNodeCreationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.inner.as_ref() {
+            WorkerDirectoryNodeCreationErrorInner::Native(error) => formatter
+                .debug_tuple("WorkerDirectoryNodeCreationError")
+                .field(error)
+                .finish(),
+            WorkerDirectoryNodeCreationErrorInner::Retained { primary, evidence } => formatter
+                .debug_struct("WorkerDirectoryNodeCreationError")
+                .field("primary", primary)
+                .field("retained_creation_count", &evidence.retained_count())
+                .finish_non_exhaustive(),
+        }
+    }
+}
+
+impl std::fmt::Display for WorkerDirectoryNodeCreationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.inner.as_ref() {
+            WorkerDirectoryNodeCreationErrorInner::Native(error) => error.fmt(formatter),
+            WorkerDirectoryNodeCreationErrorInner::Retained { primary, .. } => {
+                primary.fmt(formatter)
+            }
+        }
+    }
+}
+
+impl std::error::Error for WorkerDirectoryNodeCreationError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self.inner.as_ref() {
+            WorkerDirectoryNodeCreationErrorInner::Native(error) => Some(error),
+            WorkerDirectoryNodeCreationErrorInner::Retained { primary, .. } => Some(primary),
+        }
+    }
+}
+
+#[allow(dead_code)] // Consumed by the T0.14 verified-effect receipt binder.
+impl VerifiedWorkerDirectoryNodeFailureBinding<'_> {
+    pub(crate) fn observation(&self) -> &WorkerDirectoryNodeObservation {
+        self.observation
+    }
+}
+
+#[allow(dead_code)] // Consumed by the T0.14 verified-effect receipt binder.
+pub(crate) struct VerifiedWorkerDirectoryNodeBinding<'authority> {
+    observation: &'authority WorkerDirectoryNodeObservation,
+    lease: &'authority platform_impl::WorkerDirectoryNodeLease,
+}
+
+#[derive(Debug)]
+#[allow(dead_code)] // Consumed by the T0.14 verified-effect receipt binder.
+pub(crate) enum WorkerDirectoryBound<Value> {
+    Bound(Value),
+    BoundWithRetirementFailure { value: Value, error: std::io::Error },
+}
+
+#[allow(dead_code)] // Consumed by the T0.14 per-node Action integration.
+impl WorkerDirectoryNodeCreation {
+    pub(in crate::platform) fn new(
+        observation: WorkerDirectoryNodeObservation,
+        lease: platform_impl::WorkerDirectoryNodeLease,
+    ) -> Self {
+        Self { observation, lease }
+    }
+
+    pub(crate) fn bind_after_reverify<Value, BindingError>(
+        self,
+        bind: impl for<'authority> FnOnce(
+            VerifiedWorkerDirectoryNodeBinding<'authority>,
+        ) -> Result<Value, BindingError>,
+    ) -> Result<WorkerDirectoryBound<Value>, WorkerDirectoryBindingError<BindingError>> {
+        platform_impl::reverify_worker_directory_node_lease(&self.lease, &self.observation)
+            .map_err(WorkerDirectoryBindingError::Reverification)?;
+        let value = bind(VerifiedWorkerDirectoryNodeBinding {
+            observation: &self.observation,
+            lease: &self.lease,
+        })
+        .map_err(WorkerDirectoryBindingError::Binding)?;
+        Ok(
+            match platform_impl::retire_worker_directory_node_authority(&self.lease) {
+                Ok(()) => WorkerDirectoryBound::Bound(value),
+                Err(error) => WorkerDirectoryBound::BoundWithRetirementFailure { value, error },
+            },
+        )
+    }
+}
+
+#[allow(dead_code)] // Consumed by the T0.14 verified-effect receipt binder.
+impl VerifiedWorkerDirectoryNodeBinding<'_> {
+    pub(crate) fn observation(&self) -> &WorkerDirectoryNodeObservation {
+        self.observation
+    }
+
+    #[cfg(test)]
+    fn reverify_retained_authority_for_test(&self) -> std::io::Result<()> {
+        platform_impl::reverify_worker_directory_node_lease(self.lease, self.observation)
+    }
 }
 
 pub(crate) struct WorkerDirectoryCreationError {
@@ -714,7 +1016,7 @@ fn validate_windows_worker_lock_anchor_identity(
 ///
 /// Ownership assignment for a future dedicated principal is intentionally a
 /// separate setup action; this primitive never recursively changes metadata.
-#[allow(dead_code)] // Consumed by the T0.14 setup action integration follow-up.
+#[cfg(test)]
 pub(crate) fn create_worker_directory_layout(
     layout: &WorkerDirectoryLayout,
 ) -> Result<WorkerDirectoryCreation, WorkerDirectoryCreationError> {
@@ -726,6 +1028,50 @@ pub(crate) fn create_worker_directory_layout(
     {
         platform_impl::create_worker_directory_layout(layout).map_err(Into::into)
     }
+}
+
+#[allow(dead_code)] // Consumed by the T0.14 per-node Action integration.
+pub(crate) fn inspect_worker_directory_node(
+    layout: &WorkerDirectoryLayout,
+    node: WorkerDirectoryNode,
+) -> WorkerDirectoryNodeInspection {
+    if !layout.materialization_nodes().contains(&node) {
+        return WorkerDirectoryNodeInspection::Conflict(
+            WorkerDirectoryInspectionIssue::UnsafeOrConflictingState,
+        );
+    }
+    platform_impl::inspect_worker_directory_node(layout, node)
+}
+
+#[allow(dead_code)] // Consumed by the T0.14 per-node Action integration.
+pub(crate) fn create_worker_directory_node(
+    layout: &WorkerDirectoryLayout,
+    node: WorkerDirectoryNode,
+    _authority: &NativeMutationAuthority,
+) -> Result<WorkerDirectoryNodeCreateOutcome, WorkerDirectoryNodeCreationError> {
+    if !layout.materialization_nodes().contains(&node) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "worker directory node is outside the closed materialization set",
+        )
+        .into());
+    }
+    platform_impl::create_worker_directory_node(layout, node)
+}
+
+#[allow(dead_code)] // Consumed by succeeded-intent recovery in the T0.14 receipt slice.
+pub(crate) fn retire_succeeded_worker_directory_evidence(
+    layout: &WorkerDirectoryLayout,
+    node: WorkerDirectoryNode,
+    _authority: &NativeMutationAuthority,
+) -> std::io::Result<()> {
+    if !layout.materialization_nodes().contains(&node) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "worker directory node is outside the closed materialization set",
+        ));
+    }
+    platform_impl::retire_succeeded_worker_directory_evidence(layout, node)
 }
 
 #[allow(dead_code)] // Reached through the deferred T0.14 action integration.
@@ -2461,6 +2807,408 @@ mod worker_directory_tests {
     const CONCURRENT_CHILD_ROOT_ENV: &str = "STYRN_TEST_WORKER_CONCURRENT_CHILD_ROOT";
     #[cfg(target_os = "linux")]
     const XDG_CHILD_ROOT_ENV: &str = "STYRN_TEST_WORKER_XDG_CHILD_ROOT";
+
+    #[test]
+    fn worker_directory_node_inspection_distinguishes_absent_healthy_and_conflict() {
+        let principal = resolve_current_worker_principal().unwrap();
+        let parent = unique_test_directory("node-inspection-state");
+        std::fs::create_dir(&parent).unwrap();
+        let root = parent.join("chosen-root");
+        let layout =
+            resolve_worker_directory_layout(InstallationScope::System, &principal, Some(&root))
+                .unwrap();
+
+        assert_eq!(
+            inspect_worker_directory_node(&layout, WorkerDirectoryNode::Root),
+            WorkerDirectoryNodeInspection::Absent,
+        );
+
+        create_worker_directory_layout(&layout)
+            .unwrap()
+            .bind_after_reverify(|_| Ok::<_, ()>(()))
+            .unwrap();
+        assert_eq!(
+            inspect_worker_directory_node(&layout, WorkerDirectoryNode::Root),
+            WorkerDirectoryNodeInspection::Healthy,
+        );
+
+        std::fs::remove_dir(root.join("repos")).unwrap();
+        std::fs::write(root.join("repos"), b"not a directory\n").unwrap();
+        assert_eq!(
+            inspect_worker_directory_node(&layout, WorkerDirectoryNode::Repos),
+            WorkerDirectoryNodeInspection::Conflict(
+                WorkerDirectoryInspectionIssue::UnsafeOrConflictingState,
+            ),
+        );
+
+        std::fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn worker_directory_node_inspection_does_not_preflight_a_sibling() {
+        let principal = resolve_current_worker_principal().unwrap();
+        let parent = unique_test_directory("node-inspection-sibling");
+        std::fs::create_dir(&parent).unwrap();
+        let root = parent.join("chosen-root");
+        let layout =
+            resolve_worker_directory_layout(InstallationScope::System, &principal, Some(&root))
+                .unwrap();
+        create_worker_directory_layout(&layout)
+            .unwrap()
+            .bind_after_reverify(|_| Ok::<_, ()>(()))
+            .unwrap();
+        std::fs::remove_dir(root.join("repos")).unwrap();
+        std::fs::write(root.join("repos"), b"hostile sibling\n").unwrap();
+        std::fs::remove_dir(root.join("jobs")).unwrap();
+
+        assert_eq!(
+            inspect_worker_directory_node(&layout, WorkerDirectoryNode::Jobs),
+            WorkerDirectoryNodeInspection::Absent,
+        );
+        assert_eq!(
+            std::fs::read(root.join("repos")).unwrap(),
+            b"hostile sibling\n"
+        );
+
+        std::fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn worker_directory_node_inspection_reports_principal_drift_as_unknowable() {
+        let principal = resolve_current_worker_principal().unwrap();
+        let parent = unique_test_directory("node-inspection-principal-drift");
+        std::fs::create_dir(&parent).unwrap();
+        let root = parent.join("chosen-root");
+        let mut layout =
+            resolve_worker_directory_layout(InstallationScope::System, &principal, Some(&root))
+                .unwrap();
+        layout.principal_revalidation = Some(WorkerPrincipalRevalidationTest::Deleted);
+
+        assert_eq!(
+            inspect_worker_directory_node(&layout, WorkerDirectoryNode::Root),
+            WorkerDirectoryNodeInspection::Unknowable(
+                WorkerDirectoryInspectionIssue::PrincipalDrift,
+            ),
+        );
+        assert!(directory_entry_names(&parent).is_empty());
+
+        std::fs::remove_dir(parent).unwrap();
+    }
+
+    #[test]
+    fn worker_directory_node_inspection_missing_parent_is_absent_without_creation() {
+        let principal = resolve_current_worker_principal().unwrap();
+        let parent = unique_test_directory("node-inspection-missing-parent");
+        std::fs::create_dir(&parent).unwrap();
+        let missing_parent = parent.join("missing");
+        let root = missing_parent.join("chosen-root");
+        let layout =
+            resolve_worker_directory_layout(InstallationScope::System, &principal, Some(&root))
+                .unwrap();
+
+        assert_eq!(
+            inspect_worker_directory_node(&layout, WorkerDirectoryNode::Root),
+            WorkerDirectoryNodeInspection::Absent,
+        );
+        assert!(!missing_parent.exists());
+
+        std::fs::remove_dir(parent).unwrap();
+    }
+
+    #[test]
+    fn worker_directory_node_inspection_rejects_unbound_creation_evidence() {
+        let principal = resolve_current_worker_principal().unwrap();
+        let parent = unique_test_directory("node-inspection-unbound-evidence");
+        std::fs::create_dir(&parent).unwrap();
+        let root = parent.join("chosen-root");
+        let layout =
+            resolve_worker_directory_layout(InstallationScope::System, &principal, Some(&root))
+                .unwrap();
+        let authority = TestNativeMutationAuthority::for_test();
+        let WorkerDirectoryNodeCreateOutcome::Created(creation) =
+            create_worker_directory_node(&layout, WorkerDirectoryNode::Root, &authority).unwrap()
+        else {
+            panic!("fresh root was not created");
+        };
+
+        // Simulate interruption after publication but before a durable receipt
+        // callback has authorized retirement of the native provenance record.
+        drop(creation);
+
+        assert_eq!(
+            inspect_worker_directory_node(&layout, WorkerDirectoryNode::Root),
+            WorkerDirectoryNodeInspection::Conflict(
+                WorkerDirectoryInspectionIssue::UnsafeOrConflictingState,
+            ),
+        );
+
+        std::fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn retire_succeeded_worker_directory_evidence_clears_only_the_selected_record() {
+        let principal = resolve_current_worker_principal().unwrap();
+        let parent = unique_test_directory("node-retire-succeeded-evidence");
+        std::fs::create_dir(&parent).unwrap();
+        let root = parent.join("chosen-root");
+        let layout =
+            resolve_worker_directory_layout(InstallationScope::System, &principal, Some(&root))
+                .unwrap();
+        let authority = TestNativeMutationAuthority::for_test();
+        let WorkerDirectoryNodeCreateOutcome::Created(creation) =
+            create_worker_directory_node(&layout, WorkerDirectoryNode::Root, &authority).unwrap()
+        else {
+            panic!("fresh root was not created");
+        };
+        drop(creation);
+
+        retire_succeeded_worker_directory_evidence(&layout, WorkerDirectoryNode::Root, &authority)
+            .unwrap();
+
+        assert_eq!(
+            inspect_worker_directory_node(&layout, WorkerDirectoryNode::Root),
+            WorkerDirectoryNodeInspection::Healthy,
+        );
+        retire_succeeded_worker_directory_evidence(&layout, WorkerDirectoryNode::Root, &authority)
+            .unwrap();
+
+        std::fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn worker_directory_node_creation_materializes_only_the_selected_node() {
+        let principal = resolve_current_worker_principal().unwrap();
+        let parent = unique_test_directory("node-create-one");
+        let profile = parent.join("profile");
+        std::fs::create_dir_all(&profile).unwrap();
+        let root = profile.join("first/second/chosen-root");
+        let layout = worker_directory_layout_for_test(
+            InstallationScope::User,
+            principal,
+            root,
+            Some(profile),
+        );
+        let authority = TestNativeMutationAuthority::for_test();
+        let nodes = layout.materialization_nodes();
+
+        for (index, node) in nodes.iter().copied().enumerate() {
+            let selected = layout.path_for_node(node).unwrap();
+            let outcome = create_worker_directory_node(&layout, node, &authority).unwrap();
+            let WorkerDirectoryNodeCreateOutcome::Created(creation) = outcome else {
+                panic!("an absent selected node must be reported as Created");
+            };
+            let bound = creation
+                .bind_after_reverify(|binding| {
+                    assert_eq!(binding.observation().path(), selected);
+                    assert_eq!(
+                        binding.observation().disposition(),
+                        WorkerDirectoryNodeDisposition::Created,
+                    );
+                    Ok::<_, ()>(())
+                })
+                .unwrap();
+            assert!(matches!(bound, WorkerDirectoryBound::Bound(())));
+
+            for earlier in &nodes[..=index] {
+                assert!(std::fs::symlink_metadata(layout.path_for_node(*earlier).unwrap()).is_ok());
+            }
+            for later in &nodes[index + 1..] {
+                assert!(std::fs::symlink_metadata(layout.path_for_node(*later).unwrap()).is_err());
+            }
+            assert!(matches!(
+                create_worker_directory_node(&layout, node, &authority).unwrap(),
+                WorkerDirectoryNodeCreateOutcome::Existing,
+            ));
+        }
+
+        std::fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn worker_directory_node_creation_does_not_preflight_or_create_siblings() {
+        let principal = resolve_current_worker_principal().unwrap();
+        let parent = unique_test_directory("node-create-sibling");
+        std::fs::create_dir(&parent).unwrap();
+        let root = parent.join("chosen-root");
+        let layout =
+            resolve_worker_directory_layout(InstallationScope::System, &principal, Some(&root))
+                .unwrap();
+        let authority = TestNativeMutationAuthority::for_test();
+        let WorkerDirectoryNodeCreateOutcome::Created(root_creation) =
+            create_worker_directory_node(&layout, WorkerDirectoryNode::Root, &authority).unwrap()
+        else {
+            panic!("fresh root was not created");
+        };
+        root_creation
+            .bind_after_reverify(|_| Ok::<_, ()>(()))
+            .unwrap();
+        std::fs::write(root.join("repos"), b"hostile sibling\n").unwrap();
+
+        let WorkerDirectoryNodeCreateOutcome::Created(jobs_creation) =
+            create_worker_directory_node(&layout, WorkerDirectoryNode::Jobs, &authority).unwrap()
+        else {
+            panic!("fresh jobs node was not created");
+        };
+        jobs_creation
+            .bind_after_reverify(|_| Ok::<_, ()>(()))
+            .unwrap();
+
+        assert_eq!(
+            std::fs::read(root.join("repos")).unwrap(),
+            b"hostile sibling\n"
+        );
+        assert!(root.join("jobs").is_dir());
+        assert!(!root.join("cache").exists());
+        assert!(!root.join("artifacts").exists());
+        assert!(!root.join("logs").exists());
+        std::fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn worker_directory_node_binding_rejects_selected_path_substitution() {
+        let principal = resolve_current_worker_principal().unwrap();
+        let parent = unique_test_directory("node-binding-substitution");
+        std::fs::create_dir(&parent).unwrap();
+        let root = parent.join("chosen-root");
+        let displaced = parent.join("displaced-root");
+        let layout =
+            resolve_worker_directory_layout(InstallationScope::System, &principal, Some(&root))
+                .unwrap();
+        let authority = TestNativeMutationAuthority::for_test();
+        let WorkerDirectoryNodeCreateOutcome::Created(creation) =
+            create_worker_directory_node(&layout, WorkerDirectoryNode::Root, &authority).unwrap()
+        else {
+            panic!("fresh root was not created");
+        };
+        std::fs::rename(&root, &displaced).unwrap();
+        std::fs::create_dir(&root).unwrap();
+
+        let error = creation
+            .bind_after_reverify(|_| Ok::<_, ()>(()))
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            WorkerDirectoryBindingError::Reverification(error)
+                if error.kind() == std::io::ErrorKind::PermissionDenied
+        ));
+
+        std::fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[test]
+    fn worker_directory_node_creation_lock_survives_through_binding_callback() {
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let principal = resolve_current_worker_principal().unwrap();
+        let parent = unique_test_directory("node-create-concurrent");
+        std::fs::create_dir(&parent).unwrap();
+        let root = parent.join("chosen-root");
+        let layout =
+            resolve_worker_directory_layout(InstallationScope::System, &principal, Some(&root))
+                .unwrap();
+        let first_layout = layout.clone();
+        let second_layout = layout.clone();
+        let (first_bound_tx, first_bound_rx) = mpsc::channel();
+        let (release_first_tx, release_first_rx) = mpsc::channel();
+        let first = std::thread::spawn(move || {
+            let authority = TestNativeMutationAuthority::for_test();
+            let WorkerDirectoryNodeCreateOutcome::Created(creation) =
+                create_worker_directory_node(&first_layout, WorkerDirectoryNode::Root, &authority)
+                    .unwrap()
+            else {
+                panic!("first caller did not create the root");
+            };
+            creation
+                .bind_after_reverify(|_| {
+                    first_bound_tx.send(()).unwrap();
+                    release_first_rx
+                        .recv_timeout(Duration::from_secs(10))
+                        .unwrap();
+                    Ok::<_, ()>(())
+                })
+                .unwrap();
+        });
+        first_bound_rx
+            .recv_timeout(Duration::from_secs(10))
+            .unwrap();
+
+        let (second_done_tx, second_done_rx) = mpsc::channel();
+        let second = std::thread::spawn(move || {
+            let authority = TestNativeMutationAuthority::for_test();
+            let existing = match create_worker_directory_node(
+                &second_layout,
+                WorkerDirectoryNode::Root,
+                &authority,
+            ) {
+                Ok(WorkerDirectoryNodeCreateOutcome::Existing) => Ok(true),
+                Ok(WorkerDirectoryNodeCreateOutcome::Created(creation)) => creation
+                    .bind_after_reverify(|_| Ok::<_, String>(()))
+                    .map(|_| false)
+                    .map_err(|error| format!("{error:?}")),
+                Err(error) => Err(error.to_string()),
+            };
+            second_done_tx.send(existing).unwrap();
+        });
+        assert!(matches!(
+            second_done_rx.recv_timeout(Duration::from_millis(150)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        ));
+
+        release_first_tx.send(()).unwrap();
+        first.join().unwrap();
+        assert!(matches!(
+            second_done_rx
+                .recv_timeout(Duration::from_secs(10))
+                .unwrap(),
+            Ok(true),
+        ));
+        second.join().unwrap();
+
+        std::fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn worker_directory_node_failure_evidence_binds_exactly_one_created_node() {
+        let principal = resolve_current_worker_principal().unwrap();
+        let parent = unique_test_directory("node-failure-evidence");
+        std::fs::create_dir(&parent).unwrap();
+        let root = parent.join("chosen-root");
+        let layout =
+            resolve_worker_directory_layout(InstallationScope::System, &principal, Some(&root))
+                .unwrap();
+        let authority = TestNativeMutationAuthority::for_test();
+        platform_impl::set_worker_node_post_publish_failure_for_test(true);
+
+        let error = create_worker_directory_node(&layout, WorkerDirectoryNode::Root, &authority)
+            .unwrap_err();
+        platform_impl::set_worker_node_post_publish_failure_for_test(false);
+
+        assert_eq!(error.kind(), std::io::ErrorKind::Other);
+        assert_eq!(error.retained_creation_evidence_count(), 1);
+        let bound = error
+            .bind_retained_creation_evidence_after_reverify(|binding| {
+                assert_eq!(binding.observation().path(), root);
+                assert_eq!(
+                    binding.observation().disposition(),
+                    WorkerDirectoryNodeDisposition::Created,
+                );
+                Ok::<_, ()>(binding.observation().path().to_path_buf())
+            })
+            .unwrap();
+        assert!(matches!(
+            bound,
+            WorkerDirectoryNodeFailureBound::Bound { value, primary }
+                if value == root && primary.kind() == std::io::ErrorKind::Other
+        ));
+        assert_eq!(
+            inspect_worker_directory_node(&layout, WorkerDirectoryNode::Root),
+            WorkerDirectoryNodeInspection::Healthy,
+        );
+
+        std::fs::remove_dir_all(parent).unwrap();
+    }
 
     #[test]
     fn system_worker_directory_layout_has_the_exact_cross_scope_contract() {

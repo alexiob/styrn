@@ -859,6 +859,521 @@ pub(super) fn create_worker_directory_layout(
     finish_worker_directory_mutation(resolution, creation_lock, lock_anchor)
 }
 
+pub(super) fn inspect_worker_directory_node(
+    layout: &super::WorkerDirectoryLayout,
+    node: super::WorkerDirectoryNode,
+) -> super::WorkerDirectoryNodeInspection {
+    let verified_principal = match revalidate_worker_root_principal(layout) {
+        Ok(principal) => principal,
+        Err(_) => {
+            return super::WorkerDirectoryNodeInspection::Unknowable(
+                super::WorkerDirectoryInspectionIssue::PrincipalDrift,
+            );
+        }
+    };
+    let Some(path) = layout.path_for_node(node) else {
+        return super::WorkerDirectoryNodeInspection::Conflict(
+            super::WorkerDirectoryInspectionIssue::UnsafeOrConflictingState,
+        );
+    };
+    let path = match WindowsWorkerPath::parse(&path) {
+        Ok(path) => path,
+        Err(error) => return classify_worker_directory_inspection_error(error),
+    };
+    let directory = match open_existing_worker_path(&path) {
+        Ok(directory) => directory,
+        Err(error) => return classify_worker_directory_inspection_error(error),
+    };
+    let security = match WorkerCreationSecurity::new(&verified_principal) {
+        Ok(security) => security,
+        Err(_) => {
+            return super::WorkerDirectoryNodeInspection::Unknowable(
+                super::WorkerDirectoryInspectionIssue::PrincipalDrift,
+            );
+        }
+    };
+    let verified = match node {
+        super::WorkerDirectoryNode::Support { .. } => {
+            verify_trusted_worker_ancestor(&directory, &security.owner_sid, false)
+        }
+        _ => verify_worker_directory_security(&directory, &security.owner_sid),
+    }
+    .and_then(|()| {
+        let identity = worker_directory_identity(&directory)?;
+        let reopened = open_existing_worker_path(&path)?;
+        if worker_directory_identity(&reopened)? == identity {
+            Ok(())
+        } else {
+            Err(permission_denied(
+                "worker directory path changed during inspection",
+            ))
+        }
+    });
+    match verified {
+        Ok(()) => super::WorkerDirectoryNodeInspection::Healthy,
+        Err(error) => classify_worker_directory_inspection_error(error),
+    }
+}
+
+fn classify_worker_directory_inspection_error(
+    error: io::Error,
+) -> super::WorkerDirectoryNodeInspection {
+    if error.kind() == io::ErrorKind::NotFound {
+        super::WorkerDirectoryNodeInspection::Absent
+    } else if error.kind() == io::ErrorKind::PermissionDenied && error.raw_os_error().is_none() {
+        super::WorkerDirectoryNodeInspection::Conflict(
+            super::WorkerDirectoryInspectionIssue::UnsafeOrConflictingState,
+        )
+    } else {
+        super::WorkerDirectoryNodeInspection::Unknowable(
+            super::WorkerDirectoryInspectionIssue::ObservationUnavailable,
+        )
+    }
+}
+
+pub(super) fn create_worker_directory_node(
+    layout: &super::WorkerDirectoryLayout,
+    node: super::WorkerDirectoryNode,
+) -> Result<super::WorkerDirectoryNodeCreateOutcome, super::WorkerDirectoryNodeCreationError> {
+    let root_path = WindowsWorkerPath::parse(layout.root())?;
+    let (first_creatable, allow_untrusted_parent_create) = match &layout.creation_policy {
+        super::WorkerRootCreationPolicy::ExistingParent {
+            allow_untrusted_parent_create,
+        } => (
+            root_path
+                .components
+                .len()
+                .checked_sub(1)
+                .ok_or_else(|| invalid_data("worker root has no leaf component"))?,
+            *allow_untrusted_parent_create,
+        ),
+        super::WorkerRootCreationPolicy::CreateMissingFrom(anchor) => {
+            let anchor = WindowsWorkerPath::parse(anchor)?;
+            if !root_path.has_component_prefix(&anchor)
+                || root_path.components.len() == anchor.components.len()
+            {
+                return Err(permission_denied(
+                    "worker standard root escapes its native profile anchor",
+                )
+                .into());
+            }
+            (anchor.components.len(), false)
+        }
+    };
+    let initial_security = WorkerCreationSecurity::new(&layout.principal)?;
+    let lock_anchor = prepare_worker_lock_anchor(
+        &root_path,
+        first_creatable,
+        allow_untrusted_parent_create,
+        &initial_security,
+    )?;
+    let lock_suffix = &root_path.components[first_creatable..];
+    let lock_security = WorkerCreationSecurity::new(&resolve_current_worker_principal()?)?;
+    let creation_lock =
+        WorkerLayoutLock::acquire(&lock_anchor.directory, lock_suffix, &lock_security)?;
+    #[cfg(test)]
+    run_before_worker_anchor_reverify_hook();
+    lock_anchor.reverify_path_identity()?;
+    let verified_principal = revalidate_worker_root_principal(layout)?;
+    let owner_sid = principal_sid(&verified_principal)?;
+    let owner_matches_current = worker_owner_matches_current(&owner_sid)?;
+    let mutation_anchor = lock_anchor.directory.try_clone()?;
+    let root = layout.root().to_path_buf();
+    let test_plan = WorkerMutationThreadTestPlan {
+        privilege: take_worker_privilege_test_plan(),
+        native_create_failure_after: take_worker_native_create_failure_after(),
+        after_real_cleanup: take_after_real_worker_privilege_cleanup_hook(),
+    };
+    let resolution = if owner_matches_current
+        && test_plan.privilege.is_none()
+        && test_plan.after_real_cleanup.is_none()
+    {
+        let security = WorkerCreationSecurity::new(&verified_principal)?;
+        super::reconcile_windows_privileged_worker_mutation(
+            perform_worker_directory_node_mutation(
+                &root,
+                &root_path,
+                first_creatable,
+                mutation_anchor,
+                node,
+                &security,
+                WorkerMutationControl::new(None, test_plan.native_create_failure_after),
+            ),
+            Ok(()),
+        )
+    } else {
+        run_worker_node_mutation_on_privileged_thread(
+            root,
+            root_path,
+            first_creatable,
+            mutation_anchor,
+            node,
+            verified_principal,
+            test_plan,
+        )?
+    };
+    finish_worker_directory_node_mutation(resolution, creation_lock, lock_anchor)
+}
+
+fn perform_worker_directory_node_mutation(
+    root: &Path,
+    root_path: &WindowsWorkerPath,
+    first_creatable: usize,
+    anchor: std::fs::File,
+    node: super::WorkerDirectoryNode,
+    security: &WorkerCreationSecurity,
+    control: WorkerMutationControl,
+) -> super::WindowsPrivilegedWorkerMutation<WorkerNodeMutationEvidence> {
+    let mut created = CreatedWorkerDirectoryEvidence::default();
+    let operation = (|| -> io::Result<WorkerNodeCompleteEvidence> {
+        control.fail_if_requested(0)?;
+        control.fail_after_native_create_if_requested(0)?;
+        let (parent, name, path, canonical) =
+            prepare_worker_node_parent(root, root_path, first_creatable, anchor, node, security)?;
+        let opened = open_or_create_worker_directory_at(
+            &parent,
+            &name,
+            true,
+            security,
+            canonical,
+            path.clone(),
+        )?;
+        let opened = created.retain_for_continuation(opened, security, control)?;
+        if opened.disposition == super::WorkerDirectoryNodeDisposition::Created {
+            control.fail_if_requested(1)?;
+        }
+        let reopened = open_existing_worker_path(&WindowsWorkerPath::parse(&path)?)?;
+        if worker_directory_identity(&reopened)? != opened.identity {
+            return Err(permission_denied(
+                "worker node path changed during creation",
+            ));
+        }
+        Ok(WorkerNodeCompleteEvidence {
+            observation: super::WorkerDirectoryNodeObservation::new(
+                path,
+                opened.disposition,
+                opened.identity,
+            ),
+            directory: opened.directory,
+            owner_sid: security.owner_sid.clone(),
+            created: std::mem::take(&mut created),
+        })
+    })();
+    match operation {
+        Ok(complete) => super::WindowsPrivilegedWorkerMutation {
+            operation_error: None,
+            evidence: WorkerNodeMutationEvidence::Complete(Box::new(complete)),
+        },
+        Err(error) => super::WindowsPrivilegedWorkerMutation {
+            operation_error: Some(error),
+            evidence: WorkerNodeMutationEvidence::Partial {
+                created,
+                owner_sid: security.owner_sid.clone(),
+            },
+        },
+    }
+}
+
+fn prepare_worker_node_parent(
+    root: &Path,
+    root_path: &WindowsWorkerPath,
+    first_creatable: usize,
+    mut directory: std::fs::File,
+    node: super::WorkerDirectoryNode,
+    security: &WorkerCreationSecurity,
+) -> io::Result<(std::fs::File, Vec<u16>, PathBuf, bool)> {
+    let root_index = root_path
+        .components
+        .len()
+        .checked_sub(1)
+        .ok_or_else(|| invalid_data("worker root has no leaf component"))?;
+    let (target_index, child_name) = match node {
+        super::WorkerDirectoryNode::Support { ordinal } => {
+            let index = first_creatable
+                .checked_add(usize::from(ordinal))
+                .ok_or_else(|| invalid_data("worker support ordinal overflows"))?;
+            if index >= root_index {
+                return Err(permission_denied(
+                    "worker support node is outside the closed materialization set",
+                ));
+            }
+            (index, None)
+        }
+        super::WorkerDirectoryNode::Root => (root_index, None),
+        super::WorkerDirectoryNode::Repos => (root_index, Some("repos")),
+        super::WorkerDirectoryNode::Jobs => (root_index, Some("jobs")),
+        super::WorkerDirectoryNode::Cache => (root_index, Some("cache")),
+        super::WorkerDirectoryNode::Artifacts => (root_index, Some("artifacts")),
+        super::WorkerDirectoryNode::Logs => (root_index, Some("logs")),
+    };
+    for (index, component) in root_path.components[first_creatable..target_index]
+        .iter()
+        .enumerate()
+    {
+        let absolute_index = first_creatable + index;
+        let opened = open_worker_directory_at_with_security(&directory, component, true)?;
+        if absolute_index == root_index {
+            verify_worker_directory_security(&opened, &security.owner_sid)?;
+        } else {
+            verify_trusted_worker_ancestor(&opened, &security.owner_sid, false)?;
+        }
+        directory = opened;
+    }
+    if let Some(child_name) = child_name {
+        let root_directory = open_worker_directory_at_with_security(
+            &directory,
+            &root_path.components[root_index],
+            true,
+        )?;
+        verify_worker_directory_security(&root_directory, &security.owner_sid)?;
+        return Ok((
+            root_directory,
+            child_name.encode_utf16().collect(),
+            root.join(child_name),
+            true,
+        ));
+    }
+    Ok((
+        directory,
+        root_path.components[target_index].clone(),
+        worker_path_prefix(root, root_path.components.len(), target_index),
+        node == super::WorkerDirectoryNode::Root,
+    ))
+}
+
+fn run_worker_node_mutation_on_privileged_thread(
+    root: PathBuf,
+    root_path: WindowsWorkerPath,
+    first_creatable: usize,
+    anchor: std::fs::File,
+    node: super::WorkerDirectoryNode,
+    principal: WorkerPrincipal,
+    test_plan: WorkerMutationThreadTestPlan,
+) -> io::Result<super::WindowsPrivilegedWorkerMutationResolution<WorkerNodeMutationEvidence>> {
+    std::thread::scope(|scope| {
+        scope
+            .spawn(move || {
+                if test_plan
+                    .privilege
+                    .is_some_and(|plan| plan.enable_not_assigned)
+                {
+                    super::validate_windows_restore_privilege_result(false, true, 1300)?;
+                    unreachable!("not-assigned privilege validation always fails");
+                }
+                let security = WorkerCreationSecurity::new(&principal)?;
+                if let Some(plan) = test_plan.privilege {
+                    let mutation = perform_worker_directory_node_mutation(
+                        &root,
+                        &root_path,
+                        first_creatable,
+                        anchor,
+                        node,
+                        &security,
+                        WorkerMutationControl::new(
+                            plan.fail_after_created,
+                            test_plan.native_create_failure_after,
+                        ),
+                    );
+                    let cleanup = plan
+                        .cleanup_error
+                        .map_or(Ok(()), |code| Err(io::Error::from_raw_os_error(code)));
+                    return Ok(super::reconcile_windows_privileged_worker_mutation(
+                        mutation, cleanup,
+                    ));
+                }
+                let privilege = ThreadRestorePrivilege::enable()?;
+                let mutation = perform_worker_directory_node_mutation(
+                    &root,
+                    &root_path,
+                    first_creatable,
+                    anchor,
+                    node,
+                    &security,
+                    WorkerMutationControl::new(None, test_plan.native_create_failure_after),
+                );
+                let cleanup = privilege.restore_and_revert();
+                let cleanup = match test_plan.after_real_cleanup {
+                    Some(hook) => hook(cleanup),
+                    None => cleanup,
+                };
+                Ok(super::reconcile_windows_privileged_worker_mutation(
+                    mutation, cleanup,
+                ))
+            })
+            .join()
+            .map_err(|_| io::Error::other("Windows worker privilege thread panicked"))?
+    })
+}
+
+enum WorkerNodeMutationEvidence {
+    Complete(Box<WorkerNodeCompleteEvidence>),
+    Partial {
+        created: CreatedWorkerDirectoryEvidence,
+        owner_sid: Vec<u8>,
+    },
+}
+
+struct WorkerNodeCompleteEvidence {
+    observation: super::WorkerDirectoryNodeObservation,
+    directory: std::fs::File,
+    owner_sid: Vec<u8>,
+    created: CreatedWorkerDirectoryEvidence,
+}
+
+fn finish_worker_directory_node_mutation(
+    resolution: super::WindowsPrivilegedWorkerMutationResolution<WorkerNodeMutationEvidence>,
+    creation_lock: WorkerLayoutLock,
+    lock_anchor: WorkerLockAnchor,
+) -> Result<super::WorkerDirectoryNodeCreateOutcome, super::WorkerDirectoryNodeCreationError> {
+    match resolution {
+        super::WindowsPrivilegedWorkerMutationResolution::Success(
+            WorkerNodeMutationEvidence::Complete(complete),
+        ) => {
+            let WorkerNodeCompleteEvidence {
+                observation,
+                directory,
+                owner_sid,
+                created: _,
+            } = *complete;
+            if observation.disposition() == super::WorkerDirectoryNodeDisposition::Existing {
+                return Ok(super::WorkerDirectoryNodeCreateOutcome::Existing);
+            }
+            Ok(super::WorkerDirectoryNodeCreateOutcome::Created(
+                super::WorkerDirectoryNodeCreation::new(
+                    observation,
+                    WorkerDirectoryNodeLease {
+                        _creation_lock: creation_lock,
+                        lock_anchor,
+                        node: directory,
+                        owner_sid,
+                    },
+                ),
+            ))
+        }
+        super::WindowsPrivilegedWorkerMutationResolution::Success(
+            WorkerNodeMutationEvidence::Partial { .. },
+        ) => unreachable!("a successful worker node mutation is complete"),
+        super::WindowsPrivilegedWorkerMutationResolution::OperationFailure { error, evidence } => {
+            let evidence = evidence.into_failure(creation_lock, lock_anchor);
+            if evidence.retained_count() == 0 {
+                Err(error.into())
+            } else {
+                Err(
+                    super::WorkerDirectoryNodeCreationError::with_retained_evidence(
+                        error, evidence,
+                    ),
+                )
+            }
+        }
+        super::WindowsPrivilegedWorkerMutationResolution::Failure {
+            operation_error: _,
+            cleanup_error,
+            evidence,
+        } => {
+            let evidence = evidence.into_failure(creation_lock, lock_anchor);
+            if evidence.retained_count() == 0 {
+                Err(cleanup_error.into())
+            } else {
+                Err(
+                    super::WorkerDirectoryNodeCreationError::with_retained_evidence(
+                        cleanup_error,
+                        evidence,
+                    ),
+                )
+            }
+        }
+    }
+}
+
+impl WorkerNodeMutationEvidence {
+    fn into_failure(
+        self,
+        creation_lock: WorkerLayoutLock,
+        lock_anchor: WorkerLockAnchor,
+    ) -> WorkerDirectoryNodeFailureEvidence {
+        let (created, owner_sid) = match self {
+            Self::Complete(complete) => {
+                let WorkerNodeCompleteEvidence {
+                    owner_sid, created, ..
+                } = *complete;
+                (created, owner_sid)
+            }
+            Self::Partial { created, owner_sid } => (created, owner_sid),
+        };
+        created.into_failure(creation_lock, lock_anchor, owner_sid)
+    }
+}
+
+#[allow(dead_code)] // Retained by the T0.14 per-node Action receipt binder.
+pub(super) struct WorkerDirectoryNodeLease {
+    _creation_lock: WorkerLayoutLock,
+    lock_anchor: WorkerLockAnchor,
+    node: std::fs::File,
+    owner_sid: Vec<u8>,
+}
+
+#[allow(dead_code)] // Retained by the T0.14 per-node failure receipt binder.
+pub(super) type WorkerDirectoryNodeFailureEvidence = WorkerDirectoryFailureEvidence;
+
+#[allow(dead_code)] // Consumed by the T0.14 per-node failure receipt binder.
+pub(super) fn reverify_worker_directory_node_failure_evidence(
+    evidence: &WorkerDirectoryNodeFailureEvidence,
+) -> io::Result<super::WorkerDirectoryNodeObservation> {
+    let mut observations = reverify_worker_directory_failure_evidence(evidence)?;
+    if observations.len() != 1 {
+        return Err(permission_denied(
+            "worker node failure evidence does not identify exactly one creation",
+        ));
+    }
+    Ok(observations.remove(0))
+}
+
+#[allow(dead_code)] // Consumed by the T0.14 per-node failure receipt binder.
+pub(super) fn retire_worker_directory_node_failure_authority(
+    _evidence: &WorkerDirectoryNodeFailureEvidence,
+) -> io::Result<()> {
+    Ok(())
+}
+
+#[allow(dead_code)] // Consumed by the T0.14 per-node Action receipt binder.
+pub(super) fn reverify_worker_directory_node_lease(
+    lease: &WorkerDirectoryNodeLease,
+    observation: &super::WorkerDirectoryNodeObservation,
+) -> io::Result<()> {
+    lease.lock_anchor.reverify_path_identity()?;
+    verify_worker_directory_security(&lease.node, &lease.owner_sid)?;
+    if worker_directory_identity(&lease.node)? != observation.identity() {
+        return Err(permission_denied(
+            "retained worker directory identity changed before release",
+        ));
+    }
+    let path = WindowsWorkerPath::parse(observation.path())?;
+    let reopened = open_existing_worker_path(&path)?;
+    if worker_directory_identity(&reopened)? != observation.identity() {
+        return Err(permission_denied(
+            "worker directory path changed before retained evidence release",
+        ));
+    }
+    Ok(())
+}
+
+#[allow(dead_code)] // Consumed by the T0.14 per-node Action receipt binder.
+pub(super) fn retire_worker_directory_node_authority(
+    _lease: &WorkerDirectoryNodeLease,
+) -> io::Result<()> {
+    Ok(())
+}
+
+pub(super) fn retire_succeeded_worker_directory_evidence(
+    _layout: &super::WorkerDirectoryLayout,
+    _node: super::WorkerDirectoryNode,
+) -> io::Result<()> {
+    // Windows has no durable platform provenance sidecar after a successful
+    // create. The succeeded receipt intent is therefore already sufficient
+    // authority and cleanup is idempotently empty.
+    Ok(())
+}
+
 fn perform_worker_directory_mutation(
     root: &Path,
     root_path: &WindowsWorkerPath,
@@ -5156,6 +5671,45 @@ mod tests {
             drop(error);
             std::fs::remove_dir_all(parent).unwrap();
         }
+    }
+
+    #[test]
+    fn worker_directory_node_failure_evidence_retains_immediate_created_handle() {
+        let principal = test_principal();
+        let parent = std::env::temp_dir().join(format!(
+            "styrn-worker-node-native-create-evidence-{}-{}",
+            std::process::id(),
+            uuid::Uuid::now_v7()
+        ));
+        std::fs::create_dir(&parent).unwrap();
+        let root = parent.join("root");
+        let layout = crate::platform::resolve_worker_directory_layout(
+            crate::platform::InstallationScope::System,
+            &principal,
+            Some(&root),
+        )
+        .unwrap();
+        set_worker_native_create_failure_after(Some(1));
+
+        let error =
+            create_worker_directory_node(&layout, crate::platform::WorkerDirectoryNode::Root)
+                .unwrap_err();
+        set_worker_native_create_failure_after(None);
+
+        assert_eq!(error.retained_creation_evidence_count(), 1);
+        assert_eq!(error.retained_unresolved_creation_evidence_count(), 1);
+        let bound = error
+            .bind_retained_creation_evidence_after_reverify(|binding| {
+                assert_eq!(binding.observation().path(), root);
+                Ok::<_, ()>(binding.observation().path().to_path_buf())
+            })
+            .unwrap();
+        assert!(matches!(
+            bound,
+            crate::platform::WorkerDirectoryNodeFailureBound::Bound { value, .. }
+                if value == root
+        ));
+        std::fs::remove_dir_all(parent).unwrap();
     }
 
     #[test]
