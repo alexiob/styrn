@@ -480,3 +480,14 @@ mod fixture_support {
 #[cfg(plan_receipt_forge_fixture)]
 #[path = "hostile_receipt.rs"]
 mod hostile_receipt;
+
+#[cfg(any(
+    plan_worker_native_authority_construct_fixture,
+    plan_worker_native_mutation_call_fixture,
+    plan_worker_prepare_fixture,
+    plan_worker_execute_prepared_fixture,
+    plan_worker_parameters_construct_fixture,
+    plan_worker_verified_effect_construct_fixture
+))]
+#[path = "hostile_worker_directory_execution.rs"]
+mod hostile_worker_directory_execution;

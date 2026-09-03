@@ -6914,6 +6914,96 @@ fn a_setup_owned_descendant_cannot_invoke_the_gate_executor_directly() {
     );
 }
 
+#[test]
+fn worker_directory_execution_boundary_cannot_construct_native_authority() {
+    assert_fixture_fails_with_cfg(
+        "worker_directory_execution_boundary.rs",
+        &["plan_worker_native_authority_construct_fixture"],
+        FixtureExpectation::new(
+            "E0603",
+            "tuple struct constructor `NativeMutationAuthority` is private",
+            3,
+            Some("private tuple struct constructor"),
+            "hostile_worker_directory_execution.rs",
+        ),
+    );
+}
+
+#[test]
+fn worker_directory_execution_boundary_cannot_invoke_native_mutation_through_production_mint() {
+    assert_fixture_fails_with_cfg(
+        "worker_directory_execution_boundary.rs",
+        &["plan_worker_native_mutation_call_fixture"],
+        FixtureExpectation::new(
+            "E0603",
+            "function `native_mutation_authority` is private",
+            14,
+            Some("private function"),
+            "hostile_worker_directory_execution.rs",
+        ),
+    );
+}
+
+#[test]
+fn worker_directory_execution_boundary_cannot_prepare_an_action() {
+    assert_fixture_fails_with_cfg(
+        "worker_directory_execution_boundary.rs",
+        &["plan_worker_prepare_fixture"],
+        FixtureExpectation::new(
+            "E0624",
+            "method `prepare` is private",
+            20,
+            Some("private method"),
+            "hostile_worker_directory_execution.rs",
+        ),
+    );
+}
+
+#[test]
+fn worker_directory_execution_boundary_cannot_execute_a_prepared_action() {
+    assert_fixture_fails_with_cfg(
+        "worker_directory_execution_boundary.rs",
+        &["plan_worker_execute_prepared_fixture"],
+        FixtureExpectation::new(
+            "E0624",
+            "method `execute_prepared_and_bind` is private",
+            25,
+            Some("private method"),
+            "hostile_worker_directory_execution.rs",
+        ),
+    );
+}
+
+#[test]
+fn worker_directory_execution_boundary_cannot_construct_parameters() {
+    assert_fixture_fails_with_cfg(
+        "worker_directory_execution_boundary.rs",
+        &["plan_worker_parameters_construct_fixture"],
+        FixtureExpectation::new(
+            "E0451",
+            "fields `action_id`, `installation_scope`, `principal`, `root`, `node` and `path` of struct `action::WorkerDirectoryActionParameters` are private",
+            38,
+            Some("private field"),
+            "hostile_worker_directory_execution.rs",
+        ),
+    );
+}
+
+#[test]
+fn worker_directory_execution_boundary_cannot_construct_verified_effect() {
+    assert_fixture_fails_with_cfg(
+        "worker_directory_execution_boundary.rs",
+        &["plan_worker_verified_effect_construct_fixture"],
+        FixtureExpectation::new(
+            "E0451",
+            "fields `effect` and `_authority` of struct `action::VerifiedActionEffect` are private",
+            51,
+            Some("private field"),
+            "hostile_worker_directory_execution.rs",
+        ),
+    );
+}
+
 #[derive(Clone, Copy)]
 struct FixtureExpectation {
     code: &'static str,
@@ -7019,7 +7109,10 @@ fn compile_fixture(name: &str, configurations: &[&str]) -> Output {
         .arg(format!("dependency={}", artifacts.deps_dir.display()));
     let full_journal_fixture = matches!(
         name,
-        "plan_journal_apply.rs" | "forged_action_effect.rs" | "forged_receipt_entry.rs"
+        "plan_journal_apply.rs"
+            | "forged_action_effect.rs"
+            | "forged_receipt_entry.rs"
+            | "worker_directory_execution_boundary.rs"
     );
     let full_setup_fixture = name == "pending_publication_forge.rs";
     if !full_journal_fixture && !full_setup_fixture {
