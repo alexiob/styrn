@@ -529,8 +529,28 @@ fn worker_node_has_reserved_evidence(
     )?;
     let staging = worker_staging_name(&destination_parent, name)?;
     let provenance = worker_creation_provenance_name(&destination_parent, name)?;
-    Ok(worker_parent_entry_exists(&staging_parent, &staging)?
-        || worker_parent_entry_exists(&staging_parent, &provenance)?)
+    if worker_parent_entry_exists(&staging_parent, &staging)?
+        || worker_parent_entry_exists(&staging_parent, &provenance)?
+    {
+        return Ok(true);
+    }
+    let retired = worker_creation_retired_provenance_name(&destination_parent, name)?;
+    if !worker_parent_entry_exists(&staging_parent, &retired)? {
+        return Ok(false);
+    }
+    let directory = open_worker_directory_at(&destination_parent, name).map_err(|_| {
+        permission_denied("retired worker provenance has no exact destination directory")
+    })?;
+    let identity = worker_recovery_candidate_identity(name, &directory)?;
+    open_retired_worker_creation_provenance(
+        &staging_parent,
+        &destination_parent,
+        name,
+        identity,
+        expected_uid,
+    )?
+    .ok_or_else(|| permission_denied("retired worker provenance marker disappeared"))?;
+    Ok(false)
 }
 
 fn worker_parent_entry_exists(parent: &std::fs::File, name: &std::ffi::CStr) -> io::Result<bool> {
@@ -935,38 +955,50 @@ pub(super) fn retire_succeeded_worker_directory_evidence(
         &destination_parent,
         name,
         identity,
+        expected_uid,
     )?;
     retire_worker_creation_provenance_state(&retirement)
 }
 
 fn retire_worker_creation_provenance(provenance: &WorkerCreationProvenance) -> io::Result<()> {
     verify_worker_creation_provenance(provenance)?;
-    if unsafe { libc::unlinkat(provenance.directory.as_raw_fd(), c"record".as_ptr(), 0) } == -1 {
-        return Err(io::Error::last_os_error());
+    let retired_name = worker_creation_retired_provenance_name_from_marker(&provenance.name)?;
+    if worker_parent_entry_exists(&provenance.parent, &retired_name)? {
+        return Err(permission_denied(
+            "active and retired worker provenance markers both exist",
+        ));
+    }
+    if unsafe {
+        libc::renameatx_np(
+            provenance.parent.as_raw_fd(),
+            provenance.name.as_ptr(),
+            provenance.parent.as_raw_fd(),
+            retired_name.as_ptr(),
+            libc::RENAME_EXCL,
+        )
+    } == -1
+    {
+        let error = io::Error::last_os_error();
+        return Err(if error.kind() == io::ErrorKind::AlreadyExists {
+            permission_denied("retired worker provenance marker already exists")
+        } else {
+            error
+        });
     }
     #[cfg(test)]
     fail_worker_provenance_retirement_at(
-        super::WorkerProvenanceRetirementFault::AfterRecordUnlink,
+        super::WorkerProvenanceRetirementFault::AfterMarkerRename,
     )?;
-    retire_empty_worker_creation_provenance(
-        &provenance.parent,
-        &provenance.name,
-        &provenance.directory,
-        provenance.directory_identity,
-    )
+    // The exact retired directory is the durable terminal marker. A future
+    // uninstall path may remove it; successful creation retirement must not.
+    verify_retired_worker_creation_provenance(provenance)?;
+    sync_worker_creation_provenance_parent(&provenance.parent)?;
+    verify_retired_worker_creation_provenance(provenance)
 }
 
 enum WorkerCreationProvenanceRetirement {
     Active(WorkerCreationProvenance),
-    Empty {
-        parent: std::fs::File,
-        name: CString,
-        directory: std::fs::File,
-        directory_identity: super::WorkerDirectoryIdentity,
-    },
-    Absent {
-        parent: std::fs::File,
-    },
+    Retired(WorkerCreationProvenance),
 }
 
 fn open_worker_creation_provenance_for_retirement(
@@ -974,64 +1006,54 @@ fn open_worker_creation_provenance_for_retirement(
     destination_parent: &std::fs::File,
     destination_name: &[u8],
     created_identity: super::WorkerDirectoryIdentity,
+    expected_uid: u32,
 ) -> io::Result<WorkerCreationProvenanceRetirement> {
-    let parent = staging_parent.try_clone()?;
-    let name = worker_creation_provenance_name(destination_parent, destination_name)?;
-    let directory = match open_worker_directory_at(staging_parent, name.to_bytes()) {
-        Ok(directory) => directory,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return Ok(WorkerCreationProvenanceRetirement::Absent { parent });
-        }
-        Err(error) => return Err(error),
-    };
-    verify_staged_worker_directory_security(&directory, unsafe { libc::geteuid() }, unsafe {
-        libc::geteuid()
-    })?;
-    let directory_identity = worker_directory_identity(&directory)?;
-    let descriptor = unsafe {
-        libc::openat(
-            directory.as_raw_fd(),
-            c"record".as_ptr(),
-            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-        )
-    };
-    if descriptor == -1 {
-        let error = worker_directory_open_error(io::Error::last_os_error());
-        if error.kind() == io::ErrorKind::NotFound {
-            verify_empty_worker_creation_provenance(
-                &parent,
-                &name,
-                &directory,
-                directory_identity,
-            )?;
-            return Ok(WorkerCreationProvenanceRetirement::Empty {
-                parent,
-                name,
-                directory,
-                directory_identity,
-            });
-        }
-        return Err(error);
+    let active_name = worker_creation_provenance_name(destination_parent, destination_name)?;
+    let retired_name =
+        worker_creation_retired_provenance_name(destination_parent, destination_name)?;
+    let active_exists = worker_parent_entry_exists(staging_parent, &active_name)?;
+    let retired_exists = worker_parent_entry_exists(staging_parent, &retired_name)?;
+    if active_exists && retired_exists {
+        return Err(permission_denied(
+            "active and retired worker provenance markers both exist",
+        ));
     }
-    let file = unsafe { std::fs::File::from_raw_fd(descriptor) };
-    let expected_record = worker_creation_provenance_record(
-        staging_parent,
-        destination_parent,
-        destination_name,
-        created_identity,
-    )?;
-    let file_identity = worker_provenance_file_identity(&file)?;
-    let provenance = WorkerCreationProvenance {
-        parent,
-        name,
-        directory,
-        directory_identity,
-        file,
-        file_identity,
-        expected_record,
+    let (provenance, retired) = if active_exists {
+        (
+            open_worker_creation_provenance_at_name(
+                staging_parent,
+                destination_parent,
+                destination_name,
+                created_identity,
+                expected_uid,
+                active_name,
+            )?
+            .ok_or_else(|| permission_denied("active worker provenance marker disappeared"))?,
+            false,
+        )
+    } else if retired_exists {
+        (
+            open_worker_creation_provenance_at_name(
+                staging_parent,
+                destination_parent,
+                destination_name,
+                created_identity,
+                expected_uid,
+                retired_name,
+            )?
+            .ok_or_else(|| permission_denied("retired worker provenance marker disappeared"))?,
+            true,
+        )
+    } else {
+        return Err(permission_denied(
+            "succeeded worker evidence lacks an exact retired provenance marker",
+        ));
     };
-    verify_worker_creation_provenance(&provenance)?;
-    Ok(WorkerCreationProvenanceRetirement::Active(provenance))
+    Ok(if retired {
+        WorkerCreationProvenanceRetirement::Retired(provenance)
+    } else {
+        WorkerCreationProvenanceRetirement::Active(provenance)
+    })
 }
 
 fn retire_worker_creation_provenance_state(
@@ -1041,59 +1063,12 @@ fn retire_worker_creation_provenance_state(
         WorkerCreationProvenanceRetirement::Active(provenance) => {
             retire_worker_creation_provenance(provenance)
         }
-        WorkerCreationProvenanceRetirement::Empty {
-            parent,
-            name,
-            directory,
-            directory_identity,
-        } => retire_empty_worker_creation_provenance(parent, name, directory, *directory_identity),
-        WorkerCreationProvenanceRetirement::Absent { parent } => {
-            sync_worker_creation_provenance_parent(parent)
+        WorkerCreationProvenanceRetirement::Retired(provenance) => {
+            verify_retired_worker_creation_provenance(provenance)?;
+            sync_worker_creation_provenance_parent(&provenance.parent)?;
+            verify_retired_worker_creation_provenance(provenance)
         }
     }
-}
-
-fn verify_empty_worker_creation_provenance(
-    parent: &std::fs::File,
-    name: &std::ffi::CStr,
-    directory: &std::fs::File,
-    expected_identity: super::WorkerDirectoryIdentity,
-) -> io::Result<()> {
-    verify_staged_worker_directory_security(directory, unsafe { libc::geteuid() }, unsafe {
-        libc::geteuid()
-    })?;
-    if worker_directory_identity(directory)? != expected_identity
-        || worker_directory_identity_at(parent, name)? != expected_identity
-        || !worker_parent_entry_snapshot(directory)?.is_empty()
-    {
-        return Err(permission_denied(
-            "partially retired worker provenance is not the exact empty directory",
-        ));
-    }
-    Ok(())
-}
-
-fn retire_empty_worker_creation_provenance(
-    parent: &std::fs::File,
-    name: &std::ffi::CStr,
-    directory: &std::fs::File,
-    expected_identity: super::WorkerDirectoryIdentity,
-) -> io::Result<()> {
-    verify_empty_worker_creation_provenance(parent, name, directory, expected_identity)?;
-    directory.sync_all()?;
-    #[cfg(test)]
-    fail_worker_provenance_retirement_at(
-        super::WorkerProvenanceRetirementFault::AfterDirectorySync,
-    )?;
-    verify_empty_worker_creation_provenance(parent, name, directory, expected_identity)?;
-    if unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) } == -1 {
-        return Err(io::Error::last_os_error());
-    }
-    #[cfg(test)]
-    fail_worker_provenance_retirement_at(
-        super::WorkerProvenanceRetirementFault::AfterDirectoryUnlink,
-    )?;
-    sync_worker_creation_provenance_parent(parent)
 }
 
 fn sync_worker_creation_provenance_parent(parent: &std::fs::File) -> io::Result<()> {
@@ -1206,6 +1181,59 @@ fn worker_creation_provenance_name(
     destination_parent: &std::fs::File,
     destination_name: &[u8],
 ) -> io::Result<CString> {
+    worker_creation_provenance_name_with_prefix(
+        destination_parent,
+        destination_name,
+        ".styrn-worker-provenance-",
+    )
+}
+
+fn worker_creation_retired_provenance_name(
+    destination_parent: &std::fs::File,
+    destination_name: &[u8],
+) -> io::Result<CString> {
+    worker_creation_provenance_name_with_prefix(
+        destination_parent,
+        destination_name,
+        ".styrn-worker-retired-",
+    )
+}
+
+fn worker_creation_active_provenance_name_from_retired(
+    retired_name: &std::ffi::CStr,
+) -> io::Result<CString> {
+    const RETIRED_PREFIX: &[u8] = b".styrn-worker-retired-";
+    let suffix = retired_name
+        .to_bytes()
+        .strip_prefix(RETIRED_PREFIX)
+        .ok_or_else(|| invalid_data("retired worker provenance name has an invalid prefix"))?;
+    let mut name = b".styrn-worker-provenance-".to_vec();
+    name.extend_from_slice(suffix);
+    CString::new(name).map_err(|_| invalid_data("worker provenance name contains a NUL byte"))
+}
+
+fn worker_creation_retired_provenance_name_from_marker(
+    marker_name: &std::ffi::CStr,
+) -> io::Result<CString> {
+    const ACTIVE_PREFIX: &[u8] = b".styrn-worker-provenance-";
+    const RETIRED_PREFIX: &[u8] = b".styrn-worker-retired-";
+    if marker_name.to_bytes().starts_with(RETIRED_PREFIX) {
+        return Ok(marker_name.to_owned());
+    }
+    let suffix = marker_name
+        .to_bytes()
+        .strip_prefix(ACTIVE_PREFIX)
+        .ok_or_else(|| invalid_data("active worker provenance name has an invalid prefix"))?;
+    let mut name = RETIRED_PREFIX.to_vec();
+    name.extend_from_slice(suffix);
+    CString::new(name).map_err(|_| invalid_data("worker provenance name contains a NUL byte"))
+}
+
+fn worker_creation_provenance_name_with_prefix(
+    destination_parent: &std::fs::File,
+    destination_name: &[u8],
+    prefix: &str,
+) -> io::Result<CString> {
     use std::fmt::Write;
 
     let identity = worker_directory_identity(destination_parent)?;
@@ -1215,7 +1243,7 @@ fn worker_creation_provenance_name(
     digest.update(identity.file_id);
     digest.update(destination_name);
     let digest = digest.finalize();
-    let mut name = String::from(".styrn-worker-provenance-");
+    let mut name = String::from(prefix);
     for byte in &digest[..16] {
         write!(&mut name, "{byte:02x}").expect("writing a provenance digest cannot fail");
     }
@@ -1227,17 +1255,28 @@ fn worker_creation_provenance_record(
     destination_parent: &std::fs::File,
     destination_name: &[u8],
     created_identity: super::WorkerDirectoryIdentity,
+    provenance_directory_identity: super::WorkerDirectoryIdentity,
+    provenance_file_identity: PrivateFileIdentity,
+    expected_uid: u32,
 ) -> io::Result<Vec<u8>> {
     let staging_parent = worker_directory_identity(staging_parent)?;
     let destination_parent = worker_directory_identity(destination_parent)?;
     let name_length = u32::try_from(destination_name.len())
         .map_err(|_| invalid_data("worker directory component is too long"))?;
-    let mut record = Vec::with_capacity(96 + destination_name.len());
-    record.extend_from_slice(b"STYRN-WORKER-PROVENANCE-V1\0");
-    for identity in [staging_parent, destination_parent, created_identity] {
+    let mut record = Vec::with_capacity(144 + destination_name.len());
+    record.extend_from_slice(b"STYRN-WORKER-PROVENANCE-V2\0");
+    for identity in [
+        staging_parent,
+        destination_parent,
+        created_identity,
+        provenance_directory_identity,
+    ] {
         record.extend_from_slice(&identity.volume.to_le_bytes());
         record.extend_from_slice(&identity.file_id);
     }
+    record.extend_from_slice(&provenance_file_identity.first.to_le_bytes());
+    record.extend_from_slice(&provenance_file_identity.second.to_le_bytes());
+    record.extend_from_slice(&expected_uid.to_le_bytes());
     record.extend_from_slice(&name_length.to_le_bytes());
     record.extend_from_slice(destination_name);
     Ok(record)
@@ -1292,6 +1331,13 @@ fn worker_provenance_identity_at(
 }
 
 fn verify_worker_creation_provenance(provenance: &WorkerCreationProvenance) -> io::Result<()> {
+    verify_worker_creation_provenance_at_name(provenance, &provenance.name)
+}
+
+fn verify_worker_creation_provenance_at_name(
+    provenance: &WorkerCreationProvenance,
+    name: &std::ffi::CStr,
+) -> io::Result<()> {
     use std::io::{Read, Seek};
 
     verify_staged_worker_directory_security(
@@ -1300,11 +1346,18 @@ fn verify_worker_creation_provenance(provenance: &WorkerCreationProvenance) -> i
         unsafe { libc::geteuid() },
     )?;
     if worker_directory_identity(&provenance.directory)? != provenance.directory_identity
-        || worker_directory_identity_at(&provenance.parent, &provenance.name)?
-            != provenance.directory_identity
+        || worker_directory_identity_at(&provenance.parent, name)? != provenance.directory_identity
         || worker_provenance_file_identity(&provenance.file)? != provenance.file_identity
         || worker_provenance_identity_at(&provenance.directory, c"record")?
             != provenance.file_identity
+        || worker_parent_entry_snapshot(&provenance.directory)?
+            != vec![(
+                b"record".to_vec(),
+                super::WorkerDirectoryIdentity::from_unix(
+                    provenance.file_identity.first,
+                    provenance.file_identity.second,
+                ),
+            )]
     {
         return Err(permission_denied(
             "worker creation provenance identity changed",
@@ -1322,16 +1375,41 @@ fn verify_worker_creation_provenance(provenance: &WorkerCreationProvenance) -> i
     Ok(())
 }
 
+fn verify_retired_worker_creation_provenance(
+    provenance: &WorkerCreationProvenance,
+) -> io::Result<()> {
+    let retired_name = worker_creation_retired_provenance_name_from_marker(&provenance.name)?;
+    verify_worker_creation_provenance_at_name(provenance, &retired_name)?;
+    let active_name = worker_creation_active_provenance_name_from_retired(&retired_name)?;
+    if worker_parent_entry_exists(&provenance.parent, &active_name)? {
+        return Err(permission_denied(
+            "active and retired worker provenance markers both exist",
+        ));
+    }
+    Ok(())
+}
+
 fn create_worker_creation_provenance(
     staging_parent: &std::fs::File,
     destination_parent: &std::fs::File,
     destination_name: &[u8],
     created_identity: super::WorkerDirectoryIdentity,
+    expected_uid: u32,
 ) -> io::Result<WorkerCreationProvenance> {
     use std::io::Write;
 
     let name = worker_creation_provenance_name(destination_parent, destination_name)?;
+    let retired_name =
+        worker_creation_retired_provenance_name(destination_parent, destination_name)?;
     let entries_before = worker_parent_entry_snapshot(staging_parent)?;
+    if entries_before
+        .iter()
+        .any(|(entry, _)| entry == retired_name.to_bytes())
+    {
+        return Err(permission_denied(
+            "retired worker provenance conflicts with a new creation",
+        ));
+    }
     if unsafe { libc::mkdirat(staging_parent.as_raw_fd(), name.as_ptr(), 0o700) } == -1 {
         let error = io::Error::last_os_error();
         return Err(if error.kind() == io::ErrorKind::AlreadyExists {
@@ -1373,6 +1451,9 @@ fn create_worker_creation_provenance(
         destination_parent,
         destination_name,
         created_identity,
+        directory_identity,
+        file_identity,
+        expected_uid,
     )
     .map_err(|error| {
         io::Error::new(
@@ -1402,8 +1483,49 @@ fn open_worker_creation_provenance(
     destination_parent: &std::fs::File,
     destination_name: &[u8],
     created_identity: super::WorkerDirectoryIdentity,
+    expected_uid: u32,
 ) -> io::Result<Option<WorkerCreationProvenance>> {
     let name = worker_creation_provenance_name(destination_parent, destination_name)?;
+    open_worker_creation_provenance_at_name(
+        staging_parent,
+        destination_parent,
+        destination_name,
+        created_identity,
+        expected_uid,
+        name,
+    )
+}
+
+fn open_retired_worker_creation_provenance(
+    staging_parent: &std::fs::File,
+    destination_parent: &std::fs::File,
+    destination_name: &[u8],
+    created_identity: super::WorkerDirectoryIdentity,
+    expected_uid: u32,
+) -> io::Result<Option<WorkerCreationProvenance>> {
+    let name = worker_creation_retired_provenance_name(destination_parent, destination_name)?;
+    let provenance = open_worker_creation_provenance_at_name(
+        staging_parent,
+        destination_parent,
+        destination_name,
+        created_identity,
+        expected_uid,
+        name,
+    )?;
+    if let Some(provenance) = &provenance {
+        verify_retired_worker_creation_provenance(provenance)?;
+    }
+    Ok(provenance)
+}
+
+fn open_worker_creation_provenance_at_name(
+    staging_parent: &std::fs::File,
+    destination_parent: &std::fs::File,
+    destination_name: &[u8],
+    created_identity: super::WorkerDirectoryIdentity,
+    expected_uid: u32,
+    name: CString,
+) -> io::Result<Option<WorkerCreationProvenance>> {
     let directory = match open_worker_directory_at(staging_parent, name.to_bytes()) {
         Ok(directory) => directory,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -1417,20 +1539,28 @@ fn open_worker_creation_provenance(
         libc::openat(
             directory.as_raw_fd(),
             c"record".as_ptr(),
-            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC,
         )
     };
     if descriptor == -1 {
-        return Err(worker_directory_open_error(io::Error::last_os_error()));
+        let error = worker_directory_open_error(io::Error::last_os_error());
+        return Err(if error.kind() == io::ErrorKind::NotFound {
+            permission_denied("worker creation provenance record is missing")
+        } else {
+            error
+        });
     }
     let file = unsafe { std::fs::File::from_raw_fd(descriptor) };
+    let file_identity = worker_provenance_file_identity(&file)?;
     let expected_record = worker_creation_provenance_record(
         staging_parent,
         destination_parent,
         destination_name,
         created_identity,
+        directory_identity,
+        file_identity,
+        expected_uid,
     )?;
-    let file_identity = worker_provenance_file_identity(&file)?;
     let provenance = WorkerCreationProvenance {
         parent: staging_parent.try_clone()?,
         name,
@@ -1550,12 +1680,28 @@ fn open_or_create_worker_directory_at(
 ) -> Result<OpenedWorkerDirectory, WorkerDirectoryOpenError> {
     match open_worker_directory_at(parent, name) {
         Ok(directory) => {
-            if let Some(provenance) = open_worker_creation_provenance(
+            let created_identity = worker_recovery_candidate_identity(name, &directory)?;
+            let active = open_worker_creation_provenance(
                 staging_parent,
                 parent,
                 name,
-                worker_recovery_candidate_identity(name, &directory)?,
-            )? {
+                created_identity,
+                expected_uid,
+            )?;
+            let retired = open_retired_worker_creation_provenance(
+                staging_parent,
+                parent,
+                name,
+                created_identity,
+                expected_uid,
+            )?;
+            if active.is_some() && retired.is_some() {
+                return Err(permission_denied(
+                    "active and retired worker provenance markers both exist",
+                )
+                .into());
+            }
+            if let Some(provenance) = active {
                 if let Some(authority) = unpublished_parent {
                     authority.reverify_parent(parent)?;
                     if authority.worker_uid != expected_uid || !existing_must_be_canonical {
@@ -1578,6 +1724,7 @@ fn open_or_create_worker_directory_at(
                     "published worker creation provenance is replayable conflict evidence, not receipt ownership",
                 ).into());
             }
+            drop(retired);
             verify_existing_worker_directory(&directory, expected_uid, existing_must_be_canonical)?;
             return Ok(OpenedWorkerDirectory {
                 directory,
@@ -1585,7 +1732,18 @@ fn open_or_create_worker_directory_at(
                 provenance: None,
             });
         }
-        Err(error) if error.kind() == io::ErrorKind::NotFound && may_create => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound && may_create => {
+            let active_name = worker_creation_provenance_name(parent, name)?;
+            let retired_name = worker_creation_retired_provenance_name(parent, name)?;
+            if worker_parent_entry_exists(staging_parent, &active_name)?
+                || worker_parent_entry_exists(staging_parent, &retired_name)?
+            {
+                return Err(permission_denied(
+                    "worker creation evidence exists without its exact destination directory",
+                )
+                .into());
+            }
+        }
         Err(error) => return Err(error.into()),
     }
     let staged =
@@ -1617,17 +1775,33 @@ fn create_or_open_complete_worker_root(
 )> {
     match open_worker_directory_at(root_parent, root_name) {
         Ok(directory) => {
-            if let Some(provenance) = open_worker_creation_provenance(
+            let created_identity = worker_recovery_candidate_identity(root_name, &directory)?;
+            let active = open_worker_creation_provenance(
                 root_parent,
                 root_parent,
                 root_name,
-                worker_recovery_candidate_identity(root_name, &directory)?,
-            )? {
+                created_identity,
+                expected_uid,
+            )?;
+            let retired = open_retired_worker_creation_provenance(
+                root_parent,
+                root_parent,
+                root_name,
+                created_identity,
+                expected_uid,
+            )?;
+            if active.is_some() && retired.is_some() {
+                return Err(permission_denied(
+                    "active and retired worker provenance markers both exist",
+                ));
+            }
+            if let Some(provenance) = active {
                 drop(provenance);
                 return Err(permission_denied(
                     "published worker creation provenance is replayable conflict evidence, not receipt ownership",
                 ));
             }
+            drop(retired);
             verify_worker_directory_security(&directory, expected_uid)?;
             return Ok((
                 OpenedWorkerDirectory {
@@ -1638,7 +1812,17 @@ fn create_or_open_complete_worker_root(
                 None,
             ));
         }
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            let active_name = worker_creation_provenance_name(root_parent, root_name)?;
+            let retired_name = worker_creation_retired_provenance_name(root_parent, root_name)?;
+            if worker_parent_entry_exists(root_parent, &active_name)?
+                || worker_parent_entry_exists(root_parent, &retired_name)?
+            {
+                return Err(permission_denied(
+                    "worker creation evidence exists without its exact destination directory",
+                ));
+            }
+        }
         Err(error) => return Err(error),
     }
 
@@ -1690,7 +1874,10 @@ fn fail_after_staged_tree_cleanup<T>(
     if !staged.created
         || worker_parent_entry_snapshot(parent)?
             .iter()
-            .any(|(name, _)| name.starts_with(b".styrn-worker-provenance-"))
+            .any(|(name, _)| {
+                name.starts_with(b".styrn-worker-provenance-")
+                    || name.starts_with(b".styrn-worker-retired-")
+            })
     {
         return Err(original);
     }
@@ -2151,18 +2338,35 @@ fn publish_staged_worker_directory(
         destination_name.to_bytes(),
         created_expected_uid,
     )?);
-    let provenance = match open_worker_creation_provenance(
+    let active_provenance = open_worker_creation_provenance(
         staging_parent,
         destination_parent,
         destination_name.to_bytes(),
         staged.identity,
-    )? {
+        created_expected_uid,
+    )?;
+    if open_retired_worker_creation_provenance(
+        staging_parent,
+        destination_parent,
+        destination_name.to_bytes(),
+        staged.identity,
+        created_expected_uid,
+    )?
+    .is_some()
+    {
+        return Err(permission_denied(
+            "retired worker provenance conflicts with an unpublished candidate",
+        )
+        .into());
+    }
+    let provenance = match active_provenance {
         Some(provenance) => provenance,
         None if staged.created => create_worker_creation_provenance(
             staging_parent,
             destination_parent,
             destination_name.to_bytes(),
             staged.identity,
+            created_expected_uid,
         )
         .map_err(|error| {
             io::Error::new(

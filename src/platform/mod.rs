@@ -220,20 +220,13 @@ impl WorkerNodePostPublishFault {
 #[cfg(all(test, unix))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum WorkerProvenanceRetirementFault {
-    AfterRecordUnlink,
-    AfterDirectorySync,
-    AfterDirectoryUnlink,
+    AfterMarkerRename,
     BeforeParentSync,
 }
 
 #[cfg(all(test, unix))]
 impl WorkerProvenanceRetirementFault {
-    const ALL: [Self; 4] = [
-        Self::AfterRecordUnlink,
-        Self::AfterDirectorySync,
-        Self::AfterDirectoryUnlink,
-        Self::BeforeParentSync,
-    ];
+    const ALL: [Self; 2] = [Self::AfterMarkerRename, Self::BeforeParentSync];
 }
 
 #[cfg(not(test))]
@@ -2905,13 +2898,14 @@ mod worker_directory_tests {
         let layout =
             resolve_worker_directory_layout(InstallationScope::System, &principal, Some(&root))
                 .unwrap();
-        create_worker_directory_layout(&layout)
-            .unwrap()
-            .bind_after_reverify(|_| Ok::<_, ()>(()))
-            .unwrap();
-        std::fs::remove_dir(root.join("repos")).unwrap();
+        let authority = TestNativeMutationAuthority::for_test();
+        let WorkerDirectoryNodeCreateOutcome::Created(creation) =
+            create_worker_directory_node(&layout, WorkerDirectoryNode::Root, &authority).unwrap()
+        else {
+            panic!("fresh root was not created");
+        };
+        creation.bind_after_reverify(|_| Ok::<_, ()>(())).unwrap();
         std::fs::write(root.join("repos"), b"hostile sibling\n").unwrap();
-        std::fs::remove_dir(root.join("jobs")).unwrap();
 
         assert_eq!(
             inspect_worker_directory_node(&layout, WorkerDirectoryNode::Jobs),
@@ -3004,7 +2998,10 @@ mod worker_directory_tests {
     }
 
     #[test]
-    fn retire_succeeded_worker_directory_evidence_clears_only_the_selected_record() {
+    fn retire_succeeded_worker_directory_evidence_retains_an_exact_terminal_marker() {
+        #[cfg(unix)]
+        use std::os::unix::fs::MetadataExt;
+
         let principal = resolve_current_worker_principal().unwrap();
         let parent = unique_test_directory("node-retire-succeeded-evidence");
         std::fs::create_dir(&parent).unwrap();
@@ -3023,12 +3020,221 @@ mod worker_directory_tests {
         retire_succeeded_worker_directory_evidence(&layout, WorkerDirectoryNode::Root, &authority)
             .unwrap();
 
+        #[cfg(unix)]
+        let (marker, marker_identity, record_identity) = {
+            let marker = only_worker_evidence_path(&parent, ".styrn-worker-retired-");
+            let marker_metadata = std::fs::symlink_metadata(&marker).unwrap();
+            let record_metadata = std::fs::symlink_metadata(marker.join("record")).unwrap();
+            assert!(marker_metadata.is_dir());
+            assert!(record_metadata.is_file());
+            (
+                marker,
+                (marker_metadata.dev(), marker_metadata.ino()),
+                (record_metadata.dev(), record_metadata.ino()),
+            )
+        };
+
         assert_eq!(
             inspect_worker_directory_node(&layout, WorkerDirectoryNode::Root),
             WorkerDirectoryNodeInspection::Healthy,
         );
         retire_succeeded_worker_directory_evidence(&layout, WorkerDirectoryNode::Root, &authority)
             .unwrap();
+        #[cfg(unix)]
+        {
+            let marker_metadata = std::fs::symlink_metadata(&marker).unwrap();
+            let record_metadata = std::fs::symlink_metadata(marker.join("record")).unwrap();
+            assert_eq!(
+                (marker_metadata.dev(), marker_metadata.ino()),
+                marker_identity,
+            );
+            assert_eq!(
+                (record_metadata.dev(), record_metadata.ino()),
+                record_identity,
+            );
+        }
+
+        std::fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn succeeded_worker_evidence_rejects_a_substituted_empty_active_marker() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let principal = resolve_current_worker_principal().unwrap();
+        let parent = unique_test_directory("node-retire-empty-substitution");
+        std::fs::create_dir(&parent).unwrap();
+        let root = parent.join("chosen-root");
+        let layout =
+            resolve_worker_directory_layout(InstallationScope::System, &principal, Some(&root))
+                .unwrap();
+        let authority = TestNativeMutationAuthority::for_test();
+        let WorkerDirectoryNodeCreateOutcome::Created(creation) =
+            create_worker_directory_node(&layout, WorkerDirectoryNode::Root, &authority).unwrap()
+        else {
+            panic!("fresh root was not created");
+        };
+
+        let error = creation
+            .bind_after_reverify(|_| Err::<(), _>("injected durable receipt failure"))
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            WorkerDirectoryBindingError::Binding("injected durable receipt failure")
+        ));
+
+        let marker = only_worker_evidence_path(&parent, ".styrn-worker-provenance-");
+        std::fs::remove_dir_all(&marker).unwrap();
+        std::fs::create_dir(&marker).unwrap();
+        std::fs::set_permissions(&marker, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let replacement = std::fs::symlink_metadata(&marker).unwrap();
+
+        let error = retire_succeeded_worker_directory_evidence(
+            &layout,
+            WorkerDirectoryNode::Root,
+            &authority,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        let retained = std::fs::symlink_metadata(&marker).unwrap();
+        assert_eq!(
+            (retained.dev(), retained.ino()),
+            (replacement.dev(), replacement.ino())
+        );
+        assert_eq!(
+            inspect_worker_directory_node(&layout, WorkerDirectoryNode::Root),
+            WorkerDirectoryNodeInspection::Conflict(
+                WorkerDirectoryInspectionIssue::UnsafeOrConflictingState,
+            ),
+        );
+
+        std::fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn interrupted_retirement_rejects_a_substituted_retired_marker() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let principal = resolve_current_worker_principal().unwrap();
+        let parent = unique_test_directory("node-retire-retired-substitution");
+        std::fs::create_dir(&parent).unwrap();
+        let root = parent.join("chosen-root");
+        let layout =
+            resolve_worker_directory_layout(InstallationScope::System, &principal, Some(&root))
+                .unwrap();
+        let authority = TestNativeMutationAuthority::for_test();
+        let WorkerDirectoryNodeCreateOutcome::Created(creation) =
+            create_worker_directory_node(&layout, WorkerDirectoryNode::Root, &authority).unwrap()
+        else {
+            panic!("fresh root was not created");
+        };
+        platform_impl::set_worker_provenance_retirement_fault_for_test(Some(
+            WorkerProvenanceRetirementFault::AfterMarkerRename,
+        ));
+        let bound = creation
+            .bind_after_reverify(|_| Ok::<_, ()>("durable receipt value"))
+            .unwrap();
+        platform_impl::set_worker_provenance_retirement_fault_for_test(None);
+        assert!(matches!(
+            bound,
+            WorkerDirectoryBound::BoundWithRetirementFailure { value, error }
+                if value == "durable receipt value"
+                    && error.kind() == std::io::ErrorKind::Other
+        ));
+
+        let marker = only_worker_evidence_path(&parent, ".styrn-worker-retired-");
+        let displaced = parent.join(".styrn-test-displaced-retired-marker");
+        std::fs::rename(&marker, &displaced).unwrap();
+        std::fs::create_dir(&marker).unwrap();
+        std::fs::set_permissions(&marker, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let replacement = std::fs::symlink_metadata(&marker).unwrap();
+
+        let error = retire_succeeded_worker_directory_evidence(
+            &layout,
+            WorkerDirectoryNode::Root,
+            &authority,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        let retained = std::fs::symlink_metadata(&marker).unwrap();
+        assert_eq!(
+            (retained.dev(), retained.ino()),
+            (replacement.dev(), replacement.ino())
+        );
+        assert!(displaced.join("record").is_file());
+        assert!(root.is_dir());
+        assert_eq!(
+            inspect_worker_directory_node(&layout, WorkerDirectoryNode::Root),
+            WorkerDirectoryNodeInspection::Conflict(
+                WorkerDirectoryInspectionIssue::UnsafeOrConflictingState,
+            ),
+        );
+
+        std::fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn active_and_retired_worker_markers_conflict_without_mutation() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let principal = resolve_current_worker_principal().unwrap();
+        let parent = unique_test_directory("node-retire-active-and-retired");
+        std::fs::create_dir(&parent).unwrap();
+        let root = parent.join("chosen-root");
+        let layout =
+            resolve_worker_directory_layout(InstallationScope::System, &principal, Some(&root))
+                .unwrap();
+        let authority = TestNativeMutationAuthority::for_test();
+        let WorkerDirectoryNodeCreateOutcome::Created(creation) =
+            create_worker_directory_node(&layout, WorkerDirectoryNode::Root, &authority).unwrap()
+        else {
+            panic!("fresh root was not created");
+        };
+        assert!(matches!(
+            creation
+                .bind_after_reverify(|_| Ok::<_, ()>("durable receipt value"))
+                .unwrap(),
+            WorkerDirectoryBound::Bound("durable receipt value")
+        ));
+
+        let retired = only_worker_evidence_path(&parent, ".styrn-worker-retired-");
+        let suffix = retired
+            .file_name()
+            .and_then(std::ffi::OsStr::to_str)
+            .and_then(|name| name.strip_prefix(".styrn-worker-retired-"))
+            .unwrap();
+        let active = parent.join(format!(".styrn-worker-provenance-{suffix}"));
+        std::fs::create_dir(&active).unwrap();
+        std::fs::set_permissions(&active, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let active_identity = std::fs::symlink_metadata(&active).unwrap();
+        let retired_identity = std::fs::symlink_metadata(&retired).unwrap();
+
+        let error = retire_succeeded_worker_directory_evidence(
+            &layout,
+            WorkerDirectoryNode::Root,
+            &authority,
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        let active_retained = std::fs::symlink_metadata(&active).unwrap();
+        let retired_retained = std::fs::symlink_metadata(&retired).unwrap();
+        assert_eq!(
+            (active_retained.dev(), active_retained.ino()),
+            (active_identity.dev(), active_identity.ino()),
+        );
+        assert_eq!(
+            (retired_retained.dev(), retired_retained.ino()),
+            (retired_identity.dev(), retired_identity.ino()),
+        );
+        assert_eq!(
+            inspect_worker_directory_node(&layout, WorkerDirectoryNode::Root),
+            WorkerDirectoryNodeInspection::Conflict(
+                WorkerDirectoryInspectionIssue::UnsafeOrConflictingState,
+            ),
+        );
 
         std::fs::remove_dir_all(parent).unwrap();
     }
@@ -3531,8 +3737,19 @@ mod worker_directory_tests {
                         && error.kind() == std::io::ErrorKind::Other
             ));
 
-            // Even a prefix where the provenance directory is already absent
-            // must retry the parent durability barrier before reporting success.
+            let retired = only_worker_evidence_path(&parent, ".styrn-worker-retired-");
+            assert!(retired.join("record").is_file(), "{fault:?}");
+            assert!(
+                std::fs::read_dir(&parent)
+                    .unwrap()
+                    .map(|entry| entry.unwrap().file_name())
+                    .filter_map(|name| name.into_string().ok())
+                    .all(|name| !name.starts_with(".styrn-worker-provenance-")),
+                "{fault:?}",
+            );
+
+            // A visible terminal marker must retry the staging-parent
+            // durability barrier before reporting logical retirement.
             platform_impl::set_worker_provenance_retirement_fault_for_test(Some(
                 WorkerProvenanceRetirementFault::BeforeParentSync,
             ));
@@ -3977,7 +4194,24 @@ mod worker_directory_tests {
             .unwrap();
 
         let parent_entries = directory_entry_names(&parent);
-        assert_eq!(parent_entries, BTreeSet::from(["chosen-root".to_owned()]));
+        assert_eq!(
+            parent_entries
+                .iter()
+                .filter(|name| !name.starts_with(".styrn-worker-retired-"))
+                .cloned()
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["chosen-root".to_owned()]),
+        );
+        #[cfg(unix)]
+        assert_eq!(
+            parent_entries
+                .iter()
+                .filter(|name| name.starts_with(".styrn-worker-retired-"))
+                .count(),
+            6,
+        );
+        #[cfg(windows)]
+        assert_eq!(parent_entries.len(), 1);
         let root_entries = directory_entry_names(&root);
         assert_eq!(
             root_entries,
@@ -4384,9 +4618,21 @@ mod worker_directory_tests {
             .bind_after_reverify(|_| Ok::<_, ()>(()))
             .unwrap();
 
+        let profile_entries = directory_entry_names(&profile);
         assert_eq!(
-            directory_entry_names(&profile),
-            BTreeSet::from(["new".to_owned()])
+            profile_entries
+                .iter()
+                .filter(|name| !name.starts_with(".styrn-worker-retired-"))
+                .cloned()
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from(["new".to_owned()]),
+        );
+        assert_eq!(
+            profile_entries
+                .iter()
+                .filter(|name| name.starts_with(".styrn-worker-retired-"))
+                .count(),
+            1,
         );
         for path in [
             profile.join("new"),
@@ -4711,6 +4957,21 @@ mod worker_directory_tests {
             .unwrap()
             .map(|entry| entry.unwrap().file_name().into_string().unwrap())
             .collect()
+    }
+
+    #[cfg(unix)]
+    fn only_worker_evidence_path(parent: &Path, prefix: &str) -> PathBuf {
+        let mut matches = std::fs::read_dir(parent)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(std::ffi::OsStr::to_str)
+                    .is_some_and(|name| name.starts_with(prefix))
+            });
+        let path = matches.next().expect("worker evidence entry was absent");
+        assert!(matches.next().is_none(), "worker evidence was ambiguous");
+        path
     }
 }
 
