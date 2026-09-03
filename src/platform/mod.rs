@@ -201,6 +201,17 @@ std::thread_local! {
     static WORKER_NODE_INSPECTION_UNAVAILABLE: std::cell::Cell<bool> = const {
         std::cell::Cell::new(false)
     };
+    static WORKER_LAYOUT_LOCK_PROBE: std::cell::RefCell<Option<
+        std::sync::mpsc::Sender<WorkerLayoutLockProbeEvent>,
+    >> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum WorkerLayoutLockProbeEvent {
+    Contended,
+    Acquired,
+    UnexpectedlyAvailable,
 }
 
 #[cfg(test)]
@@ -219,6 +230,30 @@ pub(crate) fn set_worker_node_post_binding_interruption_for_action_test(interrup
 #[allow(dead_code)] // The source-inclusion contract binary omits action tests.
 pub(crate) fn set_worker_node_inspection_unavailable_for_action_test(unavailable: bool) {
     WORKER_NODE_INSPECTION_UNAVAILABLE.with(|slot| slot.set(unavailable));
+}
+
+#[cfg(test)]
+#[allow(dead_code)] // The source-inclusion contract binary omits action tests.
+pub(crate) fn set_worker_layout_lock_probe_for_action_test(
+    probe: Option<std::sync::mpsc::Sender<WorkerLayoutLockProbeEvent>>,
+) {
+    WORKER_LAYOUT_LOCK_PROBE.with(|slot| *slot.borrow_mut() = probe);
+}
+
+#[cfg(test)]
+fn worker_layout_lock_probe_is_enabled_for_action_test() -> bool {
+    WORKER_LAYOUT_LOCK_PROBE.with(|slot| slot.borrow().is_some())
+}
+
+#[cfg(test)]
+fn notify_worker_layout_lock_probe_for_action_test(event: WorkerLayoutLockProbeEvent) {
+    WORKER_LAYOUT_LOCK_PROBE.with(|slot| {
+        if let Some(probe) = slot.borrow().as_ref() {
+            probe
+                .send(event)
+                .expect("worker layout lock probe receiver must remain available");
+        }
+    });
 }
 
 #[cfg(test)]

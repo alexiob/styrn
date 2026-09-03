@@ -565,9 +565,15 @@ pub(super) fn create_worker_directory_node(
         let creation_lock =
             open_worker_creation_anchor(&root_components, first_creatable, initial_uid)?;
         let lock_anchor_identity = worker_directory_identity(&creation_lock)?;
+        #[cfg(test)]
+        probe_worker_layout_lock_contention_for_action_test(&creation_lock)?;
         if unsafe { libc::flock(creation_lock.as_raw_fd(), libc::LOCK_EX) } == -1 {
             return Err(io::Error::last_os_error().into());
         }
+        #[cfg(test)]
+        super::notify_worker_layout_lock_probe_for_action_test(
+            super::WorkerLayoutLockProbeEvent::Acquired,
+        );
         verify_worker_path_identity(&lock_anchor_path, lock_anchor_identity)?;
         let expected_uid = revalidate_worker_root_principal(layout)?.unix_uid()?;
         let (staging_parent, parent, name, path, canonical) = worker_node_location(
@@ -681,6 +687,34 @@ pub(super) fn create_worker_directory_node(
     Ok(super::WorkerDirectoryNodeCreateOutcome::Created(
         super::WorkerDirectoryNodeCreation::new(observation, evidence.lease),
     ))
+}
+
+#[cfg(test)]
+fn probe_worker_layout_lock_contention_for_action_test(lock: &std::fs::File) -> io::Result<()> {
+    if !super::worker_layout_lock_probe_is_enabled_for_action_test() {
+        return Ok(());
+    }
+    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_UN) } == -1 {
+            return Err(io::Error::last_os_error());
+        }
+        super::notify_worker_layout_lock_probe_for_action_test(
+            super::WorkerLayoutLockProbeEvent::UnexpectedlyAvailable,
+        );
+        return Ok(());
+    }
+    let error = io::Error::last_os_error();
+    if error
+        .raw_os_error()
+        .is_some_and(|raw| raw == libc::EWOULDBLOCK || raw == libc::EAGAIN)
+    {
+        super::notify_worker_layout_lock_probe_for_action_test(
+            super::WorkerLayoutLockProbeEvent::Contended,
+        );
+        Ok(())
+    } else {
+        Err(error)
+    }
 }
 
 fn worker_node_location<'component>(

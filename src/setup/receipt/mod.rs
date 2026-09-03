@@ -25,6 +25,59 @@ fn fixture_worker_principal() -> WorkerPrincipal {
         .expect("receipt security tests require a real non-privileged caller")
 }
 
+#[cfg(test)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(in crate::setup) enum ReceiptApplyLockProbeEvent {
+    Contended,
+    Acquired,
+    UnexpectedlyAvailable,
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static RECEIPT_APPLY_LOCK_PROBE: std::cell::RefCell<Option<
+        std::sync::mpsc::Sender<ReceiptApplyLockProbeEvent>,
+    >> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(in crate::setup) fn set_receipt_apply_lock_probe_for_action_test(
+    probe: Option<std::sync::mpsc::Sender<ReceiptApplyLockProbeEvent>>,
+) {
+    RECEIPT_APPLY_LOCK_PROBE.with(|slot| *slot.borrow_mut() = probe);
+}
+
+#[cfg(test)]
+fn probe_receipt_apply_lock_for_test(lock: &std::fs::File) -> std::io::Result<()> {
+    let probe = RECEIPT_APPLY_LOCK_PROBE.with(|slot| slot.borrow().clone());
+    let Some(probe) = probe else {
+        return Ok(());
+    };
+    let event = match lock.try_lock() {
+        Ok(()) => {
+            lock.unlock()?;
+            ReceiptApplyLockProbeEvent::UnexpectedlyAvailable
+        }
+        Err(std::fs::TryLockError::WouldBlock) => ReceiptApplyLockProbeEvent::Contended,
+        Err(std::fs::TryLockError::Error(error)) => return Err(error),
+    };
+    probe
+        .send(event)
+        .expect("receipt apply lock probe receiver must remain available");
+    Ok(())
+}
+
+#[cfg(test)]
+fn notify_receipt_apply_lock_acquired_for_test() {
+    RECEIPT_APPLY_LOCK_PROBE.with(|slot| {
+        if let Some(probe) = slot.borrow().as_ref() {
+            probe
+                .send(ReceiptApplyLockProbeEvent::Acquired)
+                .expect("receipt apply lock probe receiver must remain available");
+        }
+    });
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub(in crate::setup) struct ReceiptDocument {
     schema_version: u32,
@@ -1196,7 +1249,11 @@ impl ReceiptStore {
         self.preflight_writer_state()?;
         let lock = crate::platform::open_manifest_lock(&self.lock_path(), self.owner, &self.worker)
             .map_err(ReceiptStoreError::Write)?;
+        #[cfg(test)]
+        probe_receipt_apply_lock_for_test(&lock).map_err(ReceiptStoreError::Write)?;
         lock.lock().map_err(ReceiptStoreError::Write)?;
+        #[cfg(test)]
+        notify_receipt_apply_lock_acquired_for_test();
         self.read_locked()?;
         Ok(ReceiptApplySession {
             store: self,

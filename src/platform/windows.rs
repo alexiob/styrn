@@ -241,6 +241,8 @@ const SEE_MASK_NOASYNC: u32 = 0x0000_0100;
 const SW_SHOWNORMAL: i32 = 1;
 const WAIT_OBJECT_0: u32 = 0;
 const WAIT_ABANDONED_0: u32 = 0x0000_0080;
+#[cfg(test)]
+const WAIT_TIMEOUT: u32 = 0x0000_0102;
 const CSTR_EQUAL: i32 = 2;
 const INFINITE: u32 = 0xffff_ffff;
 const COINIT_APARTMENTTHREADED: u32 = 0x2;
@@ -2380,10 +2382,31 @@ impl WorkerLayoutLock {
         let handle = OwnedHandle(handle);
         #[cfg(test)]
         run_before_worker_mutex_wait_hook();
+        #[cfg(test)]
+        if super::worker_layout_lock_probe_is_enabled_for_action_test() {
+            match unsafe { WaitForSingleObject(handle.0, 0) } {
+                WAIT_TIMEOUT => super::notify_worker_layout_lock_probe_for_action_test(
+                    super::WorkerLayoutLockProbeEvent::Contended,
+                ),
+                WAIT_OBJECT_0 | WAIT_ABANDONED_0 => {
+                    if unsafe { ReleaseMutex(handle.0) } == 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                    super::notify_worker_layout_lock_probe_for_action_test(
+                        super::WorkerLayoutLockProbeEvent::UnexpectedlyAvailable,
+                    );
+                }
+                _ => return Err(io::Error::last_os_error()),
+            }
+        }
         let result = unsafe { WaitForSingleObject(handle.0, INFINITE) };
         if !matches!(result, WAIT_OBJECT_0 | WAIT_ABANDONED_0) {
             return Err(io::Error::last_os_error());
         }
+        #[cfg(test)]
+        super::notify_worker_layout_lock_probe_for_action_test(
+            super::WorkerLayoutLockProbeEvent::Acquired,
+        );
         Ok(Self { handle })
     }
 }

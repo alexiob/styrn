@@ -1538,7 +1538,6 @@ enum WorkerDirectoryRaceRole {
 enum WorkerDirectoryRaceEvent {
     Prepared(WorkerDirectoryRaceRole),
     WinnerBound,
-    LoserNativeAttempt,
 }
 
 struct WorkerDirectoryRaceRunner {
@@ -1564,11 +1563,6 @@ impl PreparedActionRunner for WorkerDirectoryRaceRunner {
             .send(WorkerDirectoryRaceEvent::Prepared(self.role))
             .unwrap();
         self.start.recv().unwrap();
-        if self.role == WorkerDirectoryRaceRole::Loser {
-            self.events
-                .send(WorkerDirectoryRaceEvent::LoserNativeAttempt)
-                .unwrap();
-        }
         let role = self.role;
         let events = self.events.clone();
         let finish_winner_binding = self.finish_winner_binding.as_ref();
@@ -1581,6 +1575,37 @@ impl PreparedActionRunner for WorkerDirectoryRaceRunner {
                 }
                 Ok(binding)
             })
+            .map_err(|error| match error {
+                super::PreparedExecutionError::Action(error) => ApplyPlanError::Action(error),
+                super::PreparedExecutionError::ReceiptConflict => {
+                    ApplyPlanError::Receipt(ReceiptStoreError::IntentConflict)
+                }
+                super::PreparedExecutionError::Binding(error) => ApplyPlanError::Receipt(error),
+            })
+    }
+}
+
+struct PauseAfterPreparedRunner {
+    entered: std::sync::mpsc::Sender<()>,
+    resume: std::sync::mpsc::Receiver<()>,
+}
+
+impl PreparedActionRunner for PauseAfterPreparedRunner {
+    fn execute_prepared_and_bind<Bind>(
+        &mut self,
+        action: &mut Action,
+        _expected: &ActionEffect,
+        bind: Bind,
+    ) -> Result<(MutationCompletion, DurableReceiptBinding), ApplyPlanError>
+    where
+        Bind: for<'authority> FnOnce(
+            VerifiedActionEffect<'authority>,
+        ) -> Result<DurableReceiptBinding, ReceiptStoreError>,
+    {
+        self.entered.send(()).unwrap();
+        self.resume.recv().unwrap();
+        action
+            .execute_prepared_and_bind(bind)
             .map_err(|error| match error {
                 super::PreparedExecutionError::Action(error) => ApplyPlanError::Action(error),
                 super::PreparedExecutionError::ReceiptConflict => {
@@ -1649,8 +1674,17 @@ fn separate_receipt_stores_racing_one_layout_have_one_owner_and_one_conflict() {
     let (loser_start_tx, loser_start_rx) = std::sync::mpsc::channel();
     let (winner_finish_tx, winner_finish_rx) = std::sync::mpsc::channel();
     let (completed_tx, completed_rx) = std::sync::mpsc::channel();
+    let (native_lock_tx, native_lock_rx) = std::sync::mpsc::channel();
 
-    let (winner_result, loser_result) = std::thread::scope(|scope| {
+    let (
+        winner_join,
+        loser_join,
+        prepared,
+        winner_bound,
+        contended,
+        completion_before_release,
+        acquired,
+    ) = std::thread::scope(|scope| {
         let winner_completed = completed_tx.clone();
         let winner_events = events_tx.clone();
         let winner = scope.spawn(move || {
@@ -1676,6 +1710,7 @@ fn separate_receipt_stores_racing_one_layout_have_one_owner_and_one_conflict() {
         });
         let loser_completed = completed_tx.clone();
         let loser = scope.spawn(move || {
+            crate::platform::set_worker_layout_lock_probe_for_action_test(Some(native_lock_tx));
             let mut runner = WorkerDirectoryRaceRunner {
                 role: WorkerDirectoryRaceRole::Loser,
                 events: events_tx,
@@ -1691,42 +1726,63 @@ fn separate_receipt_stores_racing_one_layout_have_one_owner_and_one_conflict() {
                 )]),
                 &mut runner,
             );
+            crate::platform::set_worker_layout_lock_probe_for_action_test(None);
             loser_completed
                 .send(WorkerDirectoryRaceRole::Loser)
                 .unwrap();
             result
         });
 
-        let mut prepared = [events_rx.recv().unwrap(), events_rx.recv().unwrap()];
-        prepared.sort_by_key(|event| match event {
-            WorkerDirectoryRaceEvent::Prepared(WorkerDirectoryRaceRole::Winner) => 0,
-            WorkerDirectoryRaceEvent::Prepared(WorkerDirectoryRaceRole::Loser) => 1,
-            _ => 2,
-        });
-        assert_eq!(
+        let prepared = [
+            events_rx.recv_timeout(std::time::Duration::from_secs(10)),
+            events_rx.recv_timeout(std::time::Duration::from_secs(10)),
+        ];
+        let _ = winner_start_tx.send(());
+        let winner_bound = events_rx.recv_timeout(std::time::Duration::from_secs(10));
+        let _ = loser_start_tx.send(());
+        let contended = native_lock_rx.recv_timeout(std::time::Duration::from_secs(10));
+        let completion_before_release = completed_rx.try_recv();
+        let _ = winner_finish_tx.send(());
+        let acquired = native_lock_rx.recv_timeout(std::time::Duration::from_secs(10));
+        (
+            winner.join(),
+            loser.join(),
             prepared,
-            [
-                WorkerDirectoryRaceEvent::Prepared(WorkerDirectoryRaceRole::Winner),
-                WorkerDirectoryRaceEvent::Prepared(WorkerDirectoryRaceRole::Loser),
-            ]
-        );
-        winner_start_tx.send(()).unwrap();
-        assert_eq!(
-            events_rx.recv().unwrap(),
-            WorkerDirectoryRaceEvent::WinnerBound
-        );
-        loser_start_tx.send(()).unwrap();
-        assert_eq!(
-            events_rx.recv().unwrap(),
-            WorkerDirectoryRaceEvent::LoserNativeAttempt
-        );
-        assert!(matches!(
-            completed_rx.recv_timeout(std::time::Duration::from_millis(100)),
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
-        ));
-        winner_finish_tx.send(()).unwrap();
-        (winner.join().unwrap(), loser.join().unwrap())
+            winner_bound,
+            contended,
+            completion_before_release,
+            acquired,
+        )
     });
+
+    let mut prepared = prepared.map(Result::unwrap);
+    prepared.sort_by_key(|event| match event {
+        WorkerDirectoryRaceEvent::Prepared(WorkerDirectoryRaceRole::Winner) => 0,
+        WorkerDirectoryRaceEvent::Prepared(WorkerDirectoryRaceRole::Loser) => 1,
+        _ => 2,
+    });
+    assert_eq!(
+        prepared,
+        [
+            WorkerDirectoryRaceEvent::Prepared(WorkerDirectoryRaceRole::Winner),
+            WorkerDirectoryRaceEvent::Prepared(WorkerDirectoryRaceRole::Loser),
+        ]
+    );
+    assert_eq!(winner_bound.unwrap(), WorkerDirectoryRaceEvent::WinnerBound);
+    assert_eq!(
+        contended.unwrap(),
+        crate::platform::WorkerLayoutLockProbeEvent::Contended,
+    );
+    assert!(matches!(
+        completion_before_release,
+        Err(std::sync::mpsc::TryRecvError::Empty)
+    ));
+    assert_eq!(
+        acquired.unwrap(),
+        crate::platform::WorkerLayoutLockProbeEvent::Acquired,
+    );
+    let winner_result = winner_join.unwrap();
+    let loser_result = loser_join.unwrap();
 
     assert_eq!(winner_result.unwrap().applied_count(), 1);
     let loser_error = loser_result.unwrap_err();
@@ -1772,37 +1828,81 @@ fn same_receipt_store_serializes_worker_directory_before_the_second_check() {
     second_plan.retain(|action| action.name().as_str() == "identity.directory.root");
     let store = ReceiptStore::new_user_for_test_with_worker_layout(fixture.receipt_path(), layout);
     let snapshot_store = store.clone();
-    let start = Arc::new(Barrier::new(2));
+    let (first_entered_tx, first_entered_rx) = std::sync::mpsc::channel();
+    let (release_first_tx, release_first_rx) = std::sync::mpsc::channel();
+    let (receipt_lock_tx, receipt_lock_rx) = std::sync::mpsc::channel();
+    let (completed_tx, completed_rx) = std::sync::mpsc::channel();
 
-    let reports = std::thread::scope(|scope| {
-        let first_store = store.clone();
-        let first_start = Arc::clone(&start);
-        let first = scope.spawn(move || {
-            first_start.wait();
-            apply_plan_with_journal(
-                &mut first_plan,
-                &first_store,
-                &mut ReceiptMetadataSource::for_test([(
-                    "019cb090-3400-7000-8000-000000000071",
-                    "2026-09-03T12:41:00Z",
-                )]),
+    let (first_join, second_join, contended, completion_before_release, acquired) =
+        std::thread::scope(|scope| {
+            let first_store = store.clone();
+            let first_completed = completed_tx.clone();
+            let first = scope.spawn(move || {
+                let mut runner = PauseAfterPreparedRunner {
+                    entered: first_entered_tx,
+                    resume: release_first_rx,
+                };
+                let result = apply_plan_with_runner(
+                    &mut first_plan,
+                    &first_store,
+                    &mut ReceiptMetadataSource::for_test([(
+                        "019cb090-3400-7000-8000-000000000071",
+                        "2026-09-03T12:41:00Z",
+                    )]),
+                    &mut runner,
+                );
+                first_completed
+                    .send(WorkerDirectoryRaceRole::Winner)
+                    .unwrap();
+                result
+            });
+            let first_entered = first_entered_rx.recv_timeout(std::time::Duration::from_secs(10));
+            let second = scope.spawn(move || {
+                crate::setup::receipt::set_receipt_apply_lock_probe_for_action_test(Some(
+                    receipt_lock_tx,
+                ));
+                let result = apply_plan_with_journal(
+                    &mut second_plan,
+                    &store,
+                    &mut ReceiptMetadataSource::for_test([(
+                        "019cb090-3400-7000-8000-000000000072",
+                        "2026-09-03T12:41:01Z",
+                    )]),
+                );
+                crate::setup::receipt::set_receipt_apply_lock_probe_for_action_test(None);
+                completed_tx.send(WorkerDirectoryRaceRole::Loser).unwrap();
+                result
+            });
+            let contended = if first_entered.is_ok() {
+                receipt_lock_rx.recv_timeout(std::time::Duration::from_secs(10))
+            } else {
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected)
+            };
+            let completion_before_release = completed_rx.try_recv();
+            let _ = release_first_tx.send(());
+            let acquired = receipt_lock_rx.recv_timeout(std::time::Duration::from_secs(10));
+            (
+                first.join(),
+                second.join(),
+                contended,
+                completion_before_release,
+                acquired,
             )
-            .unwrap()
         });
-        let second = scope.spawn(move || {
-            start.wait();
-            apply_plan_with_journal(
-                &mut second_plan,
-                &store,
-                &mut ReceiptMetadataSource::for_test([(
-                    "019cb090-3400-7000-8000-000000000072",
-                    "2026-09-03T12:41:01Z",
-                )]),
-            )
-            .unwrap()
-        });
-        [first.join().unwrap(), second.join().unwrap()]
-    });
+
+    assert_eq!(
+        contended.unwrap(),
+        crate::setup::receipt::ReceiptApplyLockProbeEvent::Contended,
+    );
+    assert!(matches!(
+        completion_before_release,
+        Err(std::sync::mpsc::TryRecvError::Empty)
+    ));
+    assert_eq!(
+        acquired.unwrap(),
+        crate::setup::receipt::ReceiptApplyLockProbeEvent::Acquired,
+    );
+    let reports = [first_join.unwrap().unwrap(), second_join.unwrap().unwrap()];
 
     assert_eq!(
         reports
