@@ -1232,6 +1232,11 @@ pub(in crate::setup) use worker_directory::dedicated_system_worker_directory_pla
 pub(in crate::setup) use worker_directory::dedicated_system_worker_directory_plan_for_test;
 #[cfg(not(action_core_fixture))]
 mod authorization;
+#[cfg(not(any(action_core_fixture, action_compile_fixture)))]
+pub(in crate::setup) use authorization::ScopePromotionAuthorizationAuthority;
+
+#[cfg(all(test, not(target_os = "windows")))]
+pub(in crate::setup) use authorization::prepare_scope_promotion_authorization_request_for_test;
 #[cfg(not(action_core_fixture))]
 mod execution;
 #[cfg(not(action_core_fixture))]

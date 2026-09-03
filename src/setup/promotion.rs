@@ -38,6 +38,21 @@ pub(crate) struct ScopePromotionCheckpoint {
     user_manifest_sha256: Box<str>,
     system_manifest_path: Box<str>,
     system_manifest_sha256: Box<str>,
+    system_manifest_identity_sha256: Box<str>,
+    system_receipt_path: Box<str>,
+    system_receipt_sha256: Box<str>,
+    system_receipt_identity_sha256: Box<str>,
+    authorization_request_id: uuid::Uuid,
+    authorization_request_sha256: Box<str>,
+    authorization_record_path: Box<str>,
+    authorization_record_sha256: Box<str>,
+    authorization_record_identity_sha256: Box<str>,
+    promotion_intent_path: Box<str>,
+    promotion_intent_sha256: Box<str>,
+    promotion_intent_identity_sha256: Box<str>,
+    completion_record_path: Box<str>,
+    completion_record_sha256: Box<str>,
+    completion_record_identity_sha256: Box<str>,
     original_operator: WorkerPrincipal,
     target_principal: WorkerPrincipal,
     selector_sha256: Box<str>,
@@ -55,19 +70,49 @@ impl ScopePromotionCheckpoint {
         user_manifest_sha256: &str,
         system_manifest_path: &str,
         system_manifest_sha256: &str,
+        system_manifest_identity_sha256: &str,
+        system_receipt_path: &str,
+        system_receipt_sha256: &str,
+        system_receipt_identity_sha256: &str,
+        authorization_request_id: uuid::Uuid,
+        authorization_request_sha256: &str,
+        authorization_record_path: &str,
+        authorization_record_sha256: &str,
+        authorization_record_identity_sha256: &str,
+        promotion_intent_path: &str,
+        promotion_intent_sha256: &str,
+        promotion_intent_identity_sha256: &str,
+        completion_record_path: &str,
+        completion_record_sha256: &str,
+        completion_record_identity_sha256: &str,
         promotion_intent_id: uuid::Uuid,
     ) -> Result<Self, ScopePromotionError> {
         if !is_uuid_v7(machine_id)
             || !is_uuid_v7(promotion_intent_id)
+            || !is_uuid_v7(authorization_request_id)
             || original_operator.account_policy() != WorkerAccountPolicy::CurrentUser
             || target_principal.account_policy() != WorkerAccountPolicy::Dedicated
             || original_operator == target_principal
             || !valid_sha256(selector_sha256)
             || !valid_sha256(user_manifest_sha256)
             || !valid_sha256(system_manifest_sha256)
+            || !valid_sha256(system_manifest_identity_sha256)
+            || !valid_sha256(system_receipt_sha256)
+            || !valid_sha256(system_receipt_identity_sha256)
+            || !valid_sha256(authorization_request_sha256)
+            || !valid_sha256(authorization_record_sha256)
+            || !valid_sha256(authorization_record_identity_sha256)
+            || !valid_sha256(promotion_intent_sha256)
+            || !valid_sha256(promotion_intent_identity_sha256)
+            || !valid_sha256(completion_record_sha256)
+            || !valid_sha256(completion_record_identity_sha256)
             || sha256_hex(target_principal.name().as_bytes()) != selector_sha256
             || !normalized_absolute_path(user_manifest_path)
             || !normalized_absolute_path(system_manifest_path)
+            || !normalized_absolute_path(system_receipt_path)
+            || !normalized_absolute_path(authorization_record_path)
+            || !normalized_absolute_path(promotion_intent_path)
+            || !normalized_absolute_path(completion_record_path)
             || user_manifest_path == system_manifest_path
         {
             return Err(ScopePromotionError::Conflict);
@@ -80,6 +125,21 @@ impl ScopePromotionCheckpoint {
             user_manifest_sha256: user_manifest_sha256.into(),
             system_manifest_path: system_manifest_path.into(),
             system_manifest_sha256: system_manifest_sha256.into(),
+            system_manifest_identity_sha256: system_manifest_identity_sha256.into(),
+            system_receipt_path: system_receipt_path.into(),
+            system_receipt_sha256: system_receipt_sha256.into(),
+            system_receipt_identity_sha256: system_receipt_identity_sha256.into(),
+            authorization_request_id,
+            authorization_request_sha256: authorization_request_sha256.into(),
+            authorization_record_path: authorization_record_path.into(),
+            authorization_record_sha256: authorization_record_sha256.into(),
+            authorization_record_identity_sha256: authorization_record_identity_sha256.into(),
+            promotion_intent_path: promotion_intent_path.into(),
+            promotion_intent_sha256: promotion_intent_sha256.into(),
+            promotion_intent_identity_sha256: promotion_intent_identity_sha256.into(),
+            completion_record_path: completion_record_path.into(),
+            completion_record_sha256: completion_record_sha256.into(),
+            completion_record_identity_sha256: completion_record_identity_sha256.into(),
             original_operator: original_operator.clone(),
             target_principal: target_principal.clone(),
             selector_sha256: selector_sha256.into(),
@@ -97,6 +157,21 @@ impl ScopePromotionCheckpoint {
         user_manifest_sha256: &str,
         system_manifest_path: &str,
         system_manifest_sha256: &str,
+        system_manifest_identity_sha256: &str,
+        system_receipt_path: &str,
+        system_receipt_sha256: &str,
+        system_receipt_identity_sha256: &str,
+        authorization_request_id: uuid::Uuid,
+        authorization_request_sha256: &str,
+        authorization_record_path: &str,
+        authorization_record_sha256: &str,
+        authorization_record_identity_sha256: &str,
+        promotion_intent_path: &str,
+        promotion_intent_sha256: &str,
+        promotion_intent_identity_sha256: &str,
+        completion_record_path: &str,
+        completion_record_sha256: &str,
+        completion_record_identity_sha256: &str,
         promotion_intent_id: uuid::Uuid,
         _authority: &ScopePromotionAuthority,
     ) -> Result<Self, ScopePromotionError> {
@@ -109,6 +184,21 @@ impl ScopePromotionCheckpoint {
             user_manifest_sha256,
             system_manifest_path,
             system_manifest_sha256,
+            system_manifest_identity_sha256,
+            system_receipt_path,
+            system_receipt_sha256,
+            system_receipt_identity_sha256,
+            authorization_request_id,
+            authorization_request_sha256,
+            authorization_record_path,
+            authorization_record_sha256,
+            authorization_record_identity_sha256,
+            promotion_intent_path,
+            promotion_intent_sha256,
+            promotion_intent_identity_sha256,
+            completion_record_path,
+            completion_record_sha256,
+            completion_record_identity_sha256,
             promotion_intent_id,
         )
     }
@@ -126,6 +216,19 @@ impl ScopePromotionCheckpoint {
         system_manifest_sha256: &str,
         promotion_intent_id: uuid::Uuid,
     ) -> Result<Self, ScopePromotionError> {
+        let system_parent = Path::new(system_manifest_path)
+            .parent()
+            .ok_or(ScopePromotionError::Conflict)?;
+        let system_receipt_path = path_text(&system_parent.join("receipt.json"))?;
+        let authorization_record_path = path_text(
+            &system_parent.join(format!(".setup-request-{promotion_intent_id}.consumed")),
+        )?;
+        let promotion_intent_path = path_text(&Path::new(user_manifest_path).with_file_name(
+            format!(".receipt.json.scope-promotion.{promotion_intent_id}.json"),
+        ))?;
+        let completion_record_path = path_text(&system_parent.join(format!(
+            ".receipt.json.scope-promotion.{promotion_intent_id}.completed"
+        )))?;
         Self::new(
             machine_id,
             original_operator,
@@ -134,6 +237,21 @@ impl ScopePromotionCheckpoint {
             user_manifest_path,
             user_manifest_sha256,
             system_manifest_path,
+            system_manifest_sha256,
+            system_manifest_sha256,
+            &system_receipt_path,
+            system_manifest_sha256,
+            system_manifest_sha256,
+            promotion_intent_id,
+            system_manifest_sha256,
+            &authorization_record_path,
+            system_manifest_sha256,
+            system_manifest_sha256,
+            &promotion_intent_path,
+            system_manifest_sha256,
+            system_manifest_sha256,
+            &completion_record_path,
+            system_manifest_sha256,
             system_manifest_sha256,
             promotion_intent_id,
         )
@@ -171,6 +289,66 @@ impl ScopePromotionCheckpoint {
         &self.system_manifest_sha256
     }
 
+    pub(in crate::setup) fn system_manifest_identity_sha256(&self) -> &str {
+        &self.system_manifest_identity_sha256
+    }
+
+    pub(in crate::setup) fn system_receipt_path(&self) -> &str {
+        &self.system_receipt_path
+    }
+
+    pub(in crate::setup) fn system_receipt_sha256(&self) -> &str {
+        &self.system_receipt_sha256
+    }
+
+    pub(in crate::setup) fn system_receipt_identity_sha256(&self) -> &str {
+        &self.system_receipt_identity_sha256
+    }
+
+    pub(in crate::setup) fn authorization_request_id(&self) -> uuid::Uuid {
+        self.authorization_request_id
+    }
+
+    pub(in crate::setup) fn authorization_request_sha256(&self) -> &str {
+        &self.authorization_request_sha256
+    }
+
+    pub(in crate::setup) fn authorization_record_path(&self) -> &str {
+        &self.authorization_record_path
+    }
+
+    pub(in crate::setup) fn authorization_record_sha256(&self) -> &str {
+        &self.authorization_record_sha256
+    }
+
+    pub(in crate::setup) fn authorization_record_identity_sha256(&self) -> &str {
+        &self.authorization_record_identity_sha256
+    }
+
+    pub(in crate::setup) fn promotion_intent_path(&self) -> &str {
+        &self.promotion_intent_path
+    }
+
+    pub(in crate::setup) fn promotion_intent_sha256(&self) -> &str {
+        &self.promotion_intent_sha256
+    }
+
+    pub(in crate::setup) fn promotion_intent_identity_sha256(&self) -> &str {
+        &self.promotion_intent_identity_sha256
+    }
+
+    pub(in crate::setup) fn completion_record_path(&self) -> &str {
+        &self.completion_record_path
+    }
+
+    pub(in crate::setup) fn completion_record_sha256(&self) -> &str {
+        &self.completion_record_sha256
+    }
+
+    pub(in crate::setup) fn completion_record_identity_sha256(&self) -> &str {
+        &self.completion_record_identity_sha256
+    }
+
     pub(in crate::setup) fn original_operator(&self) -> &WorkerPrincipal {
         &self.original_operator
     }
@@ -205,27 +383,6 @@ pub(in crate::setup) fn scope_promotion_authority() -> ScopePromotionAuthority {
     }
 }
 
-#[derive(Clone)]
-pub(in crate::setup) struct ScopePromotionAuthorization {
-    request_id: uuid::Uuid,
-    request_sha256: Box<str>,
-}
-
-impl ScopePromotionAuthorization {
-    pub(in crate::setup) fn new(
-        request_id: uuid::Uuid,
-        request_sha256: &str,
-    ) -> Result<Self, ScopePromotionError> {
-        if !is_uuid_v7(request_id) || !valid_sha256(request_sha256) {
-            return Err(ScopePromotionError::Conflict);
-        }
-        Ok(Self {
-            request_id,
-            request_sha256: request_sha256.into(),
-        })
-    }
-}
-
 pub(in crate::setup) struct ScopePromotionPreparation {
     system_candidate: crate::manifest::DedicatedWorkerManifestCandidate,
     original_operator: WorkerPrincipal,
@@ -233,7 +390,7 @@ pub(in crate::setup) struct ScopePromotionPreparation {
     selector_sha256: Box<str>,
     system_receipt_path: PathBuf,
     system_manifest_path: PathBuf,
-    authorization: ScopePromotionAuthorization,
+    authorization_request_id: uuid::Uuid,
     intent_id: uuid::Uuid,
 }
 
@@ -243,7 +400,6 @@ impl ScopePromotionPreparation {
         system_candidate: crate::manifest::DedicatedWorkerManifestCandidate,
         system_receipt: &crate::setup::receipt::ReceiptStore,
         system_manifest: &crate::manifest::MachineManifestStore,
-        authorization: ScopePromotionAuthorization,
     ) -> Result<Self, ScopePromotionError> {
         let target_principal = ready
             .reverify_target(Clone::clone)
@@ -262,7 +418,7 @@ impl ScopePromotionPreparation {
             selector_sha256: sha256_hex(ready.selector().as_bytes()).into(),
             system_receipt_path: system_receipt.path().to_path_buf(),
             system_manifest_path: system_manifest.path().to_path_buf(),
-            authorization,
+            authorization_request_id: uuid::Uuid::now_v7(),
             intent_id: uuid::Uuid::now_v7(),
         })
     }
@@ -291,14 +447,320 @@ struct ScopePromotionIntentDocument {
     system_manifest_sha256: String,
     candidate_manifest: String,
     authorization_request_id: uuid::Uuid,
-    authorization_request_sha256: String,
     expected_completion: PromotionCompletion,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-enum PromotionCompletion {
+pub(in crate::setup) enum PromotionCompletion {
     ProtectedSystemPublication,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(in crate::setup) struct ScopePromotionRequestBinding {
+    version: u32,
+    authorization_request_id: uuid::Uuid,
+    promotion_intent_id: uuid::Uuid,
+    promotion_intent_path: String,
+    promotion_intent_identity_sha256: String,
+    promotion_intent_sha256: String,
+    machine_id: uuid::Uuid,
+    original_operator: WorkerPrincipal,
+    target_principal: WorkerPrincipal,
+    selector_sha256: String,
+    system_receipt_path: String,
+    system_manifest_path: String,
+    system_manifest_sha256: String,
+    expected_completion: PromotionCompletion,
+}
+
+impl ScopePromotionRequestBinding {
+    fn from_intent(intent: &ScopePromotionIntent) -> Result<Self, ScopePromotionError> {
+        let document = &intent.document;
+        let value = Self {
+            version: PROMOTION_INTENT_VERSION,
+            authorization_request_id: document.authorization_request_id,
+            promotion_intent_id: document.intent_id,
+            promotion_intent_path: path_text(&intent.path)?,
+            promotion_intent_identity_sha256: intent.identity.binding_sha256(),
+            promotion_intent_sha256: sha256_hex(&document.to_json()?),
+            machine_id: document.machine_id,
+            original_operator: document.original_operator.clone(),
+            target_principal: document.target_principal.clone(),
+            selector_sha256: document.selector_sha256.clone(),
+            system_receipt_path: document.system_receipt_path.clone(),
+            system_manifest_path: document.system_manifest_path.clone(),
+            system_manifest_sha256: document.system_manifest_sha256.clone(),
+            expected_completion: document.expected_completion,
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    pub(in crate::setup) fn validate(&self) -> Result<(), ScopePromotionError> {
+        if self.version != PROMOTION_INTENT_VERSION
+            || !is_uuid_v7(self.authorization_request_id)
+            || !is_uuid_v7(self.promotion_intent_id)
+            || !is_uuid_v7(self.machine_id)
+            || self.original_operator.account_policy() != WorkerAccountPolicy::CurrentUser
+            || self.target_principal.account_policy() != WorkerAccountPolicy::Dedicated
+            || self.original_operator == self.target_principal
+            || !normalized_absolute_path(&self.promotion_intent_path)
+            || !normalized_absolute_path(&self.system_receipt_path)
+            || !normalized_absolute_path(&self.system_manifest_path)
+            || !valid_sha256(&self.promotion_intent_identity_sha256)
+            || !valid_sha256(&self.promotion_intent_sha256)
+            || !valid_sha256(&self.selector_sha256)
+            || !valid_sha256(&self.system_manifest_sha256)
+            || sha256_hex(self.target_principal.name().as_bytes()) != self.selector_sha256
+        {
+            return Err(ScopePromotionError::Conflict);
+        }
+        Ok(())
+    }
+
+    pub(in crate::setup) fn authorization_request_id(&self) -> uuid::Uuid {
+        self.authorization_request_id
+    }
+
+    pub(in crate::setup) fn promotion_intent_id(&self) -> uuid::Uuid {
+        self.promotion_intent_id
+    }
+
+    pub(in crate::setup) fn original_operator(&self) -> &WorkerPrincipal {
+        &self.original_operator
+    }
+
+    pub(in crate::setup) fn target_principal(&self) -> &WorkerPrincipal {
+        &self.target_principal
+    }
+
+    pub(in crate::setup) fn system_receipt_path(&self) -> &str {
+        &self.system_receipt_path
+    }
+
+    pub(in crate::setup) fn system_manifest_path(&self) -> &str {
+        &self.system_manifest_path
+    }
+
+    pub(in crate::setup) fn reverify_intent(
+        &self,
+        user_receipt_store: &crate::setup::receipt::ReceiptStore,
+    ) -> Result<(), ScopePromotionError> {
+        self.validate()?;
+        let expected_path =
+            scope_promotion_intent_path(user_receipt_store.path(), self.promotion_intent_id)?;
+        if path_text(&expected_path)? != self.promotion_intent_path {
+            return Err(ScopePromotionError::Conflict);
+        }
+        let intent =
+            read_scope_promotion_intent(&expected_path, user_receipt_store.worker_principal())?
+                .ok_or(ScopePromotionError::Conflict)?;
+        validate_live_user_binding(user_receipt_store, None, &intent.document)?;
+        let observed = Self::from_intent(&intent)?;
+        if &observed != self {
+            return Err(ScopePromotionError::Conflict);
+        }
+        Ok(())
+    }
+}
+
+const MAX_PROMOTION_PROOF_BYTES: usize = 128 * 1024;
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ScopePromotionCompletionDocument {
+    version: u32,
+    authorization_request_id: uuid::Uuid,
+    authorization_request_sha256: String,
+    authorization_record_path: String,
+    authorization_record_sha256: String,
+    authorization_record_identity_sha256: String,
+    request_binding: ScopePromotionRequestBinding,
+    system_receipt_path: String,
+    system_receipt_sha256: String,
+    system_receipt_identity_sha256: String,
+    system_manifest_path: String,
+    system_manifest_sha256: String,
+    system_manifest_identity_sha256: String,
+    machine_id: uuid::Uuid,
+    expected_completion: PromotionCompletion,
+}
+
+struct ScopePromotionCompletionProof {
+    document: ScopePromotionCompletionDocument,
+    path: PathBuf,
+    sha256: String,
+    identity_sha256: String,
+}
+
+impl ScopePromotionCompletionDocument {
+    fn validate(&self) -> Result<(), ScopePromotionError> {
+        self.request_binding.validate()?;
+        if self.version != PROMOTION_INTENT_VERSION
+            || self.authorization_request_id != self.request_binding.authorization_request_id
+            || self.machine_id != self.request_binding.machine_id
+            || self.expected_completion != PromotionCompletion::ProtectedSystemPublication
+            || self.expected_completion != self.request_binding.expected_completion
+            || self.system_receipt_path != self.request_binding.system_receipt_path
+            || self.system_manifest_path != self.request_binding.system_manifest_path
+            || self.system_manifest_sha256 != self.request_binding.system_manifest_sha256
+            || !normalized_absolute_path(&self.authorization_record_path)
+            || !valid_sha256(&self.authorization_request_sha256)
+            || !valid_sha256(&self.authorization_record_sha256)
+            || !valid_sha256(&self.authorization_record_identity_sha256)
+            || !valid_sha256(&self.system_receipt_sha256)
+            || !valid_sha256(&self.system_receipt_identity_sha256)
+            || !valid_sha256(&self.system_manifest_identity_sha256)
+        {
+            return Err(ScopePromotionError::Conflict);
+        }
+        Ok(())
+    }
+
+    fn to_json(&self) -> Result<Vec<u8>, ScopePromotionError> {
+        self.validate()?;
+        let mut bytes =
+            serde_json::to_vec_pretty(self).map_err(|_| ScopePromotionError::Conflict)?;
+        bytes.push(b'\n');
+        if bytes.len() > MAX_PROMOTION_PROOF_BYTES {
+            return Err(ScopePromotionError::Conflict);
+        }
+        Ok(bytes)
+    }
+
+    fn from_json(bytes: &[u8]) -> Result<Self, ScopePromotionError> {
+        if bytes.len() > MAX_PROMOTION_PROOF_BYTES {
+            return Err(ScopePromotionError::Conflict);
+        }
+        let value =
+            serde_json::from_slice::<Self>(bytes).map_err(|_| ScopePromotionError::Conflict)?;
+        value.validate()?;
+        if value.to_json()? != bytes {
+            return Err(ScopePromotionError::Conflict);
+        }
+        Ok(value)
+    }
+}
+
+fn scope_promotion_completion_path(
+    system_receipt_path: &Path,
+    intent_id: uuid::Uuid,
+) -> Result<PathBuf, ScopePromotionError> {
+    Ok(system_receipt_path
+        .parent()
+        .ok_or(ScopePromotionError::Conflict)?
+        .join(format!(
+            ".receipt.json.scope-promotion.{intent_id}.completed"
+        )))
+}
+
+pub(in crate::setup) fn write_scope_promotion_completion(
+    system_receipt_store: &crate::setup::receipt::ReceiptStore,
+    authorization: &crate::setup::receipt::ProtectedScopePromotionAuthorization,
+    receipt: &crate::setup::receipt::PromotionReceiptSnapshot,
+    manifest: &crate::manifest::PromotionManifestSnapshot,
+    _authority: &ScopePromotionAuthority,
+) -> Result<(), ScopePromotionError> {
+    let binding = authorization.binding();
+    if system_receipt_store.installation_scope() != InstallationScope::System
+        || system_receipt_store.worker_principal() != binding.target_principal()
+        || path_text(system_receipt_store.path())? != binding.system_receipt_path
+        || path_text(receipt.path())? != binding.system_receipt_path
+        || path_text(manifest.path())? != binding.system_manifest_path
+        || manifest.sha256() != binding.system_manifest_sha256
+        || manifest.machine_id() != binding.machine_id
+    {
+        return Err(ScopePromotionError::Conflict);
+    }
+    let document = ScopePromotionCompletionDocument {
+        version: PROMOTION_INTENT_VERSION,
+        authorization_request_id: authorization.request_id(),
+        authorization_request_sha256: authorization.request_sha256().to_owned(),
+        authorization_record_path: path_text(authorization.path())?,
+        authorization_record_sha256: authorization.sha256().to_owned(),
+        authorization_record_identity_sha256: authorization.identity_sha256().to_owned(),
+        request_binding: binding.clone(),
+        system_receipt_path: path_text(receipt.path())?,
+        system_receipt_sha256: receipt.sha256().to_owned(),
+        system_receipt_identity_sha256: receipt.identity_sha256().to_owned(),
+        system_manifest_path: path_text(manifest.path())?,
+        system_manifest_sha256: manifest.sha256().to_owned(),
+        system_manifest_identity_sha256: manifest.identity_sha256(),
+        machine_id: manifest.machine_id(),
+        expected_completion: PromotionCompletion::ProtectedSystemPublication,
+    };
+    let bytes = document.to_json()?;
+    let path =
+        scope_promotion_completion_path(system_receipt_store.path(), binding.promotion_intent_id)?;
+    if path.exists() {
+        let existing =
+            read_scope_promotion_completion(system_receipt_store, binding.promotion_intent_id)?;
+        return if existing.document == document {
+            Ok(())
+        } else {
+            Err(ScopePromotionError::Conflict)
+        };
+    }
+    let temporary = path.with_extension("completed.tmp");
+    #[cfg(test)]
+    let owner = crate::platform::ManifestOwner::CurrentProcess;
+    #[cfg(not(test))]
+    let owner = crate::platform::ManifestOwner::System;
+    let mut file = crate::platform::create_private_publication_file(
+        &temporary,
+        owner,
+        system_receipt_store.worker_principal(),
+    )
+    .map_err(|_| ScopePromotionError::Stage("completion temporary create"))?;
+    let result = (|| {
+        file.write_all(&bytes)
+            .map_err(|_| ScopePromotionError::Stage("completion temporary write"))?;
+        let complete = file
+            .complete_exact(&bytes)
+            .map_err(|_| ScopePromotionError::Stage("completion temporary completion"))?;
+        complete
+            .publish_no_replace(&path)
+            .map_err(|_| ScopePromotionError::Stage("completion publication"))?;
+        crate::platform::sync_parent_directory(path.parent().ok_or(ScopePromotionError::Conflict)?)
+            .map_err(|_| ScopePromotionError::Stage("completion parent sync"))
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temporary);
+    }
+    result
+}
+
+fn read_scope_promotion_completion(
+    system_receipt_store: &crate::setup::receipt::ReceiptStore,
+    intent_id: uuid::Uuid,
+) -> Result<ScopePromotionCompletionProof, ScopePromotionError> {
+    let path = scope_promotion_completion_path(system_receipt_store.path(), intent_id)?;
+    let identity =
+        crate::platform::private_file_identity(&path).map_err(|_| ScopePromotionError::Conflict)?;
+    #[cfg(test)]
+    let owner = crate::platform::ManifestOwner::CurrentProcess;
+    #[cfg(not(test))]
+    let owner = crate::platform::ManifestOwner::System;
+    let file = crate::platform::open_verified_private_file_for_read(
+        &path,
+        owner,
+        system_receipt_store.worker_principal(),
+        identity,
+    )
+    .map_err(|_| ScopePromotionError::Conflict)?;
+    let mut bytes = Vec::new();
+    file.take((MAX_PROMOTION_PROOF_BYTES + 1) as u64)
+        .read_to_end(&mut bytes)
+        .map_err(|_| ScopePromotionError::Conflict)?;
+    let document = ScopePromotionCompletionDocument::from_json(&bytes)?;
+    Ok(ScopePromotionCompletionProof {
+        document,
+        path,
+        sha256: sha256_hex(&bytes),
+        identity_sha256: identity.binding_sha256(),
+    })
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -356,7 +818,6 @@ impl ScopePromotionIntentDocument {
             || !valid_sha256(&self.user_manifest_sha256)
             || !valid_sha256(&self.selector_sha256)
             || !valid_sha256(&self.system_manifest_sha256)
-            || !valid_sha256(&self.authorization_request_sha256)
             || sha256_hex(self.candidate_manifest.as_bytes()) != self.system_manifest_sha256
         {
             return Err(ScopePromotionError::Conflict);
@@ -438,8 +899,7 @@ pub(in crate::setup) fn write_scope_promotion_intent(
         system_manifest_path: path_text(&preparation.system_manifest_path)?,
         system_manifest_sha256: sha256_hex(system_candidate.as_bytes()),
         candidate_manifest: system_candidate,
-        authorization_request_id: preparation.authorization.request_id,
-        authorization_request_sha256: preparation.authorization.request_sha256.to_string(),
+        authorization_request_id: preparation.authorization_request_id,
         expected_completion: PromotionCompletion::ProtectedSystemPublication,
     };
     let expected_bytes = document
@@ -473,6 +933,17 @@ pub(in crate::setup) fn write_scope_promotion_intent(
         .publish_no_replace(&path)
         .map_err(|_| ScopePromotionError::Stage("promotion intent publication"))?;
     Ok(document.intent_id)
+}
+
+pub(in crate::setup) fn scope_promotion_request_binding(
+    receipt_store: &crate::setup::receipt::ReceiptStore,
+    intent_id: uuid::Uuid,
+) -> Result<ScopePromotionRequestBinding, ScopePromotionError> {
+    let path = scope_promotion_intent_path(receipt_store.path(), intent_id)?;
+    let intent = read_scope_promotion_intent(&path, receipt_store.worker_principal())?
+        .ok_or(ScopePromotionError::Conflict)?;
+    validate_live_user_binding(receipt_store, None, &intent.document)?;
+    ScopePromotionRequestBinding::from_intent(&intent)
 }
 
 fn reject_concurrent_scope_promotion_intents(expected: &Path) -> Result<(), ScopePromotionError> {
@@ -587,10 +1058,11 @@ pub(in crate::setup) fn publish_scope_promotion_system_manifest(
         }
         let pending_authority = crate::setup::pending::pending_publication_authority();
         let authority = scope_promotion_authority();
-        system_receipt_store
+        let request_binding = ScopePromotionRequestBinding::from_intent(&intent)?;
+        let authorization = system_receipt_store
             .verify_scope_promotion_authorization(
                 document.authorization_request_id,
-                &document.authorization_request_sha256,
+                &request_binding,
                 &authority,
             )
             .map_err(|_| ScopePromotionError::Stage("protected authorization marker"))?;
@@ -600,17 +1072,16 @@ pub(in crate::setup) fn publish_scope_promotion_system_manifest(
         let session = system_receipt_store
             .begin_pending_publication(&pending_authority)
             .map_err(|_| ScopePromotionError::Stage("system receipt publication session"))?;
-        let machine_id = session
-            .publish_scope_promotion_system_manifest(
-                system_manifest_store,
-                &document.candidate_manifest,
-                document.machine_id,
-                completed,
-                metadata,
-                &pending_authority,
-                &authority,
-            )
-            .map_err(|_| ScopePromotionError::Stage("system manifest publication protocol"))?;
+        let machine_id = session.publish_scope_promotion_system_manifest(
+            system_manifest_store,
+            &document.candidate_manifest,
+            document.machine_id,
+            completed,
+            metadata,
+            &pending_authority,
+            &authority,
+            &authorization,
+        )?;
         let system = system_manifest_store
             .promotion_snapshot(&authority)
             .map_err(|_| ScopePromotionError::Conflict)?
@@ -628,6 +1099,7 @@ pub(in crate::setup) fn publish_scope_promotion_system_manifest(
 pub(in crate::setup) fn finalize_scope_promotion(
     user_receipt_store: &crate::setup::receipt::ReceiptStore,
     user_manifest_store: &crate::manifest::MachineManifestStore,
+    system_receipt_store: &crate::setup::receipt::ReceiptStore,
     system_manifest_store: &crate::manifest::MachineManifestStore,
     intent_id: uuid::Uuid,
     metadata: &mut crate::setup::receipt::ReceiptMetadataSource,
@@ -637,6 +1109,7 @@ pub(in crate::setup) fn finalize_scope_promotion(
         let _ = (
             user_receipt_store,
             user_manifest_store,
+            system_receipt_store,
             system_manifest_store,
             intent_id,
             metadata,
@@ -653,6 +1126,7 @@ pub(in crate::setup) fn finalize_scope_promotion(
             return recover_completed_scope_promotion(
                 user_receipt_store,
                 user_manifest_store,
+                system_receipt_store,
                 system_manifest_store,
                 intent_id,
                 &authority,
@@ -661,17 +1135,35 @@ pub(in crate::setup) fn finalize_scope_promotion(
         let document = &intent.document;
         if user_receipt_store.installation_scope() != InstallationScope::User
             || user_manifest_store.installation_scope() != InstallationScope::User
+            || system_receipt_store.installation_scope() != InstallationScope::System
             || system_manifest_store.installation_scope() != InstallationScope::System
             || user_receipt_store.worker_principal() != &document.original_operator
             || user_manifest_store.worker_principal() != &document.original_operator
+            || system_receipt_store.worker_principal() != &document.target_principal
             || system_manifest_store.worker_principal() != &document.target_principal
             || path_text(user_receipt_store.path())? != document.user_receipt_path
             || path_text(user_manifest_store.path())? != document.user_manifest_path
+            || path_text(system_receipt_store.path())? != document.system_receipt_path
             || path_text(system_manifest_store.path())? != document.system_manifest_path
             || sha256_hex(document.target_principal.name().as_bytes()) != document.selector_sha256
         {
             return Err(ScopePromotionError::Conflict);
         }
+        let pending_authority = crate::setup::pending::pending_publication_authority();
+        let system_receipt_session = system_receipt_store
+            .begin_pending_publication(&pending_authority)
+            .map_err(|_| ScopePromotionError::Conflict)?;
+        let request_binding = ScopePromotionRequestBinding::from_intent(&intent)?;
+        let authorization = system_receipt_store
+            .verify_scope_promotion_authorization(
+                document.authorization_request_id,
+                &request_binding,
+                &authority,
+            )
+            .map_err(|_| ScopePromotionError::Conflict)?;
+        let system_receipt = system_receipt_session
+            .promotion_receipt_snapshot()
+            .map_err(|_| ScopePromotionError::Conflict)?;
         let system = system_manifest_store
             .promotion_snapshot(&authority)
             .map_err(|_| ScopePromotionError::Conflict)?
@@ -682,6 +1174,24 @@ pub(in crate::setup) fn finalize_scope_promotion(
         {
             return Err(ScopePromotionError::Conflict);
         }
+        let completion = read_scope_promotion_completion(system_receipt_store, document.intent_id)?;
+        if completion.document.request_binding != request_binding
+            || completion.document.authorization_request_sha256 != authorization.request_sha256()
+            || completion.document.authorization_record_path != path_text(authorization.path())?
+            || completion.document.authorization_record_sha256 != authorization.sha256()
+            || completion.document.authorization_record_identity_sha256
+                != authorization.identity_sha256()
+            || completion.document.system_receipt_path != path_text(system_receipt.path())?
+            || completion.document.system_receipt_sha256 != system_receipt.sha256()
+            || completion.document.system_receipt_identity_sha256
+                != system_receipt.identity_sha256()
+            || completion.document.system_manifest_path != path_text(system.path())?
+            || completion.document.system_manifest_sha256 != system.sha256()
+            || completion.document.system_manifest_identity_sha256 != system.identity_sha256()
+        {
+            return Err(ScopePromotionError::Conflict);
+        }
+        drop(system_receipt_session);
         let checkpoint = ScopePromotionCheckpoint::new(
             document.machine_id,
             &document.original_operator,
@@ -691,14 +1201,30 @@ pub(in crate::setup) fn finalize_scope_promotion(
             &document.user_manifest_sha256,
             &document.system_manifest_path,
             &document.system_manifest_sha256,
+            &completion.document.system_manifest_identity_sha256,
+            &document.system_receipt_path,
+            &completion.document.system_receipt_sha256,
+            &completion.document.system_receipt_identity_sha256,
+            document.authorization_request_id,
+            &completion.document.authorization_request_sha256,
+            &completion.document.authorization_record_path,
+            &completion.document.authorization_record_sha256,
+            &completion.document.authorization_record_identity_sha256,
+            &request_binding.promotion_intent_path,
+            &request_binding.promotion_intent_sha256,
+            &request_binding.promotion_intent_identity_sha256,
+            &path_text(&completion.path)?,
+            &completion.sha256,
+            &completion.identity_sha256,
             document.intent_id,
-        )?;
+        )
+        .map_err(|_| ScopePromotionError::Stage("promotion checkpoint tuple"))?;
         let receipt = user_receipt_store
             .read_snapshot()
-            .map_err(|_| ScopePromotionError::Conflict)?;
+            .map_err(|_| ScopePromotionError::Stage("promotion checkpoint receipt read"))?;
         let checkpoint_exists = receipt
             .has_scope_promotion_checkpoint(&checkpoint)
-            .map_err(|_| ScopePromotionError::Conflict)?;
+            .map_err(|_| ScopePromotionError::Stage("promotion checkpoint lookup"))?;
         let current_receipt_identity =
             crate::platform::private_file_identity(user_receipt_store.path())
                 .map_err(|_| ScopePromotionError::Conflict)?;
@@ -783,12 +1309,14 @@ pub(in crate::setup) fn finalize_scope_promotion(
 fn recover_completed_scope_promotion(
     user_receipt_store: &crate::setup::receipt::ReceiptStore,
     user_manifest_store: &crate::manifest::MachineManifestStore,
+    system_receipt_store: &crate::setup::receipt::ReceiptStore,
     system_manifest_store: &crate::manifest::MachineManifestStore,
     intent_id: uuid::Uuid,
     authority: &ScopePromotionAuthority,
 ) -> Result<crate::platform::EstablishedDedicatedAccountEvidence, ScopePromotionError> {
     if user_receipt_store.installation_scope() != InstallationScope::User
         || user_manifest_store.installation_scope() != InstallationScope::User
+        || system_receipt_store.installation_scope() != InstallationScope::System
         || system_manifest_store.installation_scope() != InstallationScope::System
     {
         return Err(ScopePromotionError::Conflict);
@@ -802,13 +1330,72 @@ fn recover_completed_scope_promotion(
         .ok_or(ScopePromotionError::Conflict)?;
     if checkpoint.original_operator() != user_receipt_store.worker_principal()
         || checkpoint.original_operator() != user_manifest_store.worker_principal()
+        || checkpoint.target_principal() != system_receipt_store.worker_principal()
         || checkpoint.target_principal() != system_manifest_store.worker_principal()
         || path_text(user_manifest_store.path())? != checkpoint.user_manifest_path()
+        || path_text(system_receipt_store.path())? != checkpoint.system_receipt_path()
         || path_text(system_manifest_store.path())? != checkpoint.system_manifest_path()
         || user_manifest_store
             .promotion_snapshot(authority)
             .map_err(|_| ScopePromotionError::Conflict)?
             .is_some()
+    {
+        return Err(ScopePromotionError::Conflict);
+    }
+    let pending_authority = crate::setup::pending::pending_publication_authority();
+    let system_receipt_session = system_receipt_store
+        .begin_pending_publication(&pending_authority)
+        .map_err(|_| ScopePromotionError::Conflict)?;
+    let system_receipt = system_receipt_session
+        .promotion_receipt_snapshot()
+        .map_err(|_| ScopePromotionError::Conflict)?;
+    if system_receipt.sha256() != checkpoint.system_receipt_sha256()
+        || system_receipt.identity_sha256() != checkpoint.system_receipt_identity_sha256()
+    {
+        return Err(ScopePromotionError::Conflict);
+    }
+    let completion = read_scope_promotion_completion(system_receipt_store, intent_id)?;
+    let binding = &completion.document.request_binding;
+    if path_text(&completion.path)? != checkpoint.completion_record_path()
+        || completion.sha256 != checkpoint.completion_record_sha256()
+        || completion.identity_sha256 != checkpoint.completion_record_identity_sha256()
+        || binding.promotion_intent_id != intent_id
+        || binding.promotion_intent_path != checkpoint.promotion_intent_path()
+        || binding.promotion_intent_sha256 != checkpoint.promotion_intent_sha256()
+        || binding.promotion_intent_identity_sha256 != checkpoint.promotion_intent_identity_sha256()
+        || binding.machine_id != checkpoint.machine_id()
+        || binding.original_operator != *checkpoint.original_operator()
+        || binding.target_principal != *checkpoint.target_principal()
+        || binding.selector_sha256 != checkpoint.selector_sha256()
+        || binding.system_receipt_path != checkpoint.system_receipt_path()
+        || binding.system_manifest_path != checkpoint.system_manifest_path()
+        || binding.system_manifest_sha256 != checkpoint.system_manifest_sha256()
+        || binding.authorization_request_id != checkpoint.authorization_request_id()
+    {
+        return Err(ScopePromotionError::Conflict);
+    }
+    let authorization = system_receipt_store
+        .verify_scope_promotion_authorization(
+            checkpoint.authorization_request_id(),
+            binding,
+            authority,
+        )
+        .map_err(|_| ScopePromotionError::Conflict)?;
+    if authorization.request_sha256() != checkpoint.authorization_request_sha256()
+        || path_text(authorization.path())? != checkpoint.authorization_record_path()
+        || authorization.sha256() != checkpoint.authorization_record_sha256()
+        || authorization.identity_sha256() != checkpoint.authorization_record_identity_sha256()
+        || completion.document.authorization_request_sha256
+            != checkpoint.authorization_request_sha256()
+        || completion.document.authorization_record_path != checkpoint.authorization_record_path()
+        || completion.document.authorization_record_sha256
+            != checkpoint.authorization_record_sha256()
+        || completion.document.authorization_record_identity_sha256
+            != checkpoint.authorization_record_identity_sha256()
+        || completion.document.system_receipt_path != checkpoint.system_receipt_path()
+        || completion.document.system_receipt_sha256 != checkpoint.system_receipt_sha256()
+        || completion.document.system_receipt_identity_sha256
+            != checkpoint.system_receipt_identity_sha256()
     {
         return Err(ScopePromotionError::Conflict);
     }
@@ -818,9 +1405,15 @@ fn recover_completed_scope_promotion(
         .ok_or(ScopePromotionError::Conflict)?;
     if system.machine_id() != checkpoint.machine_id()
         || system.sha256() != checkpoint.system_manifest_sha256()
+        || system.identity_sha256() != checkpoint.system_manifest_identity_sha256()
+        || completion.document.system_manifest_path != checkpoint.system_manifest_path()
+        || completion.document.system_manifest_sha256 != checkpoint.system_manifest_sha256()
+        || completion.document.system_manifest_identity_sha256
+            != checkpoint.system_manifest_identity_sha256()
     {
         return Err(ScopePromotionError::Conflict);
     }
+    drop(system_receipt_session);
     established_evidence(checkpoint.target_principal(), authority)
 }
 
@@ -1102,9 +1695,52 @@ mod tests {
         let _ = std::fs::remove_dir_all(root);
     }
 
+    #[cfg(not(target_os = "windows"))]
+    #[derive(Clone, Copy, Eq, PartialEq)]
+    enum PromotionProofCase {
+        Normal,
+        AlteredIntentBeforePublication,
+        AlteredIntentAfterAuthorization,
+        MissingCompletionBeforePublicationRerun,
+        MissingAuthorizationBeforeFinalization,
+        SubstitutedReceiptBeforeFinalization,
+        MissingAuthorizationAfterIntentRetirement,
+    }
+
     #[test]
     #[cfg(not(target_os = "windows"))]
     fn scope_promotion_preserves_one_uuid_and_dedicated_account_established_rerun() {
+        run_scope_promotion_protocol(PromotionProofCase::Normal);
+    }
+
+    #[test]
+    #[cfg(not(target_os = "windows"))]
+    fn scope_promotion_publication_reemits_missing_completion_proof() {
+        run_scope_promotion_protocol(PromotionProofCase::MissingCompletionBeforePublicationRerun);
+    }
+
+    #[test]
+    #[cfg(not(target_os = "windows"))]
+    fn scope_promotion_rejects_intent_changed_after_real_authorization() {
+        run_scope_promotion_protocol(PromotionProofCase::AlteredIntentBeforePublication);
+        run_scope_promotion_protocol(PromotionProofCase::AlteredIntentAfterAuthorization);
+    }
+
+    #[test]
+    #[cfg(not(target_os = "windows"))]
+    fn scope_promotion_finalization_requires_protected_authorization_and_receipt_identity() {
+        run_scope_promotion_protocol(PromotionProofCase::MissingAuthorizationBeforeFinalization);
+        run_scope_promotion_protocol(PromotionProofCase::SubstitutedReceiptBeforeFinalization);
+    }
+
+    #[test]
+    #[cfg(not(target_os = "windows"))]
+    fn scope_promotion_intent_absent_recovery_revalidates_protected_evidence() {
+        run_scope_promotion_protocol(PromotionProofCase::MissingAuthorizationAfterIntentRetirement);
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn run_scope_promotion_protocol(case: PromotionProofCase) {
         let root = std::env::temp_dir().join(format!(
             "styrn-scope-promotion-e2e-{}",
             uuid::Uuid::now_v7()
@@ -1195,17 +1831,11 @@ mod tests {
                 &system_layout,
             )
             .unwrap();
-        let authorization = super::ScopePromotionAuthorization::new(
-            uuid::Uuid::parse_str("019cad99-54a0-7000-8000-000000000024").unwrap(),
-            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
-        )
-        .unwrap();
         let preparation = super::ScopePromotionPreparation::new(
             &ready,
             system_candidate,
             &system_receipt,
             &system_manifest,
-            authorization,
         )
         .unwrap();
         let machine_id = crate::setup::pending::publish_manifest_and_begin_scope_promotion(
@@ -1251,50 +1881,90 @@ mod tests {
                 "2026-09-03T12:01:06Z",
             ),
         ]);
-        system_receipt
-            .reserve_authorization(
-                "019cad99-54a0-7000-8000-000000000024",
-                "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
-            )
-            .unwrap();
-        let promotion_authority = super::scope_promotion_authority();
-        assert!(system_receipt
-            .verify_scope_promotion_authorization(
-                uuid::Uuid::parse_str("019cad99-54a0-7000-8000-000000000024").unwrap(),
-                "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
-                &promotion_authority,
-            )
-            .is_err());
-        system_receipt
-            .verify_scope_promotion_authorization(
-                uuid::Uuid::parse_str("019cad99-54a0-7000-8000-000000000024").unwrap(),
-                "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
-                &promotion_authority,
-            )
-            .unwrap();
-        let empty_execution = crate::setup::action::apply_plan_with_journal(
-            &mut [],
-            &system_receipt,
-            &mut system_metadata,
-        )
-        .unwrap();
-        assert!(super::publish_scope_promotion_system_manifest(
+        let request = crate::setup::action::prepare_scope_promotion_authorization_request_for_test(
+            &system_plan,
+            root.join("user-state/styrn/authorization-request.json"),
+            operator.clone(),
             &user_receipt,
             preparation.intent_id,
-            &system_receipt,
-            &system_manifest,
-            empty_execution.completion(),
-            &mut system_metadata,
-        )
-        .is_err());
-        assert!(user_manifest_path.is_file());
-        assert!(!system_manifest_path.exists());
-        let system_execution = crate::setup::action::apply_plan_with_journal(
-            &mut system_plan,
-            &system_receipt,
-            &mut system_metadata,
         )
         .unwrap();
+        let intent_path =
+            super::scope_promotion_intent_path(&user_receipt_path, preparation.intent_id).unwrap();
+        if case == PromotionProofCase::AlteredIntentBeforePublication {
+            let authorized_intent = std::fs::read(&intent_path).unwrap();
+            let mut altered_intent =
+                super::ScopePromotionIntentDocument::from_json(&authorized_intent).unwrap();
+            let mut altered_candidate =
+                crate::manifest::MachineManifest::parse_toml(&altered_intent.candidate_manifest)
+                    .unwrap();
+            altered_candidate.name.push_str("-unauthorized");
+            altered_intent.candidate_manifest = altered_candidate.to_toml().unwrap();
+            altered_intent.system_manifest_sha256 =
+                super::sha256_hex(altered_intent.candidate_manifest.as_bytes());
+            std::fs::write(&intent_path, altered_intent.to_json().unwrap()).unwrap();
+            let error = request
+                .run_scope_promotion(
+                    &mut system_plan,
+                    &user_receipt,
+                    &system_receipt,
+                    &mut system_metadata,
+                )
+                .unwrap_err();
+            assert_eq!(error.error_code(), "setup.plan_invalid");
+            assert!(user_manifest_path.is_file());
+            assert!(!system_manifest_path.exists());
+            assert_eq!(
+                std::fs::read(&intent_path).unwrap(),
+                altered_intent.to_json().unwrap()
+            );
+            let _ = std::fs::remove_dir_all(root);
+            return;
+        }
+
+        let system_execution = request
+            .run_scope_promotion(
+                &mut system_plan,
+                &user_receipt,
+                &system_receipt,
+                &mut system_metadata,
+            )
+            .unwrap();
+        if case == PromotionProofCase::AlteredIntentAfterAuthorization {
+            let authorized_intent = std::fs::read(&intent_path).unwrap();
+            let mut altered_intent =
+                super::ScopePromotionIntentDocument::from_json(&authorized_intent).unwrap();
+            let mut altered_candidate =
+                crate::manifest::MachineManifest::parse_toml(&altered_intent.candidate_manifest)
+                    .unwrap();
+            altered_candidate.name.push_str("-after-reservation");
+            altered_intent.candidate_manifest = altered_candidate.to_toml().unwrap();
+            altered_intent.system_manifest_sha256 =
+                super::sha256_hex(altered_intent.candidate_manifest.as_bytes());
+            std::fs::write(&intent_path, altered_intent.to_json().unwrap()).unwrap();
+            let error = super::publish_scope_promotion_system_manifest(
+                &user_receipt,
+                preparation.intent_id,
+                &system_receipt,
+                &system_manifest,
+                system_execution.completion(),
+                &mut system_metadata,
+            )
+            .unwrap_err();
+            assert_eq!(error.error_code(), "setup.receipt_conflict");
+            assert!(user_manifest_path.is_file());
+            assert!(!system_manifest_path.exists());
+            assert!(system_receipt_path
+                .parent()
+                .unwrap()
+                .join(format!(
+                    ".setup-request-{}.consumed",
+                    preparation.authorization_request_id
+                ))
+                .is_file());
+            let _ = std::fs::remove_dir_all(root);
+            return;
+        }
         super::publish_scope_promotion_system_manifest(
             &user_receipt,
             preparation.intent_id,
@@ -1315,6 +1985,83 @@ mod tests {
             machine_id
         );
 
+        if case == PromotionProofCase::MissingCompletionBeforePublicationRerun {
+            let completion_path =
+                super::scope_promotion_completion_path(&system_receipt_path, preparation.intent_id)
+                    .unwrap();
+            std::fs::remove_file(&completion_path).unwrap();
+            super::publish_scope_promotion_system_manifest(
+                &user_receipt,
+                preparation.intent_id,
+                &system_receipt,
+                &system_manifest,
+                system_execution.completion(),
+                &mut system_metadata,
+            )
+            .unwrap();
+            assert!(completion_path.is_file());
+        }
+
+        let authorization_marker = system_receipt_path.parent().unwrap().join(format!(
+            ".setup-request-{}.consumed",
+            preparation.authorization_request_id
+        ));
+        if case == PromotionProofCase::MissingAuthorizationBeforeFinalization {
+            let displaced = authorization_marker.with_extension("consumed.displaced");
+            std::fs::rename(&authorization_marker, &displaced).unwrap();
+            let error = match super::finalize_scope_promotion(
+                &user_receipt,
+                &user_manifest,
+                &system_receipt,
+                &system_manifest,
+                preparation.intent_id,
+                &mut user_metadata,
+            ) {
+                Err(error) => error,
+                Ok(_) => panic!("missing authorization unexpectedly finalized promotion"),
+            };
+            assert_eq!(error.error_code(), "setup.receipt_conflict");
+            assert!(user_manifest_path.is_file());
+            assert!(intent_path.is_file());
+            assert!(displaced.is_file());
+            let receipt: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&user_receipt_path).unwrap()).unwrap();
+            assert!(receipt["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|entry| { entry["action"]["type"] != "scope_promotion" }));
+            let _ = std::fs::remove_dir_all(root);
+            return;
+        }
+        if case == PromotionProofCase::SubstitutedReceiptBeforeFinalization {
+            let displaced = system_receipt_path.with_extension("json.displaced");
+            let receipt_bytes = std::fs::read(&system_receipt_path).unwrap();
+            std::fs::rename(&system_receipt_path, &displaced).unwrap();
+            std::fs::write(&system_receipt_path, &receipt_bytes).unwrap();
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(&system_receipt_path, std::fs::Permissions::from_mode(0o600))
+                .unwrap();
+            let error = match super::finalize_scope_promotion(
+                &user_receipt,
+                &user_manifest,
+                &system_receipt,
+                &system_manifest,
+                preparation.intent_id,
+                &mut user_metadata,
+            ) {
+                Err(error) => error,
+                Ok(_) => panic!("substituted receipt unexpectedly finalized promotion"),
+            };
+            assert_eq!(error.error_code(), "setup.receipt_conflict");
+            assert!(user_manifest_path.is_file());
+            assert!(intent_path.is_file());
+            assert_eq!(std::fs::read(&system_receipt_path).unwrap(), receipt_bytes);
+            assert!(displaced.is_file());
+            let _ = std::fs::remove_dir_all(root);
+            return;
+        }
+
         let exact_user_manifest = std::fs::read(&user_manifest_path).unwrap();
         let exact_system_manifest = std::fs::read(&system_manifest_path).unwrap();
         let mut third_system = crate::manifest::MachineManifest::parse_toml(
@@ -1326,6 +2073,7 @@ mod tests {
         assert!(super::finalize_scope_promotion(
             &user_receipt,
             &user_manifest,
+            &system_receipt,
             &system_manifest,
             preparation.intent_id,
             &mut user_metadata,
@@ -1349,6 +2097,7 @@ mod tests {
         assert!(super::finalize_scope_promotion(
             &user_receipt,
             &user_manifest,
+            &system_receipt,
             &system_manifest,
             preparation.intent_id,
             &mut user_metadata,
@@ -1372,6 +2121,7 @@ mod tests {
         assert!(super::finalize_scope_promotion(
             &user_receipt,
             &user_manifest,
+            &system_receipt,
             &system_manifest,
             preparation.intent_id,
             &mut user_metadata,
@@ -1391,6 +2141,7 @@ mod tests {
         assert!(super::finalize_scope_promotion(
             &user_receipt,
             &user_manifest,
+            &system_receipt,
             &system_manifest,
             preparation.intent_id,
             &mut user_metadata,
@@ -1408,6 +2159,7 @@ mod tests {
         assert!(super::finalize_scope_promotion(
             &user_receipt,
             &user_manifest,
+            &system_receipt,
             &system_manifest,
             preparation.intent_id,
             &mut user_metadata,
@@ -1424,6 +2176,7 @@ mod tests {
         let evidence = super::finalize_scope_promotion(
             &user_receipt,
             &user_manifest,
+            &system_receipt,
             &system_manifest,
             preparation.intent_id,
             &mut user_metadata,
@@ -1454,9 +2207,43 @@ mod tests {
                 .unwrap()
                 .exists()
         );
+        if case == PromotionProofCase::MissingAuthorizationAfterIntentRetirement {
+            let displaced = authorization_marker.with_extension("consumed.displaced");
+            std::fs::rename(&authorization_marker, &displaced).unwrap();
+            let error = match super::finalize_scope_promotion(
+                &user_receipt,
+                &user_manifest,
+                &system_receipt,
+                &system_manifest,
+                preparation.intent_id,
+                &mut user_metadata,
+            ) {
+                Err(error) => error,
+                Ok(_) => panic!("missing protected evidence unexpectedly recovered promotion"),
+            };
+            assert_eq!(error.error_code(), "setup.receipt_conflict");
+            assert!(!user_manifest_path.exists());
+            assert!(system_manifest_path.is_file());
+            assert!(!intent_path.exists());
+            assert!(displaced.is_file());
+            let receipt: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&user_receipt_path).unwrap()).unwrap();
+            assert_eq!(
+                receipt["entries"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|entry| entry["action"]["type"] == "scope_promotion")
+                    .count(),
+                1
+            );
+            let _ = std::fs::remove_dir_all(root);
+            return;
+        }
         let recovered = super::finalize_scope_promotion(
             &user_receipt,
             &user_manifest,
+            &system_receipt,
             &system_manifest,
             preparation.intent_id,
             &mut user_metadata,

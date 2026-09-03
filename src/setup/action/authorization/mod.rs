@@ -417,11 +417,20 @@ struct AuthorizationRequest {
     principal: WorkerPrincipal,
     privilege_class: HostPrivilegeClass,
     displayed_actions: Vec<RequestedAction>,
+    #[cfg(not(action_compile_fixture))]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    scope_promotion: Option<crate::setup::promotion::ScopePromotionRequestBinding>,
 }
 
 struct PreparedAuthorizationRequest {
     bytes: Vec<u8>,
     digest: String,
+}
+
+pub(in crate::setup) struct ScopePromotionAuthorizationAuthority(());
+
+fn scope_promotion_authorization_authority() -> ScopePromotionAuthorizationAuthority {
+    ScopePromotionAuthorizationAuthority(())
 }
 
 #[derive(Clone, Debug, Deserialize, Hash, PartialEq, Eq, Serialize)]
@@ -702,9 +711,46 @@ fn write_authorization_request(
     write_prepared_authorization_request(&prepared, context)
 }
 
+#[cfg(not(action_compile_fixture))]
 fn prepare_authorization_request(
     displayed_actions: &[RequestedAction],
     context: &AuthorizationContext,
+) -> Result<PreparedAuthorizationRequest, AuthorizationError> {
+    prepare_authorization_request_with_binding(displayed_actions, context, None, None)
+}
+
+#[cfg(action_compile_fixture)]
+fn prepare_authorization_request(
+    displayed_actions: &[RequestedAction],
+    context: &AuthorizationContext,
+) -> Result<PreparedAuthorizationRequest, AuthorizationError> {
+    let executable = context
+        .executable
+        .to_str()
+        .ok_or(AuthorizationError::RequestInvalid)?;
+    let request = AuthorizationRequest {
+        schema_version: REQUEST_SCHEMA_VERSION,
+        request_id: Uuid::now_v7().to_string(),
+        issued_at: context.now.to_rfc3339_opts(SecondsFormat::Secs, true),
+        expires_at: (context.now + REQUEST_LIFETIME).to_rfc3339_opts(SecondsFormat::Secs, true),
+        installation_scope: RequestScope::System,
+        host_id: context.host_id.clone(),
+        executable: executable.to_owned(),
+        principal: context.principal.clone(),
+        privilege_class: context.privilege_class,
+        displayed_actions: displayed_actions.to_vec(),
+    };
+    let bytes = serde_json::to_vec(&request).map_err(|_| AuthorizationError::RequestInvalid)?;
+    let digest = request_digest(&bytes);
+    Ok(PreparedAuthorizationRequest { bytes, digest })
+}
+
+#[cfg(not(action_compile_fixture))]
+fn prepare_authorization_request_with_binding(
+    displayed_actions: &[RequestedAction],
+    context: &AuthorizationContext,
+    request_id: Option<uuid::Uuid>,
+    scope_promotion: Option<crate::setup::promotion::ScopePromotionRequestBinding>,
 ) -> Result<PreparedAuthorizationRequest, AuthorizationError> {
     let executable = context
         .executable
@@ -720,7 +766,7 @@ fn prepare_authorization_request(
     }
     let request = AuthorizationRequest {
         schema_version: REQUEST_SCHEMA_VERSION,
-        request_id: Uuid::now_v7().to_string(),
+        request_id: request_id.unwrap_or_else(Uuid::now_v7).to_string(),
         issued_at: context.now.to_rfc3339_opts(SecondsFormat::Secs, true),
         expires_at: (context.now + REQUEST_LIFETIME).to_rfc3339_opts(SecondsFormat::Secs, true),
         installation_scope: RequestScope::System,
@@ -729,6 +775,7 @@ fn prepare_authorization_request(
         principal: context.principal.clone(),
         privilege_class: context.privilege_class,
         displayed_actions: displayed_actions.to_vec(),
+        scope_promotion,
     };
     let bytes = serde_json::to_vec(&request).map_err(|_| AuthorizationError::RequestInvalid)?;
     if bytes.len() > MAX_REQUEST_BYTES {
@@ -781,6 +828,64 @@ fn write_request(
         .map(requested_action)
         .collect::<Vec<_>>();
     write_authorization_request(&displayed_actions, context)
+}
+
+#[cfg(all(test, not(target_os = "windows")))]
+pub(in crate::setup) struct PreparedAuthorizationRequestForTest {
+    context: AuthorizationContext,
+    digest: String,
+}
+
+#[cfg(all(test, not(target_os = "windows")))]
+impl PreparedAuthorizationRequestForTest {
+    pub(in crate::setup) fn run_scope_promotion(
+        self,
+        plan: &mut Vec<Action>,
+        user_store: &ReceiptStore,
+        system_store: &ReceiptStore,
+        metadata: &mut ReceiptMetadataSource,
+    ) -> Result<ApplyReport, AuthorizationError> {
+        run_privileged_request_with_promotion(
+            &self.context,
+            &self.digest,
+            plan,
+            user_store,
+            system_store,
+            metadata,
+        )
+    }
+}
+
+#[cfg(all(test, not(target_os = "windows")))]
+pub(in crate::setup) fn prepare_scope_promotion_authorization_request_for_test(
+    plan: &[Action],
+    request_path: PathBuf,
+    original_operator: WorkerPrincipal,
+    user_store: &ReceiptStore,
+    intent_id: uuid::Uuid,
+) -> Result<PreparedAuthorizationRequestForTest, AuthorizationError> {
+    let context = AuthorizationContext::new_for_test(
+        "host-scope-promotion",
+        std::env::current_exe().map_err(|_| AuthorizationError::RequestInvalid)?,
+        request_path,
+        original_operator,
+        "2026-09-03T12:00:30Z",
+    )?;
+    let binding = crate::setup::promotion::scope_promotion_request_binding(user_store, intent_id)
+        .map_err(|_| AuthorizationError::RequestInvalid)?;
+    let displayed_actions = plan
+        .iter()
+        .filter(|action| action.privilege() != Privilege::None)
+        .map(requested_action)
+        .collect::<Vec<_>>();
+    let prepared = prepare_authorization_request_with_binding(
+        &displayed_actions,
+        &context,
+        Some(binding.authorization_request_id()),
+        Some(binding),
+    )?;
+    let digest = write_prepared_authorization_request(&prepared, &context)?;
+    Ok(PreparedAuthorizationRequestForTest { context, digest })
 }
 
 fn requested_action(action: &Action) -> RequestedAction {
@@ -848,6 +953,45 @@ pub(super) fn run_privileged_request(
     system_store: &ReceiptStore,
     metadata: &mut ReceiptMetadataSource,
 ) -> Result<ApplyReport, AuthorizationError> {
+    run_privileged_request_internal(
+        context,
+        expected_request_digest,
+        recomputed_plan,
+        None,
+        system_store,
+        metadata,
+    )
+}
+
+#[cfg(all(test, not(target_os = "windows")))]
+fn run_privileged_request_with_promotion(
+    context: &AuthorizationContext,
+    expected_request_digest: &str,
+    recomputed_plan: &mut Vec<Action>,
+    user_store: &ReceiptStore,
+    system_store: &ReceiptStore,
+    metadata: &mut ReceiptMetadataSource,
+) -> Result<ApplyReport, AuthorizationError> {
+    run_privileged_request_internal(
+        context,
+        expected_request_digest,
+        recomputed_plan,
+        Some(user_store),
+        system_store,
+        metadata,
+    )
+}
+
+fn run_privileged_request_internal(
+    context: &AuthorizationContext,
+    expected_request_digest: &str,
+    recomputed_plan: &mut Vec<Action>,
+    user_store: Option<&ReceiptStore>,
+    system_store: &ReceiptStore,
+    metadata: &mut ReceiptMetadataSource,
+) -> Result<ApplyReport, AuthorizationError> {
+    #[cfg(action_compile_fixture)]
+    let _ = user_store;
     #[cfg(not(test))]
     crate::platform::verify_setup_authorization_executable(&context.executable)
         .map_err(|_| AuthorizationError::RequestInvalid)?;
@@ -893,6 +1037,35 @@ pub(super) fn run_privileged_request(
         return Err(AuthorizationError::RequestInvalid);
     }
 
+    #[cfg(not(action_compile_fixture))]
+    if let Some(binding) = &request.scope_promotion {
+        let user_store = user_store.ok_or(AuthorizationError::RequestInvalid)?;
+        let request_id =
+            Uuid::parse_str(&request.request_id).map_err(|_| AuthorizationError::RequestInvalid)?;
+        if request_id != binding.authorization_request_id()
+            || request.principal != *binding.original_operator()
+            || system_store.worker_principal() != binding.target_principal()
+            || system_store.path().to_str() != Some(binding.system_receipt_path())
+        {
+            return Err(AuthorizationError::RequestInvalid);
+        }
+        binding
+            .reverify_intent(user_store)
+            .map_err(|_| AuthorizationError::RequestInvalid)?;
+        system_store
+            .reserve_scope_promotion_authorization(
+                request_id,
+                expected_request_digest,
+                binding,
+                &scope_promotion_authorization_authority(),
+            )
+            .map_err(AuthorizationError::RequestConsumed)?;
+    } else {
+        system_store
+            .reserve_authorization(&request.request_id, expected_request_digest)
+            .map_err(AuthorizationError::RequestConsumed)?;
+    }
+    #[cfg(action_compile_fixture)]
     system_store
         .reserve_authorization(&request.request_id, expected_request_digest)
         .map_err(AuthorizationError::RequestConsumed)?;

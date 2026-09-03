@@ -35,8 +35,10 @@ a user-visible milestone.
 
 The immediate delivery order is therefore capability-first:
 
-1. Finish T0.14 as one complete rootless-default plus optional dedicated-adoption
-   capability.
+1. Finish T0.14 Slice 5 as an internal accepted security and durability checkpoint for
+   rootless-default plus optional dedicated adoption. It is not a user-visible milestone:
+   T0.20 must supply the single production CLI consumer and runnable isolated-state setup
+   journey before this capability satisfies the delivery-slice acceptance rule above.
 2. Pull T0.19–T0.21 forward together with the minimum rootless portions of T0.15–T0.17
    needed for a truthful, runnable `styrn setup`: defaults/config/flags/wizard all feed
    one path; the command creates the current user's worker tree, receipt, and manifest;
