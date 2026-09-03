@@ -12,7 +12,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum InstallationScope {
     User,
@@ -1361,14 +1361,14 @@ fn validate_user_scope_principal(
     Ok(())
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum PrincipalKind {
     UnixUid,
     WindowsSid,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub(crate) enum WorkerAccountPolicy {
     CurrentUser,
@@ -1671,12 +1671,23 @@ fn inspect_established_dedicated_account_for_test(
 }
 
 impl DedicatedAccountHandle {
+    pub(crate) fn reverify_and_bind_for_action<Output>(
+        &self,
+        authority: &DedicatedAccountActionAuthority,
+        bind: impl for<'binding> FnOnce(&'binding WorkerPrincipal) -> Output,
+    ) -> Result<Output, DedicatedAccountIssue> {
+        let _ = authority;
+        self.reverify_and_bind(&DedicatedAccountFactoryAuthority(()), |verified| {
+            bind(verified.principal())
+        })
+    }
+
     #[allow(dead_code)] // Used only when the action graph owns the revalidation authority.
     pub(crate) fn reverify_for_adoption(
         &self,
         _authority: &DedicatedAccountActionAuthority,
     ) -> Result<(), DedicatedAccountIssue> {
-        self.reverify_and_bind(&DedicatedAccountFactoryAuthority(()), |_| ())
+        self.reverify_and_bind_for_action(_authority, |_| ())
     }
 
     #[allow(dead_code)] // Invoked by the later sealed dedicated factories.
@@ -1751,7 +1762,7 @@ pub(crate) fn inspect_dedicated_account(spec: DedicatedAccountSpec) -> Dedicated
 ///
 /// Keep this type free of `Display`: callers must choose deliberately whether
 /// a diagnostic needs the account name or native identifier.
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
 pub(crate) struct WorkerPrincipal {
     principal_kind: PrincipalKind,
     principal_id: String,

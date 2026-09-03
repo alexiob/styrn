@@ -37,10 +37,20 @@ const MAX_REQUEST_BYTES: usize = 64 * 1024;
 const AUTHORIZATION_PENDING_INSTRUCTIONS: &str =
     "Authorize the displayed system change, then rerun setup.";
 
-fn deferred_authorization_pending(action: &Action) -> PendingAction {
-    let instructions = HumanInstructions::new(AUTHORIZATION_PENDING_INSTRUCTIONS)
-        .expect("static authorization instructions are valid");
-    PendingAction::new(action.name().clone(), NeedsHuman::new(instructions, None))
+fn deferred_authorization_pending(
+    action: &Action,
+    needs_human: Option<NeedsHuman>,
+) -> Result<PendingAction, super::execution::ApplyPlanError> {
+    let needs_human = needs_human.unwrap_or_else(|| {
+        let instructions = HumanInstructions::new(AUTHORIZATION_PENDING_INSTRUCTIONS)
+            .expect("static authorization instructions are valid");
+        NeedsHuman::new(instructions, None)
+    });
+    match action {
+        Action::WorkerDirectory(_) => PendingAction::deferred_system(action, needs_human)
+            .map_err(super::execution::ApplyPlanError::Action),
+        _ => Ok(PendingAction::new(action.name().clone(), needs_human)),
+    }
 }
 
 pub(super) trait AuthorizationInvoker {
@@ -422,6 +432,16 @@ enum RequestedAction {
         privilege: RequestedPrivilege,
         operation: RequestedOperation,
     },
+    WorkerDirectory {
+        action_id: String,
+        privilege: RequestedPrivilege,
+        installation_scope: RequestScope,
+        target_principal: WorkerPrincipal,
+        root: String,
+        node: RequestedWorkerDirectoryNode,
+        path: String,
+        parameter_sha256: String,
+    },
     #[cfg(test)]
     TestState {
         action_id: String,
@@ -434,6 +454,7 @@ impl RequestedAction {
     fn action_id(&self) -> &str {
         match self {
             Self::Foundation { action_id, .. } => action_id,
+            Self::WorkerDirectory { action_id, .. } => action_id,
             #[cfg(test)]
             Self::TestState { action_id, .. } => action_id,
         }
@@ -442,8 +463,49 @@ impl RequestedAction {
     fn privilege(&self) -> RequestedPrivilege {
         match self {
             Self::Foundation { privilege, .. } => *privilege,
+            Self::WorkerDirectory { privilege, .. } => *privilege,
             #[cfg(test)]
             Self::TestState { privilege, .. } => *privilege,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Hash, PartialEq, Eq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case", deny_unknown_fields)]
+enum RequestedWorkerDirectoryNode {
+    Support { ordinal: u16 },
+    Root,
+    Repos,
+    Jobs,
+    Cache,
+    Artifacts,
+    Logs,
+}
+
+impl RequestedWorkerDirectoryNode {
+    fn action_id(self) -> String {
+        match self {
+            Self::Support { ordinal } => format!("identity.directory.support-{ordinal}"),
+            Self::Root => "identity.directory.root".to_owned(),
+            Self::Repos => "identity.directory.repos".to_owned(),
+            Self::Jobs => "identity.directory.jobs".to_owned(),
+            Self::Cache => "identity.directory.cache".to_owned(),
+            Self::Artifacts => "identity.directory.artifacts".to_owned(),
+            Self::Logs => "identity.directory.logs".to_owned(),
+        }
+    }
+}
+
+impl From<crate::platform::WorkerDirectoryNode> for RequestedWorkerDirectoryNode {
+    fn from(node: crate::platform::WorkerDirectoryNode) -> Self {
+        match node {
+            crate::platform::WorkerDirectoryNode::Support { ordinal } => Self::Support { ordinal },
+            crate::platform::WorkerDirectoryNode::Root => Self::Root,
+            crate::platform::WorkerDirectoryNode::Repos => Self::Repos,
+            crate::platform::WorkerDirectoryNode::Jobs => Self::Jobs,
+            crate::platform::WorkerDirectoryNode::Cache => Self::Cache,
+            crate::platform::WorkerDirectoryNode::Artifacts => Self::Artifacts,
+            crate::platform::WorkerDirectoryNode::Logs => Self::Logs,
         }
     }
 }
@@ -466,7 +528,7 @@ enum RequestedOperation {
     Remove,
 }
 
-#[derive(Clone, Copy, Debug, Deserialize, PartialEq, Eq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Hash, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum RequestScope {
     System,
@@ -517,11 +579,11 @@ pub(super) fn execute_with_authorization<I: AuthorizationInvoker>(
         {
             ActionCheck::Todo => {
                 requested_privileged.push(requested_action(action));
-                privileged_pending.push(deferred_authorization_pending(action));
+                privileged_pending.push(deferred_authorization_pending(action, None)?);
             }
             ActionCheck::Done => {}
             ActionCheck::NeedsHuman(needs_human) => {
-                privileged_pending.push(PendingAction::new(action.name().clone(), needs_human))
+                privileged_pending.push(deferred_authorization_pending(action, Some(needs_human))?)
             }
         }
     }
@@ -743,8 +805,32 @@ fn requested_action(action: &Action) -> RequestedAction {
         Action::DedicatedAccountPrerequisite(_) => unreachable!(
             "non-privileged dedicated-account prerequisites cannot enter authorization requests"
         ),
-        Action::WorkerDirectory(_) => {
-            unreachable!("ordinary worker-directory actions cannot enter authorization requests")
+        Action::WorkerDirectory(worker_action) => {
+            let super::ActionParameters::WorkerDirectory(parameters) = worker_action.parameters()
+            else {
+                unreachable!("worker-directory action parameters remain closed")
+            };
+            let deferred = worker_action
+                .deferred_parameters()
+                .expect("dedicated system directory factory emits valid deferred parameters");
+            RequestedAction::WorkerDirectory {
+                action_id: parameters.action_id().as_str().to_owned(),
+                privilege,
+                installation_scope: RequestScope::System,
+                target_principal: parameters.principal().clone(),
+                root: parameters
+                    .root()
+                    .to_str()
+                    .expect("validated worker root is Unicode")
+                    .to_owned(),
+                node: parameters.node().into(),
+                path: parameters
+                    .path()
+                    .to_str()
+                    .expect("validated worker path is Unicode")
+                    .to_owned(),
+                parameter_sha256: deferred.parameter_sha256().to_owned(),
+            }
         }
         #[cfg(test)]
         Action::Test(action) => RequestedAction::TestState {
@@ -769,9 +855,7 @@ pub(super) fn run_privileged_request(
     if system_store.installation_scope() != InstallationScope::System {
         return Err(AuthorizationError::RequestInvalid);
     }
-    if system_store.worker_principal() != &context.principal {
-        return Err(AuthorizationError::PrincipalInvalid);
-    }
+    validate_system_store_binding(recomputed_plan, system_store, &context.principal)?;
     validate_plan(recomputed_plan, context.privilege_class)?;
     if recomputed_plan
         .iter()
@@ -831,6 +915,50 @@ pub(super) fn run_privileged_request(
     Ok(result?)
 }
 
+fn validate_system_store_binding(
+    plan: &[Action],
+    system_store: &ReceiptStore,
+    original_operator: &WorkerPrincipal,
+) -> Result<(), AuthorizationError> {
+    let mut dedicated_target = None::<WorkerPrincipal>;
+    let mut has_other_actions = false;
+    for action in plan {
+        match action {
+            Action::WorkerDirectory(worker_action) => {
+                let super::ActionParameters::WorkerDirectory(parameters) =
+                    worker_action.parameters()
+                else {
+                    return Err(AuthorizationError::RequestInvalid);
+                };
+                if parameters.installation_scope() != InstallationScope::System
+                    || parameters.principal().account_policy()
+                        != crate::platform::WorkerAccountPolicy::Dedicated
+                {
+                    return Err(AuthorizationError::RequestInvalid);
+                }
+                if dedicated_target
+                    .replace(parameters.principal().clone())
+                    .is_some_and(|target| target != *parameters.principal())
+                {
+                    return Err(AuthorizationError::PrincipalInvalid);
+                }
+            }
+            _ => has_other_actions = true,
+        }
+    }
+    match dedicated_target {
+        Some(target)
+            if !has_other_actions
+                && &target != original_operator
+                && &target == system_store.worker_principal() =>
+        {
+            Ok(())
+        }
+        None if original_operator == system_store.worker_principal() => Ok(()),
+        _ => Err(AuthorizationError::PrincipalInvalid),
+    }
+}
+
 /// Applies a mixed system-scope plan after the native authorization boundary.
 ///
 /// Receipt preparation and publication remain in this process. Only the
@@ -844,13 +972,12 @@ fn execute_system_plan_with_test_user_runner<U: PreparedActionRunner>(
     context: &SetupExecutionContext,
     user_runner: &mut U,
 ) -> Result<ApplyReport, AuthorizationError> {
-    if system_store.installation_scope() != InstallationScope::System
-        || system_store.worker_principal() != context.original_principal()
-    {
+    if system_store.installation_scope() != InstallationScope::System {
         return Err(AuthorizationError::PrincipalInvalid);
     }
     crate::platform::verify_worker_principal(context.original_principal())
         .map_err(|_| AuthorizationError::PrincipalInvalid)?;
+    validate_system_store_binding(plan, system_store, context.original_principal())?;
 
     let privilege_class = match context.host_privilege() {
         #[cfg(not(target_os = "windows"))]
@@ -1030,6 +1157,31 @@ fn validate_request(
                 )
         ) {
             return Err(AuthorizationError::RequestInvalid);
+        }
+        if let RequestedAction::WorkerDirectory {
+            action_id,
+            installation_scope,
+            target_principal,
+            root,
+            node,
+            path,
+            parameter_sha256,
+            ..
+        } = action
+        {
+            if *installation_scope != RequestScope::System
+                || target_principal.account_policy()
+                    != crate::platform::WorkerAccountPolicy::Dedicated
+                || action_id != &node.action_id()
+                || validate_absolute_normalized_path(Path::new(root)).is_err()
+                || validate_absolute_normalized_path(Path::new(path)).is_err()
+                || !path.starts_with(root)
+                || validate_request_digest(parameter_sha256).is_err()
+                || !crate::setup::validate_probe_static_text(target_principal.principal_id())
+                || !crate::setup::validate_probe_static_text(target_principal.name())
+            {
+                return Err(AuthorizationError::RequestInvalid);
+            }
         }
     }
     Ok(())

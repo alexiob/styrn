@@ -20,10 +20,29 @@ enum DedicatedAccountPrerequisiteState {
     NeedsHuman(NeedsHuman),
 }
 
-#[allow(dead_code)] // Shared by later dedicated directory and manifest factories.
+#[derive(Clone)]
 pub(crate) struct DedicatedAccountReady {
     original_operator: crate::platform::WorkerPrincipal,
     target: crate::platform::DedicatedAccountHandle,
+    selector: Box<str>,
+}
+
+impl DedicatedAccountReady {
+    pub(super) fn original_operator(&self) -> &crate::platform::WorkerPrincipal {
+        &self.original_operator
+    }
+
+    pub(super) fn selector(&self) -> &str {
+        &self.selector
+    }
+
+    pub(super) fn reverify_target<Output>(
+        &self,
+        bind: impl for<'binding> FnOnce(&'binding crate::platform::WorkerPrincipal) -> Output,
+    ) -> Result<Output, crate::platform::DedicatedAccountIssue> {
+        let authority = super::dedicated_account_action_authority();
+        self.target.reverify_and_bind_for_action(&authority, bind)
+    }
 }
 
 pub(crate) struct DedicatedAccountSelection {
@@ -150,7 +169,7 @@ pub(in crate::setup) fn select_dedicated_account(
     )
 }
 
-fn select_dedicated_account_observation(
+pub(super) fn select_dedicated_account_observation(
     context: &crate::platform::SetupExecutionContext,
     spec: DedicatedAccountSpec,
     observation: crate::platform::DedicatedAccountObservation,
@@ -161,6 +180,7 @@ fn select_dedicated_account_observation(
     {
         return Err(ActionError::InvalidDedicatedAccountSelection);
     }
+    let selector = spec.name().to_owned();
     let (component, ready) = match observation {
         crate::platform::DedicatedAccountObservation::PresentHealthy(handle) => {
             let authority = super::dedicated_account_action_authority();
@@ -170,6 +190,7 @@ fn select_dedicated_account_observation(
                     Some(DedicatedAccountReady {
                         original_operator: operator.clone(),
                         target: handle,
+                        selector: selector.into(),
                     }),
                 )
             } else {

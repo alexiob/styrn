@@ -951,6 +951,29 @@ impl ReceiptStore {
     }
 
     #[cfg(test)]
+    pub(in crate::setup) fn new_system_for_test_with_worker_layout(
+        path: impl Into<PathBuf>,
+        layout: crate::platform::WorkerDirectoryLayout,
+    ) -> Self {
+        let path = path.into();
+        let trusted_root = path.parent().map(Path::to_path_buf).unwrap_or_default();
+        Self {
+            scope: InstallationScope::System,
+            path,
+            trusted_root,
+            owner: crate::platform::ManifestOwner::CurrentProcess,
+            worker: layout.worker_principal().clone(),
+            interruption: None,
+            interrupt_after_prepare: false,
+            interrupt_before_intent_retirement: false,
+            interrupt_after_completed_nodes: None,
+            worker_directory_layout_override: Some(layout),
+            intent_read_interruption: None,
+            pending_publication_intent_interruption: None,
+        }
+    }
+
+    #[cfg(test)]
     pub(in crate::setup) fn new_user_for_test_with_worker_layout_failing_before_replace(
         path: impl Into<PathBuf>,
         layout: crate::platform::WorkerDirectoryLayout,
@@ -3217,13 +3240,47 @@ impl ReceiptEntry {
             }
             return Ok(());
         }
+        if matches!(self.action, ReceiptAction::DeferredSystemAction(_)) {
+            if self.status != ReceiptStatus::Pending
+                || self.privilege_used != ReceiptPrivilege::None
+                || !self.directories_created.is_empty()
+                || !self.files_created.is_empty()
+                || !self.files_modified.is_empty()
+                || !self.services.is_empty()
+                || !self.accounts.is_empty()
+                || !self.registry_keys.is_empty()
+                || !self.firewall_rules.is_empty()
+                || self.download_provenance.0.is_some()
+            {
+                return Err(ReceiptError::InvalidDeferredSystemAction);
+            }
+            return Ok(());
+        }
         let ReceiptAction::WorkerDirectory(parameters) = &self.action else {
             return Ok(());
         };
         if self.status == ReceiptStatus::Pending {
-            return Ok(());
+            return if parameters.installation_scope == InstallationScope::User {
+                Ok(())
+            } else {
+                Err(ReceiptError::InvalidWorkerDirectoryAction)
+            };
         }
-        if self.privilege_used != ReceiptPrivilege::None
+        let expected_privilege = match parameters.installation_scope {
+            InstallationScope::User => ReceiptPrivilege::None,
+            InstallationScope::System => {
+                #[cfg(not(target_os = "windows"))]
+                {
+                    ReceiptPrivilege::Root
+                }
+                #[cfg(target_os = "windows")]
+                {
+                    ReceiptPrivilege::Admin
+                }
+            }
+        };
+        if self.status != ReceiptStatus::Applied
+            || self.privilege_used != expected_privilege
             || self.directories_created.len() != 1
             || self.directories_created[0].path != parameters.path
             || !self.files_created.is_empty()
@@ -3250,6 +3307,7 @@ impl ReceiptEntry {
 enum ReceiptAction {
     Foundation(FoundationActionParameters),
     DedicatedAccountPrerequisite(DedicatedAccountPrerequisiteParameters),
+    DeferredSystemAction(DeferredSystemActionParameters),
     WorkerDirectory(WorkerDirectoryActionParameters),
 }
 
@@ -3261,7 +3319,9 @@ impl ReceiptAction {
     fn requires_current_v1_digest(&self) -> bool {
         matches!(
             self,
-            Self::DedicatedAccountPrerequisite(_) | Self::WorkerDirectory(_)
+            Self::DedicatedAccountPrerequisite(_)
+                | Self::DeferredSystemAction(_)
+                | Self::WorkerDirectory(_)
         )
     }
 
@@ -3281,6 +3341,16 @@ impl ReceiptAction {
                     selector: parameters.selector().to_owned(),
                 }),
             ),
+            crate::setup::action::ActionParameters::DeferredSystemAction(parameters) => {
+                Ok(Self::DeferredSystemAction(DeferredSystemActionParameters {
+                    action_id: ActionIdentifier(parameters.action_id().as_str().to_owned()),
+                    target_scope: parameters.target_scope(),
+                    target_principal: ReceiptWorkerPrincipal::from_worker_principal(
+                        parameters.target_principal(),
+                    ),
+                    parameter_sha256: Sha256Digest(parameters.parameter_sha256().to_owned()),
+                }))
+            }
             crate::setup::action::ActionParameters::WorkerDirectory(parameters) => {
                 Ok(Self::WorkerDirectory(WorkerDirectoryActionParameters {
                     action_id: ActionIdentifier(parameters.action_id().as_str().to_owned()),
@@ -3300,6 +3370,7 @@ impl ReceiptAction {
         match self {
             Self::Foundation(parameters) => &parameters.action_id.0,
             Self::DedicatedAccountPrerequisite(parameters) => &parameters.action_id.0,
+            Self::DeferredSystemAction(parameters) => &parameters.action_id.0,
             Self::WorkerDirectory(parameters) => &parameters.action_id.0,
         }
     }
@@ -3308,6 +3379,7 @@ impl ReceiptAction {
         match self {
             Self::Foundation(parameters) => parameters.action_id.validate(),
             Self::DedicatedAccountPrerequisite(parameters) => parameters.validate(),
+            Self::DeferredSystemAction(parameters) => parameters.validate(),
             Self::WorkerDirectory(parameters) => parameters.validate(),
         }
     }
@@ -3319,10 +3391,10 @@ impl ReceiptAction {
             Self::DedicatedAccountPrerequisite(_) => {
                 Err(ReceiptError::InvalidDedicatedAccountPrerequisite)
             }
+            Self::DeferredSystemAction(_) if scope == InstallationScope::User => Ok(()),
+            Self::DeferredSystemAction(_) => Err(ReceiptError::InvalidDeferredSystemAction),
             Self::WorkerDirectory(parameters) => {
-                if scope == InstallationScope::User
-                    && parameters.installation_scope == InstallationScope::User
-                {
+                if scope == parameters.installation_scope {
                     Ok(())
                 } else {
                     Err(ReceiptError::InvalidWorkerDirectoryAction)
@@ -3340,6 +3412,12 @@ impl ReceiptAction {
                 Ok(())
             }
             Self::DedicatedAccountPrerequisite(_) => Err(ReceiptError::InvalidWorkerPrincipal),
+            Self::DeferredSystemAction(_)
+                if worker.account_policy() == WorkerAccountPolicy::CurrentUser =>
+            {
+                Ok(())
+            }
+            Self::DeferredSystemAction(_) => Err(ReceiptError::InvalidWorkerPrincipal),
             Self::WorkerDirectory(parameters) => {
                 if parameters.principal.to_worker_principal()? == *worker {
                     Ok(())
@@ -3366,6 +3444,29 @@ impl ReceiptAction {
             || !layout.materialization_nodes().contains(&node)
         {
             return Err(ReceiptError::InvalidWorkerDirectoryAction);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct DeferredSystemActionParameters {
+    action_id: ActionIdentifier,
+    target_scope: InstallationScope,
+    target_principal: ReceiptWorkerPrincipal,
+    parameter_sha256: Sha256Digest,
+}
+
+impl DeferredSystemActionParameters {
+    fn validate(&self) -> Result<(), ReceiptError> {
+        self.action_id.validate()?;
+        self.target_principal.validate()?;
+        self.parameter_sha256.validate()?;
+        if self.target_scope != InstallationScope::System
+            || self.target_principal.account_policy != WorkerAccountPolicy::Dedicated
+        {
+            return Err(ReceiptError::InvalidDeferredSystemAction);
         }
         Ok(())
     }
@@ -3416,9 +3517,12 @@ struct WorkerDirectoryActionParameters {
 impl WorkerDirectoryActionParameters {
     fn validate(&self) -> Result<(), ReceiptError> {
         self.action_id.validate()?;
-        if self.installation_scope != InstallationScope::User
-            || self.principal.account_policy != WorkerAccountPolicy::CurrentUser
-        {
+        let valid_scope_policy = matches!(
+            (self.installation_scope, self.principal.account_policy),
+            (InstallationScope::User, WorkerAccountPolicy::CurrentUser)
+                | (InstallationScope::System, WorkerAccountPolicy::Dedicated)
+        );
+        if !valid_scope_policy {
             return Err(ReceiptError::InvalidWorkerDirectoryAction);
         }
         self.principal.validate()?;
@@ -4042,6 +4146,8 @@ pub(crate) enum ReceiptError {
     InvalidWorkerDirectoryAction,
     #[error("setup receipt dedicated-account prerequisite is invalid")]
     InvalidDedicatedAccountPrerequisite,
+    #[error("setup receipt deferred system action is invalid")]
+    InvalidDeferredSystemAction,
     #[error("setup receipt worker principal is invalid")]
     InvalidWorkerPrincipal,
     #[error("setup receipt timestamp is not canonical UTC RFC 3339")]

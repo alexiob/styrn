@@ -2,8 +2,9 @@ use super::*;
 use crate::setup::{
     action::{
         execution::{ApplyPlanError, DurableReceiptBinding, PreparedActionRunner},
-        Action, ActionEffect, ActionError, HumanInstructions, MutationCompletion, NeedsHuman,
-        PendingSeverity, PreparedExecutionError, Privilege, ScriptFragment, VerifiedActionEffect,
+        Action, ActionEffect, ActionError, ActionParameters, HumanInstructions, MutationCompletion,
+        NeedsHuman, PendingSeverity, PreparedExecutionError, Privilege, ScriptFragment,
+        VerifiedActionEffect,
     },
     receipt::{ReceiptMetadataSource, ReceiptStore, ReceiptStoreError},
 };
@@ -184,6 +185,210 @@ fn current_user_worker_directory_never_requests_authorization() {
     assert!(report.everything_ready());
     assert_eq!(invoker.calls(), 0);
     assert!(!fixture.request_path().exists());
+}
+
+#[test]
+fn dedicated_worker_authorization_request_binds_target_separately_from_operator() {
+    let fixture = AuthorizationFixture::new("dedicated-worker-request-binding");
+    let context = fixture.context();
+    let selector = crate::platform::resolve_current_worker_principal()
+        .unwrap()
+        .name()
+        .to_owned();
+    let (ready, target) = super::super::tests::dedicated_ready_for_test(&selector);
+    let (plan, layout) =
+        super::super::worker_directory::dedicated_system_worker_directory_plan_for_test(
+            &ready,
+            fixture.root.join("dedicated-worker"),
+            Some(fixture.root.clone()),
+        )
+        .unwrap();
+
+    let displayed_actions = plan.iter().map(requested_action).collect::<Vec<_>>();
+    let prepared = prepare_authorization_request(&displayed_actions, &context).unwrap();
+    let request: AuthorizationRequest = serde_json::from_slice(&prepared.bytes).unwrap();
+
+    assert_eq!(request.principal, *ready.original_operator());
+    assert_ne!(request.principal, target);
+    assert_eq!(request.displayed_actions.len(), 6);
+    for (requested, action) in request.displayed_actions.iter().zip(&plan) {
+        let RequestedAction::WorkerDirectory {
+            action_id,
+            installation_scope,
+            target_principal,
+            root,
+            path,
+            parameter_sha256,
+            ..
+        } = requested
+        else {
+            panic!("dedicated directory escaped the typed request boundary");
+        };
+        assert_eq!(action_id, action.name().as_str());
+        assert_eq!(*installation_scope, RequestScope::System);
+        assert_eq!(target_principal, &target);
+        assert_eq!(Path::new(root), layout.root());
+        let ActionParameters::WorkerDirectory(parameters) = action.parameters() else {
+            panic!("dedicated plan emitted the wrong action parameters");
+        };
+        assert_eq!(Path::new(path), parameters.path());
+        assert_eq!(parameter_sha256.len(), 64);
+    }
+}
+
+#[test]
+fn deferred_system_action_is_journaled_only_in_the_operator_receipt() {
+    let fixture = AuthorizationFixture::new("dedicated-worker-declined");
+    let store = ReceiptStore::new_user_for_test(fixture.user_receipt());
+    let selector = crate::platform::resolve_current_worker_principal()
+        .unwrap()
+        .name()
+        .to_owned();
+    let (ready, target) = super::super::tests::dedicated_ready_for_test(&selector);
+    let root = fixture.root.join("declined-dedicated-worker");
+    let (mut plan, _) =
+        super::super::worker_directory::dedicated_system_worker_directory_plan_for_test(
+            &ready,
+            root.clone(),
+            Some(fixture.root.clone()),
+        )
+        .unwrap();
+    let mut metadata = ReceiptMetadataSource::for_test([
+        (
+            "019cb047-3c00-7000-8000-000000000101",
+            "2026-09-02T12:00:01Z",
+        ),
+        (
+            "019cb047-3c00-7000-8000-000000000102",
+            "2026-09-02T12:00:02Z",
+        ),
+        (
+            "019cb047-3c00-7000-8000-000000000103",
+            "2026-09-02T12:00:03Z",
+        ),
+        (
+            "019cb047-3c00-7000-8000-000000000104",
+            "2026-09-02T12:00:04Z",
+        ),
+        (
+            "019cb047-3c00-7000-8000-000000000105",
+            "2026-09-02T12:00:05Z",
+        ),
+        (
+            "019cb047-3c00-7000-8000-000000000106",
+            "2026-09-02T12:00:06Z",
+        ),
+    ]);
+    let mut invoker = SpyInvoker::default();
+
+    let report = execute_with_authorization(
+        &mut plan,
+        &store,
+        &mut metadata,
+        &fixture.context(),
+        AuthorizationOptions::interactive_decline(),
+        &mut invoker,
+    )
+    .unwrap();
+
+    assert_eq!(
+        report.privileged_status(),
+        PrivilegedStatus::Pending { count: 6 }
+    );
+    assert_eq!(report.pending().len(), 6);
+    assert_eq!(invoker.calls(), 0);
+    assert!(!root.exists());
+    assert!(!fixture.system_receipt().exists());
+    let receipt = serde_json::from_slice::<serde_json::Value>(
+        &store.read_snapshot().unwrap().to_json().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(receipt["installation_scope"], "user");
+    for entry in receipt["entries"].as_array().unwrap() {
+        assert_eq!(entry["action"]["type"], "deferred_system_action");
+        assert_eq!(entry["action"]["parameters"]["target_scope"], "system");
+        assert_eq!(
+            entry["action"]["parameters"]["target_principal"]["name"],
+            target.name()
+        );
+        assert_eq!(entry["status"], "pending");
+        assert_eq!(entry["privilege_used"], "none");
+        assert_eq!(entry["directories_created"], serde_json::json!([]));
+    }
+}
+
+#[test]
+fn dedicated_system_worker_directory_child_requires_target_store_and_journals_exact_nodes() {
+    let fixture = AuthorizationFixture::new("dedicated-worker-child");
+    let selector = crate::platform::resolve_current_worker_principal()
+        .unwrap()
+        .name()
+        .to_owned();
+    let (ready, target) = super::super::tests::dedicated_ready_for_test(&selector);
+    let root = fixture.root.join("authorized-dedicated-worker");
+    let (mut plan, layout) =
+        super::super::worker_directory::dedicated_system_worker_directory_plan_for_test(
+            &ready,
+            root.clone(),
+            Some(fixture.root.clone()),
+        )
+        .unwrap();
+    let context = fixture.context();
+    let digest = write_request(&plan, &context).unwrap();
+
+    let wrong_store = ReceiptStore::new_for_test(fixture.system_receipt());
+    let error = run_privileged_request(
+        &context,
+        &digest,
+        &mut plan,
+        &wrong_store,
+        &mut receipt_metadata(&[]),
+    )
+    .unwrap_err();
+    assert!(matches!(error, AuthorizationError::PrincipalInvalid));
+    assert!(!root.exists());
+    assert!(fixture.request_path().exists());
+
+    let store = ReceiptStore::new_system_for_test_with_worker_layout(
+        fixture.system_receipt(),
+        layout.clone(),
+    );
+    let mut metadata = ReceiptMetadataSource::for_test([
+        (
+            "019cb047-3c00-7000-8000-000000000111",
+            "2026-09-02T12:00:01Z",
+        ),
+        (
+            "019cb047-3c00-7000-8000-000000000112",
+            "2026-09-02T12:00:02Z",
+        ),
+        (
+            "019cb047-3c00-7000-8000-000000000113",
+            "2026-09-02T12:00:03Z",
+        ),
+        (
+            "019cb047-3c00-7000-8000-000000000114",
+            "2026-09-02T12:00:04Z",
+        ),
+        (
+            "019cb047-3c00-7000-8000-000000000115",
+            "2026-09-02T12:00:05Z",
+        ),
+        (
+            "019cb047-3c00-7000-8000-000000000116",
+            "2026-09-02T12:00:06Z",
+        ),
+    ]);
+    let report =
+        run_privileged_request(&context, &digest, &mut plan, &store, &mut metadata).unwrap();
+
+    assert_eq!(report.applied_count(), 6);
+    assert_eq!(store.worker_principal(), &target);
+    assert_eq!(store.read_snapshot().unwrap().entry_count(), 6);
+    assert!(!fixture.request_path().exists());
+    for node in layout.materialization_nodes() {
+        assert!(layout.path_for_node(node).unwrap().is_dir());
+    }
 }
 
 #[test]
@@ -685,7 +890,7 @@ fn authorization_completion_rejects_invalid_display_order_before_pending_append(
     let state = Arc::new(Mutex::new(Vec::new()));
     let privileged =
         Action::test_journaled_state("test.system-action", 1, host_privilege(), state).0;
-    let pending = vec![deferred_authorization_pending(&privileged)];
+    let pending = vec![deferred_authorization_pending(&privileged, None).unwrap()];
     let error = match super::super::execution::complete_authorized_execution(
         ordinary,
         pending,
@@ -725,7 +930,7 @@ fn ordinary_only_token_is_stale_after_authorization_reissues_completion() {
     let privileged =
         Action::test_journaled_state("test.system-action", 1, host_privilege(), state).0;
     let displayed_order = vec![privileged.name().clone()];
-    let pending = vec![deferred_authorization_pending(&privileged)];
+    let pending = vec![deferred_authorization_pending(&privileged, None).unwrap()];
     let (_, replacement) = super::super::execution::complete_authorized_execution(
         ordinary_to_consume,
         pending,

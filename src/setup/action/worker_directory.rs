@@ -1,7 +1,8 @@
 use super::{
     Action, ActionCheck, ActionDescription, ActionEffect, ActionError, ActionName,
-    ActionParameters, ActionPlan, CreatedDirectoryEffect, HumanInstructions, MutationCompletion,
-    NeedsHuman, PreparedExecutionError, VerifiedActionEffect, WorkerDirectoryActionParameters,
+    ActionParameters, ActionPlan, CreatedDirectoryEffect, DeferredSystemActionParameters,
+    HumanInstructions, MutationCompletion, NeedsHuman, PreparedExecutionError,
+    VerifiedActionEffect, WorkerDirectoryActionParameters,
 };
 use crate::platform::{
     InstallationScope, SetupExecutionContext, SetupHostPrivilege, WorkerAccountPolicy,
@@ -10,10 +11,12 @@ use crate::platform::{
     WorkerDirectoryNodeFailureBindingError, WorkerDirectoryNodeFailureBound,
     WorkerDirectoryNodeInspection, WorkerDirectoryNodeObservation,
 };
+use sha2::{Digest, Sha256};
 use std::path::{Component, Path, PathBuf};
 
 const ROOT_ACTION_ID: &str = "identity.directory.root";
 const DESCRIPTION: &str = "Create one current-user worker directory node.";
+const DEDICATED_DESCRIPTION: &str = "Create one dedicated system worker directory node.";
 const NEEDS_HUMAN: &str = "Inspect and repair this worker directory node, then rerun setup.";
 
 pub(crate) struct WorkerDirectoryAction {
@@ -21,6 +24,8 @@ pub(crate) struct WorkerDirectoryAction {
     layout: WorkerDirectoryLayout,
     parameters: WorkerDirectoryActionParameters,
     expected_effect: ActionEffect,
+    privilege: super::Privilege,
+    dedicated_ready: Option<super::dedicated_account::DedicatedAccountReady>,
 }
 
 pub(in crate::setup) fn current_user_worker_directory_plan(
@@ -30,7 +35,7 @@ pub(in crate::setup) fn current_user_worker_directory_plan(
     let layout =
         crate::platform::resolve_worker_directory_layout(InstallationScope::User, &principal, None)
             .map_err(|_| factory_error())?;
-    build_plan(layout, principal)
+    build_plan(layout, principal, super::Privilege::None, None)
 }
 
 #[cfg(test)]
@@ -46,8 +51,59 @@ pub(super) fn current_user_worker_directory_plan_for_test(
         root,
         creation_anchor,
     );
-    let plan = build_plan(layout.clone(), principal)?;
+    let plan = build_plan(layout.clone(), principal, super::Privilege::None, None)?;
     Ok((plan, layout))
+}
+
+#[allow(dead_code)] // T0.20 supplies the selected ready adoption.
+pub(in crate::setup) fn dedicated_system_worker_directory_plan(
+    ready: &super::dedicated_account::DedicatedAccountReady,
+) -> Result<ActionPlan, ActionError> {
+    let principal = ready
+        .reverify_target(Clone::clone)
+        .map_err(|_| factory_error())?;
+    let layout = crate::platform::resolve_worker_directory_layout(
+        InstallationScope::System,
+        &principal,
+        None,
+    )
+    .map_err(|_| factory_error())?;
+    build_plan(layout, principal, dedicated_native_privilege(), Some(ready))
+}
+
+#[cfg(test)]
+pub(super) fn dedicated_system_worker_directory_plan_for_test(
+    ready: &super::dedicated_account::DedicatedAccountReady,
+    root: PathBuf,
+    creation_anchor: Option<PathBuf>,
+) -> Result<(ActionPlan, WorkerDirectoryLayout), ActionError> {
+    let principal = ready
+        .reverify_target(Clone::clone)
+        .map_err(|_| factory_error())?;
+    let layout = crate::platform::worker_directory_layout_for_test(
+        InstallationScope::System,
+        principal.clone(),
+        root,
+        creation_anchor,
+    );
+    let plan = build_plan(
+        layout.clone(),
+        principal,
+        dedicated_native_privilege(),
+        Some(ready),
+    )?;
+    Ok((plan, layout))
+}
+
+fn dedicated_native_privilege() -> super::Privilege {
+    #[cfg(not(target_os = "windows"))]
+    {
+        super::Privilege::Root
+    }
+    #[cfg(target_os = "windows")]
+    {
+        super::Privilege::Admin
+    }
 }
 
 fn validate_context(
@@ -71,6 +127,8 @@ fn validate_context(
 fn build_plan(
     layout: WorkerDirectoryLayout,
     principal: crate::platform::WorkerPrincipal,
+    privilege: super::Privilege,
+    dedicated_ready: Option<&super::dedicated_account::DedicatedAccountReady>,
 ) -> Result<ActionPlan, ActionError> {
     let root = validated_path(layout.root())?;
     layout
@@ -82,18 +140,24 @@ fn build_plan(
             let action_id = ActionName::parse(&node.action_id()).map_err(|_| factory_error())?;
             let parameters = WorkerDirectoryActionParameters {
                 action_id,
-                installation_scope: InstallationScope::User,
+                installation_scope: layout.installation_scope(),
                 principal: principal.clone(),
                 root: root.clone(),
                 node,
                 path,
             };
             Ok(Action::WorkerDirectory(Box::new(WorkerDirectoryAction {
-                description: ActionDescription::new(DESCRIPTION)
-                    .expect("static worker-directory description is valid"),
+                description: ActionDescription::new(if dedicated_ready.is_some() {
+                    DEDICATED_DESCRIPTION
+                } else {
+                    DESCRIPTION
+                })
+                .expect("static worker-directory description is valid"),
                 layout: layout.clone(),
                 expected_effect: directory_effect(effect_path),
                 parameters,
+                privilege,
+                dedicated_ready: dedicated_ready.cloned(),
             })))
         })
         .collect()
@@ -212,6 +276,41 @@ fn factory_error() -> ActionError {
 }
 
 impl WorkerDirectoryAction {
+    pub(super) fn deferred_parameters(
+        &self,
+    ) -> Result<DeferredSystemActionParameters, ActionError> {
+        if self.parameters.installation_scope() != InstallationScope::System
+            || self.parameters.principal().account_policy() != WorkerAccountPolicy::Dedicated
+            || self.privilege == super::Privilege::None
+        {
+            return Err(factory_error());
+        }
+        let mut hasher = Sha256::new();
+        hasher.update(b"styrn.deferred-system-action.v1\0");
+        for field in [
+            self.parameters.action_id().as_str(),
+            self.parameters.principal().principal_id(),
+            self.parameters.principal().name(),
+            validated_path_text(self.parameters.root())?,
+            validated_path_text(self.parameters.path())?,
+        ] {
+            hasher.update((field.len() as u64).to_be_bytes());
+            hasher.update(field.as_bytes());
+        }
+        let mut parameter_sha256 = String::with_capacity(64);
+        use std::fmt::Write as _;
+        for byte in hasher.finalize() {
+            write!(&mut parameter_sha256, "{byte:02x}")
+                .expect("writing hexadecimal to a String cannot fail");
+        }
+        Ok(DeferredSystemActionParameters {
+            action_id: self.parameters.action_id().clone(),
+            target_scope: InstallationScope::System,
+            target_principal: self.parameters.principal().clone(),
+            parameter_sha256: parameter_sha256.into_boxed_str(),
+        })
+    }
+
     pub(super) fn name(&self) -> &ActionName {
         self.parameters.action_id()
     }
@@ -228,7 +327,16 @@ impl WorkerDirectoryAction {
         self.expected_effect.clone()
     }
 
+    pub(super) fn privilege(&self) -> super::Privilege {
+        self.privilege
+    }
+
     pub(super) fn check(&self) -> ActionCheck {
+        if !self.dedicated_binding_is_current() {
+            return map_inspection(WorkerDirectoryNodeInspection::Unknowable(
+                crate::platform::WorkerDirectoryInspectionIssue::PrincipalDrift,
+            ));
+        }
         map_inspection(crate::platform::inspect_worker_directory_node(
             &self.layout,
             self.parameters.node(),
@@ -241,6 +349,11 @@ impl WorkerDirectoryAction {
             VerifiedActionEffect<'authority>,
         ) -> Result<Value, BindingError>,
     ) -> Result<(MutationCompletion, Value), PreparedExecutionError<BindingError>> {
+        if !self.dedicated_binding_is_current() {
+            return Err(PreparedExecutionError::Action(ActionError::apply_failed(
+                self.name().clone(),
+            )));
+        }
         let authority = super::native_mutation_authority();
         match crate::platform::create_worker_directory_node(
             &self.layout,
@@ -269,7 +382,9 @@ impl WorkerDirectoryAction {
                             self.name().clone(),
                         )))
                     }
-                    Err(WorkerDirectoryBindingError::Binding(error)) => map_binding_error(error),
+                    Err(WorkerDirectoryBindingError::Binding(error)) => {
+                        map_binding_error(self, error)
+                    }
                 }
             }
             Err(error) => {
@@ -284,11 +399,19 @@ impl WorkerDirectoryAction {
                         )))
                     }
                     Err(WorkerDirectoryNodeFailureBindingError::Binding { error, .. }) => {
-                        map_binding_error(error)
+                        map_binding_error(self, error)
                     }
                 }
             }
         }
+    }
+
+    fn dedicated_binding_is_current(&self) -> bool {
+        self.dedicated_ready.as_ref().is_none_or(|ready| {
+            ready
+                .reverify_target(|principal| principal == self.parameters.principal())
+                .unwrap_or(false)
+        })
     }
 }
 
@@ -320,6 +443,7 @@ pub(super) fn map_failure_bound_for_test<Value, BindingError>(
 
 enum EffectBindingError<BindingError> {
     ReceiptConflict,
+    PrincipalDrift,
     Binding(BindingError),
 }
 
@@ -328,6 +452,9 @@ fn bind_verified_effect<Value, BindingError>(
     observation: &WorkerDirectoryNodeObservation,
     bind: impl for<'authority> FnOnce(VerifiedActionEffect<'authority>) -> Result<Value, BindingError>,
 ) -> Result<Value, EffectBindingError<BindingError>> {
+    if !action.dedicated_binding_is_current() {
+        return Err(EffectBindingError::PrincipalDrift);
+    }
     if observation.disposition() != WorkerDirectoryNodeDisposition::Created
         || observation.path() != action.parameters.path()
     {
@@ -349,10 +476,14 @@ fn bind_verified_effect<Value, BindingError>(
 }
 
 fn map_binding_error<Value, BindingError>(
+    action: &WorkerDirectoryAction,
     error: EffectBindingError<BindingError>,
 ) -> Result<(MutationCompletion, Value), PreparedExecutionError<BindingError>> {
     match error {
         EffectBindingError::ReceiptConflict => Err(PreparedExecutionError::ReceiptConflict),
+        EffectBindingError::PrincipalDrift => Err(PreparedExecutionError::Action(
+            ActionError::apply_failed(action.name().clone()),
+        )),
         EffectBindingError::Binding(error) => Err(PreparedExecutionError::Binding(error)),
     }
 }

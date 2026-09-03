@@ -1,0 +1,42 @@
+{
+  "schema_version": 1,
+  "installation_scope": "system",
+  "entries": [
+    {
+      "entry_id": "019cad99-54a0-7000-8000-000000000001",
+      "action": {
+        "type": "worker_directory",
+        "parameters": {
+          "action_id": "identity.directory.jobs",
+          "installation_scope": "system",
+          "principal": {
+            "account_policy": "dedicated",
+            "principal_kind": "unix-uid",
+            "principal_id": "2001",
+            "name": "build-agent"
+          },
+          "root": "/var/lib/styrn/workers/build-agent",
+          "node": {
+            "type": "jobs"
+          },
+          "path": "/var/lib/styrn/workers/build-agent/jobs"
+        }
+      },
+      "timestamp": "2026-09-03T10:00:00Z",
+      "privilege_used": "root",
+      "directories_created": [
+        {
+          "path": "/var/lib/styrn/workers/build-agent/jobs"
+        }
+      ],
+      "files_created": [],
+      "files_modified": [],
+      "services": [],
+      "accounts": [],
+      "registry_keys": [],
+      "firewall_rules": [],
+      "download_provenance": null,
+      "status": "applied"
+    }
+  ]
+}

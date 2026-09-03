@@ -61,6 +61,28 @@
         "properties": { "installation_scope": { "const": "user" } },
         "required": ["installation_scope"]
       }
+    },
+    {
+      "if": {
+        "properties": {
+          "entries": {
+            "contains": {
+              "properties": {
+                "action": {
+                  "properties": { "type": { "const": "deferred_system_action" } },
+                  "required": ["type"]
+                }
+              },
+              "required": ["action"]
+            }
+          }
+        },
+        "required": ["entries"]
+      },
+      "then": {
+        "properties": { "installation_scope": { "const": "user" } },
+        "required": ["installation_scope"]
+      }
     }
   ],
   "$defs": {
@@ -203,7 +225,6 @@
           },
           "then": {
             "properties": {
-              "privilege_used": { "const": "none" },
               "files_created": { "maxItems": 0 },
               "files_modified": { "maxItems": 0 },
               "services": { "maxItems": 0 },
@@ -221,7 +242,33 @@
                 "else": {
                   "required": ["directories_created"],
                   "properties": {
+                    "status": { "const": "applied" },
                     "directories_created": { "minItems": 1, "maxItems": 1 }
+                  }
+                }
+              },
+              {
+                "if": {
+                  "properties": {
+                    "action": {
+                      "properties": {
+                        "parameters": {
+                          "properties": { "installation_scope": { "const": "user" } },
+                          "required": ["installation_scope"]
+                        }
+                      },
+                      "required": ["parameters"]
+                    }
+                  },
+                  "required": ["action"]
+                },
+                "then": {
+                  "properties": { "privilege_used": { "const": "none" } }
+                },
+                "else": {
+                  "properties": {
+                    "status": { "const": "applied" },
+                    "privilege_used": { "enum": ["root", "admin"] }
                   }
                 }
               }
@@ -254,6 +301,31 @@
               "download_provenance": { "type": "null" }
             }
           }
+        },
+        {
+          "if": {
+            "properties": {
+              "action": {
+                "properties": { "type": { "const": "deferred_system_action" } },
+                "required": ["type"]
+              }
+            },
+            "required": ["action"]
+          },
+          "then": {
+            "properties": {
+              "status": { "const": "pending" },
+              "privilege_used": { "const": "none" },
+              "directories_created": { "maxItems": 0 },
+              "files_created": { "maxItems": 0 },
+              "files_modified": { "maxItems": 0 },
+              "services": { "maxItems": 0 },
+              "accounts": { "maxItems": 0 },
+              "registry_keys": { "maxItems": 0 },
+              "firewall_rules": { "maxItems": 0 },
+              "download_provenance": { "type": "null" }
+            }
+          }
         }
       ]
     },
@@ -261,6 +333,7 @@
       "oneOf": [
         { "$ref": "#/$defs/foundationAction" },
         { "$ref": "#/$defs/dedicatedAccountPrerequisiteAction" },
+        { "$ref": "#/$defs/deferredSystemAction" },
         { "$ref": "#/$defs/workerDirectoryAction" }
       ]
     },
@@ -325,11 +398,62 @@
           "additionalProperties": false,
           "properties": {
             "action_id": { "$ref": "#/$defs/actionIdentifier" },
-            "installation_scope": { "const": "user" },
+            "installation_scope": { "enum": ["user", "system"] },
             "principal": { "$ref": "#/$defs/workerPrincipal" },
             "root": { "$ref": "#/$defs/absolutePath" },
             "node": { "$ref": "#/$defs/workerDirectoryNode" },
             "path": { "$ref": "#/$defs/absolutePath" }
+          },
+          "allOf": [
+            {
+              "if": {
+                "properties": { "installation_scope": { "const": "user" } },
+                "required": ["installation_scope"]
+              },
+              "then": {
+                "properties": {
+                  "principal": {
+                    "properties": { "account_policy": { "const": "current-user" } },
+                    "required": ["account_policy"]
+                  }
+                }
+              },
+              "else": {
+                "properties": {
+                  "principal": {
+                    "properties": { "account_policy": { "const": "dedicated" } },
+                    "required": ["account_policy"]
+                  }
+                }
+              }
+            }
+          ]
+        }
+      }
+    },
+    "deferredSystemAction": {
+      "type": "object",
+      "required": ["type", "parameters"],
+      "additionalProperties": false,
+      "properties": {
+        "type": { "const": "deferred_system_action" },
+        "parameters": {
+          "type": "object",
+          "required": ["action_id", "target_scope", "target_principal", "parameter_sha256"],
+          "additionalProperties": false,
+          "properties": {
+            "action_id": { "$ref": "#/$defs/actionIdentifier" },
+            "target_scope": { "const": "system" },
+            "target_principal": {
+              "allOf": [
+                { "$ref": "#/$defs/workerPrincipal" },
+                {
+                  "properties": { "account_policy": { "const": "dedicated" } },
+                  "required": ["account_policy"]
+                }
+              ]
+            },
+            "parameter_sha256": { "$ref": "#/$defs/sha256" }
           }
         }
       }
@@ -343,7 +467,7 @@
       "required": ["account_policy", "principal_kind", "principal_id", "name"],
       "additionalProperties": false,
       "properties": {
-        "account_policy": { "const": "current-user" },
+        "account_policy": { "enum": ["current-user", "dedicated"] },
         "principal_kind": { "enum": ["unix-uid", "windows-sid"] },
         "principal_id": {
           "type": "string",

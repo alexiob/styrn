@@ -382,6 +382,17 @@ impl PendingAction {
         }
     }
 
+    #[cfg(not(action_core_fixture))]
+    fn deferred_system(action: &Action, needs_human: NeedsHuman) -> Result<Self, ActionError> {
+        let Action::WorkerDirectory(action) = action else {
+            return Err(ActionError::InvalidDedicatedAccountSelection);
+        };
+        Ok(Self {
+            parameters: ActionParameters::DeferredSystemAction(action.deferred_parameters()?),
+            needs_human,
+        })
+    }
+
     pub(crate) fn id(&self) -> &ActionName {
         self.parameters.action_id()
     }
@@ -413,6 +424,8 @@ pub(crate) enum ActionParameters {
     #[cfg(not(action_core_fixture))]
     DedicatedAccountPrerequisite(DedicatedAccountPrerequisiteParameters),
     #[cfg(not(action_core_fixture))]
+    DeferredSystemAction(DeferredSystemActionParameters),
+    #[cfg(not(action_core_fixture))]
     WorkerDirectory(WorkerDirectoryActionParameters),
 }
 
@@ -423,8 +436,38 @@ impl ActionParameters {
             #[cfg(not(action_core_fixture))]
             Self::DedicatedAccountPrerequisite(parameters) => parameters.action_id(),
             #[cfg(not(action_core_fixture))]
+            Self::DeferredSystemAction(parameters) => parameters.action_id(),
+            #[cfg(not(action_core_fixture))]
             Self::WorkerDirectory(parameters) => parameters.action_id(),
         }
+    }
+}
+
+#[cfg(not(action_core_fixture))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct DeferredSystemActionParameters {
+    action_id: ActionName,
+    target_scope: crate::platform::InstallationScope,
+    target_principal: crate::platform::WorkerPrincipal,
+    parameter_sha256: Box<str>,
+}
+
+#[cfg(not(action_core_fixture))]
+impl DeferredSystemActionParameters {
+    pub(in crate::setup) fn action_id(&self) -> &ActionName {
+        &self.action_id
+    }
+
+    pub(in crate::setup) fn target_scope(&self) -> crate::platform::InstallationScope {
+        self.target_scope
+    }
+
+    pub(in crate::setup) fn target_principal(&self) -> &crate::platform::WorkerPrincipal {
+        &self.target_principal
+    }
+
+    pub(in crate::setup) fn parameter_sha256(&self) -> &str {
+        &self.parameter_sha256
     }
 }
 
@@ -988,7 +1031,7 @@ mod gate {
                 #[cfg(not(action_core_fixture))]
                 Self::DedicatedAccountPrerequisite(_) => Privilege::None,
                 #[cfg(not(action_core_fixture))]
-                Self::WorkerDirectory(_) => Privilege::None,
+                Self::WorkerDirectory(action) => action.privilege(),
                 #[cfg(test)]
                 Self::Test(action) => action.privilege,
             }
@@ -1178,6 +1221,9 @@ mod worker_directory;
 pub(in crate::setup) use worker_directory::current_user_worker_directory_plan;
 #[cfg(test)]
 pub(in crate::setup::action) use worker_directory::current_user_worker_directory_plan_for_test;
+#[cfg(not(action_core_fixture))]
+#[allow(unused_imports)] // T0.20 consumes the selected dedicated System plan.
+pub(in crate::setup) use worker_directory::dedicated_system_worker_directory_plan;
 #[cfg(not(action_core_fixture))]
 mod authorization;
 #[cfg(not(action_core_fixture))]

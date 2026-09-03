@@ -43,6 +43,77 @@ fn worker_directory_action(
     )
 }
 
+pub(super) fn dedicated_ready_for_test(
+    selector: &str,
+) -> (
+    super::dedicated_account::DedicatedAccountReady,
+    crate::platform::WorkerPrincipal,
+) {
+    let operator = crate::platform::resolve_current_worker_principal().unwrap();
+    let context = crate::platform::SetupExecutionContext::new_for_test(
+        crate::platform::SetupHostPrivilege::Ordinary,
+        operator.clone(),
+    );
+    let target = crate::platform::WorkerPrincipal::new(
+        operator.principal_kind(),
+        operator.principal_id(),
+        selector,
+        crate::platform::WorkerAccountPolicy::Dedicated,
+    )
+    .unwrap();
+    let observation = crate::platform::dedicated_account_observation_for_action_test(
+        crate::platform::DedicatedAccountSpec::new(selector).unwrap(),
+        crate::platform::TestDedicatedAccountObservation::Healthy(target.clone()),
+        crate::platform::TestDedicatedAccountObservation::Healthy(target.clone()),
+    );
+    let selection = super::dedicated_account::select_dedicated_account_observation(
+        &context,
+        crate::platform::DedicatedAccountSpec::new(selector).unwrap(),
+        observation,
+    )
+    .unwrap();
+    let (_, ready) = selection.into_parts();
+    (ready.unwrap(), target)
+}
+
+#[test]
+fn dedicated_system_worker_directory_plan_binds_exact_target_and_native_privilege() {
+    let fixture = JournalFixture::new("dedicated-system-directory-plan");
+    let (ready, target) = dedicated_ready_for_test("build-agent");
+    let root = fixture.root.join("system-worker-root");
+
+    let (plan, layout) = super::worker_directory::dedicated_system_worker_directory_plan_for_test(
+        &ready,
+        root.clone(),
+        Some(fixture.root.clone()),
+    )
+    .unwrap();
+
+    assert_eq!(plan.len(), 6);
+    assert_eq!(
+        layout.installation_scope(),
+        crate::platform::InstallationScope::System
+    );
+    assert_eq!(layout.worker_principal(), &target);
+    assert_eq!(layout.root(), root);
+    #[cfg(not(target_os = "windows"))]
+    let expected_privilege = Privilege::Root;
+    #[cfg(target_os = "windows")]
+    let expected_privilege = Privilege::Admin;
+    for action in &plan {
+        assert_eq!(action.privilege(), expected_privilege);
+        let ActionParameters::WorkerDirectory(parameters) = action.parameters() else {
+            panic!("system directory plan emitted an open action variant");
+        };
+        assert_eq!(
+            parameters.installation_scope(),
+            crate::platform::InstallationScope::System
+        );
+        assert_eq!(parameters.principal(), &target);
+        assert!(parameters.path().starts_with(&root));
+    }
+}
+
 fn harden_user_journal_fixture(fixture: &JournalFixture) {
     let principal = crate::platform::resolve_current_worker_principal().unwrap();
     crate::platform::harden_manifest_directory(

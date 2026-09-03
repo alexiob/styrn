@@ -102,6 +102,46 @@ fn dedicated_account_prerequisite_receipt_value() -> serde_json::Value {
     })
 }
 
+fn deferred_system_action_receipt_value() -> serde_json::Value {
+    #[cfg(not(target_os = "windows"))]
+    let (principal_kind, principal_id) = ("unix-uid", "2001");
+    #[cfg(target_os = "windows")]
+    let (principal_kind, principal_id) = ("windows-sid", "S-1-5-21-1-2-3-2001");
+
+    serde_json::json!({
+        "schema_version": 1,
+        "installation_scope": "user",
+        "entries": [{
+            "entry_id": "019cafd0-5c00-7000-8000-000000000001",
+            "action": {
+                "type": "deferred_system_action",
+                "parameters": {
+                    "action_id": "identity.directory.jobs",
+                    "target_scope": "system",
+                    "target_principal": {
+                        "account_policy": "dedicated",
+                        "principal_kind": principal_kind,
+                        "principal_id": principal_id,
+                        "name": "build-agent"
+                    },
+                    "parameter_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                }
+            },
+            "timestamp": "2026-09-02T10:00:00Z",
+            "privilege_used": "none",
+            "directories_created": [],
+            "files_created": [],
+            "files_modified": [],
+            "services": [],
+            "accounts": [],
+            "registry_keys": [],
+            "firewall_rules": [],
+            "download_provenance": null,
+            "status": "pending"
+        }]
+    })
+}
+
 fn succeeded_intent_fixture(
     store: &ReceiptStore,
     fixture: &ReceiptFixture,
@@ -323,6 +363,129 @@ fn worker_directory_receipt_round_trips_closed_parameters_and_directory_effect()
         serialized["entries"][0]["directories_created"],
         serde_json::json!([{ "path": value["entries"][0]["action"]["parameters"]["path"] }])
     );
+}
+
+#[test]
+fn dedicated_system_worker_directory_receipt_accepts_only_the_native_privileged_pair() {
+    let mut value = worker_directory_receipt_value();
+    value["installation_scope"] = serde_json::json!("system");
+    value["entries"][0]["action"]["parameters"]["installation_scope"] = serde_json::json!("system");
+    value["entries"][0]["action"]["parameters"]["principal"]["account_policy"] =
+        serde_json::json!("dedicated");
+    #[cfg(not(target_os = "windows"))]
+    {
+        value["entries"][0]["action"]["parameters"]["root"] =
+            serde_json::json!("/var/lib/styrn/workers/build-agent");
+        value["entries"][0]["action"]["parameters"]["path"] =
+            serde_json::json!("/var/lib/styrn/workers/build-agent/jobs");
+        value["entries"][0]["directories_created"][0]["path"] =
+            serde_json::json!("/var/lib/styrn/workers/build-agent/jobs");
+        value["entries"][0]["privilege_used"] = serde_json::json!("root");
+    }
+    #[cfg(target_os = "windows")]
+    {
+        value["entries"][0]["action"]["parameters"]["root"] =
+            serde_json::json!(r"C:\ProgramData\Styrn\workers\build-agent");
+        value["entries"][0]["action"]["parameters"]["path"] =
+            serde_json::json!(r"C:\ProgramData\Styrn\workers\build-agent\jobs");
+        value["entries"][0]["directories_created"][0]["path"] =
+            serde_json::json!(r"C:\ProgramData\Styrn\workers\build-agent\jobs");
+        value["entries"][0]["privilege_used"] = serde_json::json!("admin");
+    }
+
+    let document = ReceiptDocument::from_json(&serde_json::to_vec(&value).unwrap()).unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&document.to_json().unwrap()).unwrap(),
+        value
+    );
+    let schema: serde_json::Value = serde_json::from_str(include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/schemas/setup-receipt-v1.schema.json"
+    )))
+    .unwrap();
+    let validator = jsonschema::validator_for(&schema).unwrap();
+    assert!(validator.is_valid(&value));
+
+    let mut crossed = value;
+    crossed["entries"][0]["action"]["parameters"]["principal"]["account_policy"] =
+        serde_json::json!("current-user");
+    assert!(!validator.is_valid(&crossed));
+    assert_eq!(
+        ReceiptDocument::from_json(&serde_json::to_vec(&crossed).unwrap()).unwrap_err(),
+        ReceiptError::InvalidWorkerDirectoryAction
+    );
+}
+
+#[test]
+fn deferred_system_action_receipt_is_user_scoped_pending_and_nonowning() {
+    let value = deferred_system_action_receipt_value();
+    let document = ReceiptDocument::from_json(&serde_json::to_vec(&value).unwrap()).unwrap();
+    document
+        .validate_worker_principal(&fixture_worker_principal())
+        .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&document.to_json().unwrap()).unwrap(),
+        value
+    );
+
+    for (pointer, replacement) in [
+        ("/installation_scope", serde_json::json!("system")),
+        ("/entries/0/status", serde_json::json!("applied")),
+        ("/entries/0/privilege_used", serde_json::json!("root")),
+        (
+            "/entries/0/action/parameters/target_scope",
+            serde_json::json!("user"),
+        ),
+        (
+            "/entries/0/action/parameters/target_principal/account_policy",
+            serde_json::json!("current-user"),
+        ),
+    ] {
+        let mut hostile = deferred_system_action_receipt_value();
+        *hostile.pointer_mut(pointer).unwrap() = replacement;
+        assert!(
+            ReceiptDocument::from_json(&serde_json::to_vec(&hostile).unwrap()).is_err(),
+            "runtime accepted hostile deferred action at {pointer}"
+        );
+    }
+
+    let mut owning = deferred_system_action_receipt_value();
+    owning["entries"][0]["directories_created"] =
+        serde_json::json!([{ "path": "/var/lib/styrn/workers/build-agent/jobs" }]);
+    assert!(ReceiptDocument::from_json(&serde_json::to_vec(&owning).unwrap()).is_err());
+}
+
+#[test]
+fn deferred_system_action_schema_is_user_scoped_pending_and_nonowning() {
+    let schema: serde_json::Value = serde_json::from_str(include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/schemas/setup-receipt-v1.schema.json"
+    )))
+    .unwrap();
+    let validator = jsonschema::validator_for(&schema).unwrap();
+    let base = deferred_system_action_receipt_value();
+    assert!(validator.is_valid(&base));
+
+    for (pointer, replacement) in [
+        ("/installation_scope", serde_json::json!("system")),
+        ("/entries/0/status", serde_json::json!("applied")),
+        ("/entries/0/privilege_used", serde_json::json!("admin")),
+        (
+            "/entries/0/action/parameters/target_scope",
+            serde_json::json!("user"),
+        ),
+        (
+            "/entries/0/action/parameters/target_principal/account_policy",
+            serde_json::json!("current-user"),
+        ),
+    ] {
+        let mut hostile = deferred_system_action_receipt_value();
+        *hostile.pointer_mut(pointer).unwrap() = replacement;
+        assert!(
+            !validator.is_valid(&hostile),
+            "schema accepted hostile deferred action at {pointer}"
+        );
+    }
 }
 
 #[test]
@@ -830,8 +993,15 @@ fn checked_in_schema_example_and_canonical_serialization_stay_synchronized() {
         env!("CARGO_MANIFEST_DIR"),
         "/examples/setup-receipt.json"
     ));
+    let dedicated_system_example_bytes = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/setup-receipt-system-dedicated.json"
+    ));
     #[cfg(not(target_os = "windows"))]
     let example = ReceiptDocument::from_json(example_bytes).unwrap();
+    #[cfg(not(target_os = "windows"))]
+    let dedicated_system_example =
+        ReceiptDocument::from_json(dedicated_system_example_bytes).unwrap();
 
     let mut checkpointed = pending_receipt_value();
     checkpointed["pending_publications"] = serde_json::json!([{
@@ -845,6 +1015,7 @@ fn checked_in_schema_example_and_canonical_serialization_stay_synchronized() {
     }]);
     let valid_values = vec![
         serde_json::from_slice::<serde_json::Value>(example_bytes).unwrap(),
+        serde_json::from_slice::<serde_json::Value>(dedicated_system_example_bytes).unwrap(),
         serde_json::from_str::<serde_json::Value>(COMPLETE_RECEIPT).unwrap(),
         checkpointed,
     ];
@@ -853,6 +1024,12 @@ fn checked_in_schema_example_and_canonical_serialization_stay_synchronized() {
         let mut values = valid_values;
         values.push(
             serde_json::from_slice::<serde_json::Value>(&example.to_json().unwrap()).unwrap(),
+        );
+        values.push(
+            serde_json::from_slice::<serde_json::Value>(
+                &dedicated_system_example.to_json().unwrap(),
+            )
+            .unwrap(),
         );
         values
     };
