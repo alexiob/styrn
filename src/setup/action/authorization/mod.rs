@@ -433,6 +433,40 @@ fn scope_promotion_authorization_authority() -> ScopePromotionAuthorizationAutho
     ScopePromotionAuthorizationAuthority(())
 }
 
+#[cfg(all(test, not(target_os = "windows"), not(action_compile_fixture)))]
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(in crate::setup) enum ScopePromotionChildInterruption {
+    AfterAuthorizationRecord,
+    AfterRequestRetirement,
+}
+
+#[cfg(all(test, not(target_os = "windows"), not(action_compile_fixture)))]
+std::thread_local! {
+    static SCOPE_PROMOTION_CHILD_INTERRUPTION: std::cell::Cell<Option<ScopePromotionChildInterruption>> =
+        const { std::cell::Cell::new(None) };
+}
+
+#[cfg(all(test, not(target_os = "windows"), not(action_compile_fixture)))]
+pub(in crate::setup) fn set_scope_promotion_child_interruption_for_test(
+    interruption: Option<ScopePromotionChildInterruption>,
+) {
+    SCOPE_PROMOTION_CHILD_INTERRUPTION.with(|slot| slot.set(interruption));
+}
+
+#[cfg(all(test, not(target_os = "windows"), not(action_compile_fixture)))]
+fn inject_scope_promotion_child_interruption(
+    point: ScopePromotionChildInterruption,
+) -> Result<(), AuthorizationError> {
+    SCOPE_PROMOTION_CHILD_INTERRUPTION.with(|slot| {
+        if slot.get() == Some(point) {
+            slot.set(None);
+            Err(AuthorizationError::RequestInvalid)
+        } else {
+            Ok(())
+        }
+    })
+}
+
 #[derive(Clone, Debug, Deserialize, Hash, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum RequestedAction {
@@ -839,7 +873,35 @@ pub(in crate::setup) struct PreparedAuthorizationRequestForTest {
 #[cfg(all(test, not(target_os = "windows")))]
 impl PreparedAuthorizationRequestForTest {
     pub(in crate::setup) fn run_scope_promotion(
-        self,
+        &self,
+        plan: &mut Vec<Action>,
+        user_store: &ReceiptStore,
+        system_store: &ReceiptStore,
+        metadata: &mut ReceiptMetadataSource,
+    ) -> Result<ApplyReport, AuthorizationError> {
+        self.run_scope_promotion_with_digest(&self.digest, plan, user_store, system_store, metadata)
+    }
+
+    pub(in crate::setup) fn run_scope_promotion_with_digest_for_test(
+        &self,
+        expected_request_digest: &str,
+        plan: &mut Vec<Action>,
+        user_store: &ReceiptStore,
+        system_store: &ReceiptStore,
+        metadata: &mut ReceiptMetadataSource,
+    ) -> Result<ApplyReport, AuthorizationError> {
+        self.run_scope_promotion_with_digest(
+            expected_request_digest,
+            plan,
+            user_store,
+            system_store,
+            metadata,
+        )
+    }
+
+    fn run_scope_promotion_with_digest(
+        &self,
+        expected_request_digest: &str,
         plan: &mut Vec<Action>,
         user_store: &ReceiptStore,
         system_store: &ReceiptStore,
@@ -847,7 +909,7 @@ impl PreparedAuthorizationRequestForTest {
     ) -> Result<ApplyReport, AuthorizationError> {
         run_privileged_request_with_promotion(
             &self.context,
-            &self.digest,
+            expected_request_digest,
             plan,
             user_store,
             system_store,
@@ -1008,16 +1070,111 @@ fn run_privileged_request_internal(
         return Err(AuthorizationError::RequestInvalid);
     }
     validate_request_digest(expected_request_digest)?;
-    let (request, removal) = read_request(context, expected_request_digest)?;
-    validate_request(&request, context)?;
-    let displayed = request
-        .displayed_actions
+    #[cfg(not(action_compile_fixture))]
+    let requested_plan_actions = recomputed_plan
         .iter()
-        .cloned()
-        .collect::<HashSet<_>>();
-    if displayed.len() != request.displayed_actions.len() {
-        return Err(AuthorizationError::RequestInvalid);
-    }
+        .map(requested_action)
+        .collect::<Vec<_>>();
+    #[cfg(not(action_compile_fixture))]
+    let authorized_action_count = requested_plan_actions.len();
+    #[cfg(not(action_compile_fixture))]
+    let authorized_actions_sha256 = request_digest(
+        &serde_json::to_vec(&requested_plan_actions)
+            .map_err(|_| AuthorizationError::RequestInvalid)?,
+    );
+
+    #[cfg(not(action_compile_fixture))]
+    let (displayed, removal, is_scope_promotion) =
+        match read_request(context, expected_request_digest) {
+            Ok((request, removal)) => {
+                validate_request(&request, context)?;
+                let displayed = request
+                    .displayed_actions
+                    .iter()
+                    .cloned()
+                    .collect::<HashSet<_>>();
+                if displayed.len() != request.displayed_actions.len() {
+                    return Err(AuthorizationError::RequestInvalid);
+                }
+                if let Some(binding) = &request.scope_promotion {
+                    if request.displayed_actions != requested_plan_actions {
+                        return Err(AuthorizationError::RequestInvalid);
+                    }
+                    let user_store = user_store.ok_or(AuthorizationError::RequestInvalid)?;
+                    let request_id = Uuid::parse_str(&request.request_id)
+                        .map_err(|_| AuthorizationError::RequestInvalid)?;
+                    validate_scope_promotion_request_binding(
+                        binding,
+                        request_id,
+                        context,
+                        user_store,
+                        system_store,
+                    )?;
+                    system_store
+                        .reserve_scope_promotion_authorization(
+                            request_id,
+                            expected_request_digest,
+                            &authorized_actions_sha256,
+                            authorized_action_count,
+                            binding,
+                            &scope_promotion_authorization_authority(),
+                        )
+                        .map_err(AuthorizationError::RequestConsumed)?;
+                    (displayed, Some(removal), true)
+                } else {
+                    system_store
+                        .reserve_authorization(&request.request_id, expected_request_digest)
+                        .map_err(AuthorizationError::RequestConsumed)?;
+                    (displayed, Some(removal), false)
+                }
+            }
+            Err(AuthorizationError::RequestRead(error))
+                if error.kind() == std::io::ErrorKind::NotFound && user_store.is_some() =>
+            {
+                let user_store = user_store.ok_or(AuthorizationError::RequestInvalid)?;
+                let binding =
+                    crate::setup::promotion::scope_promotion_request_binding_for_resume(user_store)
+                        .map_err(|_| AuthorizationError::RequestInvalid)?;
+                let request_id = binding.authorization_request_id();
+                validate_scope_promotion_request_binding(
+                    &binding,
+                    request_id,
+                    context,
+                    user_store,
+                    system_store,
+                )?;
+                system_store
+                    .reserve_scope_promotion_authorization(
+                        request_id,
+                        expected_request_digest,
+                        &authorized_actions_sha256,
+                        authorized_action_count,
+                        &binding,
+                        &scope_promotion_authorization_authority(),
+                    )
+                    .map_err(AuthorizationError::RequestConsumed)?;
+                (requested_plan_actions.iter().cloned().collect(), None, true)
+            }
+            Err(error) => return Err(error),
+        };
+
+    #[cfg(action_compile_fixture)]
+    let (displayed, removal, is_scope_promotion) = {
+        let (request, removal) = read_request(context, expected_request_digest)?;
+        validate_request(&request, context)?;
+        let displayed = request
+            .displayed_actions
+            .iter()
+            .cloned()
+            .collect::<HashSet<_>>();
+        if displayed.len() != request.displayed_actions.len() {
+            return Err(AuthorizationError::RequestInvalid);
+        }
+        system_store
+            .reserve_authorization(&request.request_id, expected_request_digest)
+            .map_err(AuthorizationError::RequestConsumed)?;
+        (displayed, Some(removal), false)
+    };
 
     let mut selected_indices = Vec::new();
     for (index, action) in recomputed_plan.iter().enumerate() {
@@ -1037,40 +1194,25 @@ fn run_privileged_request_internal(
         return Err(AuthorizationError::RequestInvalid);
     }
 
-    #[cfg(not(action_compile_fixture))]
-    if let Some(binding) = &request.scope_promotion {
-        let user_store = user_store.ok_or(AuthorizationError::RequestInvalid)?;
-        let request_id =
-            Uuid::parse_str(&request.request_id).map_err(|_| AuthorizationError::RequestInvalid)?;
-        if request_id != binding.authorization_request_id()
-            || request.principal != *binding.original_operator()
-            || system_store.worker_principal() != binding.target_principal()
-            || system_store.path().to_str() != Some(binding.system_receipt_path())
-        {
-            return Err(AuthorizationError::RequestInvalid);
-        }
-        binding
-            .reverify_intent(user_store)
-            .map_err(|_| AuthorizationError::RequestInvalid)?;
-        system_store
-            .reserve_scope_promotion_authorization(
-                request_id,
-                expected_request_digest,
-                binding,
-                &scope_promotion_authorization_authority(),
-            )
-            .map_err(AuthorizationError::RequestConsumed)?;
-    } else {
-        system_store
-            .reserve_authorization(&request.request_id, expected_request_digest)
-            .map_err(AuthorizationError::RequestConsumed)?;
+    #[cfg(not(all(test, not(target_os = "windows"), not(action_compile_fixture))))]
+    let _ = is_scope_promotion;
+
+    #[cfg(all(test, not(target_os = "windows"), not(action_compile_fixture)))]
+    if is_scope_promotion {
+        inject_scope_promotion_child_interruption(
+            ScopePromotionChildInterruption::AfterAuthorizationRecord,
+        )?;
     }
-    #[cfg(action_compile_fixture)]
-    system_store
-        .reserve_authorization(&request.request_id, expected_request_digest)
-        .map_err(AuthorizationError::RequestConsumed)?;
-    crate::platform::consume_verified_private_file(removal)
-        .map_err(AuthorizationError::RequestRead)?;
+    if let Some(removal) = removal {
+        crate::platform::consume_verified_private_file(removal)
+            .map_err(AuthorizationError::RequestRead)?;
+    }
+    #[cfg(all(test, not(target_os = "windows"), not(action_compile_fixture)))]
+    if is_scope_promotion {
+        inject_scope_promotion_child_interruption(
+            ScopePromotionChildInterruption::AfterRequestRetirement,
+        )?;
+    }
     let selected_set = selected_indices.iter().copied().collect::<HashSet<_>>();
     let mut selected = Vec::with_capacity(selected_indices.len());
     let mut retained = Vec::new();
@@ -1086,6 +1228,26 @@ fn run_privileged_request_internal(
     retained.sort_unstable_by_key(|(index, _)| *index);
     recomputed_plan.extend(retained.into_iter().map(|(_, action)| action));
     Ok(result?)
+}
+
+#[cfg(not(action_compile_fixture))]
+fn validate_scope_promotion_request_binding(
+    binding: &crate::setup::promotion::ScopePromotionRequestBinding,
+    request_id: uuid::Uuid,
+    context: &AuthorizationContext,
+    user_store: &ReceiptStore,
+    system_store: &ReceiptStore,
+) -> Result<(), AuthorizationError> {
+    if request_id != binding.authorization_request_id()
+        || context.principal != *binding.original_operator()
+        || system_store.worker_principal() != binding.target_principal()
+        || system_store.path().to_str() != Some(binding.system_receipt_path())
+    {
+        return Err(AuthorizationError::RequestInvalid);
+    }
+    binding
+        .reverify_intent(user_store)
+        .map_err(|_| AuthorizationError::RequestInvalid)
 }
 
 fn validate_system_store_binding(

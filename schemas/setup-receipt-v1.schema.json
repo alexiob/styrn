@@ -523,21 +523,6 @@
             "user_manifest_sha256",
             "system_manifest_path",
             "system_manifest_sha256",
-            "system_manifest_identity_sha256",
-            "system_receipt_path",
-            "system_receipt_sha256",
-            "system_receipt_identity_sha256",
-            "authorization_request_id",
-            "authorization_request_sha256",
-            "authorization_record_path",
-            "authorization_record_sha256",
-            "authorization_record_identity_sha256",
-            "promotion_intent_path",
-            "promotion_intent_sha256",
-            "promotion_intent_identity_sha256",
-            "completion_record_path",
-            "completion_record_sha256",
-            "completion_record_identity_sha256",
             "original_operator",
             "target_principal",
             "selector_sha256",
@@ -597,7 +582,49 @@
               "type": "string",
               "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
             }
-          }
+          },
+          "oneOf": [
+            {
+              "required": [
+                "system_manifest_identity_sha256",
+                "system_receipt_path",
+                "system_receipt_sha256",
+                "system_receipt_identity_sha256",
+                "authorization_request_id",
+                "authorization_request_sha256",
+                "authorization_record_path",
+                "authorization_record_sha256",
+                "authorization_record_identity_sha256",
+                "promotion_intent_path",
+                "promotion_intent_sha256",
+                "promotion_intent_identity_sha256",
+                "completion_record_path",
+                "completion_record_sha256",
+                "completion_record_identity_sha256"
+              ]
+            },
+            {
+              "not": {
+                "anyOf": [
+                  { "required": ["system_manifest_identity_sha256"] },
+                  { "required": ["system_receipt_path"] },
+                  { "required": ["system_receipt_sha256"] },
+                  { "required": ["system_receipt_identity_sha256"] },
+                  { "required": ["authorization_request_id"] },
+                  { "required": ["authorization_request_sha256"] },
+                  { "required": ["authorization_record_path"] },
+                  { "required": ["authorization_record_sha256"] },
+                  { "required": ["authorization_record_identity_sha256"] },
+                  { "required": ["promotion_intent_path"] },
+                  { "required": ["promotion_intent_sha256"] },
+                  { "required": ["promotion_intent_identity_sha256"] },
+                  { "required": ["completion_record_path"] },
+                  { "required": ["completion_record_sha256"] },
+                  { "required": ["completion_record_identity_sha256"] }
+                ]
+              }
+            }
+          ]
         }
       }
     },

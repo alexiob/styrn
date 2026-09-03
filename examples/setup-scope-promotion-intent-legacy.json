@@ -1,0 +1,31 @@
+{
+  "version": 1,
+  "intent_id": "019cad99-54a0-7000-8000-000000000042",
+  "original_operator": {
+    "principal_kind": "unix-uid",
+    "principal_id": "501",
+    "name": "alex",
+    "account_policy": "current-user"
+  },
+  "user_receipt_path": "/home/alex/.local/state/styrn/receipt.json",
+  "user_receipt_identity_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "user_manifest_path": "/home/alex/.config/styrn/machine.toml",
+  "user_manifest_identity_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "user_manifest_sha256": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+  "pending_publication_epoch": 1,
+  "machine_id": "019cad99-54a0-7000-8000-000000000040",
+  "target_principal": {
+    "principal_kind": "unix-uid",
+    "principal_id": "2001",
+    "name": "build-agent",
+    "account_policy": "dedicated"
+  },
+  "selector_sha256": "7f81291a9c35cb94e74c8794e4c1ea1c0966b92fc67a72490ef0df956320a394",
+  "system_receipt_path": "/var/lib/styrn/receipt.json",
+  "system_manifest_path": "/etc/styrn/machine.toml",
+  "system_manifest_sha256": "3c0b06c2db525fba01de387e4c4482f4b9e8c0fe57da8df96732263978cc79ff",
+  "candidate_manifest": "legacy system manifest\n",
+  "authorization_request_id": "019cad99-54a0-7000-8000-000000000043",
+  "authorization_request_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+  "expected_completion": "protected_system_publication"
+}

@@ -1237,6 +1237,10 @@ pub(in crate::setup) use authorization::ScopePromotionAuthorizationAuthority;
 
 #[cfg(all(test, not(target_os = "windows")))]
 pub(in crate::setup) use authorization::prepare_scope_promotion_authorization_request_for_test;
+#[cfg(all(test, not(target_os = "windows"), not(action_compile_fixture)))]
+pub(in crate::setup) use authorization::{
+    set_scope_promotion_child_interruption_for_test, ScopePromotionChildInterruption,
+};
 #[cfg(not(action_core_fixture))]
 mod execution;
 #[cfg(not(action_core_fixture))]

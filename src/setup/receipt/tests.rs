@@ -1001,6 +1001,10 @@ fn checked_in_schema_example_and_canonical_serialization_stay_synchronized() {
         env!("CARGO_MANIFEST_DIR"),
         "/examples/setup-receipt-scope-promotion.json"
     ));
+    let legacy_promotion_example_bytes = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/setup-receipt-scope-promotion-legacy.json"
+    ));
     #[cfg(not(target_os = "windows"))]
     let example = ReceiptDocument::from_json(example_bytes).unwrap();
     #[cfg(not(target_os = "windows"))]
@@ -1008,6 +1012,9 @@ fn checked_in_schema_example_and_canonical_serialization_stay_synchronized() {
         ReceiptDocument::from_json(dedicated_system_example_bytes).unwrap();
     #[cfg(not(target_os = "windows"))]
     let promotion_example = ReceiptDocument::from_json(promotion_example_bytes).unwrap();
+    #[cfg(not(target_os = "windows"))]
+    let legacy_promotion_example =
+        ReceiptDocument::from_json(legacy_promotion_example_bytes).unwrap();
 
     let mut checkpointed = pending_receipt_value();
     checkpointed["pending_publications"] = serde_json::json!([{
@@ -1023,6 +1030,7 @@ fn checked_in_schema_example_and_canonical_serialization_stay_synchronized() {
         serde_json::from_slice::<serde_json::Value>(example_bytes).unwrap(),
         serde_json::from_slice::<serde_json::Value>(dedicated_system_example_bytes).unwrap(),
         serde_json::from_slice::<serde_json::Value>(promotion_example_bytes).unwrap(),
+        serde_json::from_slice::<serde_json::Value>(legacy_promotion_example_bytes).unwrap(),
         serde_json::from_str::<serde_json::Value>(COMPLETE_RECEIPT).unwrap(),
         checkpointed,
     ];
@@ -1035,6 +1043,16 @@ fn checked_in_schema_example_and_canonical_serialization_stay_synchronized() {
         values.push(
             serde_json::from_slice::<serde_json::Value>(&promotion_example.to_json().unwrap())
                 .unwrap(),
+        );
+        assert_eq!(
+            legacy_promotion_example.to_json().unwrap(),
+            legacy_promotion_example_bytes
+        );
+        values.push(
+            serde_json::from_slice::<serde_json::Value>(
+                &legacy_promotion_example.to_json().unwrap(),
+            )
+            .unwrap(),
         );
         values.push(
             serde_json::from_slice::<serde_json::Value>(
@@ -1131,6 +1149,28 @@ fn checked_in_schema_example_and_canonical_serialization_stay_synchronized() {
 }
 
 #[test]
+#[cfg(not(target_os = "windows"))]
+fn legacy_scope_promotion_receipt_round_trips_but_is_not_established_evidence() {
+    let bytes = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/setup-receipt-scope-promotion-legacy.json"
+    ));
+    let document = ReceiptDocument::from_json(bytes).unwrap();
+    assert_eq!(document.to_json().unwrap(), bytes);
+    assert_eq!(
+        manifest_digest(bytes).0,
+        "89a4859b6acc67cc0a4fd175ac9299ccc3932dca56d51f740e47526d28b71008"
+    );
+
+    let authority = crate::setup::promotion::scope_promotion_authority();
+    let intent_id = uuid::Uuid::parse_str("019cad99-54a0-7000-8000-000000000042").unwrap();
+    assert!(matches!(
+        document.scope_promotion_checkpoint(intent_id, &authority),
+        Err(ReceiptError::InvalidScopePromotion)
+    ));
+}
+
+#[test]
 fn scope_promotion_receipt_cannot_claim_ownership_privilege_or_selector_identity() {
     let bytes = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -1138,6 +1178,16 @@ fn scope_promotion_receipt_cannot_claim_ownership_privilege_or_selector_identity
     ));
     let value = serde_json::from_slice::<serde_json::Value>(bytes).unwrap();
     ReceiptDocument::from_json(bytes).unwrap();
+
+    let mut partial_protected = value.clone();
+    partial_protected["entries"][0]["action"]["parameters"]
+        .as_object_mut()
+        .unwrap()
+        .remove("completion_record_identity_sha256");
+    assert_eq!(
+        ReceiptDocument::from_json(&serde_json::to_vec(&partial_protected).unwrap()).unwrap_err(),
+        ReceiptError::InvalidScopePromotion
+    );
 
     let mut system = value.clone();
     system["installation_scope"] = serde_json::json!("system");

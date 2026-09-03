@@ -447,6 +447,8 @@ struct ScopePromotionIntentDocument {
     system_manifest_sha256: String,
     candidate_manifest: String,
     authorization_request_id: uuid::Uuid,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    authorization_request_sha256: Option<String>,
     expected_completion: PromotionCompletion,
 }
 
@@ -478,6 +480,9 @@ pub(in crate::setup) struct ScopePromotionRequestBinding {
 impl ScopePromotionRequestBinding {
     fn from_intent(intent: &ScopePromotionIntent) -> Result<Self, ScopePromotionError> {
         let document = &intent.document;
+        if document.authorization_request_sha256.is_some() {
+            return Err(ScopePromotionError::Conflict);
+        }
         let value = Self {
             version: PROMOTION_INTENT_VERSION,
             authorization_request_id: document.authorization_request_id,
@@ -818,6 +823,10 @@ impl ScopePromotionIntentDocument {
             || !valid_sha256(&self.user_manifest_sha256)
             || !valid_sha256(&self.selector_sha256)
             || !valid_sha256(&self.system_manifest_sha256)
+            || self
+                .authorization_request_sha256
+                .as_deref()
+                .is_some_and(|digest| !valid_sha256(digest))
             || sha256_hex(self.candidate_manifest.as_bytes()) != self.system_manifest_sha256
         {
             return Err(ScopePromotionError::Conflict);
@@ -900,6 +909,7 @@ pub(in crate::setup) fn write_scope_promotion_intent(
         system_manifest_sha256: sha256_hex(system_candidate.as_bytes()),
         candidate_manifest: system_candidate,
         authorization_request_id: preparation.authorization_request_id,
+        authorization_request_sha256: None,
         expected_completion: PromotionCompletion::ProtectedSystemPublication,
     };
     let expected_bytes = document
@@ -944,6 +954,43 @@ pub(in crate::setup) fn scope_promotion_request_binding(
         .ok_or(ScopePromotionError::Conflict)?;
     validate_live_user_binding(receipt_store, None, &intent.document)?;
     ScopePromotionRequestBinding::from_intent(&intent)
+}
+
+/// Recovers the one immutable protected promotion binding after the ephemeral
+/// User authorization request has been retired. The intent remains the User
+/// authority until finalization and is the only admissible reconstruction
+/// source; legacy intent bytes are deliberately classified as conflict by
+/// `from_intent` rather than upgraded into protected evidence.
+pub(in crate::setup) fn scope_promotion_request_binding_for_resume(
+    receipt_store: &crate::setup::receipt::ReceiptStore,
+) -> Result<ScopePromotionRequestBinding, ScopePromotionError> {
+    if receipt_store.installation_scope() != InstallationScope::User {
+        return Err(ScopePromotionError::Conflict);
+    }
+    let parent = receipt_store
+        .path()
+        .parent()
+        .ok_or(ScopePromotionError::Conflict)?;
+    let mut recovered = None;
+    for entry in std::fs::read_dir(parent).map_err(|_| ScopePromotionError::Conflict)? {
+        let entry = entry.map_err(|_| ScopePromotionError::Conflict)?;
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else {
+            continue;
+        };
+        if !name.starts_with(".receipt.json.scope-promotion.") || !name.ends_with(".json") {
+            continue;
+        }
+        if recovered.is_some() {
+            return Err(ScopePromotionError::Conflict);
+        }
+        let intent = read_scope_promotion_intent(&entry.path(), receipt_store.worker_principal())?
+            .ok_or(ScopePromotionError::Conflict)?;
+        validate_live_user_binding(receipt_store, None, &intent.document)?;
+        let binding = ScopePromotionRequestBinding::from_intent(&intent)?;
+        recovered = Some(binding);
+    }
+    recovered.ok_or(ScopePromotionError::Conflict)
 }
 
 fn reject_concurrent_scope_promotion_intents(expected: &Path) -> Result<(), ScopePromotionError> {
@@ -1699,6 +1746,10 @@ mod tests {
     #[derive(Clone, Copy, Eq, PartialEq)]
     enum PromotionProofCase {
         Normal,
+        InterruptedAfterAuthorizationRecord,
+        InterruptedAfterRequestRetirement,
+        InterruptedDuringSystemJournaling,
+        HostileResumeEvidence,
         AlteredIntentBeforePublication,
         AlteredIntentAfterAuthorization,
         MissingCompletionBeforePublicationRerun,
@@ -1711,6 +1762,72 @@ mod tests {
     #[cfg(not(target_os = "windows"))]
     fn scope_promotion_preserves_one_uuid_and_dedicated_account_established_rerun() {
         run_scope_promotion_protocol(PromotionProofCase::Normal);
+    }
+
+    #[test]
+    #[cfg(not(target_os = "windows"))]
+    fn scope_promotion_authorization_resumes_each_protected_interruption() {
+        run_scope_promotion_protocol(PromotionProofCase::InterruptedAfterAuthorizationRecord);
+        run_scope_promotion_protocol(PromotionProofCase::InterruptedAfterRequestRetirement);
+        run_scope_promotion_protocol(PromotionProofCase::InterruptedDuringSystemJournaling);
+    }
+
+    #[test]
+    #[cfg(not(target_os = "windows"))]
+    fn scope_promotion_resume_rejects_digest_action_binding_identity_and_completed_replay() {
+        run_scope_promotion_protocol(PromotionProofCase::HostileResumeEvidence);
+    }
+
+    #[test]
+    #[cfg(not(target_os = "windows"))]
+    fn legacy_scope_promotion_intent_round_trips_without_becoming_protected_evidence() {
+        let bytes = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/examples/setup-scope-promotion-intent-legacy.json"
+        ));
+        let document = serde_json::from_slice::<super::ScopePromotionIntentDocument>(bytes)
+            .expect("legacy intent syntax and fields must deserialize");
+        document
+            .validate()
+            .expect("legacy intent fields must satisfy v1 semantics");
+        assert_eq!(document.to_json().unwrap(), bytes);
+        let document = super::ScopePromotionIntentDocument::from_json(bytes)
+            .expect("legacy intent bytes must be canonical");
+        assert_eq!(document.to_json().unwrap(), bytes);
+        assert_eq!(
+            super::sha256_hex(bytes),
+            "cfa5c42510066caf2686172509993329ff4d18d139821be75bcdcac0f5fe6cbc"
+        );
+
+        let root = std::env::temp_dir().join(format!(
+            "styrn-legacy-promotion-intent-{}",
+            uuid::Uuid::now_v7()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let path = root.join("intent.json");
+        let principal = crate::platform::resolve_current_worker_principal().unwrap();
+        let mut file = crate::platform::create_private_file(
+            &path,
+            crate::platform::ManifestOwner::User,
+            &principal,
+        )
+        .unwrap();
+        use std::io::Write as _;
+        file.write_all(bytes).unwrap();
+        file.sync_all().unwrap();
+        let identity = crate::platform::private_file_identity(&path).unwrap();
+        let intent = super::ScopePromotionIntent {
+            document,
+            path: path.clone(),
+            identity,
+        };
+        let before = std::fs::read(&path).unwrap();
+        assert!(matches!(
+            super::ScopePromotionRequestBinding::from_intent(&intent),
+            Err(super::ScopePromotionError::Conflict)
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        let _ = std::fs::remove_dir_all(root);
     }
 
     #[test]
@@ -1881,14 +1998,16 @@ mod tests {
                 "2026-09-03T12:01:06Z",
             ),
         ]);
+        let request_path = root.join("user-state/styrn/authorization-request.json");
         let request = crate::setup::action::prepare_scope_promotion_authorization_request_for_test(
             &system_plan,
-            root.join("user-state/styrn/authorization-request.json"),
+            request_path.clone(),
             operator.clone(),
             &user_receipt,
             preparation.intent_id,
         )
         .unwrap();
+        let original_request_bytes = std::fs::read(&request_path).unwrap();
         let intent_path =
             super::scope_promotion_intent_path(&user_receipt_path, preparation.intent_id).unwrap();
         if case == PromotionProofCase::AlteredIntentBeforePublication {
@@ -1920,6 +2039,181 @@ mod tests {
             );
             let _ = std::fs::remove_dir_all(root);
             return;
+        }
+
+        if matches!(
+            case,
+            PromotionProofCase::InterruptedAfterAuthorizationRecord
+                | PromotionProofCase::InterruptedAfterRequestRetirement
+                | PromotionProofCase::HostileResumeEvidence
+        ) {
+            let interruption = if case == PromotionProofCase::InterruptedAfterAuthorizationRecord {
+                crate::setup::action::ScopePromotionChildInterruption::AfterAuthorizationRecord
+            } else {
+                crate::setup::action::ScopePromotionChildInterruption::AfterRequestRetirement
+            };
+            crate::setup::action::set_scope_promotion_child_interruption_for_test(Some(
+                interruption,
+            ));
+            let error = request
+                .run_scope_promotion(
+                    &mut system_plan,
+                    &user_receipt,
+                    &system_receipt,
+                    &mut system_metadata,
+                )
+                .unwrap_err();
+            assert_eq!(error.error_code(), "setup.plan_invalid");
+            assert!(user_manifest_path.is_file());
+            assert!(!system_manifest_path.exists());
+            assert!(system_receipt_path
+                .parent()
+                .unwrap()
+                .join(format!(
+                    ".setup-request-{}.consumed",
+                    preparation.authorization_request_id
+                ))
+                .is_file());
+            if case == PromotionProofCase::InterruptedAfterAuthorizationRecord {
+                assert!(request_path.is_file());
+            } else {
+                assert!(!request_path.exists());
+            }
+        } else if case == PromotionProofCase::InterruptedDuringSystemJournaling {
+            let mut interrupted_metadata =
+                crate::setup::receipt::ReceiptMetadataSource::for_test([(
+                    "019cad99-54a0-7000-8000-000000000029",
+                    "2026-09-03T12:00:59Z",
+                )]);
+            let error = request
+                .run_scope_promotion(
+                    &mut system_plan,
+                    &user_receipt,
+                    &system_receipt,
+                    &mut interrupted_metadata,
+                )
+                .unwrap_err();
+            assert_eq!(error.exit_code(), 13);
+            let interrupted = system_receipt.read_snapshot().unwrap();
+            assert_eq!(interrupted.entry_count(), 1);
+            assert!(user_manifest_path.is_file());
+            assert!(!system_manifest_path.exists());
+            assert!(!request_path.exists());
+        }
+
+        let authorization_marker = system_receipt_path.parent().unwrap().join(format!(
+            ".setup-request-{}.consumed",
+            preparation.authorization_request_id
+        ));
+        if case == PromotionProofCase::HostileResumeEvidence {
+            use std::io::Write as _;
+
+            let intent_bytes = std::fs::read(&intent_path).unwrap();
+            let marker_bytes = std::fs::read(&authorization_marker).unwrap();
+
+            let mut different_request =
+                serde_json::from_slice::<serde_json::Value>(&original_request_bytes).unwrap();
+            different_request["issued_at"] = serde_json::json!("2026-09-03T12:00:29Z");
+            different_request["expires_at"] = serde_json::json!("2026-09-03T12:05:29Z");
+            let different_request_bytes = serde_json::to_vec(&different_request).unwrap();
+            let different_request_digest = super::sha256_hex(&different_request_bytes);
+            let mut different_request_file = crate::platform::create_private_file(
+                &request_path,
+                crate::platform::ManifestOwner::User,
+                &operator,
+            )
+            .unwrap();
+            different_request_file
+                .write_all(&different_request_bytes)
+                .unwrap();
+            different_request_file.sync_all().unwrap();
+            let error = request
+                .run_scope_promotion_with_digest_for_test(
+                    &different_request_digest,
+                    &mut system_plan,
+                    &user_receipt,
+                    &system_receipt,
+                    &mut system_metadata,
+                )
+                .unwrap_err();
+            assert_eq!(error.error_code(), "setup.plan_invalid");
+            assert_eq!(
+                std::fs::read(&request_path).unwrap(),
+                different_request_bytes
+            );
+            std::fs::remove_file(&request_path).unwrap();
+
+            let error = request
+                .run_scope_promotion_with_digest_for_test(
+                    &"0".repeat(64),
+                    &mut system_plan,
+                    &user_receipt,
+                    &system_receipt,
+                    &mut system_metadata,
+                )
+                .unwrap_err();
+            assert_eq!(error.error_code(), "setup.plan_invalid");
+
+            let removed_action = system_plan.pop().unwrap();
+            let error = request
+                .run_scope_promotion(
+                    &mut system_plan,
+                    &user_receipt,
+                    &system_receipt,
+                    &mut system_metadata,
+                )
+                .unwrap_err();
+            assert_eq!(error.error_code(), "setup.plan_invalid");
+            system_plan.push(removed_action);
+
+            let mut altered_intent =
+                super::ScopePromotionIntentDocument::from_json(&intent_bytes).unwrap();
+            let mut altered_candidate =
+                crate::manifest::MachineManifest::parse_toml(&altered_intent.candidate_manifest)
+                    .unwrap();
+            altered_candidate.name.push_str("-resume-substitution");
+            altered_intent.candidate_manifest = altered_candidate.to_toml().unwrap();
+            altered_intent.system_manifest_sha256 =
+                super::sha256_hex(altered_intent.candidate_manifest.as_bytes());
+            std::fs::write(&intent_path, altered_intent.to_json().unwrap()).unwrap();
+            let error = request
+                .run_scope_promotion(
+                    &mut system_plan,
+                    &user_receipt,
+                    &system_receipt,
+                    &mut system_metadata,
+                )
+                .unwrap_err();
+            assert_eq!(error.error_code(), "setup.plan_invalid");
+            std::fs::write(&intent_path, &intent_bytes).unwrap();
+
+            let displaced_marker = authorization_marker.with_extension("consumed.original");
+            std::fs::rename(&authorization_marker, &displaced_marker).unwrap();
+            std::fs::write(&authorization_marker, &marker_bytes).unwrap();
+            use std::os::unix::fs::PermissionsExt as _;
+            std::fs::set_permissions(
+                &authorization_marker,
+                std::fs::Permissions::from_mode(0o600),
+            )
+            .unwrap();
+            let error = request
+                .run_scope_promotion(
+                    &mut system_plan,
+                    &user_receipt,
+                    &system_receipt,
+                    &mut system_metadata,
+                )
+                .unwrap_err();
+            assert_eq!(error.error_code(), "setup.plan_invalid");
+            std::fs::remove_file(&authorization_marker).unwrap();
+            std::fs::rename(&displaced_marker, &authorization_marker).unwrap();
+
+            assert!(user_manifest_path.is_file());
+            assert!(!system_manifest_path.exists());
+            assert!(intent_path.is_file());
+            assert!(!request_path.exists());
+            assert_eq!(std::fs::read(&intent_path).unwrap(), intent_bytes);
+            assert_eq!(std::fs::read(&authorization_marker).unwrap(), marker_bytes);
         }
 
         let system_execution = request
@@ -1985,6 +2279,22 @@ mod tests {
             machine_id
         );
 
+        if case == PromotionProofCase::HostileResumeEvidence {
+            let error = request
+                .run_scope_promotion(
+                    &mut system_plan,
+                    &user_receipt,
+                    &system_receipt,
+                    &mut system_metadata,
+                )
+                .unwrap_err();
+            assert_eq!(error.error_code(), "setup.plan_invalid");
+            assert!(user_manifest_path.is_file());
+            assert!(system_manifest_path.is_file());
+            assert!(intent_path.is_file());
+            assert!(authorization_marker.is_file());
+        }
+
         if case == PromotionProofCase::MissingCompletionBeforePublicationRerun {
             let completion_path =
                 super::scope_promotion_completion_path(&system_receipt_path, preparation.intent_id)
@@ -2002,10 +2312,6 @@ mod tests {
             assert!(completion_path.is_file());
         }
 
-        let authorization_marker = system_receipt_path.parent().unwrap().join(format!(
-            ".setup-request-{}.consumed",
-            preparation.authorization_request_id
-        ));
         if case == PromotionProofCase::MissingAuthorizationBeforeFinalization {
             let displaced = authorization_marker.with_extension("consumed.displaced");
             std::fs::rename(&authorization_marker, &displaced).unwrap();

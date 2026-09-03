@@ -427,6 +427,9 @@ pub(in crate::setup) struct ReceiptPendingPublicationSession<'a> {
 struct ScopePromotionAuthorizationRecord {
     schema_version: u32,
     request_sha256: Sha256Digest,
+    authorized_actions_sha256: Sha256Digest,
+    authorized_action_count: usize,
+    record_identity_sha256: Sha256Digest,
     promotion: crate::setup::promotion::ScopePromotionRequestBinding,
 }
 
@@ -1538,6 +1541,8 @@ impl ReceiptStore {
         &self,
         request_id: Uuid,
         request_sha256: &str,
+        authorized_actions_sha256: &str,
+        authorized_action_count: usize,
         binding: &crate::setup::promotion::ScopePromotionRequestBinding,
         _authority: &crate::setup::action::ScopePromotionAuthorizationAuthority,
     ) -> Result<ProtectedScopePromotionAuthorization, ReceiptStoreError> {
@@ -1554,22 +1559,49 @@ impl ReceiptStore {
         }
         let request_sha256 = Sha256Digest(request_sha256.to_owned());
         request_sha256.validate()?;
+        let authorized_actions_sha256 = Sha256Digest(authorized_actions_sha256.to_owned());
+        authorized_actions_sha256.validate()?;
+        if authorized_action_count == 0 {
+            return Err(ReceiptStoreError::IntentConflict);
+        }
         let destination = self.validate_destination_policy()?.to_path_buf();
         self.verify_bound_principal()?;
         self.prepare_destination(&destination)?;
         self.preflight_writer_state()?;
         let marker = destination.join(format!(".setup-request-{request_id}.consumed"));
         let temporary = destination.join(format!(".setup-request-{request_id}.tmp"));
+        self.reject_completed_scope_promotion(binding.promotion_intent_id())?;
+        match crate::platform::private_file_identity(&marker) {
+            Ok(_) => {
+                return self.verify_scope_promotion_authorization_record(
+                    request_id,
+                    binding,
+                    Some(&request_sha256.0),
+                    Some(&authorized_actions_sha256.0),
+                    Some(authorized_action_count),
+                );
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(ReceiptStoreError::Security(error)),
+        }
+        let mut file =
+            crate::platform::create_private_publication_file(&temporary, self.owner, &self.worker)
+                .map_err(ReceiptStoreError::Write)?;
+        let record_identity_sha256 = Sha256Digest(
+            crate::platform::private_file_identity(&temporary)
+                .map_err(ReceiptStoreError::Security)?
+                .binding_sha256(),
+        );
         let record = ScopePromotionAuthorizationRecord {
             schema_version: SCHEMA_VERSION,
             request_sha256,
+            authorized_actions_sha256,
+            authorized_action_count,
+            record_identity_sha256,
             promotion: binding.clone(),
         };
         let mut bytes = serde_json::to_vec_pretty(&record).map_err(|_| ReceiptError::Serialize)?;
         bytes.push(b'\n');
-        let mut file =
-            crate::platform::create_private_publication_file(&temporary, self.owner, &self.worker)
-                .map_err(ReceiptStoreError::Write)?;
         let result = (|| {
             file.write_all(&bytes).map_err(ReceiptStoreError::Write)?;
             let complete = file
@@ -1582,9 +1614,29 @@ impl ReceiptStore {
         })();
         if let Err(error) = result {
             let _ = fs::remove_file(&temporary);
+            if matches!(
+                &error,
+                ReceiptStoreError::Write(source)
+                    if source.kind() == std::io::ErrorKind::AlreadyExists
+            ) {
+                self.reject_completed_scope_promotion(binding.promotion_intent_id())?;
+                return self.verify_scope_promotion_authorization_record(
+                    request_id,
+                    binding,
+                    Some(&record.request_sha256.0),
+                    Some(&record.authorized_actions_sha256.0),
+                    Some(record.authorized_action_count),
+                );
+            }
             return Err(error);
         }
-        self.verify_scope_promotion_authorization_record(request_id, binding)
+        self.verify_scope_promotion_authorization_record(
+            request_id,
+            binding,
+            Some(&record.request_sha256.0),
+            Some(&record.authorized_actions_sha256.0),
+            Some(record.authorized_action_count),
+        )
     }
 
     #[cfg(not(any(action_core_fixture, action_compile_fixture)))]
@@ -1594,7 +1646,32 @@ impl ReceiptStore {
         expected_binding: &crate::setup::promotion::ScopePromotionRequestBinding,
         _authority: &crate::setup::promotion::ScopePromotionAuthority,
     ) -> Result<ProtectedScopePromotionAuthorization, ReceiptStoreError> {
-        self.verify_scope_promotion_authorization_record(request_id, expected_binding)
+        self.verify_scope_promotion_authorization_record(
+            request_id,
+            expected_binding,
+            None,
+            None,
+            None,
+        )
+    }
+
+    #[cfg(not(any(action_core_fixture, action_compile_fixture)))]
+    fn reject_completed_scope_promotion(
+        &self,
+        intent_id: uuid::Uuid,
+    ) -> Result<(), ReceiptStoreError> {
+        let completion = self
+            .path
+            .parent()
+            .ok_or(ReceiptStoreError::InvalidDestination)?
+            .join(format!(
+                ".receipt.json.scope-promotion.{intent_id}.completed"
+            ));
+        match crate::platform::private_file_identity(&completion) {
+            Ok(_) => Err(ReceiptStoreError::IntentConflict),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(ReceiptStoreError::Security(error)),
+        }
     }
 
     #[cfg(not(any(action_core_fixture, action_compile_fixture)))]
@@ -1602,6 +1679,9 @@ impl ReceiptStore {
         &self,
         request_id: uuid::Uuid,
         expected_binding: &crate::setup::promotion::ScopePromotionRequestBinding,
+        expected_request_sha256: Option<&str>,
+        expected_actions_sha256: Option<&str>,
+        expected_action_count: Option<usize>,
     ) -> Result<ProtectedScopePromotionAuthorization, ReceiptStoreError> {
         expected_binding
             .validate()
@@ -1641,6 +1721,8 @@ impl ReceiptStore {
             serde_json::to_vec_pretty(&record).map_err(|_| ReceiptError::Serialize)?;
         canonical.push(b'\n');
         record.request_sha256.validate()?;
+        record.authorized_actions_sha256.validate()?;
+        record.record_identity_sha256.validate()?;
         record
             .promotion
             .validate()
@@ -1648,6 +1730,13 @@ impl ReceiptStore {
         if bytes != canonical
             || record.schema_version != SCHEMA_VERSION
             || &record.promotion != expected_binding
+            || record.authorized_action_count == 0
+            || record.record_identity_sha256.0 != identity.binding_sha256()
+            || expected_request_sha256.is_some_and(|expected| expected != record.request_sha256.0)
+            || expected_actions_sha256
+                .is_some_and(|expected| expected != record.authorized_actions_sha256.0)
+            || expected_action_count
+                .is_some_and(|expected| expected != record.authorized_action_count)
         {
             return Err(ReceiptStoreError::IntentConflict);
         }
@@ -4097,21 +4186,36 @@ struct ScopePromotionParameters {
     user_manifest_sha256: Sha256Digest,
     system_manifest_path: RecordedPath,
     system_manifest_sha256: Sha256Digest,
-    system_manifest_identity_sha256: Sha256Digest,
-    system_receipt_path: RecordedPath,
-    system_receipt_sha256: Sha256Digest,
-    system_receipt_identity_sha256: Sha256Digest,
-    authorization_request_id: ReceiptEntryId,
-    authorization_request_sha256: Sha256Digest,
-    authorization_record_path: RecordedPath,
-    authorization_record_sha256: Sha256Digest,
-    authorization_record_identity_sha256: Sha256Digest,
-    promotion_intent_path: RecordedPath,
-    promotion_intent_sha256: Sha256Digest,
-    promotion_intent_identity_sha256: Sha256Digest,
-    completion_record_path: RecordedPath,
-    completion_record_sha256: Sha256Digest,
-    completion_record_identity_sha256: Sha256Digest,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    system_manifest_identity_sha256: Option<Sha256Digest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    system_receipt_path: Option<RecordedPath>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    system_receipt_sha256: Option<Sha256Digest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    system_receipt_identity_sha256: Option<Sha256Digest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    authorization_request_id: Option<ReceiptEntryId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    authorization_request_sha256: Option<Sha256Digest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    authorization_record_path: Option<RecordedPath>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    authorization_record_sha256: Option<Sha256Digest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    authorization_record_identity_sha256: Option<Sha256Digest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    promotion_intent_path: Option<RecordedPath>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    promotion_intent_sha256: Option<Sha256Digest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    promotion_intent_identity_sha256: Option<Sha256Digest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    completion_record_path: Option<RecordedPath>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    completion_record_sha256: Option<Sha256Digest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    completion_record_identity_sha256: Option<Sha256Digest>,
     original_operator: ReceiptWorkerPrincipal,
     target_principal: ReceiptWorkerPrincipal,
     selector_sha256: Sha256Digest,
@@ -4132,41 +4236,49 @@ impl ScopePromotionParameters {
             user_manifest_sha256: Sha256Digest(checkpoint.user_manifest_sha256().to_owned()),
             system_manifest_path: RecordedPath(checkpoint.system_manifest_path().to_owned()),
             system_manifest_sha256: Sha256Digest(checkpoint.system_manifest_sha256().to_owned()),
-            system_manifest_identity_sha256: Sha256Digest(
+            system_manifest_identity_sha256: Some(Sha256Digest(
                 checkpoint.system_manifest_identity_sha256().to_owned(),
-            ),
-            system_receipt_path: RecordedPath(checkpoint.system_receipt_path().to_owned()),
-            system_receipt_sha256: Sha256Digest(checkpoint.system_receipt_sha256().to_owned()),
-            system_receipt_identity_sha256: Sha256Digest(
+            )),
+            system_receipt_path: Some(RecordedPath(checkpoint.system_receipt_path().to_owned())),
+            system_receipt_sha256: Some(Sha256Digest(
+                checkpoint.system_receipt_sha256().to_owned(),
+            )),
+            system_receipt_identity_sha256: Some(Sha256Digest(
                 checkpoint.system_receipt_identity_sha256().to_owned(),
-            ),
-            authorization_request_id: ReceiptEntryId(
+            )),
+            authorization_request_id: Some(ReceiptEntryId(
                 checkpoint.authorization_request_id().to_string(),
-            ),
-            authorization_request_sha256: Sha256Digest(
+            )),
+            authorization_request_sha256: Some(Sha256Digest(
                 checkpoint.authorization_request_sha256().to_owned(),
-            ),
-            authorization_record_path: RecordedPath(
+            )),
+            authorization_record_path: Some(RecordedPath(
                 checkpoint.authorization_record_path().to_owned(),
-            ),
-            authorization_record_sha256: Sha256Digest(
+            )),
+            authorization_record_sha256: Some(Sha256Digest(
                 checkpoint.authorization_record_sha256().to_owned(),
-            ),
-            authorization_record_identity_sha256: Sha256Digest(
+            )),
+            authorization_record_identity_sha256: Some(Sha256Digest(
                 checkpoint.authorization_record_identity_sha256().to_owned(),
-            ),
-            promotion_intent_path: RecordedPath(checkpoint.promotion_intent_path().to_owned()),
-            promotion_intent_sha256: Sha256Digest(checkpoint.promotion_intent_sha256().to_owned()),
-            promotion_intent_identity_sha256: Sha256Digest(
+            )),
+            promotion_intent_path: Some(RecordedPath(
+                checkpoint.promotion_intent_path().to_owned(),
+            )),
+            promotion_intent_sha256: Some(Sha256Digest(
+                checkpoint.promotion_intent_sha256().to_owned(),
+            )),
+            promotion_intent_identity_sha256: Some(Sha256Digest(
                 checkpoint.promotion_intent_identity_sha256().to_owned(),
-            ),
-            completion_record_path: RecordedPath(checkpoint.completion_record_path().to_owned()),
-            completion_record_sha256: Sha256Digest(
+            )),
+            completion_record_path: Some(RecordedPath(
+                checkpoint.completion_record_path().to_owned(),
+            )),
+            completion_record_sha256: Some(Sha256Digest(
                 checkpoint.completion_record_sha256().to_owned(),
-            ),
-            completion_record_identity_sha256: Sha256Digest(
+            )),
+            completion_record_identity_sha256: Some(Sha256Digest(
                 checkpoint.completion_record_identity_sha256().to_owned(),
-            ),
+            )),
             original_operator: ReceiptWorkerPrincipal::from_worker_principal(
                 checkpoint.original_operator(),
             ),
@@ -4187,21 +4299,75 @@ impl ScopePromotionParameters {
         self.user_manifest_sha256.validate()?;
         self.system_manifest_path.validate()?;
         self.system_manifest_sha256.validate()?;
-        self.system_manifest_identity_sha256.validate()?;
-        self.system_receipt_path.validate()?;
-        self.system_receipt_sha256.validate()?;
-        self.system_receipt_identity_sha256.validate()?;
-        self.authorization_request_id.validate()?;
-        self.authorization_request_sha256.validate()?;
-        self.authorization_record_path.validate()?;
-        self.authorization_record_sha256.validate()?;
-        self.authorization_record_identity_sha256.validate()?;
-        self.promotion_intent_path.validate()?;
-        self.promotion_intent_sha256.validate()?;
-        self.promotion_intent_identity_sha256.validate()?;
-        self.completion_record_path.validate()?;
-        self.completion_record_sha256.validate()?;
-        self.completion_record_identity_sha256.validate()?;
+        match (
+            &self.system_manifest_identity_sha256,
+            &self.system_receipt_path,
+            &self.system_receipt_sha256,
+            &self.system_receipt_identity_sha256,
+            &self.authorization_request_id,
+            &self.authorization_request_sha256,
+            &self.authorization_record_path,
+            &self.authorization_record_sha256,
+            &self.authorization_record_identity_sha256,
+            &self.promotion_intent_path,
+            &self.promotion_intent_sha256,
+            &self.promotion_intent_identity_sha256,
+            &self.completion_record_path,
+            &self.completion_record_sha256,
+            &self.completion_record_identity_sha256,
+        ) {
+            (
+                Some(system_manifest_identity_sha256),
+                Some(system_receipt_path),
+                Some(system_receipt_sha256),
+                Some(system_receipt_identity_sha256),
+                Some(authorization_request_id),
+                Some(authorization_request_sha256),
+                Some(authorization_record_path),
+                Some(authorization_record_sha256),
+                Some(authorization_record_identity_sha256),
+                Some(promotion_intent_path),
+                Some(promotion_intent_sha256),
+                Some(promotion_intent_identity_sha256),
+                Some(completion_record_path),
+                Some(completion_record_sha256),
+                Some(completion_record_identity_sha256),
+            ) => {
+                system_manifest_identity_sha256.validate()?;
+                system_receipt_path.validate()?;
+                system_receipt_sha256.validate()?;
+                system_receipt_identity_sha256.validate()?;
+                authorization_request_id.validate()?;
+                authorization_request_sha256.validate()?;
+                authorization_record_path.validate()?;
+                authorization_record_sha256.validate()?;
+                authorization_record_identity_sha256.validate()?;
+                promotion_intent_path.validate()?;
+                promotion_intent_sha256.validate()?;
+                promotion_intent_identity_sha256.validate()?;
+                completion_record_path.validate()?;
+                completion_record_sha256.validate()?;
+                completion_record_identity_sha256.validate()?;
+            }
+            (
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            ) => {}
+            _ => return Err(ReceiptError::InvalidScopePromotion),
+        }
         self.original_operator.validate()?;
         self.target_principal.validate()?;
         self.selector_sha256.validate()?;
@@ -4226,6 +4392,42 @@ impl ScopePromotionParameters {
         authority: &crate::setup::promotion::ScopePromotionAuthority,
     ) -> Result<crate::setup::promotion::ScopePromotionCheckpoint, ReceiptError> {
         self.validate()?;
+        let (
+            Some(system_manifest_identity_sha256),
+            Some(system_receipt_path),
+            Some(system_receipt_sha256),
+            Some(system_receipt_identity_sha256),
+            Some(authorization_request_id),
+            Some(authorization_request_sha256),
+            Some(authorization_record_path),
+            Some(authorization_record_sha256),
+            Some(authorization_record_identity_sha256),
+            Some(promotion_intent_path),
+            Some(promotion_intent_sha256),
+            Some(promotion_intent_identity_sha256),
+            Some(completion_record_path),
+            Some(completion_record_sha256),
+            Some(completion_record_identity_sha256),
+        ) = (
+            &self.system_manifest_identity_sha256,
+            &self.system_receipt_path,
+            &self.system_receipt_sha256,
+            &self.system_receipt_identity_sha256,
+            &self.authorization_request_id,
+            &self.authorization_request_sha256,
+            &self.authorization_record_path,
+            &self.authorization_record_sha256,
+            &self.authorization_record_identity_sha256,
+            &self.promotion_intent_path,
+            &self.promotion_intent_sha256,
+            &self.promotion_intent_identity_sha256,
+            &self.completion_record_path,
+            &self.completion_record_sha256,
+            &self.completion_record_identity_sha256,
+        )
+        else {
+            return Err(ReceiptError::InvalidScopePromotion);
+        };
         crate::setup::promotion::ScopePromotionCheckpoint::from_durable_receipt(
             Uuid::parse_str(&self.machine_id.0).map_err(|_| ReceiptError::InvalidScopePromotion)?,
             &self.original_operator.to_worker_principal()?,
@@ -4235,22 +4437,22 @@ impl ScopePromotionParameters {
             &self.user_manifest_sha256.0,
             &self.system_manifest_path.0,
             &self.system_manifest_sha256.0,
-            &self.system_manifest_identity_sha256.0,
-            &self.system_receipt_path.0,
-            &self.system_receipt_sha256.0,
-            &self.system_receipt_identity_sha256.0,
-            Uuid::parse_str(&self.authorization_request_id.0)
+            &system_manifest_identity_sha256.0,
+            &system_receipt_path.0,
+            &system_receipt_sha256.0,
+            &system_receipt_identity_sha256.0,
+            Uuid::parse_str(&authorization_request_id.0)
                 .map_err(|_| ReceiptError::InvalidScopePromotion)?,
-            &self.authorization_request_sha256.0,
-            &self.authorization_record_path.0,
-            &self.authorization_record_sha256.0,
-            &self.authorization_record_identity_sha256.0,
-            &self.promotion_intent_path.0,
-            &self.promotion_intent_sha256.0,
-            &self.promotion_intent_identity_sha256.0,
-            &self.completion_record_path.0,
-            &self.completion_record_sha256.0,
-            &self.completion_record_identity_sha256.0,
+            &authorization_request_sha256.0,
+            &authorization_record_path.0,
+            &authorization_record_sha256.0,
+            &authorization_record_identity_sha256.0,
+            &promotion_intent_path.0,
+            &promotion_intent_sha256.0,
+            &promotion_intent_identity_sha256.0,
+            &completion_record_path.0,
+            &completion_record_sha256.0,
+            &completion_record_identity_sha256.0,
             Uuid::parse_str(&self.promotion_intent_id.0)
                 .map_err(|_| ReceiptError::InvalidScopePromotion)?,
             authority,
