@@ -3043,8 +3043,8 @@ fn inspect_dedicated_home(path: &Path, expected_uid: u32) -> DedicatedHomeState 
     {
         return DedicatedHomeState::Unsafe;
     }
-    if verify_no_extended_acl(path).is_err() {
-        return DedicatedHomeState::Unsafe;
+    if let Some(issue) = dedicated_home_acl_issue(inspect_extended_acl(path)) {
+        return issue;
     }
     match fs::read_dir(path) {
         Ok(mut entries) => match entries.next() {
@@ -3053,6 +3053,14 @@ fn inspect_dedicated_home(path: &Path, expected_uid: u32) -> DedicatedHomeState 
             Some(Err(_)) => DedicatedHomeState::Unknowable,
         },
         Err(_) => DedicatedHomeState::Unknowable,
+    }
+}
+
+fn dedicated_home_acl_issue(observation: io::Result<bool>) -> Option<DedicatedHomeState> {
+    match observation {
+        Ok(false) => None,
+        Ok(true) => Some(DedicatedHomeState::Unsafe),
+        Err(_) => Some(DedicatedHomeState::Unknowable),
     }
 }
 
@@ -4233,6 +4241,10 @@ fn verify_no_extended_acl(path: &Path) -> io::Result<()> {
     verify_no_extended_acl_c_path(&c_path(path)?)
 }
 
+fn inspect_extended_acl(path: &Path) -> io::Result<bool> {
+    inspect_extended_acl_c_path(&c_path(path)?)
+}
+
 #[cfg(test)]
 pub(super) fn seed_incompatible_worker_directory_acl_for_action_test(
     path: &Path,
@@ -4290,22 +4302,33 @@ fn verify_no_extended_acl_c_path(path: &std::ffi::CString) -> io::Result<()> {
 }
 
 fn verify_no_extended_acl_value(acl: Acl) -> io::Result<()> {
+    match inspect_extended_acl_value(acl) {
+        Ok(false) => Ok(()),
+        Ok(true) => Err(permission_denied(
+            "manifest security target has an extended ACL",
+        )),
+        Err(error) => Err(error),
+    }
+}
+
+fn inspect_extended_acl_c_path(path: &std::ffi::CString) -> io::Result<bool> {
+    inspect_extended_acl_value(unsafe { acl_get_file(path.as_ptr(), ACL_TYPE_EXTENDED) })
+}
+
+fn inspect_extended_acl_value(acl: Acl) -> io::Result<bool> {
     if acl.is_null() {
         let error = io::Error::last_os_error();
         return if error.kind() == io::ErrorKind::NotFound {
-            Ok(())
+            Ok(false)
         } else {
             Err(error)
         };
     }
     let acl = OwnedAcl(acl);
     let mut entry = std::ptr::null_mut();
-    match unsafe { acl_get_entry(acl.0, ACL_FIRST_ENTRY, &mut entry) } {
-        0 => Err(permission_denied(
-            "manifest security target has an extended ACL",
-        )),
-        _ => Err(io::Error::last_os_error()),
-    }
+    (unsafe { acl_get_entry(acl.0, ACL_FIRST_ENTRY, &mut entry) } == 0)
+        .then_some(true)
+        .ok_or_else(io::Error::last_os_error)
 }
 
 fn c_path(path: &Path) -> io::Result<std::ffi::CString> {
@@ -4519,6 +4542,21 @@ mod tests {
                 super::super::NativeDedicatedAccountInspection::Established,
             ),
             super::super::NativeDedicatedAccountObservation::PresentHealthy(_),
+        ));
+    }
+
+    #[test]
+    fn dedicated_account_acl_distinguishes_present_from_query_failure() {
+        assert!(dedicated_home_acl_issue(Ok(false)).is_none());
+        assert!(matches!(
+            dedicated_home_acl_issue(Ok(true)),
+            Some(DedicatedHomeState::Unsafe)
+        ));
+        assert!(matches!(
+            dedicated_home_acl_issue(Err(
+                io::Error::other("injected extended ACL query failure",)
+            )),
+            Some(DedicatedHomeState::Unknowable)
         ));
     }
 

@@ -5,7 +5,7 @@ use super::{
 use std::ffi::{CString, OsString};
 use std::fs;
 use std::io;
-use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
@@ -2875,26 +2875,29 @@ pub(super) fn inspect_dedicated_account(
         }
         Err(_) => return super::NativeDedicatedAccountObservation::Unknowable,
     };
-    let groups = match supplementary_groups(account.principal.name(), account.gid) {
+    let supplementary_groups = match supplementary_groups(account.principal.name(), account.gid) {
         Ok(groups) => groups,
         Err(_) => return super::NativeDedicatedAccountObservation::Unknowable,
     };
-    let privileged_groups = match linux_privileged_group_ids() {
-        Ok(groups) => groups,
+    let primary_group_name = match group_name_for_gid(account.gid) {
+        Ok(Some(name)) => name,
+        Ok(None) => return super::NativeDedicatedAccountObservation::PresentBroken,
         Err(_) => return super::NativeDedicatedAccountObservation::Unknowable,
     };
-    let privileged_group_member = account.gid == 0
-        || groups.contains(&0)
-        || privileged_groups
-            .iter()
-            .any(|group| account.gid == *group || groups.contains(group));
+    let local_record = match local_account_records_match(&account, &primary_group_name) {
+        Ok(true) => LinuxLocalRecordProof::Proven,
+        Ok(false) => LinuxLocalRecordProof::MissingOrMismatch,
+        Err(_) => LinuxLocalRecordProof::Unknowable,
+    };
     let home = PathBuf::from(account.home);
     let home_state = inspect_dedicated_home(&home, uid);
     classify_dedicated_account_record(
         spec,
         LinuxDedicatedAccountRecord {
             principal: account.principal,
-            privileged_group_member,
+            local_record,
+            primary_group_name: Some(primary_group_name),
+            supplementary_groups: Some(supplementary_groups),
             home,
             shell: PathBuf::from(account.shell),
             home_state,
@@ -2915,10 +2918,19 @@ enum DedicatedHomeState {
 #[derive(Clone)]
 struct LinuxDedicatedAccountRecord {
     principal: WorkerPrincipal,
-    privileged_group_member: bool,
+    local_record: LinuxLocalRecordProof,
+    primary_group_name: Option<String>,
+    supplementary_groups: Option<Vec<libc::gid_t>>,
     home: PathBuf,
     shell: PathBuf,
     home_state: DedicatedHomeState,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum LinuxLocalRecordProof {
+    Proven,
+    MissingOrMismatch,
+    Unknowable,
 }
 
 fn classify_dedicated_account_record(
@@ -2926,9 +2938,14 @@ fn classify_dedicated_account_record(
     record: LinuxDedicatedAccountRecord,
     home_observation: super::NativeDedicatedAccountInspection,
 ) -> super::NativeDedicatedAccountObservation {
-    if record.home_state == DedicatedHomeState::Unknowable {
+    if record.home_state == DedicatedHomeState::Unknowable
+        || record.local_record == LinuxLocalRecordProof::Unknowable
+        || record.primary_group_name.is_none()
+        || record.supplementary_groups.is_none()
+    {
         return super::NativeDedicatedAccountObservation::Unknowable;
     }
+    let ordinary_uid = record.principal.unix_uid().is_ok_and(|uid| uid >= 1000);
     let home_is_safe = match (home_observation, record.home_state) {
         (_, DedicatedHomeState::EmptySafe)
         | (
@@ -2944,7 +2961,13 @@ fn classify_dedicated_account_record(
     if record.principal.principal_kind() != PrincipalKind::UnixUid
         || record.principal.account_policy() != WorkerAccountPolicy::Dedicated
         || record.principal.name() != spec.name()
-        || record.privileged_group_member
+        || !ordinary_uid
+        || record.local_record != LinuxLocalRecordProof::Proven
+        || record.primary_group_name.as_deref() != Some(spec.name())
+        || record
+            .supplementary_groups
+            .as_ref()
+            .is_none_or(|groups| !groups.is_empty())
         || record.home != Path::new("/home").join(spec.name())
         || record.shell != Path::new("/bin/bash")
         || !home_is_safe
@@ -2990,26 +3013,13 @@ fn inspect_dedicated_home(path: &Path, expected_uid: u32) -> DedicatedHomeState 
     }
 }
 
-fn linux_privileged_group_ids() -> io::Result<Vec<libc::gid_t>> {
-    let mut groups = vec![0];
-    for name in ["sudo", "wheel"] {
-        if let Some(group) = lookup_group_gid(name)? {
-            groups.push(group);
-        }
-    }
-    groups.sort_unstable();
-    groups.dedup();
-    Ok(groups)
-}
-
-fn lookup_group_gid(name: &str) -> io::Result<Option<libc::gid_t>> {
-    let name = CString::new(name).map_err(|_| invalid_data("group name contains NUL"))?;
+fn group_name_for_gid(gid: libc::gid_t) -> io::Result<Option<String>> {
     let mut entry = unsafe { std::mem::zeroed::<libc::group>() };
     let mut result = std::ptr::null_mut();
     let mut buffer = vec![0_u8; 16 * 1024];
     let status = unsafe {
-        libc::getgrnam_r(
-            name.as_ptr(),
+        libc::getgrgid_r(
+            gid,
             &mut entry,
             buffer.as_mut_ptr().cast(),
             buffer.len(),
@@ -3019,7 +3029,152 @@ fn lookup_group_gid(name: &str) -> io::Result<Option<libc::gid_t>> {
     if status != 0 {
         return Err(io::Error::from_raw_os_error(status));
     }
-    Ok((!result.is_null()).then_some(entry.gr_gid))
+    if result.is_null() {
+        return Ok(None);
+    }
+    if entry.gr_name.is_null() {
+        return Err(invalid_data("primary group has no native name"));
+    }
+    String::from_utf8(
+        unsafe { std::ffi::CStr::from_ptr(entry.gr_name) }
+            .to_bytes()
+            .to_vec(),
+    )
+    .map(Some)
+    .map_err(|_| invalid_data("primary group name is not UTF-8"))
+}
+
+fn local_account_records_match(
+    account: &UnixAccountDetails,
+    primary_group_name: &str,
+) -> io::Result<bool> {
+    // NSS has no portable provenance API. A healthy Linux observation therefore also requires
+    // exact libc-decoded records from the trusted local account databases. Directory-only NSS
+    // identities cannot pass; an inaccessible database leaves the observation unknowable.
+    Ok(local_passwd_record_matches(account)?
+        && local_group_record_matches(primary_group_name, account.gid)?)
+}
+
+fn local_passwd_record_matches(account: &UnixAccountDetails) -> io::Result<bool> {
+    let stream = open_local_account_database(Path::new("/etc/passwd"))?;
+    let expected_uid = account.principal.unix_uid()?;
+    let expected_name = account.principal.name().as_bytes();
+    let mut found = false;
+    loop {
+        let mut entry = unsafe { std::mem::zeroed::<libc::passwd>() };
+        let mut result = std::ptr::null_mut();
+        let mut buffer = vec![0_u8; 64 * 1024];
+        let status = unsafe {
+            libc::fgetpwent_r(
+                stream.0,
+                &mut entry,
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+                &mut result,
+            )
+        };
+        if status != 0 {
+            return Err(io::Error::from_raw_os_error(status));
+        }
+        if result.is_null() {
+            return Ok(found);
+        }
+        if entry.pw_name.is_null() || entry.pw_dir.is_null() || entry.pw_shell.is_null() {
+            return Err(invalid_data("local passwd record is incomplete"));
+        }
+        let name = unsafe { std::ffi::CStr::from_ptr(entry.pw_name) }.to_bytes();
+        if name != expected_name && entry.pw_uid != expected_uid {
+            continue;
+        }
+        let home = unsafe { std::ffi::CStr::from_ptr(entry.pw_dir) }.to_bytes();
+        let shell = unsafe { std::ffi::CStr::from_ptr(entry.pw_shell) }.to_bytes();
+        if found
+            || name != expected_name
+            || entry.pw_uid != expected_uid
+            || entry.pw_gid != account.gid
+            || home != account.home.as_os_str().as_bytes()
+            || shell != account.shell.as_os_str().as_bytes()
+        {
+            return Ok(false);
+        }
+        found = true;
+    }
+}
+
+fn local_group_record_matches(expected_name: &str, expected_gid: libc::gid_t) -> io::Result<bool> {
+    let stream = open_local_account_database(Path::new("/etc/group"))?;
+    let mut found = false;
+    loop {
+        let mut entry = unsafe { std::mem::zeroed::<libc::group>() };
+        let mut result = std::ptr::null_mut();
+        let mut buffer = vec![0_u8; 64 * 1024];
+        let status = unsafe {
+            libc::fgetgrent_r(
+                stream.0,
+                &mut entry,
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+                &mut result,
+            )
+        };
+        if status != 0 {
+            return Err(io::Error::from_raw_os_error(status));
+        }
+        if result.is_null() {
+            return Ok(found);
+        }
+        if entry.gr_name.is_null() {
+            return Err(invalid_data("local group record is incomplete"));
+        }
+        let name = unsafe { std::ffi::CStr::from_ptr(entry.gr_name) }.to_bytes();
+        if name != expected_name.as_bytes() && entry.gr_gid != expected_gid {
+            continue;
+        }
+        if found || name != expected_name.as_bytes() || entry.gr_gid != expected_gid {
+            return Ok(false);
+        }
+        found = true;
+    }
+}
+
+fn open_local_account_database(path: &Path) -> io::Result<OwnedFileStream> {
+    let parent = fs::symlink_metadata(Path::new("/etc"))?;
+    if !parent.file_type().is_dir() || parent.uid() != 0 || parent.permissions().mode() & 0o022 != 0
+    {
+        return Err(permission_denied(
+            "local account database parent is not trusted",
+        ));
+    }
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file()
+        || metadata.uid() != 0
+        || metadata.permissions().mode() & 0o022 != 0
+    {
+        return Err(permission_denied("local account database is not trusted"));
+    }
+    let descriptor = file.into_raw_fd();
+    let stream = unsafe { libc::fdopen(descriptor, c"r".as_ptr()) };
+    if stream.is_null() {
+        unsafe {
+            libc::close(descriptor);
+        }
+        return Err(io::Error::last_os_error());
+    }
+    Ok(OwnedFileStream(stream))
+}
+
+struct OwnedFileStream(*mut libc::FILE);
+
+impl Drop for OwnedFileStream {
+    fn drop(&mut self) {
+        unsafe {
+            libc::fclose(self.0);
+        }
+    }
 }
 
 fn principal_for_uid(uid: u32, account_policy: WorkerAccountPolicy) -> io::Result<WorkerPrincipal> {
@@ -4066,7 +4221,9 @@ mod tests {
                 WorkerAccountPolicy::Dedicated,
             )
             .unwrap(),
-            privileged_group_member: false,
+            local_record: LinuxLocalRecordProof::Proven,
+            primary_group_name: Some("build-agent".to_owned()),
+            supplementary_groups: Some(Vec::new()),
             home: PathBuf::from("/home/build-agent"),
             shell: PathBuf::from("/bin/bash"),
             home_state: DedicatedHomeState::EmptySafe,
@@ -4080,6 +4237,57 @@ mod tests {
                 &spec,
                 record,
                 super::super::NativeDedicatedAccountInspection::Initial,
+            ),
+            super::super::NativeDedicatedAccountObservation::PresentBroken,
+        ));
+    }
+
+    #[test]
+    fn dedicated_account_observation_never_treats_nss_alone_as_local_provenance() {
+        let spec = super::super::DedicatedAccountSpec::new("build-agent").unwrap();
+        let mut record = healthy_dedicated_account_record();
+        record.local_record = LinuxLocalRecordProof::MissingOrMismatch;
+        assert!(matches!(
+            classify_dedicated_account_record(
+                &spec,
+                record,
+                super::super::NativeDedicatedAccountInspection::Initial,
+            ),
+            super::super::NativeDedicatedAccountObservation::PresentBroken,
+        ));
+    }
+
+    #[test]
+    fn dedicated_account_observation_keeps_local_provenance_failure_distinct() {
+        let spec = super::super::DedicatedAccountSpec::new("build-agent").unwrap();
+        let mut record = healthy_dedicated_account_record();
+        record.local_record = LinuxLocalRecordProof::Unknowable;
+        assert!(matches!(
+            classify_dedicated_account_record(
+                &spec,
+                record,
+                super::super::NativeDedicatedAccountInspection::Initial,
+            ),
+            super::super::NativeDedicatedAccountObservation::Unknowable,
+        ));
+    }
+
+    #[test]
+    fn dedicated_account_observation_rejects_linux_system_range_uids() {
+        let spec = super::super::DedicatedAccountSpec::new("build-agent").unwrap();
+        let mut record = healthy_dedicated_account_record();
+        record.principal = WorkerPrincipal::new(
+            PrincipalKind::UnixUid,
+            "999",
+            "build-agent",
+            WorkerAccountPolicy::Dedicated,
+        )
+        .unwrap();
+        assert!(matches!(
+            classify_dedicated_account_record(
+                &spec,
+                record,
+                super::super::NativeDedicatedAccountInspection::Established,
             ),
             super::super::NativeDedicatedAccountObservation::PresentBroken,
         ));
@@ -4107,9 +4315,9 @@ mod tests {
         )
         .unwrap();
         cases.push(wrong_kind);
-        let mut privileged_group = healthy_dedicated_account_record();
-        privileged_group.privileged_group_member = true;
-        cases.push(privileged_group);
+        let mut non_private_primary_group = healthy_dedicated_account_record();
+        non_private_primary_group.primary_group_name = Some("workers".to_owned());
+        cases.push(non_private_primary_group);
         let mut wrong_home = healthy_dedicated_account_record();
         wrong_home.home = PathBuf::from("/srv/unrelated");
         cases.push(wrong_home);
@@ -4140,6 +4348,37 @@ mod tests {
             ),
             super::super::NativeDedicatedAccountObservation::Unknowable,
         ));
+
+        let mut unavailable_group = healthy_dedicated_account_record();
+        unavailable_group.primary_group_name = None;
+        assert!(matches!(
+            classify_dedicated_account_record(
+                &spec,
+                unavailable_group,
+                super::super::NativeDedicatedAccountInspection::Initial,
+            ),
+            super::super::NativeDedicatedAccountObservation::Unknowable,
+        ));
+    }
+
+    #[test]
+    fn dedicated_account_observation_rejects_every_distinct_supplementary_group() {
+        let spec = super::super::DedicatedAccountSpec::new("build-agent").unwrap();
+        for (group_name, root_equivalent_gid) in [("docker", 998), ("lxd", 999)] {
+            let mut record = healthy_dedicated_account_record();
+            record.supplementary_groups = Some(vec![root_equivalent_gid]);
+            assert!(
+                matches!(
+                    classify_dedicated_account_record(
+                        &spec,
+                        record,
+                        super::super::NativeDedicatedAccountInspection::Initial,
+                    ),
+                    super::super::NativeDedicatedAccountObservation::PresentBroken,
+                ),
+                "membership in {group_name} must be rejected"
+            );
+        }
     }
 
     #[test]

@@ -984,18 +984,27 @@ fn inspect_dedicated_profile(path: &Path, owner_sid: &[u8]) -> io::Result<Dedica
         &trusted_installer,
         owner_sid,
     )?;
-    if entries.iter().any(|entry| {
-        entry.allowed
-            && entry.flags & INHERIT_ONLY_ACE == 0
-            && entry.principal == Principal::Unexpected
-            && entry.mask & FILE_MUTATION_ACCESS != 0
-    }) {
+    if !dedicated_profile_acl_is_safe(&entries) {
         return Ok(DedicatedProfileState::Unsafe);
     }
-    if std::fs::read_dir(path)?.next().is_some() {
-        Ok(DedicatedProfileState::PopulatedSafe)
-    } else {
-        Ok(DedicatedProfileState::EmptySafe)
+    classify_dedicated_profile_contents(std::fs::read_dir(path)?.next())
+}
+
+fn dedicated_profile_acl_is_safe(entries: &[AceInspection]) -> bool {
+    !entries.iter().any(|entry| {
+        entry.allowed
+            && entry.principal == Principal::Unexpected
+            && entry.mask & FILE_MUTATION_ACCESS != 0
+    })
+}
+
+fn classify_dedicated_profile_contents<T>(
+    first_entry: Option<io::Result<T>>,
+) -> io::Result<DedicatedProfileState> {
+    match first_entry {
+        None => Ok(DedicatedProfileState::EmptySafe),
+        Some(Ok(_)) => Ok(DedicatedProfileState::PopulatedSafe),
+        Some(Err(error)) => Err(error),
     }
 }
 
@@ -5691,6 +5700,43 @@ mod tests {
             ),
             super::super::NativeDedicatedAccountObservation::PresentHealthy(_),
         ));
+    }
+
+    #[test]
+    fn dedicated_profile_acl_rejects_unexpected_inherit_only_mutation() {
+        let inherit_only_mutation = AceInspection {
+            principal: Principal::Unexpected,
+            mask: GENERIC_WRITE,
+            flags: OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE | INHERIT_ONLY_ACE,
+            allowed: true,
+        };
+        assert!(!dedicated_profile_acl_is_safe(&[inherit_only_mutation]));
+
+        let inherit_only_read = AceInspection {
+            principal: Principal::Unexpected,
+            mask: GENERIC_READ,
+            flags: OBJECT_INHERIT_ACE | CONTAINER_INHERIT_ACE | INHERIT_ONLY_ACE,
+            allowed: true,
+        };
+        assert!(dedicated_profile_acl_is_safe(&[inherit_only_read]));
+    }
+
+    #[test]
+    fn dedicated_profile_entry_enumeration_errors_are_unknowable() {
+        assert!(matches!(
+            classify_dedicated_profile_contents::<()>(None).unwrap(),
+            DedicatedProfileState::EmptySafe
+        ));
+        assert!(matches!(
+            classify_dedicated_profile_contents(Some(Ok(()))).unwrap(),
+            DedicatedProfileState::PopulatedSafe
+        ));
+        assert!(
+            classify_dedicated_profile_contents::<()>(Some(Err(io::Error::other(
+                "injected directory-entry query failure",
+            ))))
+            .is_err()
+        );
     }
 
     #[test]
