@@ -139,6 +139,190 @@ fn checked_in_examples_parse_validate_and_round_trip_without_losing_fields() {
 }
 
 #[test]
+fn current_user_worker_manifest_candidate_is_atomic_idempotent_and_preserves_operator_fields() {
+    let principal = current_worker_principal();
+    let base = stale_current_user_worker_draft();
+    let base_before = draft_snapshot(&base);
+    let layout = platform::resolve_worker_directory_layout(
+        platform::InstallationScope::User,
+        &principal,
+        None,
+    )
+    .unwrap();
+
+    let candidate =
+        manifest::CurrentUserWorkerManifestCandidate::derive(&base, &principal).unwrap();
+    let mut expected = base_before.clone();
+    expected["worker_identity"] = serde_json::json!({
+        "mode": "current-user",
+        "principal_kind": principal.principal_kind(),
+        "principal_id": principal.principal_id(),
+        "name": principal.name(),
+        "isolation": "shared-user",
+    });
+    expected["transport"]["user"] = Value::String(principal.name().to_owned());
+    expected["paths"] = serde_json::json!({
+        "root": layout.root().to_str().unwrap(),
+        "repos": layout.repos().to_str().unwrap(),
+        "jobs": layout.jobs().to_str().unwrap(),
+        "cache": layout.cache().to_str().unwrap(),
+        "artifacts": layout.artifacts().to_str().unwrap(),
+        "logs": layout.logs().to_str().unwrap(),
+    });
+
+    assert_eq!(draft_snapshot(candidate.draft()), expected);
+    assert_eq!(draft_snapshot(&base), base_before);
+    assert_eq!(
+        candidate.security_caveat(),
+        "Current-user mode provides no OS-account isolation, no controller-credential isolation, and no same-user Styrn-state integrity boundary."
+    );
+    let repeated =
+        manifest::CurrentUserWorkerManifestCandidate::derive(candidate.draft(), &principal)
+            .unwrap();
+    assert_eq!(draft_snapshot(repeated.draft()), expected);
+    assert_eq!(draft_snapshot(&repeated.into_draft()), expected);
+
+    let mut system = base.clone();
+    system.installation.as_mut().unwrap().scope = platform::InstallationScope::System;
+    assert_candidate_rejected_unchanged(
+        &system,
+        &principal,
+        "current-user worker manifest projection requires a user-scope worker draft",
+    );
+
+    let mut controller_only = base.clone();
+    controller_only.roles = vec![manifest::MachineRole::Controller];
+    assert_candidate_rejected_unchanged(
+        &controller_only,
+        &principal,
+        "current-user worker manifest projection requires a user-scope worker draft",
+    );
+
+    let mut missing_transport = base.clone();
+    missing_transport.transport = None;
+    assert_candidate_rejected_unchanged(
+        &missing_transport,
+        &principal,
+        "current-user worker manifest projection requires an existing transport",
+    );
+
+    let mut nonnative = base;
+    nonnative.platform.os = match native_operating_system_for_test() {
+        manifest::OperatingSystem::Linux => manifest::OperatingSystem::Macos,
+        manifest::OperatingSystem::Macos | manifest::OperatingSystem::Windows => {
+            manifest::OperatingSystem::Linux
+        }
+    };
+    assert_candidate_rejected_unchanged(
+        &nonnative,
+        &principal,
+        "current-user worker manifest projection requires the native host platform",
+    );
+}
+
+#[test]
+fn current_user_worker_manifest_candidate_uses_the_exact_native_layout() {
+    let principal = current_worker_principal();
+    let candidate = manifest::CurrentUserWorkerManifestCandidate::derive(
+        &stale_current_user_worker_draft(),
+        &principal,
+    )
+    .unwrap();
+    let layout = platform::resolve_worker_directory_layout(
+        platform::InstallationScope::User,
+        &principal,
+        None,
+    )
+    .unwrap();
+    let projected_paths = [
+        candidate.draft().paths.root.as_str(),
+        candidate.draft().paths.repos.as_str(),
+        candidate.draft().paths.jobs.as_str(),
+        candidate.draft().paths.cache.as_str(),
+        candidate.draft().paths.artifacts.as_str(),
+        candidate.draft().paths.logs.as_str(),
+    ];
+    let exact_paths = [
+        layout.root(),
+        layout.repos(),
+        layout.jobs(),
+        layout.cache(),
+        layout.artifacts(),
+        layout.logs(),
+    ];
+    for (actual, exact) in projected_paths.into_iter().zip(exact_paths) {
+        assert_eq!(Some(actual), exact.to_str());
+    }
+    for node in layout.materialization_nodes() {
+        if matches!(node, platform::WorkerDirectoryNode::Support { .. }) {
+            assert!(exact_paths
+                .iter()
+                .all(|path| *path != layout.path_for_node(node).unwrap()));
+        }
+    }
+
+    let temp = TestDir::new();
+    let exact_test_root = temp.path().join("explicit-worker-layout");
+    let exact_test_layout = platform::worker_directory_layout_for_test(
+        platform::InstallationScope::User,
+        principal.clone(),
+        exact_test_root.clone(),
+        None,
+    );
+    let exact_test_candidate =
+        manifest::CurrentUserWorkerManifestCandidate::derive_with_layout_for_test(
+            candidate.draft(),
+            &principal,
+            &exact_test_layout,
+        )
+        .unwrap();
+    assert_eq!(
+        exact_test_candidate.draft().paths.root,
+        exact_test_root.to_str().unwrap()
+    );
+
+    let trusted_root = fs::canonicalize(temp.path()).unwrap().join("config");
+    let path = trusted_root.join("Styrn/machine.toml");
+    let store = MachineManifestStore::new_user(&path, principal.clone()).unwrap();
+    let minted_id = store.write_generated(candidate.draft()).unwrap();
+    assert_eq!(minted_id.get_version_num(), 7);
+    let minted = store.read().unwrap().manifest;
+    minted.validate().unwrap();
+    assert_schema_valid(&minted.to_json_value().unwrap());
+
+    let fixed_id = Uuid::parse_str("01991f5d-d72f-7b5e-a43d-9fcb61bd3267").unwrap();
+    let seeded = fs::read_to_string(&path).unwrap().replacen(
+        &minted_id.to_string(),
+        &fixed_id.to_string(),
+        1,
+    );
+    fs::write(&path, seeded).unwrap();
+    assert_eq!(store.read().unwrap().manifest.machine_id, fixed_id);
+    assert_eq!(store.write_generated(candidate.draft()).unwrap(), fixed_id);
+    let first_bytes = fs::read(&path).unwrap();
+    let first = store.read().unwrap().manifest;
+    let first_json = first.to_json_value().unwrap();
+    assert_schema_valid(&first_json);
+    assert_eq!(first.machine_id, fixed_id);
+    assert_eq!(
+        first.worker_security_caveat(),
+        Some(candidate.security_caveat())
+    );
+    assert!(!String::from_utf8(first_bytes.clone())
+        .unwrap()
+        .contains(candidate.security_caveat()));
+    assert!(!first_json.to_string().contains(candidate.security_caveat()));
+
+    let repeated =
+        manifest::CurrentUserWorkerManifestCandidate::derive(candidate.draft(), &principal)
+            .unwrap();
+    assert_eq!(store.write_generated(repeated.draft()).unwrap(), fixed_id);
+    assert_eq!(fs::read(&path).unwrap(), first_bytes);
+    let second_json = store.read().unwrap().manifest.to_json_value().unwrap();
+    assert_eq!(second_json, first_json);
+}
+
+#[test]
 fn worker_manifest_requires_installation_and_worker_identity() {
     let input = fs::read_to_string("examples/machine.toml")
         .unwrap()
@@ -1814,6 +1998,110 @@ fn simultaneous_missing_id_repairs_return_one_persisted_uuid() {
     let ids: Vec<Uuid> = receiver.into_iter().collect();
     assert_eq!(ids.len(), workers);
     assert!(ids.windows(2).all(|pair| pair[0] == pair[1]));
+}
+
+fn stale_current_user_worker_draft() -> manifest::MachineManifestDraft {
+    let mut draft = current_user_manifest().without_machine_id();
+    let principal = current_worker_principal();
+    let identity = draft.worker_identity.as_mut().unwrap();
+    identity.mode = manifest::WorkerIdentityMode::Dedicated;
+    identity.principal_kind = principal.principal_kind();
+    identity.principal_id = principal.principal_id().to_owned();
+    identity.name = "stale-worker".to_owned();
+    identity.isolation = platform::WorkerIsolation::DedicatedAccount;
+
+    let transport = draft.transport.as_mut().unwrap();
+    transport.host = "sentinel-route.internal".to_owned();
+    transport.port = Some(2207);
+    transport.user = Some("stale-worker".to_owned());
+    draft.controller.as_mut().unwrap().inventory = Some("sentinel-inventory".to_owned());
+    draft
+        .capabilities
+        .as_mut()
+        .unwrap()
+        .insert("sentinel_operator_capability".to_owned(), false);
+    let resources = draft.resources.as_mut().unwrap();
+    resources.detected.as_mut().unwrap().logical_cpus = Some(17);
+    let policy = resources.policy.as_mut().unwrap();
+    policy.reserved_memory_bytes = Some(7_340_032_001);
+    policy.reserved_disk_bytes = None;
+    policy.reserved_disk_percent = Some(23);
+    policy.max_parallel_compile_jobs = Some(5);
+    draft.herdr.as_mut().unwrap().session = Some("sentinel-session".to_owned());
+    draft.install.as_mut().unwrap().version = Some("9.8.7-test".to_owned());
+    draft.pending_actions = Some(vec![manifest::PendingAction {
+        id: "sentinel.operator-action".to_owned(),
+        severity: manifest::PendingSeverity::Info,
+        message: "Complete the operator-owned follow-up.".to_owned(),
+    }]);
+
+    #[cfg(unix)]
+    set_draft_paths(&mut draft, "/var/tmp/stale-worker-layout", '/');
+    #[cfg(windows)]
+    set_draft_paths(&mut draft, r"C:\stale-worker-layout", '\\');
+    draft
+}
+
+fn set_draft_paths(draft: &mut manifest::MachineManifestDraft, root: &str, separator: char) {
+    draft.paths.root = root.to_owned();
+    draft.paths.repos = format!("{root}{separator}repos");
+    draft.paths.jobs = format!("{root}{separator}jobs");
+    draft.paths.cache = format!("{root}{separator}cache");
+    draft.paths.artifacts = format!("{root}{separator}artifacts");
+    draft.paths.logs = format!("{root}{separator}logs");
+}
+
+fn draft_snapshot(draft: &manifest::MachineManifestDraft) -> Value {
+    serde_json::json!({
+        "schema_version": draft.schema_version,
+        "name": &draft.name,
+        "roles": &draft.roles,
+        "platform": &draft.platform,
+        "installation": &draft.installation,
+        "worker_identity": &draft.worker_identity,
+        "transport": &draft.transport,
+        "paths": &draft.paths,
+        "controller": &draft.controller,
+        "worker": &draft.worker,
+        "resources": &draft.resources,
+        "capabilities": &draft.capabilities,
+        "scheduling": &draft.scheduling,
+        "tailscale": &draft.tailscale,
+        "ssh": &draft.ssh,
+        "herdr": &draft.herdr,
+        "agents": &draft.agents,
+        "toolchains": &draft.toolchains,
+        "caches": &draft.caches,
+        "install": &draft.install,
+        "desktop": &draft.desktop,
+        "pending_actions": &draft.pending_actions,
+    })
+}
+
+fn assert_candidate_rejected_unchanged(
+    draft: &manifest::MachineManifestDraft,
+    principal: &platform::WorkerPrincipal,
+    expected: &str,
+) {
+    let before = draft_snapshot(draft);
+    let error = match manifest::CurrentUserWorkerManifestCandidate::derive(draft, principal) {
+        Ok(_) => panic!("invalid draft unexpectedly produced a candidate"),
+        Err(error) => error,
+    };
+    assert_eq!(
+        error.to_string(),
+        format!("invalid machine manifest: {expected}")
+    );
+    assert_eq!(draft_snapshot(draft), before);
+}
+
+fn native_operating_system_for_test() -> manifest::OperatingSystem {
+    #[cfg(target_os = "linux")]
+    return manifest::OperatingSystem::Linux;
+    #[cfg(target_os = "macos")]
+    return manifest::OperatingSystem::Macos;
+    #[cfg(target_os = "windows")]
+    return manifest::OperatingSystem::Windows;
 }
 
 struct TestDir(PathBuf);

@@ -164,6 +164,11 @@ struct CurrentUserWorkerManifestProjection {
     paths: Paths,
 }
 
+#[allow(dead_code)] // T0.20 consumes the candidate after setup orchestration exists.
+pub(crate) struct CurrentUserWorkerManifestCandidate {
+    draft: MachineManifestDraft,
+}
+
 macro_rules! manifest_types {
     ($($name:ident { $($field:ident : $type:ty),* $(,)? })*) => {$(
         #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -274,6 +279,63 @@ impl CurrentUserWorkerManifestProjection {
             transport_user: principal.name().to_owned(),
             paths: exact_manifest_paths(layout)?,
         })
+    }
+}
+
+#[allow(dead_code)] // T0.20 consumes the candidate after setup orchestration exists.
+impl CurrentUserWorkerManifestCandidate {
+    pub(crate) fn derive(
+        base: &MachineManifestDraft,
+        principal: &platform::WorkerPrincipal,
+    ) -> Result<Self, ManifestError> {
+        let projection = CurrentUserWorkerManifestProjection::derive(base, principal)?;
+        Self::from_projection(base, projection)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn derive_with_layout_for_test(
+        base: &MachineManifestDraft,
+        principal: &platform::WorkerPrincipal,
+        layout: &platform::WorkerDirectoryLayout,
+    ) -> Result<Self, ManifestError> {
+        let projection = CurrentUserWorkerManifestProjection::derive_with_layout_for_test(
+            base, principal, layout,
+        )?;
+        Self::from_projection(base, projection)
+    }
+
+    fn from_projection(
+        base: &MachineManifestDraft,
+        projection: CurrentUserWorkerManifestProjection,
+    ) -> Result<Self, ManifestError> {
+        let mut draft = base.clone();
+        draft
+            .installation
+            .as_mut()
+            .expect("projection validated a user installation")
+            .scope = projection.scope;
+        draft.platform.os = projection.operating_system;
+        draft.worker_identity = Some(projection.worker_identity);
+        draft
+            .transport
+            .as_mut()
+            .expect("projection validated an existing transport")
+            .user = Some(projection.transport_user);
+        draft.paths = projection.paths;
+        draft.with_machine_id(Uuid::now_v7()).validate()?;
+        Ok(Self { draft })
+    }
+
+    pub(crate) fn draft(&self) -> &MachineManifestDraft {
+        &self.draft
+    }
+
+    pub(crate) fn into_draft(self) -> MachineManifestDraft {
+        self.draft
+    }
+
+    pub(crate) const fn security_caveat(&self) -> &'static str {
+        CURRENT_USER_WORKER_SECURITY_CAVEAT
     }
 }
 

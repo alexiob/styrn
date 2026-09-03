@@ -2566,43 +2566,15 @@ fn pending_manifest_draft_for_current_user() -> crate::manifest::MachineManifest
     .unwrap()
     .without_machine_id();
     let principal = crate::platform::resolve_current_worker_principal().unwrap();
-    let identity = draft.worker_identity.as_mut().unwrap();
-    identity.principal_kind = principal.principal_kind();
-    identity.principal_id = principal.principal_id().to_owned();
-    identity.name = principal.name().to_owned();
-    draft.transport.as_mut().unwrap().user = Some(principal.name().to_owned());
 
     #[cfg(target_os = "linux")]
-    {
-        draft.platform.os = crate::manifest::OperatingSystem::Linux;
-        set_manifest_paths(&mut draft, "/home/styrn-test/.local/share/styrn", '/');
-    }
+    let operating_system = crate::manifest::OperatingSystem::Linux;
     #[cfg(target_os = "macos")]
-    {
-        draft.platform.os = crate::manifest::OperatingSystem::Macos;
-        set_manifest_paths(
-            &mut draft,
-            "/Users/styrn-test/Library/Application Support/Styrn",
-            '/',
-        );
-    }
+    let operating_system = crate::manifest::OperatingSystem::Macos;
     #[cfg(target_os = "windows")]
-    {
-        draft.platform.os = crate::manifest::OperatingSystem::Windows;
-        set_manifest_paths(&mut draft, r"C:\Users\styrn-test\AppData\Local\Styrn", '\\');
-    }
-    draft
-}
-
-fn set_manifest_paths(
-    draft: &mut crate::manifest::MachineManifestDraft,
-    root: &str,
-    separator: char,
-) {
-    draft.paths.root = root.to_owned();
-    draft.paths.repos = format!("{root}{separator}repos");
-    draft.paths.jobs = format!("{root}{separator}jobs");
-    draft.paths.cache = format!("{root}{separator}cache");
-    draft.paths.artifacts = format!("{root}{separator}artifacts");
-    draft.paths.logs = format!("{root}{separator}logs");
+    let operating_system = crate::manifest::OperatingSystem::Windows;
+    draft.platform.os = operating_system;
+    crate::manifest::CurrentUserWorkerManifestCandidate::derive(&draft, &principal)
+        .unwrap()
+        .into_draft()
 }
