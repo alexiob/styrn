@@ -229,6 +229,20 @@ impl WorkerProvenanceRetirementFault {
     const ALL: [Self; 2] = [Self::AfterMarkerRename, Self::BeforeParentSync];
 }
 
+#[cfg(all(test, unix))]
+#[allow(dead_code)] // The source-inclusion contract binary omits action tests.
+pub(crate) fn set_worker_node_post_publish_failure_for_action_test(fail: bool) {
+    platform_impl::set_worker_node_post_publish_failure_for_test(fail);
+}
+
+#[cfg(all(test, unix))]
+#[allow(dead_code)] // The source-inclusion contract binary omits action tests.
+pub(crate) fn set_worker_provenance_retirement_failure_for_action_test(fail: bool) {
+    platform_impl::set_worker_provenance_retirement_fault_for_test(
+        fail.then_some(WorkerProvenanceRetirementFault::BeforeParentSync),
+    );
+}
+
 #[cfg(not(test))]
 type NativeMutationAuthority = crate::setup::action::NativeMutationAuthority;
 

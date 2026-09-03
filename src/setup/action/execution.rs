@@ -399,13 +399,19 @@ fn finish_bound_mutation(
     binding: DurableReceiptBinding,
 ) -> Result<(), ApplyPlanError> {
     match binding {
-        DurableReceiptBinding::Appended => {
-            session.retire_finalized_intent(intent, authority)?;
-        }
-        DurableReceiptBinding::SucceededOnly(error) => return Err(error.into()),
-    }
-    match completion {
-        MutationCompletion::Applied => Ok(()),
-        MutationCompletion::AppliedThenFailed(error) => Err(error.into()),
+        DurableReceiptBinding::SucceededOnly(error) => Err(error.into()),
+        DurableReceiptBinding::Appended => match completion {
+            MutationCompletion::Applied => {
+                session.retire_finalized_intent(intent, authority)?;
+                Ok(())
+            }
+            MutationCompletion::AppliedThenFailed(error) => {
+                session.retire_finalized_intent(intent, authority)?;
+                Err(error.into())
+            }
+            MutationCompletion::AppliedThenFailedRetainingSucceededIntent(error) => {
+                Err(error.into())
+            }
+        },
     }
 }

@@ -257,8 +257,13 @@ impl WorkerDirectoryAction {
                     Ok(WorkerDirectoryBound::Bound(value)) => {
                         Ok((MutationCompletion::Applied, value))
                     }
-                    Ok(WorkerDirectoryBound::BoundWithRetirementFailure { .. })
-                    | Err(WorkerDirectoryBindingError::Reverification(_))
+                    Ok(WorkerDirectoryBound::BoundWithRetirementFailure { value, .. }) => Ok((
+                        MutationCompletion::AppliedThenFailedRetainingSucceededIntent(
+                            ActionError::apply_failed(self.name().clone()),
+                        ),
+                        value,
+                    )),
+                    Err(WorkerDirectoryBindingError::Reverification(_))
                     | Err(WorkerDirectoryBindingError::AuthorityRetirement(_)) => {
                         Err(PreparedExecutionError::Action(ActionError::apply_failed(
                             self.name().clone(),
@@ -296,9 +301,12 @@ fn map_failure_bound<Value, BindingError>(
             MutationCompletion::AppliedThenFailed(ActionError::apply_failed(action.name().clone())),
             value,
         )),
-        WorkerDirectoryNodeFailureBound::BoundWithRetirementFailure { .. } => Err(
-            PreparedExecutionError::Action(ActionError::apply_failed(action.name().clone())),
-        ),
+        WorkerDirectoryNodeFailureBound::BoundWithRetirementFailure { value, .. } => Ok((
+            MutationCompletion::AppliedThenFailedRetainingSucceededIntent(
+                ActionError::apply_failed(action.name().clone()),
+            ),
+            value,
+        )),
     }
 }
 

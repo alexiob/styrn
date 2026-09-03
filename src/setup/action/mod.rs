@@ -97,6 +97,7 @@ impl VerifiedActionEffect<'_> {
 pub(crate) enum MutationCompletion {
     Applied,
     AppliedThenFailed(ActionError),
+    AppliedThenFailedRetainingSucceededIntent(ActionError),
 }
 
 #[derive(Debug)]

@@ -813,7 +813,7 @@ fn current_user_worker_directory_existing_race_is_receipt_conflict() {
 }
 
 #[test]
-fn current_user_worker_directory_typed_failure_evidence_is_applied_then_failed() {
+fn current_user_worker_directory_typed_failure_evidence_distinguishes_retirement() {
     let fixture = JournalFixture::new("worker-directory-failure-evidence-map");
     let principal = crate::platform::resolve_current_worker_principal().unwrap();
     let context = crate::platform::SetupExecutionContext::new_for_test(
@@ -853,20 +853,244 @@ fn current_user_worker_directory_typed_failure_evidence_is_applied_then_failed()
             if action.as_str() == "identity.directory.root"
     ));
 
-    let retirement_error = super::worker_directory::map_failure_bound_for_test::<_, ()>(
-        action,
-        crate::platform::WorkerDirectoryNodeFailureBound::BoundWithRetirementFailure {
-            value: "durable binding",
-            primary: std::io::Error::other("injected post-create failure"),
-            error: std::io::Error::other("injected evidence-retirement failure"),
-        },
-    )
-    .unwrap_err();
+    let (retirement_completion, retirement_value) =
+        super::worker_directory::map_failure_bound_for_test::<_, ()>(
+            action,
+            crate::platform::WorkerDirectoryNodeFailureBound::BoundWithRetirementFailure {
+                value: "durable binding",
+                primary: std::io::Error::other("injected post-create failure"),
+                error: std::io::Error::other("injected evidence-retirement failure"),
+            },
+        )
+        .unwrap();
+    assert_eq!(retirement_value, "durable binding");
     assert!(matches!(
-        retirement_error,
-        super::PreparedExecutionError::Action(ActionError::ApplyFailed { ref action })
+        retirement_completion,
+        MutationCompletion::AppliedThenFailedRetainingSucceededIntent(
+            ActionError::ApplyFailed { ref action }
+        )
             if action.as_str() == "identity.directory.root"
     ));
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Clone, Copy, Debug)]
+enum WorkerDirectoryRetirementBranch {
+    Created,
+    RetainedFailureEvidence,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl WorkerDirectoryRetirementBranch {
+    const ALL: [Self; 2] = [Self::Created, Self::RetainedFailureEvidence];
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Created => "created",
+            Self::RetainedFailureEvidence => "retained-failure",
+        }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[derive(Default)]
+struct ObservedWorkerDirectoryBindingRunner {
+    appended: Option<bool>,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+impl PreparedActionRunner for ObservedWorkerDirectoryBindingRunner {
+    fn execute_prepared_and_bind<Bind>(
+        &mut self,
+        action: &mut Action,
+        _expected: &ActionEffect,
+        bind: Bind,
+    ) -> Result<(MutationCompletion, DurableReceiptBinding), ApplyPlanError>
+    where
+        Bind: for<'authority> FnOnce(
+            VerifiedActionEffect<'authority>,
+        ) -> Result<DurableReceiptBinding, ReceiptStoreError>,
+    {
+        let result = action
+            .execute_prepared_and_bind(bind)
+            .map_err(|error| match error {
+                super::PreparedExecutionError::Action(error) => ApplyPlanError::Action(error),
+                super::PreparedExecutionError::ReceiptConflict => {
+                    ApplyPlanError::Receipt(ReceiptStoreError::IntentConflict)
+                }
+                super::PreparedExecutionError::Binding(error) => ApplyPlanError::Receipt(error),
+            })?;
+        self.appended = Some(matches!(result.1, DurableReceiptBinding::Appended));
+        Ok(result)
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn worker_directory_native_retirement_failure_preserves_appended_binding_for_both_branches() {
+    for branch in WorkerDirectoryRetirementBranch::ALL {
+        let fixture = JournalFixture::new(&format!(
+            "worker-directory-retirement-appended-{}",
+            branch.label()
+        ));
+        harden_user_journal_fixture(&fixture);
+        let principal = crate::platform::resolve_current_worker_principal().unwrap();
+        let context = crate::platform::SetupExecutionContext::new_for_test(
+            crate::platform::SetupHostPrivilege::Ordinary,
+            principal,
+        );
+        let root = fixture.root.join("worker-root");
+        let (mut actions, layout) = current_user_worker_directory_plan_for_test(
+            &context,
+            root.clone(),
+            Some(fixture.root.clone()),
+        )
+        .unwrap();
+        let root_action = actions.remove(0);
+        assert_eq!(root_action.name().as_str(), "identity.directory.root");
+        let next_state = Arc::new(Mutex::new(Vec::new()));
+        let (next_action, next_metrics) =
+            Action::test_journaled_state("test.next", 2, Privilege::None, Arc::clone(&next_state));
+        let mut plan = vec![root_action, next_action];
+        let store =
+            ReceiptStore::new_user_for_test_with_worker_layout(fixture.receipt_path(), layout);
+        let mut runner = ObservedWorkerDirectoryBindingRunner::default();
+        crate::platform::set_worker_node_post_publish_failure_for_action_test(matches!(
+            branch,
+            WorkerDirectoryRetirementBranch::RetainedFailureEvidence
+        ));
+        crate::platform::set_worker_provenance_retirement_failure_for_action_test(true);
+
+        let result = apply_plan_with_runner(
+            &mut plan,
+            &store,
+            &mut ReceiptMetadataSource::for_test([(
+                "019cb090-3400-7000-8000-000000000201",
+                "2026-09-03T14:00:00Z",
+            )]),
+            &mut runner,
+        );
+        crate::platform::set_worker_node_post_publish_failure_for_action_test(false);
+        crate::platform::set_worker_provenance_retirement_failure_for_action_test(false);
+        let error = result.unwrap_err();
+
+        assert_eq!(error.error_code(), "setup.apply_failed", "{branch:?}");
+        assert_eq!(error.exit_code(), 13, "{branch:?}");
+        assert_eq!(runner.appended, Some(true), "{branch:?}");
+        assert_eq!(
+            store.read_snapshot().unwrap().entry_count(),
+            1,
+            "{branch:?}"
+        );
+        assert!(root.is_dir(), "{branch:?}");
+        assert_eq!(next_metrics.check_calls(), 0, "{branch:?}");
+        assert_eq!(next_metrics.mutation_calls(), 0, "{branch:?}");
+        assert!(next_state.lock().unwrap().is_empty(), "{branch:?}");
+        let intent_path = fixture.only_transaction_path();
+        let intent = fs::read(&intent_path).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&intent).unwrap()["phase"],
+            "succeeded",
+            "{branch:?}",
+        );
+
+        let recovery =
+            apply_plan_with_journal(&mut [], &store, &mut ReceiptMetadataSource::for_test([]))
+                .unwrap();
+        assert_eq!(recovery.recovered_count(), 1, "{branch:?}");
+        assert_eq!(
+            store.read_snapshot().unwrap().entry_count(),
+            1,
+            "{branch:?}"
+        );
+        assert!(!intent_path.exists(), "{branch:?}");
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+#[test]
+fn worker_directory_native_retirement_failure_preserves_append_error_for_both_branches() {
+    for branch in WorkerDirectoryRetirementBranch::ALL {
+        let fixture = JournalFixture::new(&format!(
+            "worker-directory-retirement-append-failure-{}",
+            branch.label()
+        ));
+        harden_user_journal_fixture(&fixture);
+        let principal = crate::platform::resolve_current_worker_principal().unwrap();
+        let context = crate::platform::SetupExecutionContext::new_for_test(
+            crate::platform::SetupHostPrivilege::Ordinary,
+            principal,
+        );
+        let root = fixture.root.join("worker-root");
+        let (mut actions, layout) = current_user_worker_directory_plan_for_test(
+            &context,
+            root.clone(),
+            Some(fixture.root.clone()),
+        )
+        .unwrap();
+        let root_action = actions.remove(0);
+        assert_eq!(root_action.name().as_str(), "identity.directory.root");
+        let next_state = Arc::new(Mutex::new(Vec::new()));
+        let (next_action, next_metrics) =
+            Action::test_journaled_state("test.next", 2, Privilege::None, Arc::clone(&next_state));
+        let mut plan = vec![root_action, next_action];
+        let failing_store =
+            ReceiptStore::new_user_for_test_with_worker_layout_failing_before_replace(
+                fixture.receipt_path(),
+                layout.clone(),
+            );
+        let mut runner = ObservedWorkerDirectoryBindingRunner::default();
+        crate::platform::set_worker_node_post_publish_failure_for_action_test(matches!(
+            branch,
+            WorkerDirectoryRetirementBranch::RetainedFailureEvidence
+        ));
+        crate::platform::set_worker_provenance_retirement_failure_for_action_test(true);
+
+        let result = apply_plan_with_runner(
+            &mut plan,
+            &failing_store,
+            &mut ReceiptMetadataSource::for_test([(
+                "019cb090-3400-7000-8000-000000000202",
+                "2026-09-03T14:00:01Z",
+            )]),
+            &mut runner,
+        );
+        crate::platform::set_worker_node_post_publish_failure_for_action_test(false);
+        crate::platform::set_worker_provenance_retirement_failure_for_action_test(false);
+        let error = result.unwrap_err();
+
+        assert_eq!(error.error_code(), "setup.receipt_conflict", "{branch:?}");
+        assert_eq!(error.exit_code(), 13, "{branch:?}");
+        assert_eq!(runner.appended, Some(false), "{branch:?}");
+        assert!(
+            failing_store.read_snapshot().unwrap().is_empty(),
+            "{branch:?}"
+        );
+        assert!(root.is_dir(), "{branch:?}");
+        assert_eq!(next_metrics.check_calls(), 0, "{branch:?}");
+        assert_eq!(next_metrics.mutation_calls(), 0, "{branch:?}");
+        assert!(next_state.lock().unwrap().is_empty(), "{branch:?}");
+        let intent_path = fixture.only_transaction_path();
+        let intent = fs::read(&intent_path).unwrap();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&intent).unwrap()["phase"],
+            "succeeded",
+            "{branch:?}",
+        );
+
+        let store =
+            ReceiptStore::new_user_for_test_with_worker_layout(fixture.receipt_path(), layout);
+        let recovery =
+            apply_plan_with_journal(&mut [], &store, &mut ReceiptMetadataSource::for_test([]))
+                .unwrap();
+        assert_eq!(recovery.recovered_count(), 1, "{branch:?}");
+        assert_eq!(
+            store.read_snapshot().unwrap().entry_count(),
+            1,
+            "{branch:?}"
+        );
+        assert!(!intent_path.exists(), "{branch:?}");
+    }
 }
 
 #[test]
