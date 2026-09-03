@@ -3056,7 +3056,9 @@ fn local_account_records_match(
 }
 
 fn local_passwd_record_matches(account: &UnixAccountDetails) -> io::Result<bool> {
-    let stream = open_local_account_database(Path::new("/etc/passwd"))?;
+    let Some(stream) = open_local_account_database(c"passwd")? else {
+        return Ok(false);
+    };
     let expected_uid = account.principal.unix_uid()?;
     let expected_name = account.principal.name().as_bytes();
     let mut found = false;
@@ -3073,11 +3075,15 @@ fn local_passwd_record_matches(account: &UnixAccountDetails) -> io::Result<bool>
                 &mut result,
             )
         };
-        if status != 0 {
-            return Err(io::Error::from_raw_os_error(status));
-        }
-        if result.is_null() {
-            return Ok(found);
+        match classify_local_account_scan_step(
+            status,
+            result.is_null(),
+            unsafe { libc::feof(stream.0) } != 0,
+            unsafe { libc::ferror(stream.0) } != 0,
+            found,
+        )? {
+            LocalAccountScanStep::Record => {}
+            LocalAccountScanStep::Complete(found) => return Ok(found),
         }
         if entry.pw_name.is_null() || entry.pw_dir.is_null() || entry.pw_shell.is_null() {
             return Err(invalid_data("local passwd record is incomplete"));
@@ -3102,7 +3108,9 @@ fn local_passwd_record_matches(account: &UnixAccountDetails) -> io::Result<bool>
 }
 
 fn local_group_record_matches(expected_name: &str, expected_gid: libc::gid_t) -> io::Result<bool> {
-    let stream = open_local_account_database(Path::new("/etc/group"))?;
+    let Some(stream) = open_local_account_database(c"group")? else {
+        return Ok(false);
+    };
     let mut found = false;
     loop {
         let mut entry = unsafe { std::mem::zeroed::<libc::group>() };
@@ -3117,11 +3125,15 @@ fn local_group_record_matches(expected_name: &str, expected_gid: libc::gid_t) ->
                 &mut result,
             )
         };
-        if status != 0 {
-            return Err(io::Error::from_raw_os_error(status));
-        }
-        if result.is_null() {
-            return Ok(found);
+        match classify_local_account_scan_step(
+            status,
+            result.is_null(),
+            unsafe { libc::feof(stream.0) } != 0,
+            unsafe { libc::ferror(stream.0) } != 0,
+            found,
+        )? {
+            LocalAccountScanStep::Record => {}
+            LocalAccountScanStep::Complete(found) => return Ok(found),
         }
         if entry.gr_name.is_null() {
             return Err(invalid_data("local group record is incomplete"));
@@ -3133,38 +3145,188 @@ fn local_group_record_matches(expected_name: &str, expected_gid: libc::gid_t) ->
         if found || name != expected_name.as_bytes() || entry.gr_gid != expected_gid {
             return Ok(false);
         }
+        // `gr_mem` lists other explicit members; it does not grant this worker another group.
+        // The worker's effective NSS group set is separately required to contain no distinct GID.
         found = true;
     }
 }
 
-fn open_local_account_database(path: &Path) -> io::Result<OwnedFileStream> {
-    let parent = fs::symlink_metadata(Path::new("/etc"))?;
-    if !parent.file_type().is_dir() || parent.uid() != 0 || parent.permissions().mode() & 0o022 != 0
-    {
-        return Err(permission_denied(
-            "local account database parent is not trusted",
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum LocalAccountScanStep {
+    Record,
+    Complete(bool),
+}
+
+fn classify_local_account_scan_step(
+    status: libc::c_int,
+    result_is_null: bool,
+    stream_eof: bool,
+    stream_error: bool,
+    found: bool,
+) -> io::Result<LocalAccountScanStep> {
+    if result_is_null && stream_eof && !stream_error && matches!(status, 0 | libc::ENOENT) {
+        return Ok(LocalAccountScanStep::Complete(found));
+    }
+    if status != 0 {
+        return Err(io::Error::from_raw_os_error(status));
+    }
+    if stream_error {
+        return Err(io::Error::from_raw_os_error(libc::EIO));
+    }
+    if result_is_null || stream_eof {
+        return Err(invalid_data(
+            "local account database scan returned inconsistent state",
         ));
     }
-    let file = fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(path)?;
-    let metadata = file.metadata()?;
-    if !metadata.file_type().is_file()
-        || metadata.uid() != 0
-        || metadata.permissions().mode() & 0o022 != 0
-    {
-        return Err(permission_denied("local account database is not trusted"));
+    Ok(LocalAccountScanStep::Record)
+}
+
+#[derive(Clone, Copy)]
+struct LocalAccountDatabaseNode {
+    mode: libc::mode_t,
+    uid: libc::uid_t,
+    identity: PrivateFileIdentity,
+}
+
+fn local_account_database_directory_is_trusted(
+    opened: LocalAccountDatabaseNode,
+    named: LocalAccountDatabaseNode,
+    access_acl: bool,
+    default_acl: bool,
+) -> bool {
+    opened.mode & libc::S_IFMT == libc::S_IFDIR
+        && named.mode & libc::S_IFMT == libc::S_IFDIR
+        && opened.uid == 0
+        && named.uid == 0
+        && opened.mode & 0o022 == 0
+        && named.mode & 0o022 == 0
+        && opened.identity == named.identity
+        && !access_acl
+        && !default_acl
+}
+
+fn local_account_database_file_is_trusted(
+    opened: LocalAccountDatabaseNode,
+    named: LocalAccountDatabaseNode,
+    access_acl: bool,
+) -> bool {
+    opened.mode & libc::S_IFMT == libc::S_IFREG
+        && named.mode & libc::S_IFMT == libc::S_IFREG
+        && opened.uid == 0
+        && named.uid == 0
+        && opened.mode & 0o022 == 0
+        && named.mode & 0o022 == 0
+        && opened.identity == named.identity
+        && !access_acl
+}
+
+fn local_account_database_node(file: &std::fs::File) -> io::Result<LocalAccountDatabaseNode> {
+    let mut status = unsafe { std::mem::zeroed::<libc::stat>() };
+    if unsafe { libc::fstat(file.as_raw_fd(), &mut status) } == -1 {
+        return Err(io::Error::last_os_error());
     }
+    Ok(local_account_database_node_from_status(&status))
+}
+
+fn local_account_database_named_node(
+    parent: &std::fs::File,
+    name: &std::ffi::CStr,
+) -> io::Result<Option<LocalAccountDatabaseNode>> {
+    let mut status = unsafe { std::mem::zeroed::<libc::stat>() };
+    if unsafe {
+        libc::fstatat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            &mut status,
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    } == -1
+    {
+        let error = io::Error::last_os_error();
+        return match error.raw_os_error() {
+            Some(libc::ENOENT | libc::ENOTDIR | libc::ELOOP) => Ok(None),
+            _ => Err(error),
+        };
+    }
+    Ok(Some(local_account_database_node_from_status(&status)))
+}
+
+fn local_account_database_node_from_status(status: &libc::stat) -> LocalAccountDatabaseNode {
+    LocalAccountDatabaseNode {
+        mode: status.st_mode,
+        uid: status.st_uid,
+        identity: PrivateFileIdentity::new(status.st_dev, status.st_ino),
+    }
+}
+
+fn open_local_account_node_at(
+    parent: &std::fs::File,
+    name: &std::ffi::CStr,
+    flags: libc::c_int,
+) -> io::Result<Option<std::fs::File>> {
+    let descriptor = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), flags) };
+    if descriptor == -1 {
+        let error = io::Error::last_os_error();
+        return match error.raw_os_error() {
+            Some(libc::ENOENT | libc::ENOTDIR | libc::ELOOP) => Ok(None),
+            _ => Err(error),
+        };
+    }
+    Ok(Some(unsafe { std::fs::File::from_raw_fd(descriptor) }))
+}
+
+fn open_local_account_database(name: &std::ffi::CStr) -> io::Result<Option<OwnedFileStream>> {
+    let filesystem_root = open_worker_filesystem_root()?;
+    let Some(parent) = open_local_account_node_at(
+        &filesystem_root,
+        c"etc",
+        libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+    )?
+    else {
+        return Ok(None);
+    };
+    let opened_parent = local_account_database_node(&parent)?;
+    let Some(named_parent) = local_account_database_named_node(&filesystem_root, c"etc")? else {
+        return Ok(None);
+    };
+    let access_acl = posix_acl_present(&parent, c"system.posix_acl_access")?;
+    let default_acl = posix_acl_present(&parent, c"system.posix_acl_default")?;
+    if !local_account_database_directory_is_trusted(
+        opened_parent,
+        named_parent,
+        access_acl,
+        default_acl,
+    ) {
+        return Ok(None);
+    }
+
+    let Some(file) = open_local_account_node_at(
+        &parent,
+        name,
+        libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+    )?
+    else {
+        return Ok(None);
+    };
+    let opened_file = local_account_database_node(&file)?;
+    let Some(named_file) = local_account_database_named_node(&parent, name)? else {
+        return Ok(None);
+    };
+    let access_acl = posix_acl_present(&file, c"system.posix_acl_access")?;
+    if !local_account_database_file_is_trusted(opened_file, named_file, access_acl) {
+        return Ok(None);
+    }
+
     let descriptor = file.into_raw_fd();
     let stream = unsafe { libc::fdopen(descriptor, c"r".as_ptr()) };
     if stream.is_null() {
+        let error = io::Error::last_os_error();
         unsafe {
             libc::close(descriptor);
         }
-        return Err(io::Error::last_os_error());
+        return Err(error);
     }
-    Ok(OwnedFileStream(stream))
+    Ok(Some(OwnedFileStream(stream)))
 }
 
 struct OwnedFileStream(*mut libc::FILE);
@@ -4254,6 +4416,94 @@ mod tests {
                 super::super::NativeDedicatedAccountInspection::Initial,
             ),
             super::super::NativeDedicatedAccountObservation::PresentBroken,
+        ));
+    }
+
+    #[test]
+    fn local_account_scan_treats_glibc_enoent_with_null_result_as_eof() {
+        assert!(matches!(
+            classify_local_account_scan_step(libc::ENOENT, true, true, false, true).unwrap(),
+            LocalAccountScanStep::Complete(true)
+        ));
+        assert!(matches!(
+            classify_local_account_scan_step(libc::ENOENT, true, true, false, false).unwrap(),
+            LocalAccountScanStep::Complete(false)
+        ));
+    }
+
+    #[test]
+    fn local_account_scan_requires_clean_eof_and_propagates_other_errors() {
+        for result in [
+            classify_local_account_scan_step(libc::ENOENT, true, false, false, false),
+            classify_local_account_scan_step(libc::ENOENT, true, true, true, false),
+            classify_local_account_scan_step(libc::ENOENT, false, false, false, false),
+        ] {
+            assert!(result.is_err());
+        }
+        let error = match classify_local_account_scan_step(libc::EIO, true, false, true, false) {
+            Ok(_) => panic!("a stream error was accepted as scan completion"),
+            Err(error) => error,
+        };
+        assert_eq!(error.raw_os_error(), Some(libc::EIO));
+    }
+
+    fn trusted_local_account_database_node(file_type: libc::mode_t) -> LocalAccountDatabaseNode {
+        LocalAccountDatabaseNode {
+            mode: file_type | 0o644,
+            uid: 0,
+            identity: PrivateFileIdentity::new(41, 73),
+        }
+    }
+
+    #[test]
+    fn local_account_database_parent_rejects_access_and_default_acls() {
+        let mut parent = trusted_local_account_database_node(libc::S_IFDIR);
+        parent.mode = libc::S_IFDIR | 0o755;
+        assert!(local_account_database_directory_is_trusted(
+            parent, parent, false, false
+        ));
+        for (access_acl, default_acl) in [(true, false), (false, true), (true, true)] {
+            assert!(!local_account_database_directory_is_trusted(
+                parent,
+                parent,
+                access_acl,
+                default_acl,
+            ));
+        }
+        let mut insecure_parent = parent;
+        insecure_parent.mode |= 0o020;
+        assert!(!local_account_database_directory_is_trusted(
+            insecure_parent,
+            insecure_parent,
+            false,
+            false,
+        ));
+    }
+
+    #[test]
+    fn local_account_database_leaf_rejects_acl_links_special_files_and_substitution() {
+        let opened = trusted_local_account_database_node(libc::S_IFREG);
+        assert!(local_account_database_file_is_trusted(
+            opened, opened, false
+        ));
+        assert!(!local_account_database_file_is_trusted(
+            opened, opened, true
+        ));
+
+        let mut link = opened;
+        link.mode = libc::S_IFLNK | 0o777;
+        assert!(!local_account_database_file_is_trusted(opened, link, false));
+
+        let mut fifo = opened;
+        fifo.mode = libc::S_IFIFO | 0o644;
+        assert!(!local_account_database_file_is_trusted(fifo, fifo, false));
+
+        let mut replacement = opened;
+        replacement.identity = PrivateFileIdentity::new(41, 74);
+        assert!(!local_account_database_file_is_trusted(
+            opened,
+            replacement,
+            false,
         ));
     }
 
