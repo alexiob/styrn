@@ -354,6 +354,10 @@ const CURRENT_NATIVE_PRINCIPAL_ERROR: &str =
 #[allow(dead_code)] // Task 2 consumes projection validation through its opaque candidate.
 const PATH_REPRESENTATION_ERROR: &str =
     "worker directory paths cannot be represented exactly in the manifest";
+const USER_WORKER_PATHS_ERROR: &str =
+    "user worker manifest paths do not match the store's canonical layout";
+const USER_WORKER_PLATFORM_ERROR: &str =
+    "user worker manifest platform does not match the native host";
 
 #[allow(dead_code)] // Task 2 consumes projection validation through its opaque candidate.
 fn validate_current_user_projection_base(base: &MachineManifestDraft) -> Result<(), ManifestError> {
@@ -424,6 +428,59 @@ fn exact_manifest_paths(layout: &platform::WorkerDirectoryLayout) -> Result<Path
         artifacts: exact(layout.artifacts())?,
         logs: exact(layout.logs())?,
     })
+}
+
+fn validate_user_worker_manifest_projection(
+    manifest: &MachineManifest,
+    identity: &WorkerIdentity,
+    projection: &CurrentUserWorkerManifestProjection,
+) -> Result<(), ManifestError> {
+    if manifest.platform.os != projection.operating_system {
+        return invalid(USER_WORKER_PLATFORM_ERROR);
+    }
+    if identity.principal()? != projection.principal
+        || identity.mode != projection.worker_identity.mode
+        || identity.principal_kind != projection.worker_identity.principal_kind
+        || identity.principal_id != projection.worker_identity.principal_id
+        || identity.name != projection.worker_identity.name
+        || identity.isolation != projection.worker_identity.isolation
+    {
+        return invalid("manifest worker identity does not match its store principal");
+    }
+    if manifest
+        .transport
+        .as_ref()
+        .and_then(|transport| transport.user.as_deref())
+        != Some(projection.transport_user.as_str())
+    {
+        return invalid("transport.user must equal worker_identity.name");
+    }
+    let paths = &manifest.paths;
+    let expected = &projection.paths;
+    if paths.root != expected.root
+        || paths.repos != expected.repos
+        || paths.jobs != expected.jobs
+        || paths.cache != expected.cache
+        || paths.artifacts != expected.artifacts
+        || paths.logs != expected.logs
+    {
+        return invalid(USER_WORKER_PATHS_ERROR);
+    }
+    Ok(())
+}
+
+fn canonical_current_user_store_projection(
+    principal: &platform::WorkerPrincipal,
+) -> Result<CurrentUserWorkerManifestProjection, ManifestError> {
+    validate_current_native_principal(principal)?;
+    let layout = platform::resolve_worker_directory_layout(
+        platform::InstallationScope::User,
+        principal,
+        None,
+    )
+    .map_err(|_| projection_validation(USER_WORKER_PATHS_ERROR))?;
+    CurrentUserWorkerManifestProjection::derive_from_verified_layout(principal, &layout)
+        .map_err(|_| projection_validation(USER_WORKER_PATHS_ERROR))
 }
 
 #[allow(dead_code)] // Task 2 consumes projection validation through its opaque candidate.
@@ -803,6 +860,9 @@ pub(crate) struct MachineManifestStore {
     trusted_root: PathBuf,
     security: ManifestSecurity,
     destination_origin: DestinationOrigin,
+    worker_layout_binding: WorkerManifestLayoutBinding,
+    #[cfg(test)]
+    pre_replace_worker_layout_binding: Option<WorkerManifestLayoutBinding>,
 }
 
 #[allow(dead_code)] // Source-including manifest tests omit receipt publication recovery.
@@ -824,6 +884,24 @@ enum DestinationOrigin {
     Canonical,
     Override,
     Test,
+}
+
+enum WorkerManifestLayoutBinding {
+    PrincipalOnly,
+    CanonicalCurrentUser,
+    #[cfg(test)]
+    ExactCurrentUser(Box<CurrentUserWorkerManifestProjection>),
+}
+
+impl std::fmt::Debug for WorkerManifestLayoutBinding {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::PrincipalOnly => "PrincipalOnly",
+            Self::CanonicalCurrentUser => "CanonicalCurrentUser",
+            #[cfg(test)]
+            Self::ExactCurrentUser(_) => "ExactCurrentUser",
+        })
+    }
 }
 
 #[allow(dead_code)] // Test-only policies are unused by the binary test harness itself.
@@ -927,6 +1005,9 @@ impl MachineManifestStore {
             trusted_root,
             security: ManifestSecurity::System,
             destination_origin: DestinationOrigin::Override,
+            worker_layout_binding: WorkerManifestLayoutBinding::PrincipalOnly,
+            #[cfg(test)]
+            pre_replace_worker_layout_binding: None,
         }
     }
 
@@ -947,6 +1028,9 @@ impl MachineManifestStore {
             trusted_root,
             security: ManifestSecurity::System,
             destination_origin: DestinationOrigin::Override,
+            worker_layout_binding: WorkerManifestLayoutBinding::PrincipalOnly,
+            #[cfg(test)]
+            pre_replace_worker_layout_binding: None,
         };
         store.validate_destination_policy()?;
         store.verify_bound_principal()?;
@@ -970,10 +1054,78 @@ impl MachineManifestStore {
             trusted_root,
             security: ManifestSecurity::User,
             destination_origin: DestinationOrigin::Canonical,
+            worker_layout_binding: WorkerManifestLayoutBinding::CanonicalCurrentUser,
+            #[cfg(test)]
+            pre_replace_worker_layout_binding: None,
         };
         store.validate_destination_policy()?;
         store.verify_bound_principal()?;
         Ok(store)
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn new_user_with_worker_layout_for_test(
+        path: impl Into<PathBuf>,
+        principal: platform::WorkerPrincipal,
+        layout: &platform::WorkerDirectoryLayout,
+    ) -> Result<Self, ManifestError> {
+        validate_current_native_principal(&principal)?;
+        let projection =
+            CurrentUserWorkerManifestProjection::derive_from_verified_layout(&principal, layout)?;
+        let mut store = Self::new_user(path, principal)?;
+        store.worker_layout_binding =
+            WorkerManifestLayoutBinding::ExactCurrentUser(Box::new(projection));
+        Ok(store)
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn new_system_with_worker_principal_for_test(
+        path: impl Into<PathBuf>,
+        principal: platform::WorkerPrincipal,
+    ) -> Result<Self, ManifestError> {
+        platform::verify_worker_principal(&principal)
+            .map_err(|_| projection_validation(CURRENT_NATIVE_PRINCIPAL_ERROR))?;
+        let path = path.into();
+        let trusted_root = path
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_default();
+        let store = Self {
+            scope: platform::InstallationScope::System,
+            principal,
+            path,
+            trusted_root,
+            security: ManifestSecurity::User,
+            destination_origin: DestinationOrigin::Test,
+            worker_layout_binding: WorkerManifestLayoutBinding::PrincipalOnly,
+            pre_replace_worker_layout_binding: None,
+        };
+        store.validate_destination_policy()?;
+        store.verify_bound_principal()?;
+        Ok(store)
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)]
+    pub(crate) fn with_pre_replace_worker_binding_for_test(
+        mut self,
+        principal: platform::WorkerPrincipal,
+        layout: &platform::WorkerDirectoryLayout,
+    ) -> Result<Self, ManifestError> {
+        if !matches!(
+            &self.worker_layout_binding,
+            WorkerManifestLayoutBinding::ExactCurrentUser(_)
+        ) {
+            return invalid(CURRENT_NATIVE_PRINCIPAL_ERROR);
+        }
+        let projection =
+            CurrentUserWorkerManifestProjection::derive_from_verified_layout(&principal, layout)?;
+        self.pre_replace_worker_layout_binding = Some(
+            WorkerManifestLayoutBinding::ExactCurrentUser(Box::new(projection)),
+        );
+        Ok(self)
     }
 
     fn new_user_override(
@@ -992,6 +1144,9 @@ impl MachineManifestStore {
             trusted_root,
             security: ManifestSecurity::User,
             destination_origin: DestinationOrigin::Override,
+            worker_layout_binding: WorkerManifestLayoutBinding::CanonicalCurrentUser,
+            #[cfg(test)]
+            pre_replace_worker_layout_binding: None,
         };
         store.validate_destination_policy()?;
         store.verify_bound_principal()?;
@@ -1013,6 +1168,8 @@ impl MachineManifestStore {
             trusted_root,
             security: ManifestSecurity::CurrentProcess,
             destination_origin: DestinationOrigin::Test,
+            worker_layout_binding: WorkerManifestLayoutBinding::PrincipalOnly,
+            pre_replace_worker_layout_binding: None,
         }
     }
 
@@ -1029,6 +1186,8 @@ impl MachineManifestStore {
             trusted_root: trusted_root.into(),
             security: ManifestSecurity::CurrentProcess,
             destination_origin: DestinationOrigin::Test,
+            worker_layout_binding: WorkerManifestLayoutBinding::PrincipalOnly,
+            pre_replace_worker_layout_binding: None,
         }
     }
 
@@ -1047,6 +1206,8 @@ impl MachineManifestStore {
             trusted_root,
             security: ManifestSecurity::CurrentProcessWorker,
             destination_origin: DestinationOrigin::Override,
+            worker_layout_binding: WorkerManifestLayoutBinding::PrincipalOnly,
+            pre_replace_worker_layout_binding: None,
         }
     }
 
@@ -1065,6 +1226,8 @@ impl MachineManifestStore {
             trusted_root,
             security: ManifestSecurity::CurrentProcess,
             destination_origin: DestinationOrigin::Override,
+            worker_layout_binding: WorkerManifestLayoutBinding::PrincipalOnly,
+            pre_replace_worker_layout_binding: None,
         }
     }
 
@@ -1083,6 +1246,8 @@ impl MachineManifestStore {
             trusted_root,
             security: ManifestSecurity::FailBeforeReplace,
             destination_origin: DestinationOrigin::Test,
+            worker_layout_binding: WorkerManifestLayoutBinding::PrincipalOnly,
+            pre_replace_worker_layout_binding: None,
         }
     }
 
@@ -1101,6 +1266,8 @@ impl MachineManifestStore {
             trusted_root,
             security: ManifestSecurity::FailPendingBeforeReplace,
             destination_origin: DestinationOrigin::Test,
+            worker_layout_binding: WorkerManifestLayoutBinding::PrincipalOnly,
+            pre_replace_worker_layout_binding: None,
         }
     }
 
@@ -1119,6 +1286,8 @@ impl MachineManifestStore {
             trusted_root,
             security: ManifestSecurity::FailPendingParentSync,
             destination_origin: DestinationOrigin::Test,
+            worker_layout_binding: WorkerManifestLayoutBinding::PrincipalOnly,
+            pre_replace_worker_layout_binding: None,
         }
     }
 
@@ -1137,6 +1306,8 @@ impl MachineManifestStore {
             trusted_root,
             security: ManifestSecurity::FailBeforeReplace,
             destination_origin: DestinationOrigin::Override,
+            worker_layout_binding: WorkerManifestLayoutBinding::PrincipalOnly,
+            pre_replace_worker_layout_binding: None,
         }
     }
 
@@ -1155,6 +1326,8 @@ impl MachineManifestStore {
             trusted_root,
             security: ManifestSecurity::DirectoryPublicationRace,
             destination_origin: DestinationOrigin::Test,
+            worker_layout_binding: WorkerManifestLayoutBinding::PrincipalOnly,
+            pre_replace_worker_layout_binding: None,
         }
     }
 
@@ -1175,6 +1348,8 @@ impl MachineManifestStore {
             trusted_root,
             security: ManifestSecurity::DirectoryPublicationAndCleanupFailure,
             destination_origin: DestinationOrigin::Test,
+            worker_layout_binding: WorkerManifestLayoutBinding::PrincipalOnly,
+            pre_replace_worker_layout_binding: None,
         }
     }
 
@@ -1193,6 +1368,8 @@ impl MachineManifestStore {
             trusted_root,
             security: ManifestSecurity::FailAfterReplace,
             destination_origin: DestinationOrigin::Test,
+            worker_layout_binding: WorkerManifestLayoutBinding::PrincipalOnly,
+            pre_replace_worker_layout_binding: None,
         }
     }
 
@@ -1604,6 +1781,7 @@ impl MachineManifestStore {
                     "injected manifest interruption before replacement",
                 )));
             }
+            self.revalidate_manifest_before_replace(manifest)?;
             platform::replace_file(&temporary, &self.path).map_err(ManifestError::Write)?;
             self.verify_security_after_replace()
         })();
@@ -1706,6 +1884,14 @@ impl MachineManifestStore {
     }
 
     fn validate_manifest_binding(&self, manifest: &MachineManifest) -> Result<(), ManifestError> {
+        self.validate_manifest_binding_with(manifest, &self.worker_layout_binding)
+    }
+
+    fn validate_manifest_binding_with(
+        &self,
+        manifest: &MachineManifest,
+        worker_layout_binding: &WorkerManifestLayoutBinding,
+    ) -> Result<(), ManifestError> {
         if !matches!(
             self.security,
             ManifestSecurity::System | ManifestSecurity::User
@@ -1720,15 +1906,52 @@ impl MachineManifestStore {
         if scope != self.scope {
             return invalid("manifest installation scope does not match its store");
         }
-        if manifest.roles.contains(&MachineRole::Worker) {
-            let identity = manifest.worker_identity.as_ref().ok_or_else(|| {
-                ManifestError::Validation("worker_identity is required".to_owned())
-            })?;
-            if identity.principal()? != self.principal {
-                return invalid("manifest worker identity does not match its store principal");
+        if !manifest.roles.contains(&MachineRole::Worker) {
+            return Ok(());
+        }
+        let identity = manifest
+            .worker_identity
+            .as_ref()
+            .ok_or_else(|| ManifestError::Validation("worker_identity is required".to_owned()))?;
+        match worker_layout_binding {
+            WorkerManifestLayoutBinding::PrincipalOnly => {
+                if identity.principal()? != self.principal {
+                    return invalid("manifest worker identity does not match its store principal");
+                }
+            }
+            WorkerManifestLayoutBinding::CanonicalCurrentUser => {
+                let projection = canonical_current_user_store_projection(&self.principal)?;
+                validate_user_worker_manifest_projection(manifest, identity, &projection)?;
+            }
+            #[cfg(test)]
+            WorkerManifestLayoutBinding::ExactCurrentUser(projection) => {
+                validate_user_worker_manifest_projection(manifest, identity, projection)?;
             }
         }
         Ok(())
+    }
+
+    fn revalidate_manifest_before_replace(
+        &self,
+        manifest: &MachineManifest,
+    ) -> Result<(), ManifestError> {
+        let worker_layout_binding = &self.worker_layout_binding;
+        #[cfg(test)]
+        let worker_layout_binding = self
+            .pre_replace_worker_layout_binding
+            .as_ref()
+            .unwrap_or(worker_layout_binding);
+        match worker_layout_binding {
+            WorkerManifestLayoutBinding::PrincipalOnly => self.verify_bound_principal()?,
+            WorkerManifestLayoutBinding::CanonicalCurrentUser => self
+                .verify_bound_principal()
+                .map_err(|_| projection_validation(CURRENT_NATIVE_PRINCIPAL_ERROR))?,
+            #[cfg(test)]
+            WorkerManifestLayoutBinding::ExactCurrentUser(_) => self
+                .verify_bound_principal()
+                .map_err(|_| projection_validation(CURRENT_NATIVE_PRINCIPAL_ERROR))?,
+        }
+        self.validate_manifest_binding_with(manifest, worker_layout_binding)
     }
 
     fn preflight_document_binding(&self, allow_missing_id: bool) -> Result<(), ManifestError> {

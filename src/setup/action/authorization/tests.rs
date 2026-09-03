@@ -1994,6 +1994,257 @@ fn runner_rejects_symlink_fifo_directory_and_insecure_request_nodes() {
     }
 }
 
+#[test]
+fn pending_publication_rejects_drifted_worker_manifest_before_intent_or_replacement() {
+    let fixture = AuthorizationFixture::new("pending-worker-binding-candidate");
+    let receipt_store = ReceiptStore::new_user_for_test(fixture.user_receipt());
+    let principal = crate::platform::resolve_current_worker_principal().unwrap();
+    let layout = worker_manifest_layout_for_test(&fixture, &principal, "worker-root");
+    let base = pending_manifest_draft_for_current_user();
+    let exact = crate::manifest::CurrentUserWorkerManifestCandidate::derive_with_layout_for_test(
+        &base, &principal, &layout,
+    )
+    .unwrap();
+    let manifest_path = fixture.manifest_path();
+    let manifest_store =
+        crate::manifest::MachineManifestStore::new_user_with_worker_layout_for_test(
+            &manifest_path,
+            principal.clone(),
+            &layout,
+        )
+        .unwrap();
+    let machine_id = manifest_store.write_generated(exact.draft()).unwrap();
+    let manifest_before = fs::read(&manifest_path).unwrap();
+    let manifest_identity = crate::platform::private_file_identity(&manifest_path).unwrap();
+    #[cfg(unix)]
+    let manifest_mode =
+        std::os::unix::fs::MetadataExt::mode(&fs::metadata(&manifest_path).unwrap());
+    let report = manifest_binding_pending_report(
+        &fixture,
+        &receipt_store,
+        Some((
+            "019cb0a0-0100-7000-8000-000000000001",
+            "2026-09-03T14:00:00Z",
+        )),
+    );
+    let receipt_before = fs::read(fixture.user_receipt()).unwrap();
+    let alternate_layout =
+        worker_manifest_layout_for_test(&fixture, &principal, "alternate-worker-root");
+    let mut draft =
+        crate::manifest::CurrentUserWorkerManifestCandidate::derive_with_layout_for_test(
+            exact.draft(),
+            &principal,
+            &alternate_layout,
+        )
+        .unwrap()
+        .into_draft();
+    let draft_before = format!("{draft:?}");
+
+    let error = crate::setup::pending::publish_manifest(
+        &manifest_store,
+        &receipt_store,
+        &mut draft,
+        report.completion(),
+        &mut receipt_metadata(&[(
+            "019cb0a0-0100-7000-8000-000000000002",
+            "2026-09-03T14:00:01Z",
+        )]),
+    )
+    .unwrap_err();
+
+    assert_eq!(error.error_code(), "setup.apply_failed");
+    assert_eq!(error.exit_code().as_i32(), 13);
+    assert!(error
+        .to_string()
+        .contains("user worker manifest paths do not match the store's canonical layout"));
+    assert!(!error.to_string().contains("alternate-worker-root"));
+    assert_eq!(format!("{draft:?}"), draft_before);
+    assert_eq!(fs::read(fixture.user_receipt()).unwrap(), receipt_before);
+    assert_eq!(fs::read(&manifest_path).unwrap(), manifest_before);
+    assert_eq!(
+        crate::platform::private_file_identity(&manifest_path).unwrap(),
+        manifest_identity
+    );
+    #[cfg(unix)]
+    assert_eq!(
+        std::os::unix::fs::MetadataExt::mode(&fs::metadata(&manifest_path).unwrap()),
+        manifest_mode
+    );
+    assert_eq!(
+        manifest_store.read().unwrap().manifest.machine_id,
+        machine_id
+    );
+    assert!(!pending_publication_intent_path(&fixture).exists());
+    assert_no_manifest_or_publication_temporaries(fixture.user_receipt().parent().unwrap());
+}
+
+#[test]
+fn pending_publication_pre_replace_binding_failure_recovers_with_the_bound_store() {
+    let fixture = AuthorizationFixture::new("pending-worker-binding-final");
+    let receipt_store = ReceiptStore::new_user_for_test(fixture.user_receipt());
+    let principal = crate::platform::resolve_current_worker_principal().unwrap();
+    let layout = worker_manifest_layout_for_test(&fixture, &principal, "worker-root");
+    let drifted_layout =
+        worker_manifest_layout_for_test(&fixture, &principal, "drifted-worker-root");
+    let draft = crate::manifest::CurrentUserWorkerManifestCandidate::derive_with_layout_for_test(
+        &pending_manifest_draft_for_current_user(),
+        &principal,
+        &layout,
+    )
+    .unwrap()
+    .into_draft();
+    let manifest_path = fixture.manifest_path();
+    let seed = crate::manifest::MachineManifestStore::new_user_with_worker_layout_for_test(
+        &manifest_path,
+        principal.clone(),
+        &layout,
+    )
+    .unwrap();
+    let machine_id = seed.write_generated(&draft).unwrap();
+    let manifest_before = fs::read(&manifest_path).unwrap();
+    let manifest_identity = crate::platform::private_file_identity(&manifest_path).unwrap();
+    #[cfg(unix)]
+    let manifest_mode =
+        std::os::unix::fs::MetadataExt::mode(&fs::metadata(&manifest_path).unwrap());
+    let report = manifest_binding_pending_report(
+        &fixture,
+        &receipt_store,
+        Some((
+            "019cb0a0-0200-7000-8000-000000000001",
+            "2026-09-03T14:01:00Z",
+        )),
+    );
+    let receipt_before = fs::read(fixture.user_receipt()).unwrap();
+    let mut attempted_draft = draft.clone();
+    let attempted_before = format!("{attempted_draft:?}");
+    let failing_store =
+        crate::manifest::MachineManifestStore::new_user_with_worker_layout_for_test(
+            &manifest_path,
+            principal.clone(),
+            &layout,
+        )
+        .unwrap()
+        .with_pre_replace_worker_binding_for_test(principal.clone(), &drifted_layout)
+        .unwrap();
+
+    let error = crate::setup::pending::publish_manifest(
+        &failing_store,
+        &receipt_store,
+        &mut attempted_draft,
+        report.completion(),
+        &mut receipt_metadata(&[(
+            "019cb0a0-0200-7000-8000-000000000002",
+            "2026-09-03T14:01:01Z",
+        )]),
+    )
+    .unwrap_err();
+
+    assert_eq!(error.error_code(), "setup.apply_failed");
+    assert_eq!(error.exit_code().as_i32(), 13);
+    assert!(error
+        .to_string()
+        .contains("user worker manifest paths do not match the store's canonical layout"));
+    assert!(!error.to_string().contains("drifted-worker-root"));
+    assert_eq!(format!("{attempted_draft:?}"), attempted_before);
+    assert_eq!(fs::read(fixture.user_receipt()).unwrap(), receipt_before);
+    assert_eq!(fs::read(&manifest_path).unwrap(), manifest_before);
+    assert_eq!(
+        crate::platform::private_file_identity(&manifest_path).unwrap(),
+        manifest_identity
+    );
+    #[cfg(unix)]
+    assert_eq!(
+        std::os::unix::fs::MetadataExt::mode(&fs::metadata(&manifest_path).unwrap()),
+        manifest_mode
+    );
+    assert_eq!(
+        failing_store.read().unwrap().manifest.machine_id,
+        machine_id
+    );
+    let intent_path = pending_publication_intent_path(&fixture);
+    assert!(intent_path.exists());
+    let intent_before = fs::read(&intent_path).unwrap();
+    assert_no_manifest_or_publication_temporaries(fixture.user_receipt().parent().unwrap());
+
+    let rerun = manifest_binding_pending_report(&fixture, &receipt_store, None);
+    let wrong_store = crate::manifest::MachineManifestStore::new_user_with_worker_layout_for_test(
+        &manifest_path,
+        principal.clone(),
+        &drifted_layout,
+    )
+    .unwrap();
+    let mut wrong_draft = draft.clone();
+    let wrong_error = crate::setup::pending::publish_manifest(
+        &wrong_store,
+        &receipt_store,
+        &mut wrong_draft,
+        rerun.completion(),
+        &mut receipt_metadata(&[]),
+    )
+    .unwrap_err();
+    assert_eq!(wrong_error.error_code(), "setup.apply_failed");
+    assert_eq!(wrong_error.exit_code().as_i32(), 13);
+    assert!(wrong_error
+        .to_string()
+        .contains("user worker manifest paths do not match the store's canonical layout"));
+    assert!(!wrong_error.to_string().contains("drifted-worker-root"));
+    assert_eq!(fs::read(&intent_path).unwrap(), intent_before);
+    assert_eq!(fs::read(fixture.user_receipt()).unwrap(), receipt_before);
+    assert_eq!(fs::read(&manifest_path).unwrap(), manifest_before);
+    assert_eq!(
+        crate::platform::private_file_identity(&manifest_path).unwrap(),
+        manifest_identity
+    );
+    #[cfg(unix)]
+    assert_eq!(
+        std::os::unix::fs::MetadataExt::mode(&fs::metadata(&manifest_path).unwrap()),
+        manifest_mode
+    );
+    assert_eq!(seed.read().unwrap().manifest.machine_id, machine_id);
+    assert_eq!(format!("{wrong_draft:?}"), format!("{draft:?}"));
+    assert_no_manifest_or_publication_temporaries(fixture.user_receipt().parent().unwrap());
+
+    let correct_store =
+        crate::manifest::MachineManifestStore::new_user_with_worker_layout_for_test(
+            &manifest_path,
+            principal,
+            &layout,
+        )
+        .unwrap();
+    let mut recovered_draft = draft;
+    let recovered_id = crate::setup::pending::publish_manifest(
+        &correct_store,
+        &receipt_store,
+        &mut recovered_draft,
+        rerun.completion(),
+        &mut receipt_metadata(&[]),
+    )
+    .unwrap();
+
+    assert_eq!(recovered_id, machine_id);
+    assert_eq!(
+        correct_store.read().unwrap().manifest.machine_id,
+        machine_id
+    );
+    assert_eq!(
+        correct_store
+            .read()
+            .unwrap()
+            .manifest
+            .pending_actions
+            .unwrap()[0]
+            .id,
+        "test.worker-manifest-binding"
+    );
+    let receipt = serde_json::from_slice::<serde_json::Value>(
+        &receipt_store.read_snapshot().unwrap().to_json().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(receipt["pending_publications"].as_array().unwrap().len(), 1);
+    assert!(!intent_path.exists());
+    assert_no_manifest_or_publication_temporaries(fixture.user_receipt().parent().unwrap());
+}
+
 fn assert_complete_pending_projection(
     label: &str,
     options: AuthorizationOptions,
@@ -2261,6 +2512,71 @@ fn assert_complete_pending_projection(
                 "entry_id": "019cb047-3c00-7000-8000-000000000024"
             }
         ])
+    );
+}
+
+fn manifest_binding_pending_report(
+    fixture: &AuthorizationFixture,
+    store: &ReceiptStore,
+    metadata: Option<(&'static str, &'static str)>,
+) -> AuthorizedExecutionReport {
+    let mut plan = vec![
+        Action::test_named_needs_human(
+            "test.worker-manifest-binding",
+            Privilege::None,
+            Arc::new(Mutex::new(Vec::new())),
+            NeedsHuman::new(
+                HumanInstructions::new("Complete the worker manifest check, then rerun setup.")
+                    .unwrap(),
+                None,
+            ),
+        )
+        .0,
+    ];
+    let mut metadata = match metadata {
+        Some((entry_id, timestamp)) => ReceiptMetadataSource::for_test([(entry_id, timestamp)]),
+        None => ReceiptMetadataSource::for_test([]),
+    };
+    let mut invoker = SpyInvoker::default();
+    execute_with_authorization(
+        &mut plan,
+        store,
+        &mut metadata,
+        &fixture.context(),
+        AuthorizationOptions::interactive_decline(),
+        &mut invoker,
+    )
+    .unwrap()
+}
+
+fn worker_manifest_layout_for_test(
+    fixture: &AuthorizationFixture,
+    principal: &crate::platform::WorkerPrincipal,
+    leaf: &str,
+) -> crate::platform::WorkerDirectoryLayout {
+    crate::platform::worker_directory_layout_for_test(
+        crate::platform::InstallationScope::User,
+        principal.clone(),
+        fixture.root.join(leaf),
+        None,
+    )
+}
+
+fn pending_publication_intent_path(fixture: &AuthorizationFixture) -> PathBuf {
+    fixture
+        .user_receipt()
+        .parent()
+        .unwrap()
+        .join(".receipt.json.pending-publication.json")
+}
+
+fn assert_no_manifest_or_publication_temporaries(directory: &Path) {
+    assert!(
+        fs::read_dir(directory)
+            .unwrap()
+            .map(Result::unwrap)
+            .all(|entry| !entry.file_name().to_string_lossy().contains(".tmp")),
+        "manifest or pending publication temporary remained"
     );
 }
 

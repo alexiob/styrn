@@ -22,43 +22,37 @@ fn current_worker_principal() -> platform::WorkerPrincipal {
 
 fn current_user_manifest() -> MachineManifest {
     let principal = current_worker_principal();
-    let mut input = fs::read_to_string("examples/machine.controller-worker.toml").unwrap();
-    input = input.replace(
-        "principal_id = \"501\"",
-        &format!("principal_id = \"{}\"", principal.principal_id()),
-    );
-    input = input.replace(
-        "name = \"alex-dev\"",
-        &format!("name = \"{}\"", principal.name()),
-    );
-    input = input.replace(
-        "user = \"alex-dev\"",
-        &format!("user = \"{}\"", principal.name()),
-    );
+    let layout = platform::resolve_worker_directory_layout(
+        platform::InstallationScope::User,
+        &principal,
+        None,
+    )
+    .unwrap();
+    let mut manifest = MachineManifest::parse_toml(
+        &fs::read_to_string("examples/machine.controller-worker.toml").unwrap(),
+    )
+    .unwrap();
     #[cfg(target_os = "linux")]
     {
-        input = input.replace("os = \"macos\"", "os = \"linux\"").replace(
-            "/Users/alex-dev/Library/Application Support/Styrn",
-            &format!("/home/{}/.local/share/styrn", principal.name()),
-        );
+        manifest.platform.os = manifest::OperatingSystem::Linux;
     }
     #[cfg(target_os = "windows")]
     {
-        input = input
-            .replace("os = \"macos\"", "os = \"windows\"")
-            .replace(
-                "principal_kind = \"unix-uid\"",
-                "principal_kind = \"windows-sid\"",
-            )
-            .replace(
-                "/Users/alex-dev/Library/Application Support/Styrn",
-                &format!(
-                    "C:\\\\Users\\\\{}\\\\AppData\\\\Local\\\\Styrn",
-                    principal.name()
-                ),
-            );
+        manifest.platform.os = manifest::OperatingSystem::Windows;
     }
-    MachineManifest::parse_toml(&input).unwrap()
+    let identity = manifest.worker_identity.as_mut().unwrap();
+    identity.principal_kind = principal.principal_kind();
+    identity.principal_id = principal.principal_id().to_owned();
+    identity.name = principal.name().to_owned();
+    manifest.transport.as_mut().unwrap().user = Some(principal.name().to_owned());
+    manifest.paths.root = layout.root().to_str().unwrap().to_owned();
+    manifest.paths.repos = layout.repos().to_str().unwrap().to_owned();
+    manifest.paths.jobs = layout.jobs().to_str().unwrap().to_owned();
+    manifest.paths.cache = layout.cache().to_str().unwrap().to_owned();
+    manifest.paths.artifacts = layout.artifacts().to_str().unwrap().to_owned();
+    manifest.paths.logs = layout.logs().to_str().unwrap().to_owned();
+    manifest.validate().unwrap();
+    manifest
 }
 
 #[cfg(unix)]
@@ -1005,6 +999,544 @@ fn user_store_rejects_a_different_manifest_principal_before_filesystem_mutation(
         "invalid machine manifest: manifest worker identity does not match its store principal"
     );
     assert!(!trusted_root.exists());
+}
+
+#[test]
+fn user_worker_manifest_store_rejects_an_internally_valid_alternate_root_without_replacement() {
+    let temp = TestDir::new();
+    let trusted_root = fs::canonicalize(temp.path()).unwrap().join("config");
+    let path = trusted_root.join("Styrn/machine.toml");
+    let principal = current_worker_principal();
+    let store = MachineManifestStore::new_user(&path, principal.clone()).unwrap();
+    let candidate = manifest::CurrentUserWorkerManifestCandidate::derive(
+        &stale_current_user_worker_draft(),
+        &principal,
+    )
+    .unwrap();
+    let machine_id = store.write_generated(candidate.draft()).unwrap();
+    let original = fs::read(&path).unwrap();
+    let original_identity = platform::private_file_identity(&path).unwrap();
+    #[cfg(unix)]
+    let original_mode = fs::metadata(&path).unwrap().mode();
+    let mut alternate = store.read().unwrap().manifest;
+    #[cfg(target_os = "linux")]
+    let alternate_root = format!("/home/{}/.local/share/styrn-alternate", principal.name());
+    #[cfg(target_os = "macos")]
+    let alternate_root = format!(
+        "/Users/{}/Library/Application Support/Styrn Alternate",
+        principal.name()
+    );
+    #[cfg(target_os = "windows")]
+    let alternate_root = format!(
+        r"C:\Users\{}\AppData\Local\Styrn Alternate",
+        principal.name()
+    );
+    let separator = if cfg!(target_os = "windows") {
+        '\\'
+    } else {
+        '/'
+    };
+    set_manifest_paths_root(&mut alternate, &alternate_root, separator);
+    alternate.validate().unwrap();
+    let alternate = alternate.without_machine_id();
+
+    let error = store.write_generated(&alternate).unwrap_err();
+
+    assert_eq!(
+        error.to_string(),
+        "invalid machine manifest: user worker manifest paths do not match the store's canonical layout"
+    );
+    assert!(!error.to_string().contains(&alternate_root));
+    assert_eq!(fs::read(&path).unwrap(), original);
+    assert_eq!(
+        platform::private_file_identity(&path).unwrap(),
+        original_identity
+    );
+    #[cfg(unix)]
+    assert_eq!(fs::metadata(&path).unwrap().mode(), original_mode);
+    let verified = store.read().unwrap().manifest;
+    assert_eq!(verified.machine_id, machine_id);
+    assert_no_manifest_temporaries(path.parent().unwrap());
+}
+
+#[test]
+fn worker_manifest_pre_replace_revalidation_preserves_existing_bytes_on_principal_and_layout_drift()
+{
+    let temp = TestDir::new();
+    let trusted_root = fs::canonicalize(temp.path()).unwrap().join("config");
+    let path = trusted_root.join("Styrn/machine.toml");
+    let principal = current_worker_principal();
+    let worker_root = fs::canonicalize(temp.path()).unwrap().join("worker-root");
+    let layout = platform::worker_directory_layout_for_test(
+        platform::InstallationScope::User,
+        principal.clone(),
+        worker_root,
+        None,
+    );
+    let candidate = manifest::CurrentUserWorkerManifestCandidate::derive_with_layout_for_test(
+        &stale_current_user_worker_draft(),
+        &principal,
+        &layout,
+    )
+    .unwrap();
+    let seed = MachineManifestStore::new_user_with_worker_layout_for_test(
+        &path,
+        principal.clone(),
+        &layout,
+    )
+    .unwrap();
+    let machine_id = seed.write_generated(candidate.draft()).unwrap();
+    let original = fs::read(&path).unwrap();
+    let original_identity = platform::private_file_identity(&path).unwrap();
+    #[cfg(unix)]
+    let original_mode = fs::metadata(&path).unwrap().mode();
+
+    let renamed = platform::WorkerPrincipal::new(
+        principal.principal_kind(),
+        principal.principal_id().to_owned(),
+        "renamed-current-user".to_owned(),
+        platform::WorkerAccountPolicy::CurrentUser,
+    )
+    .unwrap();
+    #[cfg(unix)]
+    let changed_id = if principal.principal_id() == "1" {
+        "2".to_owned()
+    } else {
+        "1".to_owned()
+    };
+    #[cfg(windows)]
+    let changed_id = "S-1-5-21-111111111-222222222-333333333-4242".to_owned();
+    let replaced = platform::WorkerPrincipal::new(
+        principal.principal_kind(),
+        changed_id,
+        principal.name().to_owned(),
+        platform::WorkerAccountPolicy::CurrentUser,
+    )
+    .unwrap();
+    let renamed_layout = platform::worker_directory_layout_for_test(
+        platform::InstallationScope::User,
+        renamed.clone(),
+        layout.root().to_path_buf(),
+        None,
+    );
+    let replaced_layout = platform::worker_directory_layout_for_test(
+        platform::InstallationScope::User,
+        replaced.clone(),
+        layout.root().to_path_buf(),
+        None,
+    );
+    let drifted_layout = platform::worker_directory_layout_for_test(
+        platform::InstallationScope::User,
+        principal.clone(),
+        fs::canonicalize(temp.path())
+            .unwrap()
+            .join("drifted-worker-root"),
+        None,
+    );
+    let cases = [
+        (
+            renamed,
+            renamed_layout,
+            "invalid machine manifest: manifest worker identity does not match its store principal",
+        ),
+        (
+            replaced,
+            replaced_layout,
+            "invalid machine manifest: manifest worker identity does not match its store principal",
+        ),
+        (
+            principal.clone(),
+            drifted_layout,
+            "invalid machine manifest: user worker manifest paths do not match the store's canonical layout",
+        ),
+    ];
+
+    for (observed_principal, observed_layout, expected) in cases {
+        let store = MachineManifestStore::new_user_with_worker_layout_for_test(
+            &path,
+            principal.clone(),
+            &layout,
+        )
+        .unwrap()
+        .with_pre_replace_worker_binding_for_test(observed_principal, &observed_layout)
+        .unwrap();
+
+        let error = store.write_generated(candidate.draft()).unwrap_err();
+
+        assert_eq!(error.to_string(), expected);
+        assert!(!error.to_string().contains("renamed-current-user"));
+        assert_eq!(fs::read(&path).unwrap(), original);
+        assert_eq!(
+            platform::private_file_identity(&path).unwrap(),
+            original_identity
+        );
+        #[cfg(unix)]
+        assert_eq!(fs::metadata(&path).unwrap().mode(), original_mode);
+        assert_eq!(store.read().unwrap().manifest.machine_id, machine_id);
+        assert_no_manifest_temporaries(path.parent().unwrap());
+    }
+}
+
+#[test]
+fn exact_user_worker_layout_store_test_binding_rejects_invalid_tuples_before_mutation() {
+    let temp = TestDir::new();
+    let trusted_root = fs::canonicalize(temp.path()).unwrap().join("config");
+    let path = trusted_root.join("Styrn/machine.toml");
+    let principal = current_worker_principal();
+    let user_layout = platform::worker_directory_layout_for_test(
+        platform::InstallationScope::User,
+        principal.clone(),
+        fs::canonicalize(temp.path()).unwrap().join("worker-root"),
+        None,
+    );
+    let system_layout = platform::worker_directory_layout_for_test(
+        platform::InstallationScope::System,
+        principal.clone(),
+        fs::canonicalize(temp.path())
+            .unwrap()
+            .join("system-worker-root"),
+        None,
+    );
+    let other = platform::WorkerPrincipal::new(
+        principal.principal_kind(),
+        principal.principal_id().to_owned(),
+        "other-layout-principal".to_owned(),
+        platform::WorkerAccountPolicy::CurrentUser,
+    )
+    .unwrap();
+    let mismatched_layout = platform::worker_directory_layout_for_test(
+        platform::InstallationScope::User,
+        other,
+        user_layout.root().to_path_buf(),
+        None,
+    );
+
+    for (layout, expected) in [
+        (
+            &system_layout,
+            "invalid machine manifest: current-user worker manifest projection requires a user-scope worker draft",
+        ),
+        (
+            &mismatched_layout,
+            "invalid machine manifest: current-user worker manifest projection requires the current native principal",
+        ),
+    ] {
+        let error = MachineManifestStore::new_user_with_worker_layout_for_test(
+            &path,
+            principal.clone(),
+            layout,
+        )
+        .unwrap_err();
+        assert_eq!(error.to_string(), expected);
+        assert!(!error.to_string().contains("other-layout-principal"));
+        assert!(!trusted_root.exists());
+    }
+}
+
+#[test]
+fn user_worker_manifest_store_rejects_candidate_and_stored_hostile_tuple_matrix_without_mutation() {
+    let temp = TestDir::new();
+    let trusted_root = fs::canonicalize(temp.path()).unwrap().join("config");
+    let path = trusted_root.join("Styrn/machine.toml");
+    let principal = current_worker_principal();
+    let store = MachineManifestStore::new_user(&path, principal.clone()).unwrap();
+    let candidate = manifest::CurrentUserWorkerManifestCandidate::derive(
+        &stale_current_user_worker_draft(),
+        &principal,
+    )
+    .unwrap();
+    let machine_id = store.write_generated(candidate.draft()).unwrap();
+    let machine_id_text = machine_id.to_string();
+    let valid = store.read().unwrap().manifest;
+    let valid_bytes = fs::read(&path).unwrap();
+    let valid_identity = platform::private_file_identity(&path).unwrap();
+    #[cfg(unix)]
+    let valid_mode = fs::metadata(&path).unwrap().mode();
+
+    let cases = [
+        (
+            WorkerManifestHostileAttack::RenamedPrincipal,
+            "invalid machine manifest: manifest worker identity does not match its store principal",
+        ),
+        (
+            WorkerManifestHostileAttack::ReplacedPrincipal,
+            "invalid machine manifest: manifest worker identity does not match its store principal",
+        ),
+        (
+            WorkerManifestHostileAttack::DedicatedUserScope,
+            "invalid machine manifest: dedicated worker identity requires system installation scope",
+        ),
+        (
+            WorkerManifestHostileAttack::StoreScope,
+            "invalid machine manifest: manifest installation scope does not match its store",
+        ),
+        (
+            WorkerManifestHostileAttack::TransportName,
+            "invalid machine manifest: transport.user must equal worker_identity.name",
+        ),
+        (
+            WorkerManifestHostileAttack::DetachedChild,
+            "invalid machine manifest: paths.jobs must be the jobs child of paths.root",
+        ),
+        (
+            WorkerManifestHostileAttack::AlternateRoot,
+            "invalid machine manifest: user worker manifest paths do not match the store's canonical layout",
+        ),
+        (
+            WorkerManifestHostileAttack::NativePlatform,
+            "invalid machine manifest: user worker manifest platform does not match the native host",
+        ),
+    ];
+
+    for (attack, expected) in cases {
+        let mut hostile = valid.clone();
+        let hostile_value = apply_worker_manifest_hostile_attack(&mut hostile, attack, &principal);
+        let hostile_bytes = hostile.to_toml().unwrap().into_bytes();
+
+        let error = store
+            .write_generated(&hostile.clone().without_machine_id())
+            .unwrap_err();
+        assert_eq!(error.to_string(), expected, "{attack:?}");
+        assert!(!error.to_string().contains(&hostile_value), "{attack:?}");
+        assert_eq!(fs::read(&path).unwrap(), valid_bytes, "{attack:?}");
+        assert_eq!(
+            platform::private_file_identity(&path).unwrap(),
+            valid_identity,
+            "{attack:?}"
+        );
+        #[cfg(unix)]
+        assert_eq!(
+            fs::metadata(&path).unwrap().mode(),
+            valid_mode,
+            "{attack:?}"
+        );
+        platform::verify_manifest_security(
+            &path,
+            platform::ManifestOwner::User,
+            &principal,
+            &trusted_root,
+        )
+        .unwrap();
+        assert_eq!(store.read().unwrap().manifest.machine_id, machine_id);
+        assert_no_manifest_temporaries(path.parent().unwrap());
+
+        fs::write(&path, &hostile_bytes).unwrap();
+        let stored_identity = platform::private_file_identity(&path).unwrap();
+        #[cfg(unix)]
+        let stored_mode = fs::metadata(&path).unwrap().mode();
+        let refresh_error = store.write_generated(candidate.draft()).unwrap_err();
+        assert_eq!(refresh_error.to_string(), expected, "stored {attack:?}");
+        assert!(
+            !refresh_error.to_string().contains(&hostile_value),
+            "stored {attack:?}"
+        );
+        assert_eq!(fs::read(&path).unwrap(), hostile_bytes, "stored {attack:?}");
+        assert_eq!(
+            platform::private_file_identity(&path).unwrap(),
+            stored_identity,
+            "stored {attack:?}"
+        );
+        #[cfg(unix)]
+        assert_eq!(
+            fs::metadata(&path).unwrap().mode(),
+            stored_mode,
+            "stored {attack:?}"
+        );
+        assert_eq!(
+            toml::from_str::<toml::Value>(std::str::from_utf8(&hostile_bytes).unwrap()).unwrap()
+                ["machine_id"]
+                .as_str(),
+            Some(machine_id_text.as_str()),
+            "stored {attack:?}"
+        );
+        platform::verify_manifest_security(
+            &path,
+            platform::ManifestOwner::User,
+            &principal,
+            &trusted_root,
+        )
+        .unwrap();
+        assert_no_manifest_temporaries(path.parent().unwrap());
+
+        fs::write(&path, &valid_bytes).unwrap();
+        assert_eq!(
+            platform::private_file_identity(&path).unwrap(),
+            valid_identity
+        );
+    }
+}
+
+#[test]
+fn controller_only_user_manifest_store_is_not_forced_to_claim_worker_layout() {
+    let temp = TestDir::new();
+    let trusted_root = fs::canonicalize(temp.path()).unwrap().join("config");
+    let path = trusted_root.join("Styrn/machine.toml");
+    let principal = current_worker_principal();
+    let store = MachineManifestStore::new_user(&path, principal.clone()).unwrap();
+    let mut draft = manifest::CurrentUserWorkerManifestCandidate::derive(
+        &stale_current_user_worker_draft(),
+        &principal,
+    )
+    .unwrap()
+    .into_draft();
+    draft.roles = vec![manifest::MachineRole::Controller];
+    draft.worker_identity = None;
+    draft.transport = None;
+    #[cfg(target_os = "linux")]
+    let alternate_root = format!("/home/{}/.local/share/controller-state", principal.name());
+    #[cfg(target_os = "macos")]
+    let alternate_root = format!(
+        "/Users/{}/Library/Application Support/Controller State",
+        principal.name()
+    );
+    #[cfg(target_os = "windows")]
+    let alternate_root = format!(
+        r"C:\Users\{}\AppData\Local\Controller State",
+        principal.name()
+    );
+    set_draft_paths_root(&mut draft, &alternate_root, native_path_separator());
+
+    let machine_id = store.write_generated(&draft).unwrap();
+    let stored = store.read().unwrap().manifest;
+
+    assert_eq!(stored.machine_id, machine_id);
+    assert_eq!(stored.roles, vec![manifest::MachineRole::Controller]);
+    assert!(stored.worker_identity.is_none());
+    assert!(stored.transport.is_none());
+    assert_eq!(stored.paths.root, alternate_root);
+}
+
+#[test]
+fn system_dedicated_worker_manifest_store_retains_principal_only_binding() {
+    let temp = TestDir::new();
+    let path = fs::canonicalize(temp.path())
+        .unwrap()
+        .join("system-store/machine.toml");
+    let current = current_worker_principal();
+    let dedicated = platform::WorkerPrincipal::new(
+        current.principal_kind(),
+        current.principal_id().to_owned(),
+        current.name().to_owned(),
+        platform::WorkerAccountPolicy::Dedicated,
+    )
+    .unwrap();
+    let mut draft = manifest::CurrentUserWorkerManifestCandidate::derive(
+        &stale_current_user_worker_draft(),
+        &current,
+    )
+    .unwrap()
+    .into_draft();
+    draft.installation.as_mut().unwrap().scope = platform::InstallationScope::System;
+    let identity = draft.worker_identity.as_mut().unwrap();
+    identity.mode = manifest::WorkerIdentityMode::Dedicated;
+    identity.isolation = platform::WorkerIsolation::DedicatedAccount;
+    set_draft_paths_root(&mut draft, system_root_for_test(), native_path_separator());
+    let store =
+        MachineManifestStore::new_system_with_worker_principal_for_test(&path, dedicated.clone())
+            .unwrap();
+
+    let machine_id = store.write_generated(&draft).unwrap();
+    let stored = store.read().unwrap().manifest;
+
+    assert_eq!(stored.machine_id, machine_id);
+    let stored_identity = stored.worker_identity.unwrap();
+    assert_eq!(
+        stored_identity.mode,
+        manifest::WorkerIdentityMode::Dedicated
+    );
+    assert_eq!(stored_identity.principal_kind, dedicated.principal_kind());
+    assert_eq!(stored_identity.principal_id, dedicated.principal_id());
+    assert_eq!(stored_identity.name, dedicated.name());
+    assert_eq!(
+        stored_identity.isolation,
+        platform::WorkerIsolation::DedicatedAccount
+    );
+    assert_eq!(stored.paths.root, system_root_for_test());
+}
+
+#[test]
+fn user_worker_manifest_store_mints_once_reruns_identically_and_preserves_policy() {
+    let temp = TestDir::new();
+    let trusted_root = fs::canonicalize(temp.path()).unwrap().join("config");
+    let path = trusted_root.join("Styrn/machine.toml");
+    let principal = current_worker_principal();
+    let store = MachineManifestStore::new_user(&path, principal.clone()).unwrap();
+    let candidate = manifest::CurrentUserWorkerManifestCandidate::derive(
+        &stale_current_user_worker_draft(),
+        &principal,
+    )
+    .unwrap();
+    let policy = serde_json::to_value(
+        candidate
+            .draft()
+            .resources
+            .as_ref()
+            .unwrap()
+            .policy
+            .as_ref()
+            .unwrap(),
+    )
+    .unwrap();
+
+    let machine_id = store.write_generated(candidate.draft()).unwrap();
+    assert_eq!(machine_id.get_version_num(), 7);
+    let first = fs::read(&path).unwrap();
+    assert_eq!(
+        store.write_generated(candidate.draft()).unwrap(),
+        machine_id
+    );
+    assert_eq!(fs::read(&path).unwrap(), first);
+
+    let mut observed = candidate.draft().clone();
+    observed
+        .resources
+        .as_mut()
+        .unwrap()
+        .detected
+        .as_mut()
+        .unwrap()
+        .logical_cpus = Some(73);
+    assert_eq!(store.write_generated(&observed).unwrap(), machine_id);
+    let observed_bytes = fs::read(&path).unwrap();
+    let observed_manifest = store.read().unwrap().manifest;
+    assert_eq!(observed_manifest.machine_id, machine_id);
+    assert_eq!(
+        serde_json::to_value(
+            observed_manifest
+                .resources
+                .as_ref()
+                .unwrap()
+                .policy
+                .as_ref()
+                .unwrap()
+        )
+        .unwrap(),
+        policy
+    );
+
+    let mut rejected = observed;
+    #[cfg(target_os = "linux")]
+    let rejected_root = format!("/home/{}/.local/share/styrn-rejected", principal.name());
+    #[cfg(target_os = "macos")]
+    let rejected_root = format!(
+        "/Users/{}/Library/Application Support/Styrn Rejected",
+        principal.name()
+    );
+    #[cfg(target_os = "windows")]
+    let rejected_root = format!(
+        r"C:\Users\{}\AppData\Local\Styrn Rejected",
+        principal.name()
+    );
+    set_draft_paths_root(&mut rejected, &rejected_root, native_path_separator());
+    let error = store.write_generated(&rejected).unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "invalid machine manifest: user worker manifest paths do not match the store's canonical layout"
+    );
+    assert!(!error.to_string().contains(&rejected_root));
+    assert_eq!(fs::read(&path).unwrap(), observed_bytes);
+    assert_eq!(store.read().unwrap().manifest.machine_id, machine_id);
+    assert_no_manifest_temporaries(path.parent().unwrap());
 }
 
 #[cfg(unix)]
@@ -2218,6 +2750,128 @@ fn insert_dynamic_key(manifest: &mut MachineManifest, section: &str, key: &str) 
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+enum WorkerManifestHostileAttack {
+    RenamedPrincipal,
+    ReplacedPrincipal,
+    DedicatedUserScope,
+    StoreScope,
+    TransportName,
+    DetachedChild,
+    AlternateRoot,
+    NativePlatform,
+}
+
+fn apply_worker_manifest_hostile_attack(
+    manifest: &mut MachineManifest,
+    attack: WorkerManifestHostileAttack,
+    principal: &platform::WorkerPrincipal,
+) -> String {
+    match attack {
+        WorkerManifestHostileAttack::RenamedPrincipal => {
+            let hostile = "hostile-renamed-current-user";
+            manifest.worker_identity.as_mut().unwrap().name = hostile.to_owned();
+            manifest.transport.as_mut().unwrap().user = Some(hostile.to_owned());
+            hostile.to_owned()
+        }
+        WorkerManifestHostileAttack::ReplacedPrincipal => {
+            #[cfg(unix)]
+            let hostile = if principal.principal_id() == "1" {
+                "2".to_owned()
+            } else {
+                "1".to_owned()
+            };
+            #[cfg(windows)]
+            let hostile = "S-1-5-21-111111111-222222222-333333333-4242".to_owned();
+            manifest.worker_identity.as_mut().unwrap().principal_id = hostile.clone();
+            hostile
+        }
+        WorkerManifestHostileAttack::DedicatedUserScope => {
+            let hostile = "dedicated-account";
+            let identity = manifest.worker_identity.as_mut().unwrap();
+            identity.mode = manifest::WorkerIdentityMode::Dedicated;
+            identity.isolation = platform::WorkerIsolation::DedicatedAccount;
+            hostile.to_owned()
+        }
+        WorkerManifestHostileAttack::StoreScope => {
+            let hostile = system_root_for_test();
+            manifest.installation.as_mut().unwrap().scope = platform::InstallationScope::System;
+            set_manifest_paths_root(manifest, hostile, native_path_separator());
+            hostile.to_owned()
+        }
+        WorkerManifestHostileAttack::TransportName => {
+            let hostile = "hostile-transport-name";
+            manifest.transport.as_mut().unwrap().user = Some(hostile.to_owned());
+            hostile.to_owned()
+        }
+        WorkerManifestHostileAttack::DetachedChild => {
+            let hostile = format!(
+                "{}{}detached-jobs",
+                manifest.paths.root,
+                native_path_separator()
+            );
+            manifest.paths.jobs = hostile.clone();
+            hostile
+        }
+        WorkerManifestHostileAttack::AlternateRoot => {
+            #[cfg(target_os = "linux")]
+            let hostile = format!("/home/{}/.local/share/styrn-hostile", principal.name());
+            #[cfg(target_os = "macos")]
+            let hostile = format!(
+                "/Users/{}/Library/Application Support/Styrn Hostile",
+                principal.name()
+            );
+            #[cfg(target_os = "windows")]
+            let hostile = format!(r"C:\Users\{}\AppData\Local\Styrn Hostile", principal.name());
+            set_manifest_paths_root(manifest, &hostile, native_path_separator());
+            hostile
+        }
+        WorkerManifestHostileAttack::NativePlatform => {
+            #[cfg(target_os = "linux")]
+            {
+                let hostile = "/Users/hostile-platform/Library/Application Support/Styrn";
+                manifest.platform.os = manifest::OperatingSystem::Macos;
+                set_manifest_paths_root(manifest, hostile, '/');
+                hostile.to_owned()
+            }
+            #[cfg(target_os = "macos")]
+            {
+                let hostile = "/home/hostile-platform/.local/share/styrn";
+                manifest.platform.os = manifest::OperatingSystem::Linux;
+                set_manifest_paths_root(manifest, hostile, '/');
+                hostile.to_owned()
+            }
+            #[cfg(target_os = "windows")]
+            {
+                let hostile = "/home/hostile-platform/.local/share/styrn";
+                manifest.platform.os = manifest::OperatingSystem::Linux;
+                let identity = manifest.worker_identity.as_mut().unwrap();
+                identity.principal_kind = platform::PrincipalKind::UnixUid;
+                identity.principal_id = "1".to_owned();
+                set_manifest_paths_root(manifest, hostile, '/');
+                hostile.to_owned()
+            }
+        }
+    }
+}
+
+fn native_path_separator() -> char {
+    if cfg!(target_os = "windows") {
+        '\\'
+    } else {
+        '/'
+    }
+}
+
+fn system_root_for_test() -> &'static str {
+    #[cfg(target_os = "linux")]
+    return "/srv/styrn";
+    #[cfg(target_os = "macos")]
+    return "/Users/Shared/Styrn";
+    #[cfg(target_os = "windows")]
+    return r"C:\Styrn";
+}
+
 fn set_manifest_paths_root(manifest: &mut MachineManifest, root: &str, separator: char) {
     manifest.paths.root = root.to_owned();
     manifest.paths.repos = format!("{root}{separator}repos");
@@ -2225,6 +2879,15 @@ fn set_manifest_paths_root(manifest: &mut MachineManifest, root: &str, separator
     manifest.paths.cache = format!("{root}{separator}cache");
     manifest.paths.artifacts = format!("{root}{separator}artifacts");
     manifest.paths.logs = format!("{root}{separator}logs");
+}
+
+fn set_draft_paths_root(draft: &mut manifest::MachineManifestDraft, root: &str, separator: char) {
+    draft.paths.root = root.to_owned();
+    draft.paths.repos = format!("{root}{separator}repos");
+    draft.paths.jobs = format!("{root}{separator}jobs");
+    draft.paths.cache = format!("{root}{separator}cache");
+    draft.paths.artifacts = format!("{root}{separator}artifacts");
+    draft.paths.logs = format!("{root}{separator}logs");
 }
 
 fn set_json_paths_root(manifest: &mut Value, root: &str, separator: char) {

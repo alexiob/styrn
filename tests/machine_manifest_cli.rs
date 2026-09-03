@@ -1,3 +1,7 @@
+#[allow(dead_code)]
+#[path = "../src/platform/mod.rs"]
+mod platform;
+
 use jsonschema::Validator;
 use serde_json::Value;
 use std::fs;
@@ -113,66 +117,47 @@ fn run(config_dir: &Path, arguments: &[&str]) -> Output {
         .unwrap()
 }
 
-#[cfg(unix)]
 fn current_user_manifest() -> String {
-    let uid = unsafe { libc::getuid() };
-    assert_ne!(uid, 0, "root caller rejection is covered separately");
-    let password = unsafe { libc::getpwuid(uid) };
-    assert!(!password.is_null());
-    let name = unsafe { std::ffi::CStr::from_ptr((*password).pw_name) }
-        .to_str()
-        .unwrap();
-    let mut input = fs::read_to_string("examples/machine.controller-worker.toml").unwrap();
-    input = input
-        .replace(
-            "principal_id = \"501\"",
-            &format!("principal_id = \"{uid}\""),
-        )
-        .replace("name = \"alex-dev\"", &format!("name = \"{name}\""))
-        .replace("user = \"alex-dev\"", &format!("user = \"{name}\""));
-    #[cfg(target_os = "linux")]
-    {
-        input = input.replace("os = \"macos\"", "os = \"linux\"").replace(
-            "/Users/alex-dev/Library/Application Support/Styrn",
-            &format!("/home/{name}/.local/share/styrn"),
+    let principal = platform::resolve_current_worker_principal()
+        .expect("machine CLI tests require a real non-privileged caller");
+    let layout = platform::resolve_worker_directory_layout(
+        platform::InstallationScope::User,
+        &principal,
+        None,
+    )
+    .expect("machine CLI tests require the canonical current-user worker layout");
+    let mut input: toml::Value =
+        toml::from_str(&fs::read_to_string("examples/machine.controller-worker.toml").unwrap())
+            .unwrap();
+    input["platform"]["os"] = toml::Value::String(std::env::consts::OS.to_owned());
+    input["worker_identity"]["principal_kind"] = toml::Value::String(
+        match principal.principal_kind() {
+            platform::PrincipalKind::UnixUid => "unix-uid",
+            platform::PrincipalKind::WindowsSid => "windows-sid",
+        }
+        .to_owned(),
+    );
+    input["worker_identity"]["principal_id"] =
+        toml::Value::String(principal.principal_id().to_owned());
+    input["worker_identity"]["name"] = toml::Value::String(principal.name().to_owned());
+    input["transport"]["user"] = toml::Value::String(principal.name().to_owned());
+
+    for (field, path) in [
+        ("root", layout.root()),
+        ("repos", layout.repos()),
+        ("jobs", layout.jobs()),
+        ("cache", layout.cache()),
+        ("artifacts", layout.artifacts()),
+        ("logs", layout.logs()),
+    ] {
+        input["paths"][field] = toml::Value::String(
+            path.to_str()
+                .expect("manifest paths must be valid UTF-8")
+                .to_owned(),
         );
     }
-    input
-}
 
-#[cfg(windows)]
-fn current_user_manifest() -> String {
-    let account = Command::new("whoami").output().unwrap();
-    assert!(account.status.success());
-    let qualified = String::from_utf8(account.stdout).unwrap();
-    let name = qualified.trim().rsplit('\\').next().unwrap();
-    let identity = Command::new("whoami")
-        .arg("/user")
-        .arg("/fo")
-        .arg("csv")
-        .arg("/nh")
-        .output()
-        .unwrap();
-    assert!(identity.status.success());
-    let row = String::from_utf8(identity.stdout).unwrap();
-    let sid = row.split(',').nth(1).unwrap().trim().trim_matches('"');
-    fs::read_to_string("examples/machine.controller-worker.toml")
-        .unwrap()
-        .replace("os = \"macos\"", "os = \"windows\"")
-        .replace(
-            "principal_kind = \"unix-uid\"",
-            "principal_kind = \"windows-sid\"",
-        )
-        .replace(
-            "principal_id = \"501\"",
-            &format!("principal_id = \"{sid}\""),
-        )
-        .replace("name = \"alex-dev\"", &format!("name = \"{name}\""))
-        .replace("user = \"alex-dev\"", &format!("user = \"{name}\""))
-        .replace(
-            "/Users/alex-dev/Library/Application Support/Styrn",
-            &format!("C:\\\\Users\\\\{name}\\\\AppData\\\\Local\\\\Styrn"),
-        )
+    toml::to_string_pretty(&input).unwrap()
 }
 
 fn exactly_one_json(stdout: &[u8]) -> Value {
