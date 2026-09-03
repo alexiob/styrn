@@ -391,6 +391,140 @@ fn dedicated_system_worker_directory_child_requires_target_store_and_journals_ex
     }
 }
 
+#[cfg(not(target_os = "windows"))]
+#[test]
+fn dedicated_manifest_publication_requires_the_exact_store_with_a_genuine_execution_token() {
+    let fixture = AuthorizationFixture::new("dedicated-manifest-publication");
+    let selector = crate::platform::resolve_current_worker_principal()
+        .unwrap()
+        .name()
+        .to_owned();
+    let (ready, _) = super::super::tests::dedicated_ready_for_test(&selector);
+    let native_temp = fs::canonicalize(std::env::temp_dir()).unwrap();
+    let root = native_temp.join(format!(
+        "styrn-dedicated-publish-{}",
+        fixture.root.file_name().unwrap().to_string_lossy()
+    ));
+    let (mut plan, layout) =
+        super::super::worker_directory::dedicated_system_worker_directory_plan_for_test(
+            &ready,
+            root,
+            Some(native_temp.clone()),
+        )
+        .unwrap();
+    let context = fixture.context();
+    let digest = write_request(&plan, &context).unwrap();
+    let receipt_store = ReceiptStore::new_system_for_test_with_worker_layout(
+        fixture.system_receipt(),
+        layout.clone(),
+    );
+    let mut action_metadata = ReceiptMetadataSource::for_test([
+        (
+            "019cb047-3c00-7000-8000-000000000121",
+            "2026-09-02T12:00:01Z",
+        ),
+        (
+            "019cb047-3c00-7000-8000-000000000122",
+            "2026-09-02T12:00:02Z",
+        ),
+        (
+            "019cb047-3c00-7000-8000-000000000123",
+            "2026-09-02T12:00:03Z",
+        ),
+        (
+            "019cb047-3c00-7000-8000-000000000124",
+            "2026-09-02T12:00:04Z",
+        ),
+        (
+            "019cb047-3c00-7000-8000-000000000125",
+            "2026-09-02T12:00:05Z",
+        ),
+        (
+            "019cb047-3c00-7000-8000-000000000126",
+            "2026-09-02T12:00:06Z",
+        ),
+    ]);
+    let report = run_privileged_request(
+        &context,
+        &digest,
+        &mut plan,
+        &receipt_store,
+        &mut action_metadata,
+    )
+    .unwrap();
+    let mut base = pending_manifest_draft_for_current_user();
+    base.installation.as_mut().unwrap().scope = InstallationScope::System;
+    let candidate = ready
+        .manifest_candidate_with_layout_for_test(&base, &layout)
+        .unwrap();
+    let manifest_path = fixture.root.join("system-manifest/machine.toml");
+    fs::create_dir_all(manifest_path.parent().unwrap()).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(
+            manifest_path.parent().unwrap(),
+            fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+    }
+    let drifted_layout = crate::platform::worker_directory_layout_for_test(
+        InstallationScope::System,
+        layout.worker_principal().clone(),
+        native_temp.join(format!(
+            "styrn-dedicated-drift-{}",
+            fixture.root.file_name().unwrap().to_string_lossy()
+        )),
+        Some(native_temp),
+    );
+    let wrong_store =
+        crate::manifest::MachineManifestStore::new_system_dedicated_with_layout_for_test(
+            &manifest_path,
+            &candidate,
+            &drifted_layout,
+        )
+        .unwrap();
+    let mut draft = candidate.draft().clone();
+    let error = crate::setup::pending::publish_manifest(
+        &wrong_store,
+        &receipt_store,
+        &mut draft,
+        report.completion(),
+        &mut ReceiptMetadataSource::for_test([(
+            "019cb047-3c00-7000-8000-000000000127",
+            "2026-09-02T12:00:07Z",
+        )]),
+    )
+    .unwrap_err();
+    assert_eq!(error.error_code(), "setup.apply_failed");
+    assert!(!manifest_path.exists());
+
+    let store = crate::manifest::MachineManifestStore::new_system_dedicated_with_layout_for_test(
+        &manifest_path,
+        &candidate,
+        &layout,
+    )
+    .unwrap();
+    let machine_id = crate::setup::pending::publish_manifest(
+        &store,
+        &receipt_store,
+        &mut draft,
+        report.completion(),
+        &mut ReceiptMetadataSource::for_test([(
+            "019cb047-3c00-7000-8000-000000000128",
+            "2026-09-02T12:00:08Z",
+        )]),
+    )
+    .unwrap();
+    assert_eq!(store.read().unwrap().manifest.machine_id, machine_id);
+    let receipt = serde_json::from_slice::<serde_json::Value>(
+        &receipt_store.read_snapshot().unwrap().to_json().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(receipt["pending_publications"].as_array().unwrap().len(), 1);
+    let _ = fs::remove_dir_all(layout.root());
+}
+
 #[test]
 fn current_user_worker_directory_creates_no_account() {
     let fixture = AuthorizationFixture::new("worker-directory-zero-account");

@@ -169,6 +169,42 @@ pub(crate) struct CurrentUserWorkerManifestCandidate {
     draft: MachineManifestDraft,
 }
 
+/// Sealed authority used only by dedicated-manifest projection and final
+/// replacement validation. Its private field prevents other crate modules from
+/// extracting a principal from an opaque account handle.
+#[cfg(not(test))]
+pub(crate) struct DedicatedManifestBindingAuthority(());
+
+#[cfg(test)]
+type DedicatedManifestBindingAuthority = platform::TestDedicatedManifestBindingAuthority;
+
+fn dedicated_manifest_binding_authority() -> DedicatedManifestBindingAuthority {
+    #[cfg(not(test))]
+    {
+        DedicatedManifestBindingAuthority(())
+    }
+    #[cfg(test)]
+    {
+        platform::TestDedicatedManifestBindingAuthority::for_test()
+    }
+}
+
+#[derive(Clone)]
+struct DedicatedWorkerManifestProjection {
+    operating_system: OperatingSystem,
+    principal: platform::WorkerPrincipal,
+    worker_identity: WorkerIdentity,
+    transport_user: String,
+    paths: Paths,
+}
+
+#[allow(dead_code)] // Setup orchestration consumes this after protected directory completion.
+pub(crate) struct DedicatedWorkerManifestCandidate {
+    draft: MachineManifestDraft,
+    handle: platform::DedicatedAccountHandle,
+    projection: DedicatedWorkerManifestProjection,
+}
+
 macro_rules! manifest_types {
     ($($name:ident { $($field:ident : $type:ty),* $(,)? })*) => {$(
         #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -326,6 +362,7 @@ impl CurrentUserWorkerManifestCandidate {
         Ok(Self { draft })
     }
 
+    #[allow(dead_code)] // Setup publication and contract tests consume this before T0.20.
     pub(crate) fn draft(&self) -> &MachineManifestDraft {
         &self.draft
     }
@@ -337,6 +374,170 @@ impl CurrentUserWorkerManifestCandidate {
     pub(crate) const fn security_caveat(&self) -> &'static str {
         CURRENT_USER_WORKER_SECURITY_CAVEAT
     }
+}
+
+impl DedicatedWorkerManifestCandidate {
+    #[allow(dead_code)] // T0.20 supplies the selected opaque ready handle.
+    pub(crate) fn derive(
+        base: &MachineManifestDraft,
+        handle: &platform::DedicatedAccountHandle,
+    ) -> Result<Self, ManifestError> {
+        #[cfg(target_os = "windows")]
+        {
+            let _ = (base, handle);
+            return Err(projection_validation(DEDICATED_EXECUTION_READINESS_ERROR));
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            validate_dedicated_projection_base(base)?;
+            let authority = dedicated_manifest_binding_authority();
+            let projection = handle
+                .reverify_and_bind_for_manifest(&authority, |principal| {
+                    let layout = platform::resolve_worker_directory_layout(
+                        platform::InstallationScope::System,
+                        principal,
+                        None,
+                    )
+                    .map_err(|_| projection_validation(DEDICATED_WORKER_PATHS_ERROR))?;
+                    DedicatedWorkerManifestProjection::derive(principal, &layout)
+                })
+                .map_err(|_| projection_validation(DEDICATED_PRINCIPAL_ERROR))??;
+            Self::from_projection(base, handle, projection)
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn derive_with_layout_for_test(
+        base: &MachineManifestDraft,
+        handle: &platform::DedicatedAccountHandle,
+        layout: &platform::WorkerDirectoryLayout,
+    ) -> Result<Self, ManifestError> {
+        #[cfg(target_os = "windows")]
+        {
+            let _ = (base, handle, layout);
+            return Err(projection_validation(DEDICATED_EXECUTION_READINESS_ERROR));
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            validate_dedicated_projection_base(base)?;
+            let authority = dedicated_manifest_binding_authority();
+            let projection = handle
+                .reverify_and_bind_for_manifest(&authority, |principal| {
+                    DedicatedWorkerManifestProjection::derive(principal, layout)
+                })
+                .map_err(|_| projection_validation(DEDICATED_PRINCIPAL_ERROR))??;
+            Self::from_projection(base, handle, projection)
+        }
+    }
+
+    fn from_projection(
+        base: &MachineManifestDraft,
+        handle: &platform::DedicatedAccountHandle,
+        projection: DedicatedWorkerManifestProjection,
+    ) -> Result<Self, ManifestError> {
+        let mut draft = base.clone();
+        draft
+            .installation
+            .as_mut()
+            .expect("dedicated projection validated a System installation")
+            .scope = platform::InstallationScope::System;
+        draft.platform.os = projection.operating_system.clone();
+        draft.worker_identity = Some(projection.worker_identity.clone());
+        draft
+            .transport
+            .as_mut()
+            .expect("dedicated projection validated an existing transport")
+            .user = Some(projection.transport_user.clone());
+        draft.paths = projection.paths.clone();
+        draft.with_machine_id(Uuid::now_v7()).validate()?;
+        Ok(Self {
+            draft,
+            handle: handle.clone(),
+            projection,
+        })
+    }
+
+    #[allow(dead_code)] // Setup publication and contract tests consume this before T0.20.
+    pub(crate) fn draft(&self) -> &MachineManifestDraft {
+        &self.draft
+    }
+}
+
+impl DedicatedWorkerManifestProjection {
+    fn derive(
+        principal: &platform::WorkerPrincipal,
+        layout: &platform::WorkerDirectoryLayout,
+    ) -> Result<Self, ManifestError> {
+        if principal.account_policy() != platform::WorkerAccountPolicy::Dedicated
+            || principal.isolation() != platform::WorkerIsolation::DedicatedAccount
+            || layout.installation_scope() != platform::InstallationScope::System
+            || layout.worker_principal() != principal
+        {
+            return Err(projection_validation(DEDICATED_PRINCIPAL_ERROR));
+        }
+        Ok(Self {
+            operating_system: native_operating_system(),
+            principal: principal.clone(),
+            worker_identity: worker_identity_for(principal),
+            transport_user: principal.name().to_owned(),
+            paths: exact_manifest_paths(layout)?,
+        })
+    }
+}
+
+fn validate_dedicated_projection_base(base: &MachineManifestDraft) -> Result<(), ManifestError> {
+    if base
+        .installation
+        .as_ref()
+        .map(|installation| installation.scope)
+        != Some(platform::InstallationScope::System)
+        || !base.roles.contains(&MachineRole::Worker)
+    {
+        return Err(projection_validation(DEDICATED_WORKER_DRAFT_ERROR));
+    }
+    if base.platform.os != native_operating_system() {
+        return Err(projection_validation(NATIVE_HOST_PLATFORM_ERROR));
+    }
+    if base.transport.is_none() {
+        return Err(projection_validation(EXISTING_TRANSPORT_ERROR));
+    }
+    Ok(())
+}
+
+fn validate_dedicated_worker_manifest_projection(
+    manifest: &MachineManifest,
+    identity: &WorkerIdentity,
+    projection: &DedicatedWorkerManifestProjection,
+) -> Result<(), ManifestError> {
+    if manifest.platform.os != projection.operating_system {
+        return invalid(DEDICATED_WORKER_PLATFORM_ERROR);
+    }
+    if identity.principal()? != projection.principal
+        || identity.mode != WorkerIdentityMode::Dedicated
+        || identity.isolation != platform::WorkerIsolation::DedicatedAccount
+    {
+        return invalid(DEDICATED_PRINCIPAL_ERROR);
+    }
+    if manifest
+        .transport
+        .as_ref()
+        .and_then(|transport| transport.user.as_deref())
+        != Some(projection.transport_user.as_str())
+    {
+        return invalid("transport.user must equal worker_identity.name");
+    }
+    let paths = &manifest.paths;
+    let expected = &projection.paths;
+    if paths.root != expected.root
+        || paths.repos != expected.repos
+        || paths.jobs != expected.jobs
+        || paths.cache != expected.cache
+        || paths.artifacts != expected.artifacts
+        || paths.logs != expected.logs
+    {
+        return invalid(DEDICATED_WORKER_PATHS_ERROR);
+    }
+    Ok(())
 }
 
 #[allow(dead_code)] // Task 2 consumes projection validation through its opaque candidate.
@@ -358,6 +559,17 @@ const USER_WORKER_PATHS_ERROR: &str =
     "user worker manifest paths do not match the store's canonical layout";
 const USER_WORKER_PLATFORM_ERROR: &str =
     "user worker manifest platform does not match the native host";
+const DEDICATED_WORKER_DRAFT_ERROR: &str =
+    "dedicated worker manifest projection requires a system-scope worker draft";
+const DEDICATED_PRINCIPAL_ERROR: &str =
+    "dedicated worker manifest principal does not match the selected account";
+const DEDICATED_WORKER_PATHS_ERROR: &str =
+    "dedicated worker manifest paths do not match the canonical system layout";
+const DEDICATED_WORKER_PLATFORM_ERROR: &str =
+    "dedicated worker manifest platform does not match the native host";
+#[cfg(target_os = "windows")]
+const DEDICATED_EXECUTION_READINESS_ERROR: &str =
+    "dedicated worker execution readiness is unavailable on this host";
 
 #[allow(dead_code)] // Task 2 consumes projection validation through its opaque candidate.
 fn validate_current_user_projection_base(base: &MachineManifestDraft) -> Result<(), ManifestError> {
@@ -889,8 +1101,14 @@ enum DestinationOrigin {
 enum WorkerManifestLayoutBinding {
     PrincipalOnly,
     CanonicalCurrentUser,
+    CanonicalDedicated(platform::DedicatedAccountHandle),
     #[cfg(test)]
     ExactCurrentUser(Box<CurrentUserWorkerManifestProjection>),
+    #[cfg(test)]
+    ExactDedicated {
+        handle: platform::DedicatedAccountHandle,
+        projection: Box<DedicatedWorkerManifestProjection>,
+    },
 }
 
 impl std::fmt::Debug for WorkerManifestLayoutBinding {
@@ -898,8 +1116,11 @@ impl std::fmt::Debug for WorkerManifestLayoutBinding {
         formatter.write_str(match self {
             Self::PrincipalOnly => "PrincipalOnly",
             Self::CanonicalCurrentUser => "CanonicalCurrentUser",
+            Self::CanonicalDedicated(_) => "CanonicalDedicated",
             #[cfg(test)]
             Self::ExactCurrentUser(_) => "ExactCurrentUser",
+            #[cfg(test)]
+            Self::ExactDedicated { .. } => "ExactDedicated",
         })
     }
 }
@@ -1016,6 +1237,9 @@ impl MachineManifestStore {
         path: impl Into<PathBuf>,
         principal: platform::WorkerPrincipal,
     ) -> Result<Self, ManifestError> {
+        if principal.account_policy() == platform::WorkerAccountPolicy::Dedicated {
+            return invalid(DEDICATED_PRINCIPAL_ERROR);
+        }
         let path = path.into();
         let trusted_root = path
             .parent()
@@ -1030,6 +1254,72 @@ impl MachineManifestStore {
             destination_origin: DestinationOrigin::Override,
             worker_layout_binding: WorkerManifestLayoutBinding::PrincipalOnly,
             #[cfg(test)]
+            pre_replace_worker_layout_binding: None,
+        };
+        store.validate_destination_policy()?;
+        store.verify_bound_principal()?;
+        Ok(store)
+    }
+
+    #[allow(dead_code)] // T0.20 constructs this only after protected directory completion.
+    pub(crate) fn new_system_dedicated(
+        candidate: &DedicatedWorkerManifestCandidate,
+    ) -> Result<Self, ManifestError> {
+        let path = canonical_manifest_path(platform::InstallationScope::System)?;
+        let trusted_root = path
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_default();
+        let store = Self {
+            scope: platform::InstallationScope::System,
+            principal: candidate.projection.principal.clone(),
+            path,
+            trusted_root,
+            security: ManifestSecurity::System,
+            destination_origin: DestinationOrigin::Canonical,
+            worker_layout_binding: WorkerManifestLayoutBinding::CanonicalDedicated(
+                candidate.handle.clone(),
+            ),
+            #[cfg(test)]
+            pre_replace_worker_layout_binding: None,
+        };
+        store.validate_destination_policy()?;
+        store.verify_bound_principal()?;
+        Ok(store)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_system_dedicated_with_layout_for_test(
+        path: impl Into<PathBuf>,
+        candidate: &DedicatedWorkerManifestCandidate,
+        layout: &platform::WorkerDirectoryLayout,
+    ) -> Result<Self, ManifestError> {
+        let authority = dedicated_manifest_binding_authority();
+        let projection = candidate
+            .handle
+            .reverify_and_bind_for_manifest(&authority, |principal| {
+                DedicatedWorkerManifestProjection::derive(principal, layout)
+            })
+            .map_err(|_| projection_validation(DEDICATED_PRINCIPAL_ERROR))??;
+        if projection.principal != candidate.projection.principal {
+            return invalid(DEDICATED_PRINCIPAL_ERROR);
+        }
+        let path = path.into();
+        let trusted_root = path
+            .parent()
+            .map(std::path::Path::to_path_buf)
+            .unwrap_or_default();
+        let store = Self {
+            scope: platform::InstallationScope::System,
+            principal: projection.principal.clone(),
+            path,
+            trusted_root,
+            security: ManifestSecurity::User,
+            destination_origin: DestinationOrigin::Test,
+            worker_layout_binding: WorkerManifestLayoutBinding::ExactDedicated {
+                handle: candidate.handle.clone(),
+                projection: Box::new(projection),
+            },
             pre_replace_worker_layout_binding: None,
         };
         store.validate_destination_policy()?;
@@ -1125,6 +1415,30 @@ impl MachineManifestStore {
         self.pre_replace_worker_layout_binding = Some(
             WorkerManifestLayoutBinding::ExactCurrentUser(Box::new(projection)),
         );
+        Ok(self)
+    }
+
+    #[cfg(test)]
+    #[allow(dead_code)] // Exercised by source-including manifest contract tests.
+    pub(crate) fn with_pre_replace_dedicated_worker_binding_for_test(
+        mut self,
+        layout: &platform::WorkerDirectoryLayout,
+    ) -> Result<Self, ManifestError> {
+        let handle = match &self.worker_layout_binding {
+            WorkerManifestLayoutBinding::ExactDedicated { handle, .. } => handle.clone(),
+            _ => return invalid(DEDICATED_PRINCIPAL_ERROR),
+        };
+        let authority = dedicated_manifest_binding_authority();
+        let projection = handle
+            .reverify_and_bind_for_manifest(&authority, |principal| {
+                DedicatedWorkerManifestProjection::derive(principal, layout)
+            })
+            .map_err(|_| projection_validation(DEDICATED_PRINCIPAL_ERROR))??;
+        self.pre_replace_worker_layout_binding =
+            Some(WorkerManifestLayoutBinding::ExactDedicated {
+                handle,
+                projection: Box::new(projection),
+            });
         Ok(self)
     }
 
@@ -1923,9 +2237,43 @@ impl MachineManifestStore {
                 let projection = canonical_current_user_store_projection(&self.principal)?;
                 validate_user_worker_manifest_projection(manifest, identity, &projection)?;
             }
+            WorkerManifestLayoutBinding::CanonicalDedicated(handle) => {
+                let authority = dedicated_manifest_binding_authority();
+                handle
+                    .reverify_and_bind_for_manifest(&authority, |principal| {
+                        let layout = platform::resolve_worker_directory_layout(
+                            platform::InstallationScope::System,
+                            principal,
+                            None,
+                        )
+                        .map_err(|_| projection_validation(DEDICATED_WORKER_PATHS_ERROR))?;
+                        let projection =
+                            DedicatedWorkerManifestProjection::derive(principal, &layout)?;
+                        validate_dedicated_worker_manifest_projection(
+                            manifest,
+                            identity,
+                            &projection,
+                        )
+                    })
+                    .map_err(|_| projection_validation(DEDICATED_PRINCIPAL_ERROR))??;
+            }
             #[cfg(test)]
             WorkerManifestLayoutBinding::ExactCurrentUser(projection) => {
                 validate_user_worker_manifest_projection(manifest, identity, projection)?;
+            }
+            #[cfg(test)]
+            WorkerManifestLayoutBinding::ExactDedicated { handle, projection } => {
+                let authority = dedicated_manifest_binding_authority();
+                handle
+                    .reverify_and_bind_for_manifest(&authority, |principal| {
+                        if principal != &projection.principal {
+                            return invalid(DEDICATED_PRINCIPAL_ERROR);
+                        }
+                        validate_dedicated_worker_manifest_projection(
+                            manifest, identity, projection,
+                        )
+                    })
+                    .map_err(|_| projection_validation(DEDICATED_PRINCIPAL_ERROR))??;
             }
         }
         Ok(())
@@ -1946,10 +2294,17 @@ impl MachineManifestStore {
             WorkerManifestLayoutBinding::CanonicalCurrentUser => self
                 .verify_bound_principal()
                 .map_err(|_| projection_validation(CURRENT_NATIVE_PRINCIPAL_ERROR))?,
+            WorkerManifestLayoutBinding::CanonicalDedicated(_) => self
+                .verify_bound_principal()
+                .map_err(|_| projection_validation(DEDICATED_PRINCIPAL_ERROR))?,
             #[cfg(test)]
             WorkerManifestLayoutBinding::ExactCurrentUser(_) => self
                 .verify_bound_principal()
                 .map_err(|_| projection_validation(CURRENT_NATIVE_PRINCIPAL_ERROR))?,
+            #[cfg(test)]
+            WorkerManifestLayoutBinding::ExactDedicated { .. } => self
+                .verify_bound_principal()
+                .map_err(|_| projection_validation(DEDICATED_PRINCIPAL_ERROR))?,
         }
         self.validate_manifest_binding_with(manifest, worker_layout_binding)
     }

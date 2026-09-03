@@ -55,6 +55,27 @@ fn current_user_manifest() -> MachineManifest {
     manifest
 }
 
+fn dedicated_account_handle_for_manifest_test(
+) -> (platform::DedicatedAccountHandle, platform::WorkerPrincipal) {
+    let current = current_worker_principal();
+    let target = platform::WorkerPrincipal::new(
+        current.principal_kind(),
+        current.principal_id(),
+        current.name(),
+        platform::WorkerAccountPolicy::Dedicated,
+    )
+    .unwrap();
+    let observation = platform::dedicated_account_observation_for_action_test(
+        platform::DedicatedAccountSpec::new(current.name()).unwrap(),
+        platform::TestDedicatedAccountObservation::Healthy(target.clone()),
+        platform::TestDedicatedAccountObservation::Healthy(target.clone()),
+    );
+    let platform::DedicatedAccountObservation::PresentHealthy(handle) = observation else {
+        panic!("fixture must yield an opaque healthy handle");
+    };
+    (handle, target)
+}
+
 #[cfg(unix)]
 fn system_manifest_for(principal: &platform::WorkerPrincipal) -> MachineManifest {
     let mut manifest = MachineManifest::parse_toml(
@@ -314,6 +335,121 @@ fn current_user_worker_manifest_candidate_uses_the_exact_native_layout() {
     assert_eq!(fs::read(&path).unwrap(), first_bytes);
     let second_json = store.read().unwrap().manifest.to_json_value().unwrap();
     assert_eq!(second_json, first_json);
+}
+
+#[cfg(not(target_os = "windows"))]
+#[test]
+fn dedicated_worker_manifest_candidate_and_store_bind_the_exact_system_layout() {
+    let temp = TestDir::new();
+    let temp_root = fs::canonicalize(temp.path()).unwrap();
+    let (handle, target) = dedicated_account_handle_for_manifest_test();
+    let layout = platform::worker_directory_layout_for_test(
+        platform::InstallationScope::System,
+        target.clone(),
+        temp_root.join("dedicated-system-worker"),
+        Some(temp_root.clone()),
+    );
+    let mut base = stale_current_user_worker_draft();
+    base.installation.as_mut().unwrap().scope = platform::InstallationScope::System;
+
+    let candidate = manifest::DedicatedWorkerManifestCandidate::derive_with_layout_for_test(
+        &base, &handle, &layout,
+    )
+    .unwrap();
+    let identity = candidate.draft().worker_identity.as_ref().unwrap();
+    assert_eq!(identity.mode, manifest::WorkerIdentityMode::Dedicated);
+    assert_eq!(
+        identity.isolation,
+        platform::WorkerIsolation::DedicatedAccount
+    );
+    assert_eq!(identity.principal_id, target.principal_id());
+    assert_eq!(
+        candidate
+            .draft()
+            .transport
+            .as_ref()
+            .unwrap()
+            .user
+            .as_deref(),
+        Some(target.name())
+    );
+    assert_eq!(
+        candidate.draft().paths.root,
+        layout.root().to_str().unwrap()
+    );
+
+    let path = temp_root.join("system-state/machine.toml");
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(path.parent().unwrap(), fs::Permissions::from_mode(0o700)).unwrap();
+    let store =
+        MachineManifestStore::new_system_dedicated_with_layout_for_test(&path, &candidate, &layout)
+            .unwrap();
+    let id = store.write_generated(candidate.draft()).unwrap();
+    let read = store.read().unwrap();
+    assert_eq!(read.manifest.machine_id, id);
+    assert_eq!(read.manifest.worker_identity.unwrap().name, target.name());
+}
+
+#[cfg(not(target_os = "windows"))]
+#[test]
+fn dedicated_worker_manifest_final_boundary_rejects_layout_drift_without_replacement() {
+    let temp = TestDir::new();
+    let temp_root = fs::canonicalize(temp.path()).unwrap();
+    let (handle, target) = dedicated_account_handle_for_manifest_test();
+    let layout = platform::worker_directory_layout_for_test(
+        platform::InstallationScope::System,
+        target.clone(),
+        temp_root.join("dedicated-system-worker"),
+        Some(temp_root.clone()),
+    );
+    let mut base = stale_current_user_worker_draft();
+    base.installation.as_mut().unwrap().scope = platform::InstallationScope::System;
+    let candidate = manifest::DedicatedWorkerManifestCandidate::derive_with_layout_for_test(
+        &base, &handle, &layout,
+    )
+    .unwrap();
+    let path = temp_root.join("system-state-final/machine.toml");
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    #[cfg(unix)]
+    fs::set_permissions(path.parent().unwrap(), fs::Permissions::from_mode(0o700)).unwrap();
+    let seed =
+        MachineManifestStore::new_system_dedicated_with_layout_for_test(&path, &candidate, &layout)
+            .unwrap();
+    let machine_id = seed.write_generated(candidate.draft()).unwrap();
+    let original = fs::read(&path).unwrap();
+    let original_identity = platform::private_file_identity(&path).unwrap();
+    #[cfg(unix)]
+    let original_mode = fs::metadata(&path).unwrap().mode();
+    let hostile_root = temp_root.join("secret-hostile-root");
+    let drifted_layout = platform::worker_directory_layout_for_test(
+        platform::InstallationScope::System,
+        target,
+        hostile_root.clone(),
+        Some(temp_root),
+    );
+    let store =
+        MachineManifestStore::new_system_dedicated_with_layout_for_test(&path, &candidate, &layout)
+            .unwrap()
+            .with_pre_replace_dedicated_worker_binding_for_test(&drifted_layout)
+            .unwrap();
+
+    let error = store.write_generated(candidate.draft()).unwrap_err();
+
+    assert_eq!(
+        error.to_string(),
+        "invalid machine manifest: dedicated worker manifest paths do not match the canonical system layout"
+    );
+    assert!(!error.to_string().contains(hostile_root.to_str().unwrap()));
+    assert_eq!(fs::read(&path).unwrap(), original);
+    assert_eq!(
+        platform::private_file_identity(&path).unwrap(),
+        original_identity
+    );
+    #[cfg(unix)]
+    assert_eq!(fs::metadata(&path).unwrap().mode(), original_mode);
+    assert_eq!(store.read().unwrap().manifest.machine_id, machine_id);
+    assert_no_manifest_temporaries(path.parent().unwrap());
 }
 
 #[test]

@@ -43,6 +43,28 @@ impl DedicatedAccountReady {
         let authority = super::dedicated_account_action_authority();
         self.target.reverify_and_bind_for_action(&authority, bind)
     }
+
+    pub(in crate::setup) fn manifest_candidate(
+        &self,
+        base: &crate::manifest::MachineManifestDraft,
+    ) -> Result<crate::manifest::DedicatedWorkerManifestCandidate, crate::manifest::ManifestError>
+    {
+        crate::manifest::DedicatedWorkerManifestCandidate::derive(base, &self.target)
+    }
+
+    #[cfg(test)]
+    pub(super) fn manifest_candidate_with_layout_for_test(
+        &self,
+        base: &crate::manifest::MachineManifestDraft,
+        layout: &crate::platform::WorkerDirectoryLayout,
+    ) -> Result<crate::manifest::DedicatedWorkerManifestCandidate, crate::manifest::ManifestError>
+    {
+        crate::manifest::DedicatedWorkerManifestCandidate::derive_with_layout_for_test(
+            base,
+            &self.target,
+            layout,
+        )
+    }
 }
 
 pub(crate) struct DedicatedAccountSelection {

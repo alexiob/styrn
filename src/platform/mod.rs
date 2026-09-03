@@ -1571,6 +1571,24 @@ type DedicatedAccountActionAuthority = crate::setup::action::DedicatedAccountAct
 
 #[cfg(test)]
 #[allow(dead_code)]
+pub(crate) struct TestDedicatedManifestBindingAuthority(());
+
+#[cfg(test)]
+#[allow(dead_code)]
+impl TestDedicatedManifestBindingAuthority {
+    pub(crate) const fn for_test() -> Self {
+        Self(())
+    }
+}
+
+#[cfg(test)]
+type DedicatedManifestBindingAuthority = TestDedicatedManifestBindingAuthority;
+
+#[cfg(not(test))]
+type DedicatedManifestBindingAuthority = crate::manifest::DedicatedManifestBindingAuthority;
+
+#[cfg(test)]
+#[allow(dead_code)]
 impl TestDedicatedAccountObservation {
     fn into_native(self) -> NativeDedicatedAccountObservation {
         match self {
@@ -1674,6 +1692,17 @@ impl DedicatedAccountHandle {
     pub(crate) fn reverify_and_bind_for_action<Output>(
         &self,
         authority: &DedicatedAccountActionAuthority,
+        bind: impl for<'binding> FnOnce(&'binding WorkerPrincipal) -> Output,
+    ) -> Result<Output, DedicatedAccountIssue> {
+        let _ = authority;
+        self.reverify_and_bind(&DedicatedAccountFactoryAuthority(()), |verified| {
+            bind(verified.principal())
+        })
+    }
+
+    pub(crate) fn reverify_and_bind_for_manifest<Output>(
+        &self,
+        authority: &DedicatedManifestBindingAuthority,
         bind: impl for<'binding> FnOnce(&'binding WorkerPrincipal) -> Output,
     ) -> Result<Output, DedicatedAccountIssue> {
         let _ = authority;
