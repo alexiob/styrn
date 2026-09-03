@@ -3051,12 +3051,38 @@ fn local_account_records_match(
     // NSS has no portable provenance API. A healthy Linux observation therefore also requires
     // exact libc-decoded records from the trusted local account databases. Directory-only NSS
     // identities cannot pass; an inaccessible database leaves the observation unknowable.
-    Ok(local_passwd_record_matches(account)?
-        && local_group_record_matches(primary_group_name, account.gid)?)
+    let filesystem_root = open_worker_filesystem_root()?;
+    local_account_records_match_at(&filesystem_root, 0, c"etc", account, primary_group_name)
 }
 
-fn local_passwd_record_matches(account: &UnixAccountDetails) -> io::Result<bool> {
-    let Some(stream) = open_local_account_database(c"passwd")? else {
+fn local_account_records_match_at(
+    filesystem_root: &std::fs::File,
+    expected_owner: libc::uid_t,
+    parent_name: &std::ffi::CStr,
+    account: &UnixAccountDetails,
+    primary_group_name: &str,
+) -> io::Result<bool> {
+    Ok(
+        local_passwd_record_matches_at(filesystem_root, expected_owner, parent_name, account)?
+            && local_group_record_matches_at(
+                filesystem_root,
+                expected_owner,
+                parent_name,
+                primary_group_name,
+                account.gid,
+            )?,
+    )
+}
+
+fn local_passwd_record_matches_at(
+    filesystem_root: &std::fs::File,
+    expected_owner: libc::uid_t,
+    parent_name: &std::ffi::CStr,
+    account: &UnixAccountDetails,
+) -> io::Result<bool> {
+    let Some(stream) =
+        open_local_account_database_at(filesystem_root, expected_owner, parent_name, c"passwd")?
+    else {
         return Ok(false);
     };
     let expected_uid = account.principal.unix_uid()?;
@@ -3107,8 +3133,16 @@ fn local_passwd_record_matches(account: &UnixAccountDetails) -> io::Result<bool>
     }
 }
 
-fn local_group_record_matches(expected_name: &str, expected_gid: libc::gid_t) -> io::Result<bool> {
-    let Some(stream) = open_local_account_database(c"group")? else {
+fn local_group_record_matches_at(
+    filesystem_root: &std::fs::File,
+    expected_owner: libc::uid_t,
+    parent_name: &std::ffi::CStr,
+    expected_name: &str,
+    expected_gid: libc::gid_t,
+) -> io::Result<bool> {
+    let Some(stream) =
+        open_local_account_database_at(filesystem_root, expected_owner, parent_name, c"group")?
+    else {
         return Ok(false);
     };
     let mut found = false;
@@ -3188,16 +3222,30 @@ struct LocalAccountDatabaseNode {
     identity: PrivateFileIdentity,
 }
 
+fn local_account_database_root_is_trusted(
+    root: LocalAccountDatabaseNode,
+    expected_owner: libc::uid_t,
+    access_acl: bool,
+    default_acl: bool,
+) -> bool {
+    root.mode & libc::S_IFMT == libc::S_IFDIR
+        && root.uid == expected_owner
+        && root.mode & 0o022 == 0
+        && !access_acl
+        && !default_acl
+}
+
 fn local_account_database_directory_is_trusted(
     opened: LocalAccountDatabaseNode,
     named: LocalAccountDatabaseNode,
+    expected_owner: libc::uid_t,
     access_acl: bool,
     default_acl: bool,
 ) -> bool {
     opened.mode & libc::S_IFMT == libc::S_IFDIR
         && named.mode & libc::S_IFMT == libc::S_IFDIR
-        && opened.uid == 0
-        && named.uid == 0
+        && opened.uid == expected_owner
+        && named.uid == expected_owner
         && opened.mode & 0o022 == 0
         && named.mode & 0o022 == 0
         && opened.identity == named.identity
@@ -3208,12 +3256,13 @@ fn local_account_database_directory_is_trusted(
 fn local_account_database_file_is_trusted(
     opened: LocalAccountDatabaseNode,
     named: LocalAccountDatabaseNode,
+    expected_owner: libc::uid_t,
     access_acl: bool,
 ) -> bool {
     opened.mode & libc::S_IFMT == libc::S_IFREG
         && named.mode & libc::S_IFMT == libc::S_IFREG
-        && opened.uid == 0
-        && named.uid == 0
+        && opened.uid == expected_owner
+        && named.uid == expected_owner
         && opened.mode & 0o022 == 0
         && named.mode & 0o022 == 0
         && opened.identity == named.identity
@@ -3275,18 +3324,29 @@ fn open_local_account_node_at(
     Ok(Some(unsafe { std::fs::File::from_raw_fd(descriptor) }))
 }
 
-fn open_local_account_database(name: &std::ffi::CStr) -> io::Result<Option<OwnedFileStream>> {
-    let filesystem_root = open_worker_filesystem_root()?;
+fn open_local_account_database_at(
+    filesystem_root: &std::fs::File,
+    expected_owner: libc::uid_t,
+    parent_name: &std::ffi::CStr,
+    name: &std::ffi::CStr,
+) -> io::Result<Option<OwnedFileStream>> {
+    let root = local_account_database_node(filesystem_root)?;
+    let access_acl = posix_acl_present(filesystem_root, c"system.posix_acl_access")?;
+    let default_acl = posix_acl_present(filesystem_root, c"system.posix_acl_default")?;
+    if !local_account_database_root_is_trusted(root, expected_owner, access_acl, default_acl) {
+        return Ok(None);
+    }
     let Some(parent) = open_local_account_node_at(
-        &filesystem_root,
-        c"etc",
+        filesystem_root,
+        parent_name,
         libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
     )?
     else {
         return Ok(None);
     };
     let opened_parent = local_account_database_node(&parent)?;
-    let Some(named_parent) = local_account_database_named_node(&filesystem_root, c"etc")? else {
+    let Some(named_parent) = local_account_database_named_node(filesystem_root, parent_name)?
+    else {
         return Ok(None);
     };
     let access_acl = posix_acl_present(&parent, c"system.posix_acl_access")?;
@@ -3294,6 +3354,7 @@ fn open_local_account_database(name: &std::ffi::CStr) -> io::Result<Option<Owned
     if !local_account_database_directory_is_trusted(
         opened_parent,
         named_parent,
+        expected_owner,
         access_acl,
         default_acl,
     ) {
@@ -3313,7 +3374,8 @@ fn open_local_account_database(name: &std::ffi::CStr) -> io::Result<Option<Owned
         return Ok(None);
     };
     let access_acl = posix_acl_present(&file, c"system.posix_acl_access")?;
-    if !local_account_database_file_is_trusted(opened_file, named_file, access_acl) {
+    if !local_account_database_file_is_trusted(opened_file, named_file, expected_owner, access_acl)
+    {
         return Ok(None);
     }
 
@@ -4460,12 +4522,13 @@ mod tests {
         let mut parent = trusted_local_account_database_node(libc::S_IFDIR);
         parent.mode = libc::S_IFDIR | 0o755;
         assert!(local_account_database_directory_is_trusted(
-            parent, parent, false, false
+            parent, parent, 0, false, false
         ));
         for (access_acl, default_acl) in [(true, false), (false, true), (true, true)] {
             assert!(!local_account_database_directory_is_trusted(
                 parent,
                 parent,
+                0,
                 access_acl,
                 default_acl,
             ));
@@ -4475,34 +4538,123 @@ mod tests {
         assert!(!local_account_database_directory_is_trusted(
             insecure_parent,
             insecure_parent,
+            0,
             false,
             false,
         ));
     }
 
     #[test]
+    fn local_account_database_root_requires_a_root_owned_nonwritable_acl_free_directory() {
+        let mut root = trusted_local_account_database_node(libc::S_IFDIR);
+        root.mode = libc::S_IFDIR | 0o755;
+        assert!(local_account_database_root_is_trusted(
+            root, 0, false, false
+        ));
+
+        let mut wrong_owner = root;
+        wrong_owner.uid = 1000;
+        let mut writable = root;
+        writable.mode |= 0o002;
+        let mut special = root;
+        special.mode = libc::S_IFREG | 0o755;
+        for (node, access_acl, default_acl) in [
+            (wrong_owner, false, false),
+            (writable, false, false),
+            (special, false, false),
+            (root, true, false),
+            (root, false, true),
+        ] {
+            assert!(!local_account_database_root_is_trusted(
+                node,
+                0,
+                access_acl,
+                default_acl,
+            ));
+        }
+    }
+
+    #[test]
+    fn local_account_database_real_scan_uses_retained_relative_files_and_clean_eof() {
+        let fixture = fs::canonicalize(std::env::temp_dir())
+            .unwrap()
+            .join(format!(
+                "styrn-local-account-db-{}-{}",
+                std::process::id(),
+                uuid::Uuid::now_v7()
+            ));
+        let etc = fixture.join("etc");
+        fs::create_dir(&fixture).unwrap();
+        fs::create_dir(&etc).unwrap();
+        fs::set_permissions(&fixture, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::set_permissions(&etc, fs::Permissions::from_mode(0o755)).unwrap();
+        fs::write(
+            etc.join("passwd"),
+            b"root:x:0:0:root:/root:/bin/sh\nbuild-agent:x:2001:2001::/home/build-agent:/bin/bash\n",
+        )
+        .unwrap();
+        fs::write(etc.join("group"), b"root:x:0:\nbuild-agent:x:2001:\n").unwrap();
+        for leaf in [etc.join("passwd"), etc.join("group")] {
+            fs::set_permissions(leaf, fs::Permissions::from_mode(0o644)).unwrap();
+        }
+        let root = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&fixture)
+            .unwrap();
+        let account = UnixAccountDetails {
+            principal: WorkerPrincipal::new(
+                PrincipalKind::UnixUid,
+                "2001",
+                "build-agent",
+                WorkerAccountPolicy::Dedicated,
+            )
+            .unwrap(),
+            gid: 2001,
+            home: OsString::from("/home/build-agent"),
+            shell: OsString::from("/bin/bash"),
+        };
+
+        assert!(local_account_records_match_at(
+            &root,
+            unsafe { libc::geteuid() },
+            c"etc",
+            &account,
+            "build-agent",
+        )
+        .unwrap());
+
+        fs::remove_dir_all(fixture).unwrap();
+    }
+
+    #[test]
     fn local_account_database_leaf_rejects_acl_links_special_files_and_substitution() {
         let opened = trusted_local_account_database_node(libc::S_IFREG);
         assert!(local_account_database_file_is_trusted(
-            opened, opened, false
+            opened, opened, 0, false
         ));
         assert!(!local_account_database_file_is_trusted(
-            opened, opened, true
+            opened, opened, 0, true
         ));
 
         let mut link = opened;
         link.mode = libc::S_IFLNK | 0o777;
-        assert!(!local_account_database_file_is_trusted(opened, link, false));
+        assert!(!local_account_database_file_is_trusted(
+            opened, link, 0, false
+        ));
 
         let mut fifo = opened;
         fifo.mode = libc::S_IFIFO | 0o644;
-        assert!(!local_account_database_file_is_trusted(fifo, fifo, false));
+        assert!(!local_account_database_file_is_trusted(
+            fifo, fifo, 0, false
+        ));
 
         let mut replacement = opened;
         replacement.identity = PrivateFileIdentity::new(41, 74);
         assert!(!local_account_database_file_is_trusted(
             opened,
             replacement,
+            0,
             false,
         ));
     }
