@@ -40,6 +40,15 @@ thread_local! {
     static WORKER_NODE_POST_PUBLISH_FAILURE: std::cell::Cell<bool> = const {
         std::cell::Cell::new(false)
     };
+    static WORKER_NODE_POST_PUBLISH_FAULT: std::cell::Cell<Option<super::WorkerNodePostPublishFault>> = const {
+        std::cell::Cell::new(None)
+    };
+    static WORKER_NODE_PRINCIPAL_DRIFT: std::cell::Cell<bool> = const {
+        std::cell::Cell::new(false)
+    };
+    static WORKER_PROVENANCE_RETIREMENT_FAULT: std::cell::Cell<Option<super::WorkerProvenanceRetirementFault>> = const {
+        std::cell::Cell::new(None)
+    };
 }
 
 #[cfg(test)]
@@ -67,6 +76,55 @@ fn set_worker_recovery_identity_override(
 #[cfg(test)]
 pub(super) fn set_worker_node_post_publish_failure_for_test(fail: bool) {
     WORKER_NODE_POST_PUBLISH_FAILURE.with(|slot| slot.set(fail));
+}
+
+#[cfg(test)]
+pub(super) fn set_worker_node_post_publish_fault_for_test(
+    fault: Option<super::WorkerNodePostPublishFault>,
+) {
+    WORKER_NODE_POST_PUBLISH_FAULT.with(|slot| slot.set(fault));
+}
+
+#[cfg(test)]
+pub(super) fn set_worker_node_principal_drift_for_test(drift: bool) {
+    WORKER_NODE_PRINCIPAL_DRIFT.with(|slot| slot.set(drift));
+}
+
+#[cfg(test)]
+pub(super) fn set_worker_provenance_retirement_fault_for_test(
+    fault: Option<super::WorkerProvenanceRetirementFault>,
+) {
+    WORKER_PROVENANCE_RETIREMENT_FAULT.with(|slot| slot.set(fault));
+}
+
+#[cfg(test)]
+fn fail_worker_provenance_retirement_at(
+    phase: super::WorkerProvenanceRetirementFault,
+) -> io::Result<()> {
+    WORKER_PROVENANCE_RETIREMENT_FAULT.with(|slot| {
+        if slot.get() == Some(phase) {
+            slot.set(None);
+            Err(io::Error::other(format!(
+                "injected worker provenance retirement failure at {phase:?}"
+            )))
+        } else {
+            Ok(())
+        }
+    })
+}
+
+#[cfg(test)]
+fn fail_worker_node_post_publish_at(phase: super::WorkerNodePostPublishFault) -> io::Result<()> {
+    WORKER_NODE_POST_PUBLISH_FAULT.with(|slot| {
+        if slot.get() == Some(phase) {
+            slot.set(None);
+            Err(io::Error::other(format!(
+                "injected worker node publication failure at {phase:?}"
+            )))
+        } else {
+            Ok(())
+        }
+    })
 }
 
 fn worker_recovery_candidate_identity(
@@ -162,6 +220,12 @@ pub(super) fn validate_worker_root_principal(
 fn revalidate_worker_root_principal(
     layout: &super::WorkerDirectoryLayout,
 ) -> io::Result<WorkerPrincipal> {
+    #[cfg(test)]
+    if WORKER_NODE_PRINCIPAL_DRIFT.with(std::cell::Cell::get) {
+        return Err(permission_denied(
+            "injected worker principal drift before retained binding",
+        ));
+    }
     #[cfg(test)]
     if let Some(revalidation) = &layout.principal_revalidation {
         let (resolved, current) = match revalidation {
@@ -330,8 +394,8 @@ pub(super) fn create_worker_directory_layout(
         .unwrap_or_else(|_| unreachable!("the worker layout always has exactly five children"));
     let lease = WorkerDirectoryLease {
         _creation_lock: creation_lock,
+        layout: layout.clone(),
         nodes: [directory, repos, jobs, cache, artifacts, logs],
-        expected_uid,
         creation_provenance,
     };
     Ok(super::WorkerDirectoryCreation::new(
@@ -463,15 +527,28 @@ pub(super) fn create_worker_directory_node(
     layout: &super::WorkerDirectoryLayout,
     node: super::WorkerDirectoryNode,
 ) -> Result<super::WorkerDirectoryNodeCreateOutcome, super::WorkerDirectoryNodeCreationError> {
-    let (creation_lock, parent, path, expected_uid, opened) = (|| -> io::Result<_> {
+    let (
+        creation_lock,
+        lock_anchor_path,
+        lock_anchor_identity,
+        parent,
+        destination_parent,
+        destination_name,
+        path,
+        expected_uid,
+        opened,
+    ) = (|| -> Result<_, super::WorkerDirectoryNodeCreationError> {
         let root_components = absolute_worker_components(layout.root())?;
         let first_creatable = worker_first_creatable_component(layout, &root_components)?;
+        let lock_anchor_path = worker_creation_anchor_path(layout)?;
         let initial_uid = layout.principal.unix_uid()?;
         let creation_lock =
             open_worker_creation_anchor(&root_components, first_creatable, initial_uid)?;
+        let lock_anchor_identity = worker_directory_identity(&creation_lock)?;
         if unsafe { libc::flock(creation_lock.as_raw_fd(), libc::LOCK_EX) } == -1 {
-            return Err(io::Error::last_os_error());
+            return Err(io::Error::last_os_error().into());
         }
+        verify_worker_path_identity(&lock_anchor_path, lock_anchor_identity)?;
         let expected_uid = revalidate_worker_root_principal(layout)?.unix_uid()?;
         let (staging_parent, parent, name, path, canonical) = worker_node_location(
             layout,
@@ -481,16 +558,59 @@ pub(super) fn create_worker_directory_node(
             first_creatable,
             expected_uid,
         )?;
-        let opened = open_or_create_worker_directory_at(
+        let destination_parent = parent.try_clone()?;
+        let destination_name = CString::new(name)
+            .map_err(|_| invalid_data("worker directory component contains a NUL byte"))?;
+        let opened = match open_or_create_worker_directory_at(
             &staging_parent,
             &parent,
-            name,
+            destination_name.to_bytes(),
             true,
             expected_uid,
             canonical,
             None,
-        )?;
-        Ok((creation_lock, parent, path, expected_uid, opened))
+        ) {
+            Ok(opened) => opened,
+            Err(error) => {
+                let (primary, published) = error.into_parts();
+                let Some(opened) = published else {
+                    return Err(primary.into());
+                };
+                let mut creation_provenance = Vec::new();
+                if let Some(provenance) = opened.provenance {
+                    creation_provenance.push(provenance);
+                }
+                let evidence = WorkerDirectoryNodeFailureEvidence {
+                    lease: WorkerDirectoryNodeLease {
+                        creation_lock,
+                        lock_anchor_path,
+                        lock_anchor_identity,
+                        layout: layout.clone(),
+                        node: opened.directory,
+                        destination_parent,
+                        destination_name,
+                        path,
+                        creation_provenance,
+                    },
+                };
+                return Err(
+                    super::WorkerDirectoryNodeCreationError::with_retained_evidence(
+                        primary, evidence,
+                    ),
+                );
+            }
+        };
+        Ok((
+            creation_lock,
+            lock_anchor_path,
+            lock_anchor_identity,
+            parent,
+            destination_parent,
+            destination_name,
+            path,
+            expected_uid,
+            opened,
+        ))
     })()?;
     if opened.disposition == super::WorkerDirectoryNodeDisposition::Existing {
         return Ok(super::WorkerDirectoryNodeCreateOutcome::Existing);
@@ -501,19 +621,23 @@ pub(super) fn create_worker_directory_node(
     }
     let evidence = WorkerDirectoryNodeFailureEvidence {
         lease: WorkerDirectoryNodeLease {
-            _creation_lock: creation_lock,
+            creation_lock,
+            lock_anchor_path,
+            lock_anchor_identity,
+            layout: layout.clone(),
             node: opened.directory,
-            expected_uid,
+            destination_parent,
+            destination_name,
+            path,
             creation_provenance,
         },
-        path,
     };
     let operation = (|| -> io::Result<super::WorkerDirectoryNodeObservation> {
         harden_new_worker_directory(&evidence.lease.node, expected_uid)?;
         evidence.lease.node.sync_all()?;
         parent.sync_all()?;
         let identity = worker_directory_identity(&evidence.lease.node)?;
-        verify_worker_path_identity(&evidence.path, identity)?;
+        verify_worker_path_identity(&evidence.lease.path, identity)?;
         #[cfg(test)]
         if WORKER_NODE_POST_PUBLISH_FAILURE.with(std::cell::Cell::get) {
             return Err(io::Error::other(
@@ -521,7 +645,7 @@ pub(super) fn create_worker_directory_node(
             ));
         }
         Ok(super::WorkerDirectoryNodeObservation::new(
-            evidence.path.clone(),
+            evidence.lease.path.clone(),
             super::WorkerDirectoryNodeDisposition::Created,
             identity,
         ))
@@ -608,16 +732,20 @@ fn worker_node_location<'component>(
 
 #[allow(dead_code)] // Retained by the T0.14 per-node Action receipt binder.
 pub(super) struct WorkerDirectoryNodeLease {
-    _creation_lock: std::fs::File,
+    creation_lock: std::fs::File,
+    lock_anchor_path: PathBuf,
+    lock_anchor_identity: super::WorkerDirectoryIdentity,
+    layout: super::WorkerDirectoryLayout,
     node: std::fs::File,
-    expected_uid: u32,
+    destination_parent: std::fs::File,
+    destination_name: CString,
+    path: PathBuf,
     creation_provenance: Vec<WorkerCreationProvenance>,
 }
 
 #[allow(dead_code)] // Retained by the T0.14 per-node failure receipt binder.
 pub(super) struct WorkerDirectoryNodeFailureEvidence {
     lease: WorkerDirectoryNodeLease,
-    path: PathBuf,
 }
 
 #[allow(dead_code)] // Consumed by the T0.14 per-node failure receipt binder.
@@ -631,14 +759,9 @@ impl WorkerDirectoryNodeFailureEvidence {
 pub(super) fn reverify_worker_directory_node_failure_evidence(
     evidence: &WorkerDirectoryNodeFailureEvidence,
 ) -> io::Result<super::WorkerDirectoryNodeObservation> {
-    for provenance in &evidence.lease.creation_provenance {
-        verify_worker_creation_provenance(provenance)?;
-    }
-    verify_worker_directory_security(&evidence.lease.node, evidence.lease.expected_uid)?;
-    let identity = worker_directory_identity(&evidence.lease.node)?;
-    verify_worker_path_identity(&evidence.path, identity)?;
+    let identity = reverify_worker_directory_node_authority(&evidence.lease)?;
     Ok(super::WorkerDirectoryNodeObservation::new(
-        evidence.path.clone(),
+        evidence.lease.path.clone(),
         super::WorkerDirectoryNodeDisposition::Created,
         identity,
     ))
@@ -656,42 +779,55 @@ pub(super) fn reverify_worker_directory_node_lease(
     lease: &WorkerDirectoryNodeLease,
     observation: &super::WorkerDirectoryNodeObservation,
 ) -> io::Result<()> {
+    let identity = reverify_worker_directory_node_authority(lease)?;
+    if observation.path() != lease.path || identity != observation.identity() {
+        return Err(permission_denied(
+            "retained worker directory observation changed before release",
+        ));
+    }
+    Ok(())
+}
+
+fn reverify_worker_directory_node_authority(
+    lease: &WorkerDirectoryNodeLease,
+) -> io::Result<super::WorkerDirectoryIdentity> {
+    let principal = revalidate_worker_root_principal(&lease.layout)?;
+    let expected_uid = principal.unix_uid()?;
+    if worker_directory_identity(&lease.creation_lock)? != lease.lock_anchor_identity {
+        return Err(permission_denied(
+            "worker creation lock identity changed before retained evidence release",
+        ));
+    }
+    verify_worker_path_identity(&lease.lock_anchor_path, lease.lock_anchor_identity)?;
+    lease.node.sync_all()?;
+    lease.destination_parent.sync_all()?;
     for provenance in &lease.creation_provenance {
         verify_worker_creation_provenance(provenance)?;
     }
-    verify_worker_directory_security(&lease.node, lease.expected_uid)?;
-    if worker_directory_identity(&lease.node)? != observation.identity() {
+    verify_worker_directory_security(&lease.node, expected_uid)?;
+    let identity = worker_directory_identity(&lease.node)?;
+    let relative =
+        open_worker_directory_at(&lease.destination_parent, lease.destination_name.to_bytes())
+            .map_err(|_| {
+                permission_denied(
+                    "worker directory descriptor-relative path changed before release",
+                )
+            })?;
+    if worker_directory_identity(&relative)? != identity {
         return Err(permission_denied(
-            "retained worker directory identity changed before release",
+            "worker directory descriptor-relative path changed before release",
         ));
     }
-    verify_worker_path_identity(observation.path(), observation.identity())
+    verify_worker_path_identity(&lease.path, identity)?;
+    Ok(identity)
 }
 
 #[allow(dead_code)] // Consumed by the T0.14 per-node Action receipt binder.
 pub(super) fn retire_worker_directory_node_authority(
     lease: &WorkerDirectoryNodeLease,
 ) -> io::Result<()> {
-    for provenance in &lease.creation_provenance {
-        verify_worker_creation_provenance(provenance)?;
-    }
     for provenance in lease.creation_provenance.iter().rev() {
-        if unsafe { libc::unlinkat(provenance.directory.as_raw_fd(), c"record".as_ptr(), 0) } == -1
-        {
-            return Err(io::Error::last_os_error());
-        }
-        provenance.directory.sync_all()?;
-        if unsafe {
-            libc::unlinkat(
-                provenance.parent.as_raw_fd(),
-                provenance.name.as_ptr(),
-                libc::AT_REMOVEDIR,
-            )
-        } == -1
-        {
-            return Err(io::Error::last_os_error());
-        }
-        provenance.parent.sync_all()?;
+        retire_worker_creation_provenance(provenance)?;
     }
     Ok(())
 }
@@ -747,12 +883,13 @@ pub(super) fn retire_succeeded_worker_directory_evidence(
     verify_existing_worker_directory(&directory, expected_uid, canonical)?;
     let identity = worker_directory_identity(&directory)?;
     verify_worker_path_identity(&path, identity)?;
-    let Some(provenance) =
-        open_worker_creation_provenance(&staging_parent, &destination_parent, name, identity)?
-    else {
-        return Ok(());
-    };
-    retire_worker_creation_provenance(&provenance)
+    let retirement = open_worker_creation_provenance_for_retirement(
+        &staging_parent,
+        &destination_parent,
+        name,
+        identity,
+    )?;
+    retire_worker_creation_provenance_state(&retirement)
 }
 
 fn retire_worker_creation_provenance(provenance: &WorkerCreationProvenance) -> io::Result<()> {
@@ -760,23 +897,206 @@ fn retire_worker_creation_provenance(provenance: &WorkerCreationProvenance) -> i
     if unsafe { libc::unlinkat(provenance.directory.as_raw_fd(), c"record".as_ptr(), 0) } == -1 {
         return Err(io::Error::last_os_error());
     }
-    provenance.directory.sync_all()?;
-    if unsafe {
-        libc::unlinkat(
-            provenance.parent.as_raw_fd(),
-            provenance.name.as_ptr(),
-            libc::AT_REMOVEDIR,
+    #[cfg(test)]
+    fail_worker_provenance_retirement_at(
+        super::WorkerProvenanceRetirementFault::AfterRecordUnlink,
+    )?;
+    retire_empty_worker_creation_provenance(
+        &provenance.parent,
+        &provenance.name,
+        &provenance.directory,
+        provenance.directory_identity,
+    )
+}
+
+enum WorkerCreationProvenanceRetirement {
+    Active(WorkerCreationProvenance),
+    Empty {
+        parent: std::fs::File,
+        name: CString,
+        directory: std::fs::File,
+        directory_identity: super::WorkerDirectoryIdentity,
+    },
+    Absent {
+        parent: std::fs::File,
+    },
+}
+
+fn open_worker_creation_provenance_for_retirement(
+    staging_parent: &std::fs::File,
+    destination_parent: &std::fs::File,
+    destination_name: &[u8],
+    created_identity: super::WorkerDirectoryIdentity,
+) -> io::Result<WorkerCreationProvenanceRetirement> {
+    let parent = staging_parent.try_clone()?;
+    let name = worker_creation_provenance_name(destination_parent, destination_name)?;
+    let directory = match open_worker_directory_at(staging_parent, name.to_bytes()) {
+        Ok(directory) => directory,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(WorkerCreationProvenanceRetirement::Absent { parent });
+        }
+        Err(error) => return Err(error),
+    };
+    verify_staged_worker_directory_security(&directory, unsafe { libc::geteuid() }, unsafe {
+        libc::geteuid()
+    })?;
+    let directory_identity = worker_directory_identity(&directory)?;
+    let descriptor = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            c"record".as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
         )
-    } == -1
+    };
+    if descriptor == -1 {
+        let error = worker_directory_open_error(io::Error::last_os_error());
+        if error.kind() == io::ErrorKind::NotFound {
+            verify_empty_worker_creation_provenance(
+                &parent,
+                &name,
+                &directory,
+                directory_identity,
+            )?;
+            return Ok(WorkerCreationProvenanceRetirement::Empty {
+                parent,
+                name,
+                directory,
+                directory_identity,
+            });
+        }
+        return Err(error);
+    }
+    let file = unsafe { std::fs::File::from_raw_fd(descriptor) };
+    let expected_record = worker_creation_provenance_record(
+        staging_parent,
+        destination_parent,
+        destination_name,
+        created_identity,
+    )?;
+    let file_identity = worker_provenance_file_identity(&file)?;
+    let provenance = WorkerCreationProvenance {
+        parent,
+        name,
+        directory,
+        directory_identity,
+        file,
+        file_identity,
+        expected_record,
+    };
+    verify_worker_creation_provenance(&provenance)?;
+    Ok(WorkerCreationProvenanceRetirement::Active(provenance))
+}
+
+fn retire_worker_creation_provenance_state(
+    retirement: &WorkerCreationProvenanceRetirement,
+) -> io::Result<()> {
+    match retirement {
+        WorkerCreationProvenanceRetirement::Active(provenance) => {
+            retire_worker_creation_provenance(provenance)
+        }
+        WorkerCreationProvenanceRetirement::Empty {
+            parent,
+            name,
+            directory,
+            directory_identity,
+        } => retire_empty_worker_creation_provenance(parent, name, directory, *directory_identity),
+        WorkerCreationProvenanceRetirement::Absent { parent } => {
+            sync_worker_creation_provenance_parent(parent)
+        }
+    }
+}
+
+fn verify_empty_worker_creation_provenance(
+    parent: &std::fs::File,
+    name: &std::ffi::CStr,
+    directory: &std::fs::File,
+    expected_identity: super::WorkerDirectoryIdentity,
+) -> io::Result<()> {
+    verify_staged_worker_directory_security(directory, unsafe { libc::geteuid() }, unsafe {
+        libc::geteuid()
+    })?;
+    if worker_directory_identity(directory)? != expected_identity
+        || worker_directory_identity_at(parent, name)? != expected_identity
+        || !worker_parent_entry_snapshot(directory)?.is_empty()
     {
+        return Err(permission_denied(
+            "partially retired worker provenance is not the exact empty directory",
+        ));
+    }
+    Ok(())
+}
+
+fn retire_empty_worker_creation_provenance(
+    parent: &std::fs::File,
+    name: &std::ffi::CStr,
+    directory: &std::fs::File,
+    expected_identity: super::WorkerDirectoryIdentity,
+) -> io::Result<()> {
+    verify_empty_worker_creation_provenance(parent, name, directory, expected_identity)?;
+    directory.sync_all()?;
+    #[cfg(test)]
+    fail_worker_provenance_retirement_at(
+        super::WorkerProvenanceRetirementFault::AfterDirectorySync,
+    )?;
+    verify_empty_worker_creation_provenance(parent, name, directory, expected_identity)?;
+    if unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) } == -1 {
         return Err(io::Error::last_os_error());
     }
-    provenance.parent.sync_all()
+    #[cfg(test)]
+    fail_worker_provenance_retirement_at(
+        super::WorkerProvenanceRetirementFault::AfterDirectoryUnlink,
+    )?;
+    sync_worker_creation_provenance_parent(parent)
+}
+
+fn sync_worker_creation_provenance_parent(parent: &std::fs::File) -> io::Result<()> {
+    #[cfg(test)]
+    fail_worker_provenance_retirement_at(super::WorkerProvenanceRetirementFault::BeforeParentSync)?;
+    parent.sync_all()
 }
 struct OpenedWorkerDirectory {
     directory: std::fs::File,
     disposition: super::WorkerDirectoryNodeDisposition,
     provenance: Option<WorkerCreationProvenance>,
+}
+
+struct WorkerDirectoryOpenError {
+    primary: io::Error,
+    published: Option<OpenedWorkerDirectory>,
+}
+
+impl WorkerDirectoryOpenError {
+    fn published(primary: io::Error, published: OpenedWorkerDirectory) -> Self {
+        Self {
+            primary,
+            published: Some(published),
+        }
+    }
+
+    fn into_parts(self) -> (io::Error, Option<OpenedWorkerDirectory>) {
+        (self.primary, self.published)
+    }
+}
+
+impl std::fmt::Display for WorkerDirectoryOpenError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.primary.fmt(formatter)
+    }
+}
+
+impl From<io::Error> for WorkerDirectoryOpenError {
+    fn from(primary: io::Error) -> Self {
+        Self {
+            primary,
+            published: None,
+        }
+    }
+}
+
+impl From<WorkerDirectoryOpenError> for io::Error {
+    fn from(error: WorkerDirectoryOpenError) -> Self {
+        error.primary
+    }
 }
 
 struct WorkerCreationProvenance {
@@ -791,8 +1111,8 @@ struct WorkerCreationProvenance {
 
 pub(super) struct WorkerDirectoryLease {
     _creation_lock: std::fs::File,
+    layout: super::WorkerDirectoryLayout,
     nodes: [std::fs::File; 6],
-    expected_uid: u32,
     creation_provenance: Vec<WorkerCreationProvenance>,
 }
 
@@ -800,11 +1120,12 @@ pub(super) fn reverify_worker_directory_lease(
     lease: &WorkerDirectoryLease,
     observations: &[super::WorkerDirectoryNodeObservation; 6],
 ) -> io::Result<()> {
+    let expected_uid = revalidate_worker_root_principal(&lease.layout)?.unix_uid()?;
     for provenance in &lease.creation_provenance {
         verify_worker_creation_provenance(provenance)?;
     }
     for (directory, observation) in lease.nodes.iter().zip(observations) {
-        verify_worker_directory_security(directory, lease.expected_uid)?;
+        verify_worker_directory_security(directory, expected_uid)?;
         if worker_directory_identity(directory)? != observation.identity() {
             return Err(permission_denied(
                 "retained worker directory identity changed before release",
@@ -821,29 +1142,11 @@ pub(super) fn reverify_worker_directory_lease(
 }
 
 pub(super) fn retire_worker_directory_authority(lease: &WorkerDirectoryLease) -> io::Result<()> {
-    for provenance in &lease.creation_provenance {
-        verify_worker_creation_provenance(provenance)?;
-    }
     // Child evidence is retired before the root record, so a partial cleanup
     // leaves the root transaction visibly incomplete rather than silently
     // converting an unbound creation into an ordinary existing tree.
     for provenance in lease.creation_provenance.iter().rev() {
-        if unsafe { libc::unlinkat(provenance.directory.as_raw_fd(), c"record".as_ptr(), 0) } == -1
-        {
-            return Err(io::Error::last_os_error());
-        }
-        provenance.directory.sync_all()?;
-        if unsafe {
-            libc::unlinkat(
-                provenance.parent.as_raw_fd(),
-                provenance.name.as_ptr(),
-                libc::AT_REMOVEDIR,
-            )
-        } == -1
-        {
-            return Err(io::Error::last_os_error());
-        }
-        provenance.parent.sync_all()?;
+        retire_worker_creation_provenance(provenance)?;
     }
     Ok(())
 }
@@ -1118,6 +1421,17 @@ fn worker_first_creatable_component(
     }
 }
 
+fn worker_creation_anchor_path(layout: &super::WorkerDirectoryLayout) -> io::Result<PathBuf> {
+    match &layout.creation_policy {
+        super::WorkerRootCreationPolicy::ExistingParent { .. } => layout
+            .root()
+            .parent()
+            .map(Path::to_path_buf)
+            .ok_or_else(|| invalid_data("worker root has no fixed parent anchor")),
+        super::WorkerRootCreationPolicy::CreateMissingFrom(anchor) => Ok(anchor.clone()),
+    }
+}
+
 fn open_worker_creation_anchor(
     root_components: &[&[u8]],
     first_creatable: usize,
@@ -1174,7 +1488,7 @@ fn open_or_create_worker_directory_at(
     expected_uid: u32,
     existing_must_be_canonical: bool,
     unpublished_parent: Option<&CreatorOnlyUnpublishedParent<'_>>,
-) -> io::Result<OpenedWorkerDirectory> {
+) -> Result<OpenedWorkerDirectory, WorkerDirectoryOpenError> {
     match open_worker_directory_at(parent, name) {
         Ok(directory) => {
             if let Some(provenance) = open_worker_creation_provenance(
@@ -1188,7 +1502,7 @@ fn open_or_create_worker_directory_at(
                     if authority.worker_uid != expected_uid || !existing_must_be_canonical {
                         return Err(permission_denied(
                             "unpublished parent authority does not match the canonical worker child",
-                        ));
+                        ).into());
                     }
                     verify_existing_worker_directory(
                         &directory,
@@ -1203,7 +1517,7 @@ fn open_or_create_worker_directory_at(
                 }
                 return Err(permission_denied(
                     "published worker creation provenance is replayable conflict evidence, not receipt ownership",
-                ));
+                ).into());
             }
             verify_existing_worker_directory(&directory, expected_uid, existing_must_be_canonical)?;
             return Ok(OpenedWorkerDirectory {
@@ -1213,7 +1527,7 @@ fn open_or_create_worker_directory_at(
             });
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound && may_create => {}
-        Err(error) => return Err(error),
+        Err(error) => return Err(error.into()),
     }
     let staged =
         create_unpublished_worker_directory(staging_parent, parent, name, expected_uid, false)?;
@@ -1272,8 +1586,13 @@ fn create_or_open_complete_worker_root(
     )?;
     maybe_interrupt_worker_mkdir();
     let children_result = {
-        let recovery_authority =
-            verify_unpublished_worker_recovery_authority(&staged, expected_uid)?;
+        let recovery_authority = verify_unpublished_worker_recovery_authority(
+            &staged,
+            root_parent,
+            root_parent,
+            root_name,
+            expected_uid,
+        )?;
         open_or_create_worker_children(
             root_parent,
             &staged.directory,
@@ -1569,6 +1888,12 @@ fn verify_staged_or_published_worker_directory(
 struct CreatorOnlyUnpublishedParent<'authority> {
     parent: &'authority std::fs::File,
     identity: super::WorkerDirectoryIdentity,
+    staging_parent: &'authority std::fs::File,
+    staging_parent_identity: super::WorkerDirectoryIdentity,
+    staging_name: CString,
+    canonical_parent: &'authority std::fs::File,
+    canonical_parent_identity: super::WorkerDirectoryIdentity,
+    canonical_name: CString,
     creator_uid: u32,
     worker_uid: u32,
 }
@@ -1583,6 +1908,34 @@ impl CreatorOnlyUnpublishedParent<'_> {
             return Err(permission_denied(
                 "unpublished worker parent authority no longer names the retained directory",
             ));
+        }
+        if worker_directory_identity(self.staging_parent)? != self.staging_parent_identity
+            || worker_directory_identity(self.canonical_parent)? != self.canonical_parent_identity
+            || worker_directory_identity_at(self.staging_parent, &self.staging_name).map_err(
+                |_| {
+                    permission_denied(
+                        "unpublished worker parent no longer occupies its retained staging name",
+                    )
+                },
+            )? != self.identity
+        {
+            return Err(permission_denied(
+                "unpublished worker parent no longer occupies its retained staging name",
+            ));
+        }
+        match worker_directory_identity_at(self.canonical_parent, &self.canonical_name) {
+            Ok(identity) if identity == self.identity => {
+                return Err(permission_denied(
+                    "unpublished worker parent was published at its canonical destination",
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(_) => {
+                return Err(permission_denied(
+                    "canonical worker destination cannot be reverified as absent or different",
+                ));
+            }
         }
         let status = worker_directory_status(self.parent)?;
         if status.st_uid != self.creator_uid || status.st_mode & 0o777 != 0o700 {
@@ -1599,6 +1952,9 @@ impl CreatorOnlyUnpublishedParent<'_> {
 
 fn verify_unpublished_worker_recovery_authority<'authority>(
     staged: &'authority StagedWorkerDirectory,
+    staging_parent: &'authority std::fs::File,
+    canonical_parent: &'authority std::fs::File,
+    canonical_name: &[u8],
     expected_uid: u32,
 ) -> io::Result<Option<CreatorOnlyUnpublishedParent<'authority>>> {
     if staged.created {
@@ -1625,12 +1981,21 @@ fn verify_unpublished_worker_recovery_authority<'authority>(
             "interrupted worker staging parent identity changed",
         ));
     }
-    Ok(Some(CreatorOnlyUnpublishedParent {
+    let authority = CreatorOnlyUnpublishedParent {
         parent: &staged.directory,
         identity: staged.identity,
+        staging_parent,
+        staging_parent_identity: worker_directory_identity(staging_parent)?,
+        staging_name: staged.name.clone(),
+        canonical_parent,
+        canonical_parent_identity: worker_directory_identity(canonical_parent)?,
+        canonical_name: CString::new(canonical_name)
+            .map_err(|_| invalid_data("worker directory component contains a NUL byte"))?,
         creator_uid,
         worker_uid: expected_uid,
-    }))
+    };
+    authority.reverify_parent(&staged.directory)?;
+    Ok(Some(authority))
 }
 
 fn verify_staged_worker_directory_entries(
@@ -1712,7 +2077,7 @@ fn publish_staged_worker_directory(
     created_expected_uid: u32,
     existing_expected_uid: u32,
     existing_must_be_canonical: bool,
-) -> io::Result<OpenedWorkerDirectory> {
+) -> Result<OpenedWorkerDirectory, WorkerDirectoryOpenError> {
     let complete_root = existing_must_be_canonical
         && worker_directory_identity(staging_parent)?
             == worker_directory_identity(destination_parent)?;
@@ -1723,8 +2088,13 @@ fn publish_staged_worker_directory(
         unsafe { libc::geteuid() },
         created_expected_uid,
     )?;
-    let _recovery_authority =
-        verify_unpublished_worker_recovery_authority(&staged, created_expected_uid)?;
+    drop(verify_unpublished_worker_recovery_authority(
+        &staged,
+        staging_parent,
+        destination_parent,
+        destination_name.to_bytes(),
+        created_expected_uid,
+    )?);
     let provenance = match open_worker_creation_provenance(
         staging_parent,
         destination_parent,
@@ -1741,7 +2111,8 @@ fn publish_staged_worker_directory(
         None => {
             return Err(permission_denied(
                 "interrupted worker staging directory lacks exact creation provenance",
-            ));
+            )
+            .into());
         }
     };
     maybe_interrupt_worker_publication(
@@ -1761,36 +2132,78 @@ fn publish_staged_worker_directory(
         )
     } == 0
     {
-        let reopened = open_worker_directory_at(destination_parent, destination_name.to_bytes())?;
-        if worker_directory_identity(&reopened)? != staged.identity {
-            return Err(permission_denied(
-                "published worker directory identity changed before verification",
-            ));
-        }
-        destination_parent.sync_all()?;
-        if existing_must_be_canonical && !complete_root {
-            harden_new_worker_directory(&staged.directory, created_expected_uid)?;
-            staged.directory.sync_all()?;
-            destination_parent.sync_all()?;
-            verify_worker_directory_security(&staged.directory, created_expected_uid)?;
-        } else {
-            verify_staged_or_published_worker_directory(&staged.directory, created_expected_uid)?;
-        }
-        return Ok(OpenedWorkerDirectory {
+        let opened = OpenedWorkerDirectory {
             directory: staged.directory,
             disposition: super::WorkerDirectoryNodeDisposition::Created,
             provenance: Some(provenance),
-        });
+        };
+        let finish = (|| -> io::Result<()> {
+            #[cfg(test)]
+            fail_worker_node_post_publish_at(super::WorkerNodePostPublishFault::AfterRename)?;
+            #[cfg(test)]
+            fail_worker_node_post_publish_at(
+                super::WorkerNodePostPublishFault::BeforeDestinationReopen,
+            )?;
+            let reopened =
+                open_worker_directory_at(destination_parent, destination_name.to_bytes())?;
+            #[cfg(test)]
+            fail_worker_node_post_publish_at(
+                super::WorkerNodePostPublishFault::BeforeIdentityCheck,
+            )?;
+            if worker_directory_identity(&reopened)? != staged.identity {
+                return Err(permission_denied(
+                    "published worker directory identity changed before verification",
+                ));
+            }
+            #[cfg(test)]
+            fail_worker_node_post_publish_at(
+                super::WorkerNodePostPublishFault::BeforeFirstParentSync,
+            )?;
+            destination_parent.sync_all()?;
+            if existing_must_be_canonical && !complete_root {
+                #[cfg(test)]
+                fail_worker_node_post_publish_at(
+                    super::WorkerNodePostPublishFault::BeforeHardening,
+                )?;
+                harden_new_worker_directory(&opened.directory, created_expected_uid)?;
+                #[cfg(test)]
+                fail_worker_node_post_publish_at(
+                    super::WorkerNodePostPublishFault::BeforeNodeSync,
+                )?;
+                opened.directory.sync_all()?;
+                #[cfg(test)]
+                fail_worker_node_post_publish_at(
+                    super::WorkerNodePostPublishFault::BeforeSecondParentSync,
+                )?;
+                destination_parent.sync_all()?;
+                #[cfg(test)]
+                fail_worker_node_post_publish_at(
+                    super::WorkerNodePostPublishFault::BeforeSecurityCheck,
+                )?;
+                verify_worker_directory_security(&opened.directory, created_expected_uid)?;
+            } else {
+                verify_staged_or_published_worker_directory(
+                    &opened.directory,
+                    created_expected_uid,
+                )?;
+            }
+            Ok(())
+        })();
+        return match finish {
+            Ok(()) => Ok(opened),
+            Err(error) => Err(WorkerDirectoryOpenError::published(error, opened)),
+        };
     }
     let error = io::Error::last_os_error();
     if error.kind() != io::ErrorKind::AlreadyExists {
-        return Err(error);
+        return Err(error.into());
     }
     let directory = open_worker_directory_at(destination_parent, destination_name.to_bytes())?;
     if worker_directory_identity(&directory)? != staged.identity {
         return Err(permission_denied(
             "worker publication conflict retains exact creation evidence",
-        ));
+        )
+        .into());
     }
     verify_staged_or_published_worker_directory(&directory, existing_expected_uid)?;
     if existing_must_be_canonical && !complete_root {
@@ -3208,18 +3621,22 @@ mod tests {
 
     #[test]
     fn creator_only_unpublished_parent_requires_distinct_worker_and_live_identity() {
-        let parent = fs::canonicalize(std::env::temp_dir())
+        let outer = fs::canonicalize(std::env::temp_dir())
             .unwrap()
             .join(format!(
                 "styrn-worker-creator-only-capability-{}-{}",
                 std::process::id(),
                 uuid::Uuid::now_v7()
             ));
-        fs::create_dir(&parent).unwrap();
-        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
-        let directory = open_existing_worker_path(&parent).unwrap();
+        fs::create_dir(&outer).unwrap();
+        let staging_path = outer.join("private-root");
+        let canonical_path = outer.join("root");
+        fs::create_dir(&staging_path).unwrap();
+        fs::set_permissions(&staging_path, fs::Permissions::from_mode(0o700)).unwrap();
+        let staging_parent = open_existing_worker_path(&outer).unwrap();
+        let directory = open_existing_worker_path(&staging_path).unwrap();
         let staged = StagedWorkerDirectory {
-            name: CString::new("unused-test-name").unwrap(),
+            name: CString::new("private-root").unwrap(),
             identity: worker_directory_identity(&directory).unwrap(),
             directory,
             created: false,
@@ -3230,17 +3647,41 @@ mod tests {
         {
             let capability = verify_unpublished_worker_recovery_authority(
                 &staged,
+                &staging_parent,
+                &staging_parent,
+                b"root",
                 distinct_worker_uid,
             )
             .unwrap()
             .expect("a retained creator-only parent should mint authority for a distinct worker");
             capability.reverify_parent(&staged.directory).unwrap();
-            assert!(verify_unpublished_worker_recovery_authority(&staged, creator_uid).is_err());
-            fs::set_permissions(&parent, fs::Permissions::from_mode(0o750)).unwrap();
+            assert!(verify_unpublished_worker_recovery_authority(
+                &staged,
+                &staging_parent,
+                &staging_parent,
+                b"root",
+                creator_uid,
+            )
+            .is_err());
+            fs::set_permissions(&staging_path, fs::Permissions::from_mode(0o750)).unwrap();
+            assert!(capability.reverify_parent(&staged.directory).is_err());
+            fs::set_permissions(&staging_path, fs::Permissions::from_mode(0o700)).unwrap();
+            capability.reverify_parent(&staged.directory).unwrap();
+
+            fs::create_dir(&canonical_path).unwrap();
+            capability.reverify_parent(&staged.directory).unwrap();
+            fs::remove_dir(&canonical_path).unwrap();
+
+            fs::rename(&staging_path, &canonical_path).unwrap();
+            fs::create_dir(&staging_path).unwrap();
+            fs::set_permissions(&staging_path, fs::Permissions::from_mode(0o700)).unwrap();
             assert!(capability.reverify_parent(&staged.directory).is_err());
         }
         drop(staged);
-        fs::remove_dir(parent).unwrap();
+        drop(staging_parent);
+        fs::remove_dir(staging_path).unwrap();
+        fs::remove_dir(canonical_path).unwrap();
+        fs::remove_dir(outer).unwrap();
     }
 
     #[test]

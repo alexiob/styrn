@@ -42,6 +42,14 @@ thread_local! {
         const { std::cell::Cell::new(None) };
     static AFTER_REAL_WORKER_PRIVILEGE_CLEANUP_HOOK: std::cell::Cell<Option<WorkerPrivilegeCleanupHook>> =
         const { std::cell::Cell::new(None) };
+    static WORKER_NODE_PRINCIPAL_DRIFT: std::cell::Cell<bool> = const {
+        std::cell::Cell::new(false)
+    };
+}
+
+#[cfg(test)]
+pub(super) fn set_worker_node_principal_drift_for_test(drift: bool) {
+    WORKER_NODE_PRINCIPAL_DRIFT.with(|slot| slot.set(drift));
 }
 
 #[cfg(test)]
@@ -119,7 +127,7 @@ fn set_worker_privilege_test_plan(plan: WorkerPrivilegeTestPlan) {
 }
 
 #[cfg(test)]
-fn set_worker_native_create_failure_after(created: Option<usize>) {
+pub(super) fn set_worker_native_create_failure_after(created: Option<usize>) {
     WORKER_NATIVE_CREATE_FAILURE_AFTER.with(|slot| slot.set(created));
 }
 
@@ -665,6 +673,12 @@ fn revalidate_worker_root_principal(
     layout: &super::WorkerDirectoryLayout,
 ) -> io::Result<WorkerPrincipal> {
     #[cfg(test)]
+    if WORKER_NODE_PRINCIPAL_DRIFT.with(std::cell::Cell::get) {
+        return Err(permission_denied(
+            "injected worker principal drift before retained binding",
+        ));
+    }
+    #[cfg(test)]
     if let Some(revalidation) = &layout.principal_revalidation {
         let (resolved, current) = match revalidation {
             super::WorkerPrincipalRevalidationTest::Resolved { principal, current } => {
@@ -856,7 +870,7 @@ pub(super) fn create_worker_directory_layout(
             test_plan,
         )?
     };
-    finish_worker_directory_mutation(resolution, creation_lock, lock_anchor)
+    finish_worker_directory_mutation(resolution, creation_lock, lock_anchor, layout)
 }
 
 pub(super) fn inspect_worker_directory_node(
@@ -1012,7 +1026,7 @@ pub(super) fn create_worker_directory_node(
             test_plan,
         )?
     };
-    finish_worker_directory_node_mutation(resolution, creation_lock, lock_anchor)
+    finish_worker_directory_node_mutation(resolution, creation_lock, lock_anchor, layout)
 }
 
 fn perform_worker_directory_node_mutation(
@@ -1054,8 +1068,6 @@ fn perform_worker_directory_node_mutation(
                 opened.disposition,
                 opened.identity,
             ),
-            directory: opened.directory,
-            owner_sid: security.owner_sid.clone(),
             created: std::mem::take(&mut created),
         })
     })();
@@ -1066,10 +1078,7 @@ fn perform_worker_directory_node_mutation(
         },
         Err(error) => super::WindowsPrivilegedWorkerMutation {
             operation_error: Some(error),
-            evidence: WorkerNodeMutationEvidence::Partial {
-                created,
-                owner_sid: security.owner_sid.clone(),
-            },
+            evidence: WorkerNodeMutationEvidence::Partial { created },
         },
     }
 }
@@ -1209,14 +1218,11 @@ enum WorkerNodeMutationEvidence {
     Complete(Box<WorkerNodeCompleteEvidence>),
     Partial {
         created: CreatedWorkerDirectoryEvidence,
-        owner_sid: Vec<u8>,
     },
 }
 
 struct WorkerNodeCompleteEvidence {
     observation: super::WorkerDirectoryNodeObservation,
-    directory: std::fs::File,
-    owner_sid: Vec<u8>,
     created: CreatedWorkerDirectoryEvidence,
 }
 
@@ -1224,6 +1230,7 @@ fn finish_worker_directory_node_mutation(
     resolution: super::WindowsPrivilegedWorkerMutationResolution<WorkerNodeMutationEvidence>,
     creation_lock: WorkerLayoutLock,
     lock_anchor: WorkerLockAnchor,
+    layout: &super::WorkerDirectoryLayout,
 ) -> Result<super::WorkerDirectoryNodeCreateOutcome, super::WorkerDirectoryNodeCreationError> {
     match resolution {
         super::WindowsPrivilegedWorkerMutationResolution::Success(
@@ -1231,21 +1238,34 @@ fn finish_worker_directory_node_mutation(
         ) => {
             let WorkerNodeCompleteEvidence {
                 observation,
-                directory,
-                owner_sid,
-                created: _,
+                mut created,
             } = *complete;
             if observation.disposition() == super::WorkerDirectoryNodeDisposition::Existing {
                 return Ok(super::WorkerDirectoryNodeCreateOutcome::Existing);
             }
+            if created.created.len() != 1 {
+                let evidence = created.into_failure(creation_lock, lock_anchor, layout.clone());
+                return Err(
+                    super::WorkerDirectoryNodeCreationError::with_retained_evidence(
+                        permission_denied(
+                            "successful worker node mutation lacks exact native creation authority",
+                        ),
+                        evidence,
+                    ),
+                );
+            }
+            let created = created
+                .created
+                .pop()
+                .expect("the exact created worker node was counted above");
             Ok(super::WorkerDirectoryNodeCreateOutcome::Created(
                 super::WorkerDirectoryNodeCreation::new(
                     observation,
                     WorkerDirectoryNodeLease {
                         _creation_lock: creation_lock,
                         lock_anchor,
-                        node: directory,
-                        owner_sid,
+                        layout: layout.clone(),
+                        created,
                     },
                 ),
             ))
@@ -1254,7 +1274,7 @@ fn finish_worker_directory_node_mutation(
             WorkerNodeMutationEvidence::Partial { .. },
         ) => unreachable!("a successful worker node mutation is complete"),
         super::WindowsPrivilegedWorkerMutationResolution::OperationFailure { error, evidence } => {
-            let evidence = evidence.into_failure(creation_lock, lock_anchor);
+            let evidence = evidence.into_failure(creation_lock, lock_anchor, layout.clone());
             if evidence.retained_count() == 0 {
                 Err(error.into())
             } else {
@@ -1270,7 +1290,7 @@ fn finish_worker_directory_node_mutation(
             cleanup_error,
             evidence,
         } => {
-            let evidence = evidence.into_failure(creation_lock, lock_anchor);
+            let evidence = evidence.into_failure(creation_lock, lock_anchor, layout.clone());
             if evidence.retained_count() == 0 {
                 Err(cleanup_error.into())
             } else {
@@ -1290,17 +1310,16 @@ impl WorkerNodeMutationEvidence {
         self,
         creation_lock: WorkerLayoutLock,
         lock_anchor: WorkerLockAnchor,
+        layout: super::WorkerDirectoryLayout,
     ) -> WorkerDirectoryNodeFailureEvidence {
-        let (created, owner_sid) = match self {
+        let created = match self {
             Self::Complete(complete) => {
-                let WorkerNodeCompleteEvidence {
-                    owner_sid, created, ..
-                } = *complete;
-                (created, owner_sid)
+                let WorkerNodeCompleteEvidence { created, .. } = *complete;
+                created
             }
-            Self::Partial { created, owner_sid } => (created, owner_sid),
+            Self::Partial { created } => created,
         };
-        created.into_failure(creation_lock, lock_anchor, owner_sid)
+        created.into_failure(creation_lock, lock_anchor, layout)
     }
 }
 
@@ -1308,8 +1327,8 @@ impl WorkerNodeMutationEvidence {
 pub(super) struct WorkerDirectoryNodeLease {
     _creation_lock: WorkerLayoutLock,
     lock_anchor: WorkerLockAnchor,
-    node: std::fs::File,
-    owner_sid: Vec<u8>,
+    layout: super::WorkerDirectoryLayout,
+    created: RetainedCreatedWorkerDirectory,
 }
 
 #[allow(dead_code)] // Retained by the T0.14 per-node failure receipt binder.
@@ -1340,18 +1359,13 @@ pub(super) fn reverify_worker_directory_node_lease(
     lease: &WorkerDirectoryNodeLease,
     observation: &super::WorkerDirectoryNodeObservation,
 ) -> io::Result<()> {
+    let principal = revalidate_worker_root_principal(&lease.layout)?;
+    let owner_sid = principal_sid(&principal)?;
     lease.lock_anchor.reverify_path_identity()?;
-    verify_worker_directory_security(&lease.node, &lease.owner_sid)?;
-    if worker_directory_identity(&lease.node)? != observation.identity() {
+    let identity = reverify_retained_created_worker_directory(&lease.created, &owner_sid)?;
+    if identity != observation.identity() || lease.created.intended.path != observation.path() {
         return Err(permission_denied(
-            "retained worker directory identity changed before release",
-        ));
-    }
-    let path = WindowsWorkerPath::parse(observation.path())?;
-    let reopened = open_existing_worker_path(&path)?;
-    if worker_directory_identity(&reopened)? != observation.identity() {
-        return Err(permission_denied(
-            "worker directory path changed before retained evidence release",
+            "retained worker directory observation changed before release",
         ));
     }
     Ok(())
@@ -1507,7 +1521,6 @@ fn perform_worker_directory_mutation(
                 root: root_observation,
                 children,
                 nodes: [directory, repos, jobs, cache, artifacts, logs],
-                owner_sid: security.owner_sid.clone(),
                 created: std::mem::take(&mut created),
             },
         )))
@@ -1519,7 +1532,7 @@ fn perform_worker_directory_mutation(
         },
         Err(error) => super::WindowsPrivilegedWorkerMutation {
             operation_error: Some(error),
-            evidence: created.into_partial(security.owner_sid.clone()),
+            evidence: created.into_partial(),
         },
     }
 }
@@ -1592,13 +1605,14 @@ fn finish_worker_directory_mutation(
     resolution: super::WindowsPrivilegedWorkerMutationResolution<WorkerMutationEvidence>,
     creation_lock: WorkerLayoutLock,
     lock_anchor: WorkerLockAnchor,
+    layout: &super::WorkerDirectoryLayout,
 ) -> Result<super::WorkerDirectoryCreation, super::WorkerDirectoryCreationError> {
     match resolution {
         super::WindowsPrivilegedWorkerMutationResolution::Success(evidence) => {
-            Ok(evidence.into_creation(creation_lock, lock_anchor))
+            Ok(evidence.into_creation(creation_lock, lock_anchor, layout.clone()))
         }
         super::WindowsPrivilegedWorkerMutationResolution::OperationFailure { error, evidence } => {
-            let evidence = evidence.into_failure(creation_lock, lock_anchor);
+            let evidence = evidence.into_failure(creation_lock, lock_anchor, layout.clone());
             Err(
                 super::WorkerDirectoryCreationError::with_windows_retained_evidence(
                     error, None, false, evidence,
@@ -1610,7 +1624,7 @@ fn finish_worker_directory_mutation(
             cleanup_error,
             evidence,
         } => {
-            let evidence = evidence.into_failure(creation_lock, lock_anchor);
+            let evidence = evidence.into_failure(creation_lock, lock_anchor, layout.clone());
             Err(
                 super::WorkerDirectoryCreationError::with_windows_retained_evidence(
                     cleanup_error,
@@ -1627,7 +1641,6 @@ enum WorkerMutationEvidence {
     Complete(Box<CompleteWorkerMutationEvidence>),
     Partial {
         created: CreatedWorkerDirectoryEvidence,
-        owner_sid: Vec<u8>,
     },
 }
 
@@ -1635,7 +1648,6 @@ struct CompleteWorkerMutationEvidence {
     root: super::WorkerDirectoryNodeObservation,
     children: [super::WorkerDirectoryNodeObservation; 5],
     nodes: [std::fs::File; 6],
-    owner_sid: Vec<u8>,
     created: CreatedWorkerDirectoryEvidence,
 }
 
@@ -1644,6 +1656,7 @@ impl WorkerMutationEvidence {
         self,
         creation_lock: WorkerLayoutLock,
         lock_anchor: WorkerLockAnchor,
+        layout: super::WorkerDirectoryLayout,
     ) -> super::WorkerDirectoryCreation {
         let Self::Complete(complete) = self else {
             unreachable!("only a complete worker mutation can resolve as success");
@@ -1652,7 +1665,6 @@ impl WorkerMutationEvidence {
             root,
             children,
             nodes,
-            owner_sid,
             created: _,
         } = *complete;
         super::WorkerDirectoryCreation::new(
@@ -1661,8 +1673,8 @@ impl WorkerMutationEvidence {
             WorkerDirectoryLease {
                 _creation_lock: creation_lock,
                 lock_anchor,
+                layout,
                 nodes,
-                owner_sid,
             },
         )
     }
@@ -1671,17 +1683,16 @@ impl WorkerMutationEvidence {
         self,
         creation_lock: WorkerLayoutLock,
         lock_anchor: WorkerLockAnchor,
+        layout: super::WorkerDirectoryLayout,
     ) -> WorkerDirectoryFailureEvidence {
-        let (created, owner_sid) = match self {
+        let created = match self {
             Self::Complete(complete) => {
-                let CompleteWorkerMutationEvidence {
-                    owner_sid, created, ..
-                } = *complete;
-                (created, owner_sid)
+                let CompleteWorkerMutationEvidence { created, .. } = *complete;
+                created
             }
-            Self::Partial { created, owner_sid } => (created, owner_sid),
+            Self::Partial { created, .. } => created,
         };
-        created.into_failure(creation_lock, lock_anchor, owner_sid)
+        created.into_failure(creation_lock, lock_anchor, layout)
     }
 }
 
@@ -1717,25 +1728,22 @@ impl CreatedWorkerDirectoryEvidence {
         })
     }
 
-    fn into_partial(self, owner_sid: Vec<u8>) -> WorkerMutationEvidence {
-        WorkerMutationEvidence::Partial {
-            created: self,
-            owner_sid,
-        }
+    fn into_partial(self) -> WorkerMutationEvidence {
+        WorkerMutationEvidence::Partial { created: self }
     }
 
     fn into_failure(
         self,
         creation_lock: WorkerLayoutLock,
         lock_anchor: WorkerLockAnchor,
-        owner_sid: Vec<u8>,
+        layout: super::WorkerDirectoryLayout,
     ) -> WorkerDirectoryFailureEvidence {
         WorkerDirectoryFailureEvidence {
             created: self,
             lease: WorkerDirectoryFailureLease {
                 _creation_lock: creation_lock,
                 lock_anchor,
-                owner_sid,
+                layout,
             },
         }
     }
@@ -1835,8 +1843,8 @@ struct OpenedWorkerDirectory {
 pub(super) struct WorkerDirectoryLease {
     _creation_lock: WorkerLayoutLock,
     lock_anchor: WorkerLockAnchor,
+    layout: super::WorkerDirectoryLayout,
     nodes: [std::fs::File; 6],
-    owner_sid: Vec<u8>,
 }
 
 pub(super) struct WorkerDirectoryFailureEvidence {
@@ -1847,7 +1855,7 @@ pub(super) struct WorkerDirectoryFailureEvidence {
 struct WorkerDirectoryFailureLease {
     _creation_lock: WorkerLayoutLock,
     lock_anchor: WorkerLockAnchor,
-    owner_sid: Vec<u8>,
+    layout: super::WorkerDirectoryLayout,
 }
 
 impl WorkerDirectoryFailureEvidence {
@@ -1885,9 +1893,11 @@ pub(super) fn reverify_worker_directory_lease(
     lease: &WorkerDirectoryLease,
     observations: &[super::WorkerDirectoryNodeObservation; 6],
 ) -> io::Result<()> {
+    let principal = revalidate_worker_root_principal(&lease.layout)?;
+    let owner_sid = principal_sid(&principal)?;
     lease.lock_anchor.reverify_path_identity()?;
     for (directory, observation) in lease.nodes.iter().zip(observations) {
-        verify_worker_directory_security(directory, &lease.owner_sid)?;
+        verify_worker_directory_security(directory, &owner_sid)?;
         if worker_directory_identity(directory)? != observation.identity() {
             return Err(permission_denied(
                 "retained worker directory identity changed before release",
@@ -1907,11 +1917,12 @@ pub(super) fn reverify_worker_directory_lease(
 pub(super) fn reverify_worker_directory_failure_evidence(
     evidence: &WorkerDirectoryFailureEvidence,
 ) -> io::Result<Vec<super::WorkerDirectoryNodeObservation>> {
+    let principal = revalidate_worker_root_principal(&evidence.lease.layout)?;
+    let owner_sid = principal_sid(&principal)?;
     evidence.lease.lock_anchor.reverify_path_identity()?;
     let mut observations = Vec::with_capacity(evidence.created.created.len());
     for created in &evidence.created.created {
-        let identity =
-            reverify_retained_created_worker_directory(created, &evidence.lease.owner_sid)?;
+        let identity = reverify_retained_created_worker_directory(created, &owner_sid)?;
         observations.push(super::WorkerDirectoryNodeObservation::new(
             created.intended.path.clone(),
             super::WorkerDirectoryNodeDisposition::Created,
