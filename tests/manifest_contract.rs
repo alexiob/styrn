@@ -55,6 +55,7 @@ fn current_user_manifest() -> MachineManifest {
     manifest
 }
 
+#[allow(dead_code)] // Windows refuses runnable dedicated publication until T0.18.
 fn dedicated_account_handle_for_manifest_test(
 ) -> (platform::DedicatedAccountHandle, platform::WorkerPrincipal) {
     let current = current_worker_principal();

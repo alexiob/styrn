@@ -14,6 +14,9 @@ mod probe_values;
 #[allow(dead_code)]
 mod probe_wire;
 #[allow(dead_code)]
+#[cfg(not(any(action_core_fixture, action_compile_fixture)))]
+pub(crate) mod promotion;
+#[allow(dead_code)]
 #[cfg(not(action_core_fixture))]
 pub(crate) mod receipt;
 

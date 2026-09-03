@@ -43,7 +43,7 @@ fn worker_directory_action(
     )
 }
 
-pub(super) fn dedicated_ready_for_test(
+pub(in crate::setup) fn dedicated_ready_for_test(
     selector: &str,
 ) -> (
     super::dedicated_account::DedicatedAccountReady,

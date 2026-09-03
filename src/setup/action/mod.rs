@@ -1215,6 +1215,9 @@ pub(in crate::setup) use dedicated_account::dedicated_account_prerequisite_actio
 #[allow(unused_imports)] // T0.20 consumes the ready-or-fallback selection.
 pub(in crate::setup) use dedicated_account::select_dedicated_account;
 #[cfg(not(action_core_fixture))]
+#[allow(unused_imports)] // Promotion is absent from compile-boundary fixtures.
+pub(in crate::setup) use dedicated_account::DedicatedAccountReady;
+#[cfg(not(action_core_fixture))]
 mod worker_directory;
 #[cfg(not(action_core_fixture))]
 #[allow(unused_imports)] // T0.20 consumes the production constructor.
@@ -1224,13 +1227,16 @@ pub(in crate::setup::action) use worker_directory::current_user_worker_directory
 #[cfg(not(action_core_fixture))]
 #[allow(unused_imports)] // T0.20 consumes the selected dedicated System plan.
 pub(in crate::setup) use worker_directory::dedicated_system_worker_directory_plan;
+#[cfg(test)]
+#[allow(unused_imports)] // Windows refuses runnable dedicated publication until T0.18.
+pub(in crate::setup) use worker_directory::dedicated_system_worker_directory_plan_for_test;
 #[cfg(not(action_core_fixture))]
 mod authorization;
 #[cfg(not(action_core_fixture))]
 mod execution;
 #[cfg(not(action_core_fixture))]
 #[allow(unused_imports)] // Private canonical route; T0.20 adds its authorized frontend.
-use execution::apply_plan_with_journal;
+pub(in crate::setup) use execution::apply_plan_with_journal;
 #[cfg(not(action_core_fixture))]
 #[allow(unused_imports)] // Opaque completion capability consumed by setup projections.
 pub(in crate::setup) use execution::CompletedExecutionToken;
@@ -1260,7 +1266,7 @@ fn valid_action_name_segment(segment: &str) -> bool {
 }
 
 #[cfg(test)]
-mod tests;
+pub(in crate::setup) mod tests;
 
 #[allow(unexpected_cfgs)]
 mod fixture_support {

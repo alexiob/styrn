@@ -163,7 +163,7 @@ impl ApplyPlanError {
     }
 }
 
-pub(super) fn apply_plan_with_journal(
+pub(in crate::setup) fn apply_plan_with_journal(
     plan: &mut [Action],
     store: &crate::setup::receipt::ReceiptStore,
     metadata: &mut crate::setup::receipt::ReceiptMetadataSource,

@@ -83,6 +83,28 @@
         "properties": { "installation_scope": { "const": "user" } },
         "required": ["installation_scope"]
       }
+    },
+    {
+      "if": {
+        "properties": {
+          "entries": {
+            "contains": {
+              "properties": {
+                "action": {
+                  "properties": { "type": { "const": "scope_promotion" } },
+                  "required": ["type"]
+                }
+              },
+              "required": ["action"]
+            }
+          }
+        },
+        "required": ["entries"]
+      },
+      "then": {
+        "properties": { "installation_scope": { "const": "user" } },
+        "required": ["installation_scope"]
+      }
     }
   ],
   "$defs": {
@@ -326,6 +348,31 @@
               "download_provenance": { "type": "null" }
             }
           }
+        },
+        {
+          "if": {
+            "properties": {
+              "action": {
+                "properties": { "type": { "const": "scope_promotion" } },
+                "required": ["type"]
+              }
+            },
+            "required": ["action"]
+          },
+          "then": {
+            "properties": {
+              "status": { "const": "applied" },
+              "privilege_used": { "const": "none" },
+              "directories_created": { "maxItems": 0 },
+              "files_created": { "maxItems": 0 },
+              "files_modified": { "maxItems": 0 },
+              "services": { "maxItems": 0 },
+              "accounts": { "maxItems": 0 },
+              "registry_keys": { "maxItems": 0 },
+              "firewall_rules": { "maxItems": 0 },
+              "download_provenance": { "type": "null" }
+            }
+          }
         }
       ]
     },
@@ -334,6 +381,7 @@
         { "$ref": "#/$defs/foundationAction" },
         { "$ref": "#/$defs/dedicatedAccountPrerequisiteAction" },
         { "$ref": "#/$defs/deferredSystemAction" },
+        { "$ref": "#/$defs/scopePromotionAction" },
         { "$ref": "#/$defs/workerDirectoryAction" }
       ]
     },
@@ -454,6 +502,68 @@
               ]
             },
             "parameter_sha256": { "$ref": "#/$defs/sha256" }
+          }
+        }
+      }
+    },
+    "scopePromotionAction": {
+      "type": "object",
+      "required": ["type", "parameters"],
+      "additionalProperties": false,
+      "properties": {
+        "type": { "const": "scope_promotion" },
+        "parameters": {
+          "type": "object",
+          "required": [
+            "action_id",
+            "machine_id",
+            "source_scope",
+            "target_scope",
+            "user_manifest_path",
+            "user_manifest_sha256",
+            "system_manifest_path",
+            "system_manifest_sha256",
+            "original_operator",
+            "target_principal",
+            "selector_sha256",
+            "promotion_intent_id"
+          ],
+          "additionalProperties": false,
+          "properties": {
+            "action_id": { "const": "identity.scope-promotion" },
+            "machine_id": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+            },
+            "source_scope": { "const": "user" },
+            "target_scope": { "const": "system" },
+            "user_manifest_path": { "$ref": "#/$defs/absolutePath" },
+            "user_manifest_sha256": { "$ref": "#/$defs/sha256" },
+            "system_manifest_path": { "$ref": "#/$defs/absolutePath" },
+            "system_manifest_sha256": { "$ref": "#/$defs/sha256" },
+            "original_operator": {
+              "allOf": [
+                { "$ref": "#/$defs/workerPrincipal" },
+                {
+                  "properties": { "account_policy": { "const": "current-user" } },
+                  "required": ["account_policy"]
+                }
+              ]
+            },
+            "target_principal": {
+              "allOf": [
+                { "$ref": "#/$defs/workerPrincipal" },
+                {
+                  "properties": { "account_policy": { "const": "dedicated" } },
+                  "required": ["account_policy"]
+                }
+              ]
+            },
+            "selector_sha256": { "$ref": "#/$defs/sha256" },
+            "promotion_intent_id": {
+              "type": "string",
+              "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+            }
           }
         }
       }

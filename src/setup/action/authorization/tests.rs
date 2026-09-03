@@ -401,15 +401,22 @@ fn dedicated_manifest_publication_requires_the_exact_store_with_a_genuine_execut
         .to_owned();
     let (ready, _) = super::super::tests::dedicated_ready_for_test(&selector);
     let native_temp = fs::canonicalize(std::env::temp_dir()).unwrap();
-    let root = native_temp.join(format!(
+    let isolated_anchor = native_temp.join(format!(
         "styrn-dedicated-publish-{}",
         fixture.root.file_name().unwrap().to_string_lossy()
     ));
+    fs::create_dir(&isolated_anchor).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(&isolated_anchor, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let root = isolated_anchor.join("dedicated-worker-root");
     let (mut plan, layout) =
         super::super::worker_directory::dedicated_system_worker_directory_plan_for_test(
             &ready,
             root,
-            Some(native_temp.clone()),
+            Some(isolated_anchor.clone()),
         )
         .unwrap();
     let context = fixture.context();
@@ -471,11 +478,8 @@ fn dedicated_manifest_publication_requires_the_exact_store_with_a_genuine_execut
     let drifted_layout = crate::platform::worker_directory_layout_for_test(
         InstallationScope::System,
         layout.worker_principal().clone(),
-        native_temp.join(format!(
-            "styrn-dedicated-drift-{}",
-            fixture.root.file_name().unwrap().to_string_lossy()
-        )),
-        Some(native_temp),
+        isolated_anchor.join("dedicated-worker-drift"),
+        Some(isolated_anchor.clone()),
     );
     let wrong_store =
         crate::manifest::MachineManifestStore::new_system_dedicated_with_layout_for_test(
@@ -522,7 +526,7 @@ fn dedicated_manifest_publication_requires_the_exact_store_with_a_genuine_execut
     )
     .unwrap();
     assert_eq!(receipt["pending_publications"].as_array().unwrap().len(), 1);
-    let _ = fs::remove_dir_all(layout.root());
+    let _ = fs::remove_dir_all(isolated_anchor);
 }
 
 #[test]

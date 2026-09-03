@@ -997,11 +997,17 @@ fn checked_in_schema_example_and_canonical_serialization_stay_synchronized() {
         env!("CARGO_MANIFEST_DIR"),
         "/examples/setup-receipt-system-dedicated.json"
     ));
+    let promotion_example_bytes = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/setup-receipt-scope-promotion.json"
+    ));
     #[cfg(not(target_os = "windows"))]
     let example = ReceiptDocument::from_json(example_bytes).unwrap();
     #[cfg(not(target_os = "windows"))]
     let dedicated_system_example =
         ReceiptDocument::from_json(dedicated_system_example_bytes).unwrap();
+    #[cfg(not(target_os = "windows"))]
+    let promotion_example = ReceiptDocument::from_json(promotion_example_bytes).unwrap();
 
     let mut checkpointed = pending_receipt_value();
     checkpointed["pending_publications"] = serde_json::json!([{
@@ -1016,6 +1022,7 @@ fn checked_in_schema_example_and_canonical_serialization_stay_synchronized() {
     let valid_values = vec![
         serde_json::from_slice::<serde_json::Value>(example_bytes).unwrap(),
         serde_json::from_slice::<serde_json::Value>(dedicated_system_example_bytes).unwrap(),
+        serde_json::from_slice::<serde_json::Value>(promotion_example_bytes).unwrap(),
         serde_json::from_str::<serde_json::Value>(COMPLETE_RECEIPT).unwrap(),
         checkpointed,
     ];
@@ -1024,6 +1031,10 @@ fn checked_in_schema_example_and_canonical_serialization_stay_synchronized() {
         let mut values = valid_values;
         values.push(
             serde_json::from_slice::<serde_json::Value>(&example.to_json().unwrap()).unwrap(),
+        );
+        values.push(
+            serde_json::from_slice::<serde_json::Value>(&promotion_example.to_json().unwrap())
+                .unwrap(),
         );
         values.push(
             serde_json::from_slice::<serde_json::Value>(
@@ -1117,6 +1128,49 @@ fn checked_in_schema_example_and_canonical_serialization_stay_synchronized() {
     let mut hostless = serde_json::from_str::<serde_json::Value>(COMPLETE_RECEIPT).unwrap();
     hostless["entries"][0]["download_provenance"]["url"] = serde_json::json!("https://");
     assert!(!validator.is_valid(&hostless));
+}
+
+#[test]
+fn scope_promotion_receipt_cannot_claim_ownership_privilege_or_selector_identity() {
+    let bytes = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/setup-receipt-scope-promotion.json"
+    ));
+    let value = serde_json::from_slice::<serde_json::Value>(bytes).unwrap();
+    ReceiptDocument::from_json(bytes).unwrap();
+
+    let mut system = value.clone();
+    system["installation_scope"] = serde_json::json!("system");
+    assert_eq!(
+        ReceiptDocument::from_json(&serde_json::to_vec(&system).unwrap()).unwrap_err(),
+        ReceiptError::InvalidScopePromotion
+    );
+
+    let mut privileged = value.clone();
+    privileged["entries"][0]["privilege_used"] = serde_json::json!("root");
+    assert_eq!(
+        ReceiptDocument::from_json(&serde_json::to_vec(&privileged).unwrap()).unwrap_err(),
+        ReceiptError::InvalidScopePromotion
+    );
+
+    let mut owning = value.clone();
+    owning["entries"][0]["files_created"] = serde_json::json!([{
+        "path": "/etc/styrn/machine.toml",
+        "sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    }]);
+    assert_eq!(
+        ReceiptDocument::from_json(&serde_json::to_vec(&owning).unwrap()).unwrap_err(),
+        ReceiptError::InvalidScopePromotion
+    );
+
+    let mut selector_as_identity = value;
+    selector_as_identity["entries"][0]["action"]["parameters"]["target_principal"]["name"] =
+        serde_json::json!("release-agent");
+    assert_eq!(
+        ReceiptDocument::from_json(&serde_json::to_vec(&selector_as_identity).unwrap())
+            .unwrap_err(),
+        ReceiptError::InvalidScopePromotion
+    );
 }
 
 #[test]

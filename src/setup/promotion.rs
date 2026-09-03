@@ -1,0 +1,1476 @@
+//! Crash-safe promotion from current-user fallback authority to protected System authority.
+
+use crate::platform::{InstallationScope, WorkerAccountPolicy, WorkerPrincipal};
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+use std::{
+    fmt::Write as _,
+    io::{Read, Write},
+    path::{Component, Path, PathBuf},
+};
+
+const SCOPE_PROMOTION_ACTION_ID: &str = "identity.scope-promotion";
+
+#[cfg(test)]
+std::thread_local! {
+    static INTERRUPT_AFTER_CHECKPOINT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static INTERRUPT_AFTER_USER_RETIREMENT: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn set_interrupt_after_checkpoint_for_test(value: bool) {
+    INTERRUPT_AFTER_CHECKPOINT.with(|slot| slot.set(value));
+}
+
+#[cfg(test)]
+fn set_interrupt_after_user_retirement_for_test(value: bool) {
+    INTERRUPT_AFTER_USER_RETIREMENT.with(|slot| slot.set(value));
+}
+
+/// Typed, non-owning receipt-v1 checkpoint for an authority promotion.
+///
+/// Construction stays inside this module; receipt code can only project an
+/// already-validated value and cannot turn an arbitrary action into promotion
+/// evidence.
+pub(crate) struct ScopePromotionCheckpoint {
+    machine_id: uuid::Uuid,
+    user_manifest_path: Box<str>,
+    user_manifest_sha256: Box<str>,
+    system_manifest_path: Box<str>,
+    system_manifest_sha256: Box<str>,
+    original_operator: WorkerPrincipal,
+    target_principal: WorkerPrincipal,
+    selector_sha256: Box<str>,
+    promotion_intent_id: uuid::Uuid,
+}
+
+impl ScopePromotionCheckpoint {
+    #[allow(clippy::too_many_arguments)] // Receipt v1 binds this complete immutable tuple.
+    fn new(
+        machine_id: uuid::Uuid,
+        original_operator: &WorkerPrincipal,
+        target_principal: &WorkerPrincipal,
+        selector_sha256: &str,
+        user_manifest_path: &str,
+        user_manifest_sha256: &str,
+        system_manifest_path: &str,
+        system_manifest_sha256: &str,
+        promotion_intent_id: uuid::Uuid,
+    ) -> Result<Self, ScopePromotionError> {
+        if !is_uuid_v7(machine_id)
+            || !is_uuid_v7(promotion_intent_id)
+            || original_operator.account_policy() != WorkerAccountPolicy::CurrentUser
+            || target_principal.account_policy() != WorkerAccountPolicy::Dedicated
+            || original_operator == target_principal
+            || !valid_sha256(selector_sha256)
+            || !valid_sha256(user_manifest_sha256)
+            || !valid_sha256(system_manifest_sha256)
+            || sha256_hex(target_principal.name().as_bytes()) != selector_sha256
+            || !normalized_absolute_path(user_manifest_path)
+            || !normalized_absolute_path(system_manifest_path)
+            || user_manifest_path == system_manifest_path
+        {
+            return Err(ScopePromotionError::Conflict);
+        }
+        crate::platform::verify_worker_principal(original_operator)
+            .map_err(|_| ScopePromotionError::Conflict)?;
+        Ok(Self {
+            machine_id,
+            user_manifest_path: user_manifest_path.into(),
+            user_manifest_sha256: user_manifest_sha256.into(),
+            system_manifest_path: system_manifest_path.into(),
+            system_manifest_sha256: system_manifest_sha256.into(),
+            original_operator: original_operator.clone(),
+            target_principal: target_principal.clone(),
+            selector_sha256: selector_sha256.into(),
+            promotion_intent_id,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)] // Durable recovery must rebind the complete receipt tuple.
+    pub(in crate::setup) fn from_durable_receipt(
+        machine_id: uuid::Uuid,
+        original_operator: &WorkerPrincipal,
+        target_principal: &WorkerPrincipal,
+        selector_sha256: &str,
+        user_manifest_path: &str,
+        user_manifest_sha256: &str,
+        system_manifest_path: &str,
+        system_manifest_sha256: &str,
+        promotion_intent_id: uuid::Uuid,
+        _authority: &ScopePromotionAuthority,
+    ) -> Result<Self, ScopePromotionError> {
+        Self::new(
+            machine_id,
+            original_operator,
+            target_principal,
+            selector_sha256,
+            user_manifest_path,
+            user_manifest_sha256,
+            system_manifest_path,
+            system_manifest_sha256,
+            promotion_intent_id,
+        )
+    }
+
+    #[cfg(test)]
+    #[allow(clippy::too_many_arguments)] // Mirrors the production tuple for focused contract tests.
+    fn new_for_test(
+        machine_id: uuid::Uuid,
+        original_operator: &WorkerPrincipal,
+        target_principal: &WorkerPrincipal,
+        selector_sha256: &str,
+        user_manifest_path: &str,
+        user_manifest_sha256: &str,
+        system_manifest_path: &str,
+        system_manifest_sha256: &str,
+        promotion_intent_id: uuid::Uuid,
+    ) -> Result<Self, ScopePromotionError> {
+        Self::new(
+            machine_id,
+            original_operator,
+            target_principal,
+            selector_sha256,
+            user_manifest_path,
+            user_manifest_sha256,
+            system_manifest_path,
+            system_manifest_sha256,
+            promotion_intent_id,
+        )
+    }
+
+    pub(in crate::setup) const fn action_id(&self) -> &'static str {
+        SCOPE_PROMOTION_ACTION_ID
+    }
+
+    pub(in crate::setup) fn machine_id(&self) -> uuid::Uuid {
+        self.machine_id
+    }
+
+    pub(in crate::setup) fn source_scope(&self) -> InstallationScope {
+        InstallationScope::User
+    }
+
+    pub(in crate::setup) fn target_scope(&self) -> InstallationScope {
+        InstallationScope::System
+    }
+
+    pub(in crate::setup) fn user_manifest_path(&self) -> &str {
+        &self.user_manifest_path
+    }
+
+    pub(in crate::setup) fn user_manifest_sha256(&self) -> &str {
+        &self.user_manifest_sha256
+    }
+
+    pub(in crate::setup) fn system_manifest_path(&self) -> &str {
+        &self.system_manifest_path
+    }
+
+    pub(in crate::setup) fn system_manifest_sha256(&self) -> &str {
+        &self.system_manifest_sha256
+    }
+
+    pub(in crate::setup) fn original_operator(&self) -> &WorkerPrincipal {
+        &self.original_operator
+    }
+
+    pub(in crate::setup) fn target_principal(&self) -> &WorkerPrincipal {
+        &self.target_principal
+    }
+
+    pub(in crate::setup) fn selector_sha256(&self) -> &str {
+        &self.selector_sha256
+    }
+
+    pub(in crate::setup) fn promotion_intent_id(&self) -> uuid::Uuid {
+        self.promotion_intent_id
+    }
+}
+
+#[cfg(not(test))]
+pub(crate) struct ScopePromotionAuthority(());
+
+#[cfg(test)]
+pub(crate) type ScopePromotionAuthority = crate::manifest::TestScopePromotionAuthority;
+
+pub(in crate::setup) fn scope_promotion_authority() -> ScopePromotionAuthority {
+    #[cfg(test)]
+    {
+        crate::manifest::TestScopePromotionAuthority::new()
+    }
+    #[cfg(not(test))]
+    {
+        ScopePromotionAuthority(())
+    }
+}
+
+#[derive(Clone)]
+pub(in crate::setup) struct ScopePromotionAuthorization {
+    request_id: uuid::Uuid,
+    request_sha256: Box<str>,
+}
+
+impl ScopePromotionAuthorization {
+    pub(in crate::setup) fn new(
+        request_id: uuid::Uuid,
+        request_sha256: &str,
+    ) -> Result<Self, ScopePromotionError> {
+        if !is_uuid_v7(request_id) || !valid_sha256(request_sha256) {
+            return Err(ScopePromotionError::Conflict);
+        }
+        Ok(Self {
+            request_id,
+            request_sha256: request_sha256.into(),
+        })
+    }
+}
+
+pub(in crate::setup) struct ScopePromotionPreparation {
+    system_candidate: crate::manifest::DedicatedWorkerManifestCandidate,
+    original_operator: WorkerPrincipal,
+    target_principal: WorkerPrincipal,
+    selector_sha256: Box<str>,
+    system_receipt_path: PathBuf,
+    system_manifest_path: PathBuf,
+    authorization: ScopePromotionAuthorization,
+    intent_id: uuid::Uuid,
+}
+
+impl ScopePromotionPreparation {
+    pub(in crate::setup) fn new(
+        ready: &crate::setup::action::DedicatedAccountReady,
+        system_candidate: crate::manifest::DedicatedWorkerManifestCandidate,
+        system_receipt: &crate::setup::receipt::ReceiptStore,
+        system_manifest: &crate::manifest::MachineManifestStore,
+        authorization: ScopePromotionAuthorization,
+    ) -> Result<Self, ScopePromotionError> {
+        let target_principal = ready
+            .reverify_target(Clone::clone)
+            .map_err(|_| ScopePromotionError::Conflict)?;
+        if system_receipt.installation_scope() != InstallationScope::System
+            || system_manifest.installation_scope() != InstallationScope::System
+            || system_receipt.worker_principal() != &target_principal
+            || system_manifest.worker_principal() != &target_principal
+        {
+            return Err(ScopePromotionError::Conflict);
+        }
+        Ok(Self {
+            system_candidate,
+            original_operator: ready.original_operator().clone(),
+            target_principal,
+            selector_sha256: sha256_hex(ready.selector().as_bytes()).into(),
+            system_receipt_path: system_receipt.path().to_path_buf(),
+            system_manifest_path: system_manifest.path().to_path_buf(),
+            authorization,
+            intent_id: uuid::Uuid::now_v7(),
+        })
+    }
+}
+
+const PROMOTION_INTENT_VERSION: u32 = 1;
+const MAX_PROMOTION_INTENT_BYTES: usize = 64 * 1024;
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ScopePromotionIntentDocument {
+    version: u32,
+    intent_id: uuid::Uuid,
+    original_operator: WorkerPrincipal,
+    user_receipt_path: String,
+    user_receipt_identity_sha256: String,
+    user_manifest_path: String,
+    user_manifest_identity_sha256: String,
+    user_manifest_sha256: String,
+    pending_publication_epoch: usize,
+    machine_id: uuid::Uuid,
+    target_principal: WorkerPrincipal,
+    selector_sha256: String,
+    system_receipt_path: String,
+    system_manifest_path: String,
+    system_manifest_sha256: String,
+    candidate_manifest: String,
+    authorization_request_id: uuid::Uuid,
+    authorization_request_sha256: String,
+    expected_completion: PromotionCompletion,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum PromotionCompletion {
+    ProtectedSystemPublication,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ScopePromotionRecoveryState {
+    RetryAuthorization,
+    CheckpointThenRetireUser,
+    RetireIntent,
+}
+
+fn classify_recovery_state(
+    user_digest: Option<&str>,
+    system_digest: Option<&str>,
+    checkpoint_exists: bool,
+    expected_user_digest: &str,
+    expected_system_digest: &str,
+) -> Result<ScopePromotionRecoveryState, ScopePromotionError> {
+    match (user_digest, system_digest, checkpoint_exists) {
+        (Some(user), None, false) if user == expected_user_digest => {
+            Ok(ScopePromotionRecoveryState::RetryAuthorization)
+        }
+        (Some(user), Some(system), _)
+            if user == expected_user_digest && system == expected_system_digest =>
+        {
+            Ok(ScopePromotionRecoveryState::CheckpointThenRetireUser)
+        }
+        (None, Some(system), true) if system == expected_system_digest => {
+            Ok(ScopePromotionRecoveryState::RetireIntent)
+        }
+        _ => Err(ScopePromotionError::Conflict),
+    }
+}
+
+struct ScopePromotionIntent {
+    document: ScopePromotionIntentDocument,
+    path: PathBuf,
+    identity: crate::platform::PrivateFileIdentity,
+}
+
+impl ScopePromotionIntentDocument {
+    fn validate(&self) -> Result<(), ScopePromotionError> {
+        if self.version != PROMOTION_INTENT_VERSION
+            || !is_uuid_v7(self.intent_id)
+            || !is_uuid_v7(self.machine_id)
+            || !is_uuid_v7(self.authorization_request_id)
+            || self.original_operator.account_policy() != WorkerAccountPolicy::CurrentUser
+            || self.target_principal.account_policy() != WorkerAccountPolicy::Dedicated
+            || self.original_operator == self.target_principal
+            || !normalized_absolute_path(&self.user_receipt_path)
+            || !normalized_absolute_path(&self.user_manifest_path)
+            || !normalized_absolute_path(&self.system_receipt_path)
+            || !normalized_absolute_path(&self.system_manifest_path)
+            || self.user_manifest_path == self.system_manifest_path
+            || !valid_sha256(&self.user_receipt_identity_sha256)
+            || !valid_sha256(&self.user_manifest_identity_sha256)
+            || !valid_sha256(&self.user_manifest_sha256)
+            || !valid_sha256(&self.selector_sha256)
+            || !valid_sha256(&self.system_manifest_sha256)
+            || !valid_sha256(&self.authorization_request_sha256)
+            || sha256_hex(self.candidate_manifest.as_bytes()) != self.system_manifest_sha256
+        {
+            return Err(ScopePromotionError::Conflict);
+        }
+        Ok(())
+    }
+
+    fn to_json(&self) -> Result<Vec<u8>, ScopePromotionError> {
+        self.validate()?;
+        let mut output =
+            serde_json::to_vec_pretty(self).map_err(|_| ScopePromotionError::Conflict)?;
+        output.push(b'\n');
+        if output.len() > MAX_PROMOTION_INTENT_BYTES {
+            return Err(ScopePromotionError::Conflict);
+        }
+        Ok(output)
+    }
+
+    fn from_json(input: &[u8]) -> Result<Self, ScopePromotionError> {
+        if input.len() > MAX_PROMOTION_INTENT_BYTES {
+            return Err(ScopePromotionError::Conflict);
+        }
+        let document =
+            serde_json::from_slice::<Self>(input).map_err(|_| ScopePromotionError::Conflict)?;
+        document.validate()?;
+        if document.to_json()? != input {
+            return Err(ScopePromotionError::Conflict);
+        }
+        Ok(document)
+    }
+}
+
+pub(in crate::setup) fn write_scope_promotion_intent(
+    receipt_store: &crate::setup::receipt::ReceiptStore,
+    user_manifest_store: &crate::manifest::MachineManifestStore,
+    system_manifest_store: &crate::manifest::MachineManifestStore,
+    preparation: &ScopePromotionPreparation,
+    machine_id: uuid::Uuid,
+    _authority: &ScopePromotionAuthority,
+) -> Result<uuid::Uuid, ScopePromotionError> {
+    if receipt_store.installation_scope() != InstallationScope::User
+        || user_manifest_store.installation_scope() != InstallationScope::User
+        || receipt_store.worker_principal() != &preparation.original_operator
+        || user_manifest_store.worker_principal() != &preparation.original_operator
+        || system_manifest_store.path() != preparation.system_manifest_path
+    {
+        return Err(ScopePromotionError::Conflict);
+    }
+    let receipt = receipt_store
+        .read_snapshot()
+        .map_err(|_| ScopePromotionError::Stage("user receipt snapshot"))?;
+    let receipt_identity = crate::platform::private_file_identity(receipt_store.path())
+        .map_err(|_| ScopePromotionError::Stage("user receipt identity"))?;
+    let user_snapshot = user_manifest_store
+        .promotion_snapshot(_authority)
+        .map_err(|_| ScopePromotionError::Stage("user manifest snapshot"))?
+        .ok_or(ScopePromotionError::Stage("user manifest absent"))?;
+    if user_snapshot.machine_id() != machine_id {
+        return Err(ScopePromotionError::Conflict);
+    }
+    let system_candidate = preparation
+        .system_candidate
+        .scope_promotion_canonical(machine_id, _authority)
+        .map_err(|_| ScopePromotionError::Stage("system manifest candidate"))?;
+    let document = ScopePromotionIntentDocument {
+        version: PROMOTION_INTENT_VERSION,
+        intent_id: preparation.intent_id,
+        original_operator: preparation.original_operator.clone(),
+        user_receipt_path: path_text(receipt_store.path())?,
+        user_receipt_identity_sha256: receipt_identity.binding_sha256(),
+        user_manifest_path: path_text(user_snapshot.path())?,
+        user_manifest_identity_sha256: user_snapshot.identity_sha256(),
+        user_manifest_sha256: user_snapshot.sha256().to_owned(),
+        pending_publication_epoch: receipt.pending_publication_count(),
+        machine_id,
+        target_principal: preparation.target_principal.clone(),
+        selector_sha256: preparation.selector_sha256.to_string(),
+        system_receipt_path: path_text(&preparation.system_receipt_path)?,
+        system_manifest_path: path_text(&preparation.system_manifest_path)?,
+        system_manifest_sha256: sha256_hex(system_candidate.as_bytes()),
+        candidate_manifest: system_candidate,
+        authorization_request_id: preparation.authorization.request_id,
+        authorization_request_sha256: preparation.authorization.request_sha256.to_string(),
+        expected_completion: PromotionCompletion::ProtectedSystemPublication,
+    };
+    let expected_bytes = document
+        .to_json()
+        .map_err(|_| ScopePromotionError::Stage("promotion intent validation"))?;
+    let path = scope_promotion_intent_path(receipt_store.path(), preparation.intent_id)?;
+    reject_concurrent_scope_promotion_intents(&path)?;
+    if let Some(existing) = read_scope_promotion_intent(&path, receipt_store.worker_principal())? {
+        return if existing.document == document {
+            Ok(existing.document.intent_id)
+        } else {
+            Err(ScopePromotionError::Conflict)
+        };
+    }
+    let temporary = path.with_file_name(format!(
+        ".receipt.json.scope-promotion.{}.tmp",
+        preparation.intent_id
+    ));
+    let mut file = crate::platform::create_private_publication_file(
+        &temporary,
+        crate::platform::ManifestOwner::User,
+        receipt_store.worker_principal(),
+    )
+    .map_err(|_| ScopePromotionError::Stage("promotion temporary create"))?;
+    file.write_all(&expected_bytes)
+        .map_err(|_| ScopePromotionError::Stage("promotion temporary write"))?;
+    let complete = file
+        .complete_exact(&expected_bytes)
+        .map_err(|_| ScopePromotionError::Stage("promotion temporary completion"))?;
+    complete
+        .publish_no_replace(&path)
+        .map_err(|_| ScopePromotionError::Stage("promotion intent publication"))?;
+    Ok(document.intent_id)
+}
+
+fn reject_concurrent_scope_promotion_intents(expected: &Path) -> Result<(), ScopePromotionError> {
+    let parent = expected.parent().ok_or(ScopePromotionError::Conflict)?;
+    let expected_name = expected.file_name().ok_or(ScopePromotionError::Conflict)?;
+    let entries = std::fs::read_dir(parent).map_err(|_| ScopePromotionError::Conflict)?;
+    for entry in entries {
+        let entry = entry.map_err(|_| ScopePromotionError::Conflict)?;
+        let name = entry.file_name();
+        let Some(name_text) = name.to_str() else {
+            continue;
+        };
+        if name != expected_name
+            && name_text.starts_with(".receipt.json.scope-promotion.")
+            && name_text.ends_with(".json")
+        {
+            return Err(ScopePromotionError::Conflict);
+        }
+    }
+    Ok(())
+}
+
+fn scope_promotion_intent_path(
+    receipt_path: &Path,
+    intent_id: uuid::Uuid,
+) -> Result<PathBuf, ScopePromotionError> {
+    let parent = receipt_path.parent().ok_or(ScopePromotionError::Conflict)?;
+    Ok(parent.join(format!(".receipt.json.scope-promotion.{intent_id}.json")))
+}
+
+fn read_scope_promotion_intent(
+    path: &Path,
+    operator: &WorkerPrincipal,
+) -> Result<Option<ScopePromotionIntent>, ScopePromotionError> {
+    let identity = match crate::platform::private_file_identity(path) {
+        Ok(identity) => identity,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(_) => return Err(ScopePromotionError::Conflict),
+    };
+    let file = crate::platform::open_verified_private_file_for_read(
+        path,
+        crate::platform::ManifestOwner::User,
+        operator,
+        identity,
+    )
+    .map_err(|_| ScopePromotionError::Conflict)?;
+    let mut input = Vec::new();
+    file.take((MAX_PROMOTION_INTENT_BYTES + 1) as u64)
+        .read_to_end(&mut input)
+        .map_err(|_| ScopePromotionError::Conflict)?;
+    let document = ScopePromotionIntentDocument::from_json(&input)?;
+    Ok(Some(ScopePromotionIntent {
+        document,
+        path: path.to_path_buf(),
+        identity,
+    }))
+}
+
+fn path_text(path: &Path) -> Result<String, ScopePromotionError> {
+    let value = path.to_str().ok_or(ScopePromotionError::Conflict)?;
+    if !normalized_absolute_path(value) {
+        return Err(ScopePromotionError::Conflict);
+    }
+    Ok(value.to_owned())
+}
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    let mut output = String::with_capacity(64);
+    for byte in Sha256::digest(bytes) {
+        write!(&mut output, "{byte:02x}").expect("writing hexadecimal cannot fail");
+    }
+    output
+}
+
+#[allow(clippy::needless_return)] // Windows is a deliberate closed refusal branch until T0.18.
+pub(in crate::setup) fn publish_scope_promotion_system_manifest(
+    user_receipt_store: &crate::setup::receipt::ReceiptStore,
+    intent_id: uuid::Uuid,
+    system_receipt_store: &crate::setup::receipt::ReceiptStore,
+    system_manifest_store: &crate::manifest::MachineManifestStore,
+    completed: &crate::setup::action::CompletedExecutionToken,
+    metadata: &mut crate::setup::receipt::ReceiptMetadataSource,
+) -> Result<uuid::Uuid, ScopePromotionError> {
+    #[cfg(target_os = "windows")]
+    {
+        let _ = (
+            user_receipt_store,
+            intent_id,
+            system_receipt_store,
+            system_manifest_store,
+            completed,
+            metadata,
+        );
+        return Err(ScopePromotionError::Conflict);
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let path = scope_promotion_intent_path(user_receipt_store.path(), intent_id)?;
+        let intent = read_scope_promotion_intent(&path, user_receipt_store.worker_principal())?
+            .ok_or(ScopePromotionError::Conflict)?;
+        let document = &intent.document;
+        validate_live_user_binding(user_receipt_store, None, document)?;
+        if system_receipt_store.installation_scope() != InstallationScope::System
+            || system_manifest_store.installation_scope() != InstallationScope::System
+            || system_receipt_store.worker_principal() != &document.target_principal
+            || system_manifest_store.worker_principal() != &document.target_principal
+            || path_text(system_receipt_store.path())? != document.system_receipt_path
+            || path_text(system_manifest_store.path())? != document.system_manifest_path
+            || sha256_hex(document.target_principal.name().as_bytes()) != document.selector_sha256
+        {
+            return Err(ScopePromotionError::Conflict);
+        }
+        let pending_authority = crate::setup::pending::pending_publication_authority();
+        let authority = scope_promotion_authority();
+        system_receipt_store
+            .verify_scope_promotion_authorization(
+                document.authorization_request_id,
+                &document.authorization_request_sha256,
+                &authority,
+            )
+            .map_err(|_| ScopePromotionError::Stage("protected authorization marker"))?;
+        system_receipt_store
+            .validate_scope_promotion_system_completion(&authority)
+            .map_err(|_| ScopePromotionError::Stage("system directory receipt completion"))?;
+        let session = system_receipt_store
+            .begin_pending_publication(&pending_authority)
+            .map_err(|_| ScopePromotionError::Stage("system receipt publication session"))?;
+        let machine_id = session
+            .publish_scope_promotion_system_manifest(
+                system_manifest_store,
+                &document.candidate_manifest,
+                document.machine_id,
+                completed,
+                metadata,
+                &pending_authority,
+                &authority,
+            )
+            .map_err(|_| ScopePromotionError::Stage("system manifest publication protocol"))?;
+        let system = system_manifest_store
+            .promotion_snapshot(&authority)
+            .map_err(|_| ScopePromotionError::Conflict)?
+            .ok_or(ScopePromotionError::Conflict)?;
+        if system.machine_id() != document.machine_id
+            || system.sha256() != document.system_manifest_sha256
+        {
+            return Err(ScopePromotionError::Conflict);
+        }
+        Ok(machine_id)
+    }
+}
+
+#[allow(clippy::needless_return)] // Windows is a deliberate closed refusal branch until T0.18.
+pub(in crate::setup) fn finalize_scope_promotion(
+    user_receipt_store: &crate::setup::receipt::ReceiptStore,
+    user_manifest_store: &crate::manifest::MachineManifestStore,
+    system_manifest_store: &crate::manifest::MachineManifestStore,
+    intent_id: uuid::Uuid,
+    metadata: &mut crate::setup::receipt::ReceiptMetadataSource,
+) -> Result<crate::platform::EstablishedDedicatedAccountEvidence, ScopePromotionError> {
+    #[cfg(target_os = "windows")]
+    {
+        let _ = (
+            user_receipt_store,
+            user_manifest_store,
+            system_manifest_store,
+            intent_id,
+            metadata,
+        );
+        return Err(ScopePromotionError::Conflict);
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        let authority = scope_promotion_authority();
+        let path = scope_promotion_intent_path(user_receipt_store.path(), intent_id)?;
+        let Some(intent) =
+            read_scope_promotion_intent(&path, user_receipt_store.worker_principal())?
+        else {
+            return recover_completed_scope_promotion(
+                user_receipt_store,
+                user_manifest_store,
+                system_manifest_store,
+                intent_id,
+                &authority,
+            );
+        };
+        let document = &intent.document;
+        if user_receipt_store.installation_scope() != InstallationScope::User
+            || user_manifest_store.installation_scope() != InstallationScope::User
+            || system_manifest_store.installation_scope() != InstallationScope::System
+            || user_receipt_store.worker_principal() != &document.original_operator
+            || user_manifest_store.worker_principal() != &document.original_operator
+            || system_manifest_store.worker_principal() != &document.target_principal
+            || path_text(user_receipt_store.path())? != document.user_receipt_path
+            || path_text(user_manifest_store.path())? != document.user_manifest_path
+            || path_text(system_manifest_store.path())? != document.system_manifest_path
+            || sha256_hex(document.target_principal.name().as_bytes()) != document.selector_sha256
+        {
+            return Err(ScopePromotionError::Conflict);
+        }
+        let system = system_manifest_store
+            .promotion_snapshot(&authority)
+            .map_err(|_| ScopePromotionError::Conflict)?
+            .ok_or(ScopePromotionError::Conflict)?;
+        if system.machine_id() != document.machine_id
+            || system.sha256() != document.system_manifest_sha256
+            || system.canonical() != document.candidate_manifest
+        {
+            return Err(ScopePromotionError::Conflict);
+        }
+        let checkpoint = ScopePromotionCheckpoint::new(
+            document.machine_id,
+            &document.original_operator,
+            &document.target_principal,
+            &document.selector_sha256,
+            &document.user_manifest_path,
+            &document.user_manifest_sha256,
+            &document.system_manifest_path,
+            &document.system_manifest_sha256,
+            document.intent_id,
+        )?;
+        let receipt = user_receipt_store
+            .read_snapshot()
+            .map_err(|_| ScopePromotionError::Conflict)?;
+        let checkpoint_exists = receipt
+            .has_scope_promotion_checkpoint(&checkpoint)
+            .map_err(|_| ScopePromotionError::Conflict)?;
+        let current_receipt_identity =
+            crate::platform::private_file_identity(user_receipt_store.path())
+                .map_err(|_| ScopePromotionError::Conflict)?;
+        if current_receipt_identity.binding_sha256() != document.user_receipt_identity_sha256
+            && !checkpoint_exists
+        {
+            return Err(ScopePromotionError::Conflict);
+        }
+        let source = user_manifest_store
+            .promotion_snapshot(&authority)
+            .map_err(|_| ScopePromotionError::Conflict)?;
+        if let Some(source) = &source {
+            if source.machine_id() != document.machine_id
+                || source.sha256() != document.user_manifest_sha256
+                || source.identity_sha256() != document.user_manifest_identity_sha256
+            {
+                return Err(ScopePromotionError::Conflict);
+            }
+        } else if !checkpoint_exists {
+            return Err(ScopePromotionError::Conflict);
+        }
+        let recovery = classify_recovery_state(
+            source
+                .as_ref()
+                .map(crate::manifest::PromotionManifestSnapshot::sha256),
+            Some(system.sha256()),
+            checkpoint_exists,
+            &document.user_manifest_sha256,
+            &document.system_manifest_sha256,
+        )?;
+        if recovery == ScopePromotionRecoveryState::RetryAuthorization {
+            return Err(ScopePromotionError::Conflict);
+        }
+        user_receipt_store
+            .commit_scope_promotion_checkpoint(&checkpoint, metadata, &authority, || {
+                #[cfg(test)]
+                if INTERRUPT_AFTER_CHECKPOINT.with(std::cell::Cell::get) {
+                    return Err(crate::setup::receipt::ReceiptStoreError::Write(
+                        std::io::Error::new(
+                            std::io::ErrorKind::Interrupted,
+                            "injected interruption after promotion checkpoint",
+                        ),
+                    ));
+                }
+                if let Some(source) = &source {
+                    user_manifest_store
+                        .retire_promotion_source(source, &authority)
+                        .map_err(|_| crate::setup::receipt::ReceiptStoreError::IntentConflict)?;
+                }
+                #[cfg(test)]
+                if INTERRUPT_AFTER_USER_RETIREMENT.with(std::cell::Cell::get) {
+                    return Err(crate::setup::receipt::ReceiptStoreError::Write(
+                        std::io::Error::new(
+                            std::io::ErrorKind::Interrupted,
+                            "injected interruption after user-manifest retirement",
+                        ),
+                    ));
+                }
+                let removal = crate::platform::prepare_verified_private_file_removal(
+                    &intent.path,
+                    crate::platform::ManifestOwner::User,
+                    user_receipt_store.worker_principal(),
+                    intent.identity,
+                )
+                .map_err(crate::setup::receipt::ReceiptStoreError::Security)?;
+                crate::platform::consume_verified_private_file(removal)
+                    .map_err(crate::setup::receipt::ReceiptStoreError::Write)?;
+                crate::platform::sync_parent_directory(
+                    intent
+                        .path
+                        .parent()
+                        .ok_or(crate::setup::receipt::ReceiptStoreError::InvalidDestination)?,
+                )
+                .map_err(crate::setup::receipt::ReceiptStoreError::Write)
+            })
+            .map_err(|_| ScopePromotionError::Conflict)?;
+        established_evidence(&document.target_principal, &authority)
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn recover_completed_scope_promotion(
+    user_receipt_store: &crate::setup::receipt::ReceiptStore,
+    user_manifest_store: &crate::manifest::MachineManifestStore,
+    system_manifest_store: &crate::manifest::MachineManifestStore,
+    intent_id: uuid::Uuid,
+    authority: &ScopePromotionAuthority,
+) -> Result<crate::platform::EstablishedDedicatedAccountEvidence, ScopePromotionError> {
+    if user_receipt_store.installation_scope() != InstallationScope::User
+        || user_manifest_store.installation_scope() != InstallationScope::User
+        || system_manifest_store.installation_scope() != InstallationScope::System
+    {
+        return Err(ScopePromotionError::Conflict);
+    }
+    let receipt = user_receipt_store
+        .read_snapshot()
+        .map_err(|_| ScopePromotionError::Conflict)?;
+    let checkpoint = receipt
+        .scope_promotion_checkpoint(intent_id, authority)
+        .map_err(|_| ScopePromotionError::Conflict)?
+        .ok_or(ScopePromotionError::Conflict)?;
+    if checkpoint.original_operator() != user_receipt_store.worker_principal()
+        || checkpoint.original_operator() != user_manifest_store.worker_principal()
+        || checkpoint.target_principal() != system_manifest_store.worker_principal()
+        || path_text(user_manifest_store.path())? != checkpoint.user_manifest_path()
+        || path_text(system_manifest_store.path())? != checkpoint.system_manifest_path()
+        || user_manifest_store
+            .promotion_snapshot(authority)
+            .map_err(|_| ScopePromotionError::Conflict)?
+            .is_some()
+    {
+        return Err(ScopePromotionError::Conflict);
+    }
+    let system = system_manifest_store
+        .promotion_snapshot(authority)
+        .map_err(|_| ScopePromotionError::Conflict)?
+        .ok_or(ScopePromotionError::Conflict)?;
+    if system.machine_id() != checkpoint.machine_id()
+        || system.sha256() != checkpoint.system_manifest_sha256()
+    {
+        return Err(ScopePromotionError::Conflict);
+    }
+    established_evidence(checkpoint.target_principal(), authority)
+}
+
+#[cfg(not(target_os = "windows"))]
+fn established_evidence(
+    target: &WorkerPrincipal,
+    authority: &ScopePromotionAuthority,
+) -> Result<crate::platform::EstablishedDedicatedAccountEvidence, ScopePromotionError> {
+    #[cfg(test)]
+    let evidence = crate::platform::established_dedicated_account_evidence_from_promotion(
+        target.name(),
+        target.clone(),
+    );
+    #[cfg(not(test))]
+    let evidence = crate::platform::established_dedicated_account_evidence_from_promotion(
+        target.name(),
+        target.clone(),
+        authority,
+    );
+    let _ = authority;
+    evidence.map_err(|_| ScopePromotionError::Conflict)
+}
+
+fn validate_live_user_binding(
+    receipt_store: &crate::setup::receipt::ReceiptStore,
+    user_manifest_store: Option<&crate::manifest::MachineManifestStore>,
+    document: &ScopePromotionIntentDocument,
+) -> Result<(), ScopePromotionError> {
+    if receipt_store.installation_scope() != InstallationScope::User
+        || receipt_store.worker_principal() != &document.original_operator
+        || path_text(receipt_store.path())? != document.user_receipt_path
+    {
+        return Err(ScopePromotionError::Conflict);
+    }
+    let receipt_identity = crate::platform::private_file_identity(receipt_store.path())
+        .map_err(|_| ScopePromotionError::Conflict)?;
+    if receipt_identity.binding_sha256() != document.user_receipt_identity_sha256 {
+        return Err(ScopePromotionError::Conflict);
+    }
+    let receipt = receipt_store
+        .read_snapshot()
+        .map_err(|_| ScopePromotionError::Conflict)?;
+    if receipt.pending_publication_count() != document.pending_publication_epoch {
+        return Err(ScopePromotionError::Conflict);
+    }
+    if let Some(store) = user_manifest_store {
+        let authority = scope_promotion_authority();
+        let snapshot = store
+            .promotion_snapshot(&authority)
+            .map_err(|_| ScopePromotionError::Conflict)?
+            .ok_or(ScopePromotionError::Conflict)?;
+        if path_text(snapshot.path())? != document.user_manifest_path
+            || snapshot.machine_id() != document.machine_id
+            || snapshot.sha256() != document.user_manifest_sha256
+            || snapshot.identity_sha256() != document.user_manifest_identity_sha256
+        {
+            return Err(ScopePromotionError::Conflict);
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, thiserror::Error)]
+pub(crate) enum ScopePromotionError {
+    #[error("scope promotion evidence conflicts with durable setup state")]
+    Conflict,
+    #[error("scope promotion evidence conflicts with durable setup state")]
+    Stage(&'static str),
+}
+
+impl ScopePromotionError {
+    pub(crate) const fn error_code(&self) -> &'static str {
+        "setup.receipt_conflict"
+    }
+}
+
+fn is_uuid_v7(value: uuid::Uuid) -> bool {
+    value.get_version_num() == 7 && value.get_variant() == uuid::Variant::RFC4122
+}
+
+fn valid_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn normalized_absolute_path(value: &str) -> bool {
+    let path = Path::new(value);
+    path.is_absolute()
+        && path
+            .components()
+            .all(|component| !matches!(component, Component::CurDir | Component::ParentDir))
+}
+
+#[cfg(test)]
+mod tests {
+    fn native_manifest_draft(
+        scope: crate::platform::InstallationScope,
+    ) -> crate::manifest::MachineManifestDraft {
+        let mut draft = crate::manifest::MachineManifest::parse_toml(include_str!(
+            "../../examples/machine.controller-worker.toml"
+        ))
+        .unwrap()
+        .without_machine_id();
+        draft.installation = Some(crate::manifest::Installation { scope });
+        #[cfg(target_os = "linux")]
+        {
+            draft.platform.os = crate::manifest::OperatingSystem::Linux;
+        }
+        #[cfg(target_os = "macos")]
+        {
+            draft.platform.os = crate::manifest::OperatingSystem::Macos;
+        }
+        #[cfg(target_os = "windows")]
+        {
+            draft.platform.os = crate::manifest::OperatingSystem::Windows;
+        }
+        draft
+    }
+
+    #[test]
+    fn scope_promotion_recovery_accepts_only_the_three_safe_durable_states() {
+        use super::ScopePromotionRecoveryState::{
+            CheckpointThenRetireUser, RetireIntent, RetryAuthorization,
+        };
+        let user = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let system = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        let third = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+        assert_eq!(
+            super::classify_recovery_state(Some(user), None, false, user, system).unwrap(),
+            RetryAuthorization
+        );
+        assert_eq!(
+            super::classify_recovery_state(Some(user), Some(system), false, user, system).unwrap(),
+            CheckpointThenRetireUser
+        );
+        assert_eq!(
+            super::classify_recovery_state(None, Some(system), true, user, system).unwrap(),
+            RetireIntent
+        );
+        for before in [None, Some(user), Some(third)] {
+            for after in [None, Some(system), Some(third)] {
+                for checkpoint in [false, true] {
+                    let expected_safe = matches!(
+                        (before, after, checkpoint),
+                        (Some(value), None, false) if value == user
+                    ) || matches!(
+                        (before, after, checkpoint),
+                        (Some(before_value), Some(after_value), _)
+                            if before_value == user && after_value == system
+                    ) || matches!(
+                        (before, after, checkpoint),
+                        (None, Some(value), true) if value == system
+                    );
+                    assert_eq!(
+                        super::classify_recovery_state(before, after, checkpoint, user, system,)
+                            .is_ok(),
+                        expected_safe,
+                        "unexpected recovery classification for {before:?}/{after:?}/{checkpoint}",
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn scope_promotion_rejects_concurrent_intent_files() {
+        let root = std::env::temp_dir().join(format!(
+            "styrn-concurrent-scope-promotion-{}",
+            uuid::Uuid::now_v7()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let expected = root.join(format!(
+            ".receipt.json.scope-promotion.{}.json",
+            uuid::Uuid::now_v7()
+        ));
+        assert!(super::reject_concurrent_scope_promotion_intents(&expected).is_ok());
+        let temporary = root.join(".receipt.json.scope-promotion.interrupted.tmp");
+        std::fs::write(&temporary, b"incomplete").unwrap();
+        assert!(super::reject_concurrent_scope_promotion_intents(&expected).is_ok());
+        let other = root.join(format!(
+            ".receipt.json.scope-promotion.{}.json",
+            uuid::Uuid::now_v7()
+        ));
+        std::fs::write(&other, b"untrusted").unwrap();
+        assert!(super::reject_concurrent_scope_promotion_intents(&expected).is_err());
+        assert_eq!(std::fs::read(&other).unwrap(), b"untrusted");
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn scope_promotion_checkpoint_is_typed_non_owning_user_history() {
+        let operator = crate::platform::resolve_current_worker_principal().unwrap();
+        let target = crate::platform::WorkerPrincipal::new(
+            operator.principal_kind(),
+            operator.principal_id(),
+            "build-agent",
+            crate::platform::WorkerAccountPolicy::Dedicated,
+        )
+        .unwrap();
+        let checkpoint = super::ScopePromotionCheckpoint::new_for_test(
+            uuid::Uuid::now_v7(),
+            &operator,
+            &target,
+            "7f81291a9c35cb94e74c8794e4c1ea1c0966b92fc67a72490ef0df956320a394",
+            "/tmp/styrn-user-machine.toml",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "/tmp/styrn-system-machine.toml",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            uuid::Uuid::now_v7(),
+        )
+        .unwrap();
+
+        assert_eq!(checkpoint.action_id(), "identity.scope-promotion");
+        assert_eq!(checkpoint.original_operator(), &operator);
+        assert_eq!(checkpoint.target_principal(), &target);
+    }
+
+    #[test]
+    fn scope_promotion_checkpoint_is_durable_once_and_cannot_claim_effects() {
+        let operator = crate::platform::resolve_current_worker_principal().unwrap();
+        let target = crate::platform::WorkerPrincipal::new(
+            operator.principal_kind(),
+            operator.principal_id(),
+            "build-agent",
+            crate::platform::WorkerAccountPolicy::Dedicated,
+        )
+        .unwrap();
+        let root = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join(format!("styrn-scope-promotion-{}", uuid::Uuid::now_v7()));
+        let receipt_path = root.join("styrn/receipt.json");
+        let store = crate::setup::receipt::ReceiptStore::new_user_for_test(&receipt_path);
+        let checkpoint = super::ScopePromotionCheckpoint::new_for_test(
+            uuid::Uuid::now_v7(),
+            &operator,
+            &target,
+            "7f81291a9c35cb94e74c8794e4c1ea1c0966b92fc67a72490ef0df956320a394",
+            "/tmp/styrn-user-machine.toml",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "/tmp/styrn-system-machine.toml",
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+            uuid::Uuid::now_v7(),
+        )
+        .unwrap();
+        let authority = super::scope_promotion_authority();
+        let mut metadata = crate::setup::receipt::ReceiptMetadataSource::for_test([(
+            "019cad99-54a0-7000-8000-000000000011",
+            "2026-09-03T11:00:00Z",
+        )]);
+
+        store
+            .append_scope_promotion_checkpoint(&checkpoint, &mut metadata, &authority)
+            .unwrap();
+        store
+            .append_scope_promotion_checkpoint(&checkpoint, &mut metadata, &authority)
+            .unwrap();
+        let document: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&receipt_path).unwrap()).unwrap();
+        let entries = document["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["action"]["type"], "scope_promotion");
+        assert_eq!(entries[0]["privilege_used"], "none");
+        assert_eq!(entries[0]["status"], "applied");
+        for field in [
+            "directories_created",
+            "files_created",
+            "files_modified",
+            "services",
+            "accounts",
+            "registry_keys",
+            "firewall_rules",
+        ] {
+            assert_eq!(entries[0][field].as_array().unwrap().len(), 0);
+        }
+        assert!(entries[0]["download_provenance"].is_null());
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    #[cfg(not(target_os = "windows"))]
+    fn scope_promotion_preserves_one_uuid_and_dedicated_account_established_rerun() {
+        let root = std::env::temp_dir().join(format!(
+            "styrn-scope-promotion-e2e-{}",
+            uuid::Uuid::now_v7()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let root = std::fs::canonicalize(root).unwrap();
+        let operator = crate::platform::resolve_current_worker_principal().unwrap();
+        let selector = operator.name().to_owned();
+        let (ready, target) = crate::setup::action::tests::dedicated_ready_for_test(&selector);
+        let user_layout = crate::platform::worker_directory_layout_for_test(
+            crate::platform::InstallationScope::User,
+            operator.clone(),
+            root.join("user-worker"),
+            Some(root.clone()),
+        );
+        let system_root = root.join("system-worker");
+        let (mut system_plan, system_layout) =
+            crate::setup::action::dedicated_system_worker_directory_plan_for_test(
+                &ready,
+                system_root,
+                Some(root.clone()),
+            )
+            .unwrap();
+
+        let user_receipt_path = root.join("user-state/styrn/receipt.json");
+        let user_receipt =
+            crate::setup::receipt::ReceiptStore::new_user_for_test(&user_receipt_path);
+        let user_manifest_path = root.join("user-config/styrn/machine.toml");
+        let user_manifest =
+            crate::manifest::MachineManifestStore::new_user_with_worker_layout_for_test(
+                &user_manifest_path,
+                operator.clone(),
+                &user_layout,
+            )
+            .unwrap();
+        let mut user_draft =
+            crate::manifest::CurrentUserWorkerManifestCandidate::derive_with_layout_for_test(
+                &native_manifest_draft(crate::platform::InstallationScope::User),
+                &operator,
+                &user_layout,
+            )
+            .unwrap()
+            .into_draft();
+        let mut prerequisite = vec![crate::setup::action::dedicated_account_prerequisite(
+            crate::platform::DedicatedAccountSpec::new(&selector).unwrap(),
+        )
+        .unwrap()];
+        let mut user_metadata = crate::setup::receipt::ReceiptMetadataSource::for_test([
+            (
+                "019cad99-54a0-7000-8000-000000000021",
+                "2026-09-03T12:00:00Z",
+            ),
+            (
+                "019cad99-54a0-7000-8000-000000000022",
+                "2026-09-03T12:00:01Z",
+            ),
+            (
+                "019cad99-54a0-7000-8000-000000000023",
+                "2026-09-03T12:00:02Z",
+            ),
+        ]);
+        let user_execution = crate::setup::action::apply_plan_with_journal(
+            &mut prerequisite,
+            &user_receipt,
+            &mut user_metadata,
+        )
+        .unwrap();
+
+        std::fs::create_dir_all(root.join("system-state")).unwrap();
+        let system_receipt_path = root.join("system-state/styrn/receipt.json");
+        let system_receipt =
+            crate::setup::receipt::ReceiptStore::new_system_for_test_with_worker_layout(
+                &system_receipt_path,
+                system_layout.clone(),
+            );
+        let system_candidate = ready
+            .manifest_candidate_with_layout_for_test(
+                &native_manifest_draft(crate::platform::InstallationScope::System),
+                &system_layout,
+            )
+            .unwrap();
+        std::fs::create_dir_all(root.join("system-config")).unwrap();
+        let system_manifest_path = root.join("system-config/styrn/machine.toml");
+        let system_manifest =
+            crate::manifest::MachineManifestStore::new_system_dedicated_with_layout_for_test(
+                &system_manifest_path,
+                &system_candidate,
+                &system_layout,
+            )
+            .unwrap();
+        let authorization = super::ScopePromotionAuthorization::new(
+            uuid::Uuid::parse_str("019cad99-54a0-7000-8000-000000000024").unwrap(),
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+        )
+        .unwrap();
+        let preparation = super::ScopePromotionPreparation::new(
+            &ready,
+            system_candidate,
+            &system_receipt,
+            &system_manifest,
+            authorization,
+        )
+        .unwrap();
+        let machine_id = crate::setup::pending::publish_manifest_and_begin_scope_promotion(
+            &user_manifest,
+            &system_manifest,
+            &user_receipt,
+            &mut user_draft,
+            user_execution.completion(),
+            &mut user_metadata,
+            &preparation,
+        )
+        .unwrap();
+        assert!(user_manifest_path.is_file());
+        assert!(!system_manifest_path.exists());
+
+        let mut system_metadata = crate::setup::receipt::ReceiptMetadataSource::for_test([
+            (
+                "019cad99-54a0-7000-8000-000000000031",
+                "2026-09-03T12:01:00Z",
+            ),
+            (
+                "019cad99-54a0-7000-8000-000000000032",
+                "2026-09-03T12:01:01Z",
+            ),
+            (
+                "019cad99-54a0-7000-8000-000000000033",
+                "2026-09-03T12:01:02Z",
+            ),
+            (
+                "019cad99-54a0-7000-8000-000000000034",
+                "2026-09-03T12:01:03Z",
+            ),
+            (
+                "019cad99-54a0-7000-8000-000000000035",
+                "2026-09-03T12:01:04Z",
+            ),
+            (
+                "019cad99-54a0-7000-8000-000000000036",
+                "2026-09-03T12:01:05Z",
+            ),
+            (
+                "019cad99-54a0-7000-8000-000000000037",
+                "2026-09-03T12:01:06Z",
+            ),
+        ]);
+        system_receipt
+            .reserve_authorization(
+                "019cad99-54a0-7000-8000-000000000024",
+                "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            )
+            .unwrap();
+        let promotion_authority = super::scope_promotion_authority();
+        assert!(system_receipt
+            .verify_scope_promotion_authorization(
+                uuid::Uuid::parse_str("019cad99-54a0-7000-8000-000000000024").unwrap(),
+                "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+                &promotion_authority,
+            )
+            .is_err());
+        system_receipt
+            .verify_scope_promotion_authorization(
+                uuid::Uuid::parse_str("019cad99-54a0-7000-8000-000000000024").unwrap(),
+                "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                &promotion_authority,
+            )
+            .unwrap();
+        let empty_execution = crate::setup::action::apply_plan_with_journal(
+            &mut [],
+            &system_receipt,
+            &mut system_metadata,
+        )
+        .unwrap();
+        assert!(super::publish_scope_promotion_system_manifest(
+            &user_receipt,
+            preparation.intent_id,
+            &system_receipt,
+            &system_manifest,
+            empty_execution.completion(),
+            &mut system_metadata,
+        )
+        .is_err());
+        assert!(user_manifest_path.is_file());
+        assert!(!system_manifest_path.exists());
+        let system_execution = crate::setup::action::apply_plan_with_journal(
+            &mut system_plan,
+            &system_receipt,
+            &mut system_metadata,
+        )
+        .unwrap();
+        super::publish_scope_promotion_system_manifest(
+            &user_receipt,
+            preparation.intent_id,
+            &system_receipt,
+            &system_manifest,
+            system_execution.completion(),
+            &mut system_metadata,
+        )
+        .unwrap();
+        assert!(user_manifest_path.is_file());
+        assert!(system_manifest_path.is_file());
+        assert_eq!(
+            user_manifest.read().unwrap().manifest.machine_id,
+            machine_id
+        );
+        assert_eq!(
+            system_manifest.read().unwrap().manifest.machine_id,
+            machine_id
+        );
+
+        let exact_user_manifest = std::fs::read(&user_manifest_path).unwrap();
+        let exact_system_manifest = std::fs::read(&system_manifest_path).unwrap();
+        let mut third_system = crate::manifest::MachineManifest::parse_toml(
+            std::str::from_utf8(&exact_system_manifest).unwrap(),
+        )
+        .unwrap();
+        third_system.name.push_str("-unexpected");
+        std::fs::write(&system_manifest_path, third_system.to_toml().unwrap()).unwrap();
+        assert!(super::finalize_scope_promotion(
+            &user_receipt,
+            &user_manifest,
+            &system_manifest,
+            preparation.intent_id,
+            &mut user_metadata,
+        )
+        .is_err());
+        assert!(user_manifest_path.is_file());
+        assert!(system_manifest_path.is_file());
+        assert!(
+            super::scope_promotion_intent_path(&user_receipt_path, preparation.intent_id)
+                .unwrap()
+                .is_file()
+        );
+        std::fs::write(&system_manifest_path, &exact_system_manifest).unwrap();
+
+        let mut third_user = crate::manifest::MachineManifest::parse_toml(
+            std::str::from_utf8(&exact_user_manifest).unwrap(),
+        )
+        .unwrap();
+        third_user.machine_id = uuid::Uuid::now_v7();
+        std::fs::write(&user_manifest_path, third_user.to_toml().unwrap()).unwrap();
+        assert!(super::finalize_scope_promotion(
+            &user_receipt,
+            &user_manifest,
+            &system_manifest,
+            preparation.intent_id,
+            &mut user_metadata,
+        )
+        .is_err());
+        assert!(user_manifest_path.is_file());
+        assert!(system_manifest_path.is_file());
+        assert!(
+            super::scope_promotion_intent_path(&user_receipt_path, preparation.intent_id)
+                .unwrap()
+                .is_file()
+        );
+        std::fs::write(&user_manifest_path, &exact_user_manifest).unwrap();
+
+        use std::os::unix::fs::PermissionsExt as _;
+        let displaced_user_manifest = user_manifest_path.with_extension("promotion-source");
+        std::fs::rename(&user_manifest_path, &displaced_user_manifest).unwrap();
+        std::fs::write(&user_manifest_path, &exact_user_manifest).unwrap();
+        std::fs::set_permissions(&user_manifest_path, std::fs::Permissions::from_mode(0o600))
+            .unwrap();
+        assert!(super::finalize_scope_promotion(
+            &user_receipt,
+            &user_manifest,
+            &system_manifest,
+            preparation.intent_id,
+            &mut user_metadata,
+        )
+        .is_err());
+        assert!(user_manifest_path.is_file());
+        assert!(system_manifest_path.is_file());
+        assert!(
+            super::scope_promotion_intent_path(&user_receipt_path, preparation.intent_id)
+                .unwrap()
+                .is_file()
+        );
+        std::fs::remove_file(&user_manifest_path).unwrap();
+        std::fs::rename(&displaced_user_manifest, &user_manifest_path).unwrap();
+
+        super::set_interrupt_after_checkpoint_for_test(true);
+        assert!(super::finalize_scope_promotion(
+            &user_receipt,
+            &user_manifest,
+            &system_manifest,
+            preparation.intent_id,
+            &mut user_metadata,
+        )
+        .is_err());
+        super::set_interrupt_after_checkpoint_for_test(false);
+        assert!(user_manifest_path.is_file());
+        assert!(system_manifest_path.is_file());
+        assert!(
+            super::scope_promotion_intent_path(&user_receipt_path, preparation.intent_id)
+                .unwrap()
+                .is_file()
+        );
+        super::set_interrupt_after_user_retirement_for_test(true);
+        assert!(super::finalize_scope_promotion(
+            &user_receipt,
+            &user_manifest,
+            &system_manifest,
+            preparation.intent_id,
+            &mut user_metadata,
+        )
+        .is_err());
+        super::set_interrupt_after_user_retirement_for_test(false);
+        assert!(!user_manifest_path.exists());
+        assert!(system_manifest_path.is_file());
+        assert!(
+            super::scope_promotion_intent_path(&user_receipt_path, preparation.intent_id)
+                .unwrap()
+                .is_file()
+        );
+        let evidence = super::finalize_scope_promotion(
+            &user_receipt,
+            &user_manifest,
+            &system_manifest,
+            preparation.intent_id,
+            &mut user_metadata,
+        )
+        .unwrap();
+        let observed = crate::platform::inspect_established_dedicated_account_for_test(
+            crate::platform::DedicatedAccountSpec::new(&selector).unwrap(),
+            &evidence,
+            crate::platform::NativeDedicatedAccountObservation::PresentHealthy(target.clone()),
+        );
+        assert!(matches!(
+            observed,
+            crate::platform::DedicatedAccountObservation::PresentHealthy(_)
+        ));
+        let receipt: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&user_receipt_path).unwrap()).unwrap();
+        assert_eq!(
+            receipt["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|entry| entry["action"]["type"] == "scope_promotion")
+                .count(),
+            1
+        );
+        assert!(
+            !super::scope_promotion_intent_path(&user_receipt_path, preparation.intent_id)
+                .unwrap()
+                .exists()
+        );
+        let recovered = super::finalize_scope_promotion(
+            &user_receipt,
+            &user_manifest,
+            &system_manifest,
+            preparation.intent_id,
+            &mut user_metadata,
+        )
+        .unwrap();
+        let recovered_observation = crate::platform::inspect_established_dedicated_account_for_test(
+            crate::platform::DedicatedAccountSpec::new(&selector).unwrap(),
+            &recovered,
+            crate::platform::NativeDedicatedAccountObservation::PresentHealthy(target),
+        );
+        assert!(matches!(
+            recovered_observation,
+            crate::platform::DedicatedAccountObservation::PresentHealthy(_)
+        ));
+        let _ = std::fs::remove_dir_all(root);
+    }
+}

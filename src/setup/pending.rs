@@ -87,6 +87,10 @@ impl PendingOutcome {
 
 pub(super) struct PendingPublicationAuthority(());
 
+pub(in crate::setup) const fn pending_publication_authority() -> PendingPublicationAuthority {
+    PendingPublicationAuthority(())
+}
+
 /// Replaces only the manifest's current unresolved projection.
 fn project_manifest(
     draft: &mut manifest::MachineManifestDraft,
@@ -153,6 +157,55 @@ pub(in crate::setup) fn publish_manifest(
     project_manifest(&mut candidate, pending)?;
     let machine_id =
         session.publish_manifest(manifest_store, &candidate, completed, metadata, &authority)?;
+    *draft = candidate;
+    Ok(machine_id)
+}
+
+pub(in crate::setup) fn publish_manifest_and_begin_scope_promotion(
+    user_manifest_store: &manifest::MachineManifestStore,
+    system_manifest_store: &manifest::MachineManifestStore,
+    receipt_store: &super::receipt::ReceiptStore,
+    draft: &mut manifest::MachineManifestDraft,
+    completed: &CompletedExecutionToken,
+    metadata: &mut super::receipt::ReceiptMetadataSource,
+    preparation: &super::promotion::ScopePromotionPreparation,
+) -> Result<uuid::Uuid, super::promotion::ScopePromotionError> {
+    let pending = completed.pending();
+    validate_unique_pending(pending)
+        .map_err(|_| super::promotion::ScopePromotionError::Conflict)?;
+    let pending_authority = PendingPublicationAuthority(());
+    let promotion_authority = super::promotion::scope_promotion_authority();
+    let session = receipt_store
+        .begin_pending_publication(&pending_authority)
+        .map_err(|_| super::promotion::ScopePromotionError::Conflict)?;
+    session
+        .validate_completed_execution(
+            completed.receipt_witness(),
+            completed.occurrences(),
+            pending,
+        )
+        .map_err(|_| super::promotion::ScopePromotionError::Conflict)?;
+    {
+        let manifest_session = user_manifest_store
+            .begin_pending_publication()
+            .map_err(|_| super::promotion::ScopePromotionError::Conflict)?;
+        session
+            .validate_manifest_binding(completed.receipt_witness(), &manifest_session)
+            .map_err(|_| super::promotion::ScopePromotionError::Conflict)?;
+    }
+    let mut candidate = draft.clone();
+    project_manifest(&mut candidate, pending)
+        .map_err(|_| super::promotion::ScopePromotionError::Conflict)?;
+    let machine_id = session.publish_manifest_and_begin_scope_promotion(
+        user_manifest_store,
+        system_manifest_store,
+        &candidate,
+        completed,
+        metadata,
+        preparation,
+        &pending_authority,
+        &promotion_authority,
+    )?;
     *draft = candidate;
     Ok(machine_id)
 }

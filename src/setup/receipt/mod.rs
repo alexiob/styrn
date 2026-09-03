@@ -157,8 +157,56 @@ impl ReceiptDocument {
         self.entries.len()
     }
 
+    pub(in crate::setup) fn pending_publication_count(&self) -> usize {
+        self.pending_publications.len()
+    }
+
     pub(in crate::setup) fn is_empty(&self) -> bool {
         self.entries.is_empty()
+    }
+
+    #[cfg(not(any(action_core_fixture, action_compile_fixture)))]
+    pub(in crate::setup) fn has_scope_promotion_checkpoint(
+        &self,
+        checkpoint: &crate::setup::promotion::ScopePromotionCheckpoint,
+    ) -> Result<bool, ReceiptError> {
+        let expected =
+            ReceiptAction::ScopePromotion(ScopePromotionParameters::from_checkpoint(checkpoint)?);
+        Ok(self.entries.iter().any(|entry| {
+            entry.status == ReceiptStatus::Applied
+                && entry.privilege_used == ReceiptPrivilege::None
+                && entry.action == expected
+        }))
+    }
+
+    #[cfg(not(any(action_core_fixture, action_compile_fixture)))]
+    pub(in crate::setup) fn scope_promotion_checkpoint(
+        &self,
+        intent_id: Uuid,
+        authority: &crate::setup::promotion::ScopePromotionAuthority,
+    ) -> Result<Option<crate::setup::promotion::ScopePromotionCheckpoint>, ReceiptError> {
+        let matches = self
+            .entries
+            .iter()
+            .filter_map(|entry| match &entry.action {
+                ReceiptAction::ScopePromotion(parameters)
+                    if entry.status == ReceiptStatus::Applied
+                        && entry.privilege_used == ReceiptPrivilege::None
+                        && parameters.promotion_intent_id.0 == intent_id.to_string() =>
+                {
+                    Some(parameters)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let [parameters] = matches.as_slice() else {
+            return if matches.is_empty() {
+                Ok(None)
+            } else {
+                Err(ReceiptError::InvalidScopePromotion)
+            };
+        };
+        parameters.to_checkpoint(authority).map(Some)
     }
 
     fn validate(&self) -> Result<(), ReceiptError> {
@@ -807,6 +855,10 @@ enum PendingPublicationIntentInterruption {
 }
 
 impl ReceiptStore {
+    pub(in crate::setup) fn path(&self) -> &Path {
+        &self.path
+    }
+
     pub(in crate::setup) fn installation_scope(&self) -> InstallationScope {
         self.scope
     }
@@ -1316,17 +1368,69 @@ impl ReceiptStore {
         }
     }
 
+    #[cfg(not(any(action_core_fixture, action_compile_fixture)))]
+    pub(in crate::setup) fn validate_scope_promotion_system_completion(
+        &self,
+        _authority: &crate::setup::promotion::ScopePromotionAuthority,
+    ) -> Result<(), ReceiptStoreError> {
+        if self.scope != InstallationScope::System
+            || self.worker.account_policy() != WorkerAccountPolicy::Dedicated
+        {
+            return Err(ReceiptStoreError::ScopeMismatch);
+        }
+        let document = self.read_snapshot()?;
+        let layout = self.worker_directory_layout()?;
+        let expected_nodes = layout.materialization_nodes();
+        let worker_entries = document
+            .entries
+            .iter()
+            .filter_map(|entry| match &entry.action {
+                ReceiptAction::WorkerDirectory(parameters)
+                    if entry.status == ReceiptStatus::Applied =>
+                {
+                    Some(parameters)
+                }
+                ReceiptAction::WorkerDirectory(_) => None,
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if worker_entries.len() != expected_nodes.len()
+            || expected_nodes.iter().any(|expected| {
+                worker_entries
+                    .iter()
+                    .filter(|parameters| {
+                        parameters.node.platform_node().ok().as_ref() == Some(expected)
+                            && parameters.principal.to_worker_principal().ok().as_ref()
+                                == Some(&self.worker)
+                    })
+                    .count()
+                    != 1
+            })
+        {
+            return Err(ReceiptStoreError::IntentConflict);
+        }
+        Ok(())
+    }
+
     /// Atomically records one privileged authorization request before any of
     /// its actions run. The system-owned directory makes request IDs one-use
     /// even when the ordinary user retained a copy of the request file.
     pub(in crate::setup) fn reserve_authorization(
         &self,
         request_id: &str,
+        request_sha256: &str,
     ) -> Result<(), ReceiptStoreError> {
         let request_id_text = request_id;
         let request_id =
             Uuid::parse_str(request_id_text).map_err(|_| ReceiptStoreError::IntentConflict)?;
         if request_id.get_version_num() != 7 || request_id.to_string() != request_id_text {
+            return Err(ReceiptStoreError::IntentConflict);
+        }
+        if request_sha256.len() != 64
+            || !request_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
             return Err(ReceiptStoreError::IntentConflict);
         }
         if self.scope != InstallationScope::System {
@@ -1345,10 +1449,11 @@ impl ReceiptStore {
             Err(error) => return Err(ReceiptStoreError::Write(error)),
         };
         let result = (|| {
-            file.write_all(b"styrn.authorization-consumed.v1\n")
+            let marker_bytes = format!("styrn.authorization-consumed.v1 {request_sha256}\n");
+            file.write_all(marker_bytes.as_bytes())
                 .map_err(ReceiptStoreError::Write)?;
             file.sync_all().map_err(ReceiptStoreError::Write)?;
-            crate::platform::harden_manifest_file(&marker, self.owner, &self.worker)
+            crate::platform::verify_private_file_security(&marker, self.owner, &self.worker)
                 .map_err(ReceiptStoreError::Write)?;
             crate::platform::sync_parent_directory(&destination).map_err(ReceiptStoreError::Write)
         })();
@@ -1356,6 +1461,40 @@ impl ReceiptStore {
             let _ = fs::remove_file(&marker);
         }
         result
+    }
+
+    #[cfg(not(any(action_core_fixture, action_compile_fixture)))]
+    pub(in crate::setup) fn verify_scope_promotion_authorization(
+        &self,
+        request_id: uuid::Uuid,
+        request_sha256: &str,
+        _authority: &crate::setup::promotion::ScopePromotionAuthority,
+    ) -> Result<(), ReceiptStoreError> {
+        if self.scope != InstallationScope::System || request_id.get_version_num() != 7 {
+            return Err(ReceiptStoreError::IntentConflict);
+        }
+        let marker = self
+            .path
+            .parent()
+            .ok_or(ReceiptStoreError::InvalidDestination)?
+            .join(format!(".authorization-{request_id}.consumed"));
+        let identity =
+            crate::platform::private_file_identity(&marker).map_err(ReceiptStoreError::Security)?;
+        let file = crate::platform::open_verified_private_file_for_read(
+            &marker,
+            self.owner,
+            &self.worker,
+            identity,
+        )
+        .map_err(ReceiptStoreError::Security)?;
+        let mut bytes = Vec::new();
+        file.take(128)
+            .read_to_end(&mut bytes)
+            .map_err(ReceiptStoreError::Read)?;
+        if bytes != format!("styrn.authorization-consumed.v1 {request_sha256}\n").as_bytes() {
+            return Err(ReceiptStoreError::IntentConflict);
+        }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -1376,6 +1515,91 @@ impl ReceiptStore {
         let publication_intent = self.read_pending_publication_intent(&existing)?;
         let mut candidate = existing.clone();
         candidate.entries.push(entry);
+        validate_append_candidate(
+            &existing,
+            &candidate,
+            publication_intent.as_ref().map(|intent| &intent.document),
+        )?;
+        self.write_document(
+            &candidate,
+            publication_intent.as_ref().map(|intent| &intent.document),
+        )
+    }
+
+    #[cfg(not(any(action_core_fixture, action_compile_fixture)))]
+    pub(in crate::setup) fn append_scope_promotion_checkpoint(
+        &self,
+        checkpoint: &crate::setup::promotion::ScopePromotionCheckpoint,
+        metadata: &mut ReceiptMetadataSource,
+        _authority: &crate::setup::promotion::ScopePromotionAuthority,
+    ) -> Result<(), ReceiptStoreError> {
+        if self.scope != InstallationScope::User
+            || self.worker != *checkpoint.original_operator()
+            || self.worker.account_policy() != WorkerAccountPolicy::CurrentUser
+        {
+            return Err(ReceiptStoreError::ScopeMismatch);
+        }
+        let destination = self.validate_destination_policy()?.to_path_buf();
+        self.verify_bound_principal()?;
+        self.prepare_destination(&destination)?;
+        self.preflight_writer_state()?;
+        let lock = crate::platform::open_manifest_lock(&self.lock_path(), self.owner, &self.worker)
+            .map_err(ReceiptStoreError::Write)?;
+        lock.lock().map_err(ReceiptStoreError::Write)?;
+        self.append_scope_promotion_checkpoint_locked(checkpoint, metadata)
+    }
+
+    #[cfg(not(any(action_core_fixture, action_compile_fixture)))]
+    pub(in crate::setup) fn commit_scope_promotion_checkpoint<After>(
+        &self,
+        checkpoint: &crate::setup::promotion::ScopePromotionCheckpoint,
+        metadata: &mut ReceiptMetadataSource,
+        _authority: &crate::setup::promotion::ScopePromotionAuthority,
+        after_durable_checkpoint: After,
+    ) -> Result<(), ReceiptStoreError>
+    where
+        After: FnOnce() -> Result<(), ReceiptStoreError>,
+    {
+        if self.scope != InstallationScope::User || self.worker != *checkpoint.original_operator() {
+            return Err(ReceiptStoreError::ScopeMismatch);
+        }
+        let destination = self.validate_destination_policy()?.to_path_buf();
+        self.verify_bound_principal()?;
+        self.prepare_destination(&destination)?;
+        self.preflight_writer_state()?;
+        let lock = crate::platform::open_manifest_lock(&self.lock_path(), self.owner, &self.worker)
+            .map_err(ReceiptStoreError::Write)?;
+        lock.lock().map_err(ReceiptStoreError::Write)?;
+        self.append_scope_promotion_checkpoint_locked(checkpoint, metadata)?;
+        after_durable_checkpoint()
+    }
+
+    #[cfg(not(any(action_core_fixture, action_compile_fixture)))]
+    fn append_scope_promotion_checkpoint_locked(
+        &self,
+        checkpoint: &crate::setup::promotion::ScopePromotionCheckpoint,
+        metadata: &mut ReceiptMetadataSource,
+    ) -> Result<(), ReceiptStoreError> {
+        let expected =
+            ReceiptAction::ScopePromotion(ScopePromotionParameters::from_checkpoint(checkpoint)?);
+        let existing = self.read_locked()?;
+        let publication_intent = self.read_pending_publication_intent(&existing)?;
+        let prior = existing
+            .entries
+            .iter()
+            .filter(|entry| matches!(entry.action, ReceiptAction::ScopePromotion(_)))
+            .collect::<Vec<_>>();
+        if !prior.is_empty() {
+            return if prior.len() == 1 && prior[0].action == expected {
+                Ok(())
+            } else {
+                Err(ReceiptStoreError::IntentConflict)
+            };
+        }
+        let mut candidate = existing.clone();
+        candidate
+            .entries
+            .push(ReceiptEntry::scope_promotion(checkpoint, metadata.next()?)?);
         validate_append_candidate(
             &existing,
             &candidate,
@@ -2640,6 +2864,148 @@ impl ReceiptPendingPublicationSession<'_> {
         Ok(manifest_candidate.machine_id())
     }
 
+    #[allow(clippy::too_many_arguments)] // Keeps all stores, tokens, and authorities explicit.
+    pub(in crate::setup) fn publish_manifest_and_begin_scope_promotion(
+        &self,
+        user_manifest_store: &crate::manifest::MachineManifestStore,
+        system_manifest_store: &crate::manifest::MachineManifestStore,
+        draft: &crate::manifest::MachineManifestDraft,
+        completed: &crate::setup::action::CompletedExecutionToken,
+        metadata: &mut ReceiptMetadataSource,
+        preparation: &crate::setup::promotion::ScopePromotionPreparation,
+        pending_authority: &crate::setup::pending::PendingPublicationAuthority,
+        promotion_authority: &crate::setup::promotion::ScopePromotionAuthority,
+    ) -> Result<uuid::Uuid, crate::setup::promotion::ScopePromotionError> {
+        let machine_id = self
+            .publish_manifest(
+                user_manifest_store,
+                draft,
+                completed,
+                metadata,
+                pending_authority,
+            )
+            .map_err(|_| crate::setup::promotion::ScopePromotionError::Conflict)?;
+        crate::setup::promotion::write_scope_promotion_intent(
+            self.store,
+            user_manifest_store,
+            system_manifest_store,
+            preparation,
+            machine_id,
+            promotion_authority,
+        )?;
+        Ok(machine_id)
+    }
+
+    #[allow(clippy::too_many_arguments)] // Keeps the protected publication tuple explicit.
+    pub(in crate::setup) fn publish_scope_promotion_system_manifest(
+        &self,
+        manifest_store: &crate::manifest::MachineManifestStore,
+        candidate_manifest: &str,
+        expected_machine_id: uuid::Uuid,
+        completed: &crate::setup::action::CompletedExecutionToken,
+        metadata: &mut ReceiptMetadataSource,
+        pending_authority: &crate::setup::pending::PendingPublicationAuthority,
+        _promotion_authority: &crate::setup::promotion::ScopePromotionAuthority,
+    ) -> Result<uuid::Uuid, crate::setup::promotion::ScopePromotionError> {
+        if self.store.scope != InstallationScope::System
+            || !completed.pending().is_empty()
+            || !completed.occurrences().is_empty()
+        {
+            return Err(crate::setup::promotion::ScopePromotionError::Conflict);
+        }
+        self.recover_pending_publication(manifest_store)
+            .map_err(|_| crate::setup::promotion::ScopePromotionError::Conflict)?;
+        let manifest_session = manifest_store
+            .begin_pending_publication()
+            .map_err(|_| crate::setup::promotion::ScopePromotionError::Conflict)?;
+        self.validate_completed_execution(
+            completed.receipt_witness(),
+            completed.occurrences(),
+            completed.pending(),
+        )
+        .map_err(|_| crate::setup::promotion::ScopePromotionError::Conflict)?;
+        self.validate_manifest_binding(completed.receipt_witness(), &manifest_session)
+            .map_err(|_| crate::setup::promotion::ScopePromotionError::Conflict)?;
+        let existing = self
+            .store
+            .read_locked()
+            .map_err(|_| crate::setup::promotion::ScopePromotionError::Conflict)?;
+        if self
+            .store
+            .read_pending_publication_intent(&existing)
+            .map_err(|_| crate::setup::promotion::ScopePromotionError::Conflict)?
+            .is_some()
+        {
+            return Err(crate::setup::promotion::ScopePromotionError::Conflict);
+        }
+        let manifest_candidate = manifest_session
+            .stored_candidate(candidate_manifest)
+            .map_err(|_| crate::setup::promotion::ScopePromotionError::Conflict)?;
+        if manifest_candidate.machine_id() != expected_machine_id {
+            return Err(crate::setup::promotion::ScopePromotionError::Conflict);
+        }
+        let links = Vec::new();
+        if existing
+            .pending_publications
+            .last()
+            .is_some_and(|publication| publication.pending == links)
+        {
+            return if manifest_session.current_canonical() == Some(candidate_manifest) {
+                Ok(expected_machine_id)
+            } else {
+                Err(crate::setup::promotion::ScopePromotionError::Conflict)
+            };
+        }
+        let metadata = metadata
+            .next()
+            .map_err(|_| crate::setup::promotion::ScopePromotionError::Conflict)?;
+        let publication = PendingPublication {
+            publication_id: metadata.entry_id,
+            timestamp: metadata.timestamp,
+            receipt_entry_count: existing.entries.len(),
+            pending: links,
+        };
+        publication
+            .validate(&existing.entries)
+            .map_err(|_| crate::setup::promotion::ScopePromotionError::Conflict)?;
+        let before_manifest_sha256 = manifest_session
+            .current_canonical()
+            .map(|canonical| manifest_digest(canonical.as_bytes()));
+        let after_manifest_sha256 = manifest_digest(candidate_manifest.as_bytes());
+        let intent = self
+            .store
+            .write_pending_publication_intent(PendingPublicationIntentDocument {
+                schema_version: SCHEMA_VERSION,
+                installation_scope: self.store.scope,
+                receipt_path: normalized_path_text(&self.store.path)
+                    .map_err(|_| crate::setup::promotion::ScopePromotionError::Conflict)?,
+                worker_principal: self.store.worker.clone(),
+                receipt_entry_count: existing.entries.len(),
+                pending_publication_count: existing.pending_publications.len(),
+                receipt_prefix_sha256: receipt_document_digest(&existing)
+                    .map_err(|_| crate::setup::promotion::ScopePromotionError::Conflict)?,
+                manifest_path: normalized_path_text(manifest_session.path())
+                    .map_err(|_| crate::setup::promotion::ScopePromotionError::Conflict)?,
+                manifest_scope: manifest_session.installation_scope(),
+                manifest_worker_principal: manifest_session.worker_principal().clone(),
+                machine_id: ReceiptEntryId(expected_machine_id.to_string()),
+                before_manifest_sha256: before_manifest_sha256.clone(),
+                after_manifest_sha256: after_manifest_sha256.clone(),
+                publication,
+                candidate_manifest: candidate_manifest.to_owned(),
+            })
+            .map_err(|_| crate::setup::promotion::ScopePromotionError::Conflict)?;
+        if before_manifest_sha256 != Some(after_manifest_sha256) {
+            manifest_session
+                .publish(&manifest_candidate)
+                .map_err(|_| crate::setup::promotion::ScopePromotionError::Conflict)?;
+        }
+        self.finalize_pending_publication(intent)
+            .map_err(|_| crate::setup::promotion::ScopePromotionError::Conflict)?;
+        let _ = pending_authority;
+        Ok(expected_machine_id)
+    }
+
     fn recover_pending_publication(
         &self,
         manifest_store: &crate::manifest::MachineManifestStore,
@@ -3028,6 +3394,32 @@ struct ReceiptEntry {
 }
 
 impl ReceiptEntry {
+    #[cfg(not(any(action_core_fixture, action_compile_fixture)))]
+    fn scope_promotion(
+        checkpoint: &crate::setup::promotion::ScopePromotionCheckpoint,
+        metadata: ReceiptMetadata,
+    ) -> Result<Self, ReceiptError> {
+        let entry = Self {
+            entry_id: metadata.entry_id,
+            action: ReceiptAction::ScopePromotion(ScopePromotionParameters::from_checkpoint(
+                checkpoint,
+            )?),
+            timestamp: metadata.timestamp,
+            privilege_used: ReceiptPrivilege::None,
+            directories_created: Vec::new(),
+            files_created: Vec::new(),
+            files_modified: Vec::new(),
+            services: Vec::new(),
+            accounts: Vec::new(),
+            registry_keys: Vec::new(),
+            firewall_rules: Vec::new(),
+            download_provenance: DownloadProvenanceSlot(None),
+            status: ReceiptStatus::Applied,
+        };
+        entry.validate()?;
+        Ok(entry)
+    }
+
     fn pending(
         action: &crate::setup::action::PendingAction,
         metadata: ReceiptMetadata,
@@ -3224,6 +3616,22 @@ impl ReceiptEntry {
     }
 
     fn validate_action_effect(&self) -> Result<(), ReceiptError> {
+        if matches!(self.action, ReceiptAction::ScopePromotion(_)) {
+            if self.status != ReceiptStatus::Applied
+                || self.privilege_used != ReceiptPrivilege::None
+                || !self.directories_created.is_empty()
+                || !self.files_created.is_empty()
+                || !self.files_modified.is_empty()
+                || !self.services.is_empty()
+                || !self.accounts.is_empty()
+                || !self.registry_keys.is_empty()
+                || !self.firewall_rules.is_empty()
+                || self.download_provenance.0.is_some()
+            {
+                return Err(ReceiptError::InvalidScopePromotion);
+            }
+            return Ok(());
+        }
         if matches!(self.action, ReceiptAction::DedicatedAccountPrerequisite(_)) {
             if self.status != ReceiptStatus::Pending
                 || self.privilege_used != ReceiptPrivilege::None
@@ -3308,6 +3716,7 @@ enum ReceiptAction {
     Foundation(FoundationActionParameters),
     DedicatedAccountPrerequisite(DedicatedAccountPrerequisiteParameters),
     DeferredSystemAction(DeferredSystemActionParameters),
+    ScopePromotion(ScopePromotionParameters),
     WorkerDirectory(WorkerDirectoryActionParameters),
 }
 
@@ -3321,6 +3730,7 @@ impl ReceiptAction {
             self,
             Self::DedicatedAccountPrerequisite(_)
                 | Self::DeferredSystemAction(_)
+                | Self::ScopePromotion(_)
                 | Self::WorkerDirectory(_)
         )
     }
@@ -3371,6 +3781,7 @@ impl ReceiptAction {
             Self::Foundation(parameters) => &parameters.action_id.0,
             Self::DedicatedAccountPrerequisite(parameters) => &parameters.action_id.0,
             Self::DeferredSystemAction(parameters) => &parameters.action_id.0,
+            Self::ScopePromotion(parameters) => &parameters.action_id.0,
             Self::WorkerDirectory(parameters) => &parameters.action_id.0,
         }
     }
@@ -3380,6 +3791,7 @@ impl ReceiptAction {
             Self::Foundation(parameters) => parameters.action_id.validate(),
             Self::DedicatedAccountPrerequisite(parameters) => parameters.validate(),
             Self::DeferredSystemAction(parameters) => parameters.validate(),
+            Self::ScopePromotion(parameters) => parameters.validate(),
             Self::WorkerDirectory(parameters) => parameters.validate(),
         }
     }
@@ -3393,6 +3805,8 @@ impl ReceiptAction {
             }
             Self::DeferredSystemAction(_) if scope == InstallationScope::User => Ok(()),
             Self::DeferredSystemAction(_) => Err(ReceiptError::InvalidDeferredSystemAction),
+            Self::ScopePromotion(_) if scope == InstallationScope::User => Ok(()),
+            Self::ScopePromotion(_) => Err(ReceiptError::InvalidScopePromotion),
             Self::WorkerDirectory(parameters) => {
                 if scope == parameters.installation_scope {
                     Ok(())
@@ -3418,6 +3832,13 @@ impl ReceiptAction {
                 Ok(())
             }
             Self::DeferredSystemAction(_) => Err(ReceiptError::InvalidWorkerPrincipal),
+            Self::ScopePromotion(parameters)
+                if parameters.original_operator.to_worker_principal()? == *worker
+                    && worker.account_policy() == WorkerAccountPolicy::CurrentUser =>
+            {
+                Ok(())
+            }
+            Self::ScopePromotion(_) => Err(ReceiptError::InvalidWorkerPrincipal),
             Self::WorkerDirectory(parameters) => {
                 if parameters.principal.to_worker_principal()? == *worker {
                     Ok(())
@@ -3456,6 +3877,98 @@ struct DeferredSystemActionParameters {
     target_scope: InstallationScope,
     target_principal: ReceiptWorkerPrincipal,
     parameter_sha256: Sha256Digest,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ScopePromotionParameters {
+    action_id: ActionIdentifier,
+    machine_id: ReceiptEntryId,
+    source_scope: InstallationScope,
+    target_scope: InstallationScope,
+    user_manifest_path: RecordedPath,
+    user_manifest_sha256: Sha256Digest,
+    system_manifest_path: RecordedPath,
+    system_manifest_sha256: Sha256Digest,
+    original_operator: ReceiptWorkerPrincipal,
+    target_principal: ReceiptWorkerPrincipal,
+    selector_sha256: Sha256Digest,
+    promotion_intent_id: ReceiptEntryId,
+}
+
+impl ScopePromotionParameters {
+    #[cfg(not(any(action_core_fixture, action_compile_fixture)))]
+    fn from_checkpoint(
+        checkpoint: &crate::setup::promotion::ScopePromotionCheckpoint,
+    ) -> Result<Self, ReceiptError> {
+        let value = Self {
+            action_id: ActionIdentifier(checkpoint.action_id().to_owned()),
+            machine_id: ReceiptEntryId(checkpoint.machine_id().to_string()),
+            source_scope: checkpoint.source_scope(),
+            target_scope: checkpoint.target_scope(),
+            user_manifest_path: RecordedPath(checkpoint.user_manifest_path().to_owned()),
+            user_manifest_sha256: Sha256Digest(checkpoint.user_manifest_sha256().to_owned()),
+            system_manifest_path: RecordedPath(checkpoint.system_manifest_path().to_owned()),
+            system_manifest_sha256: Sha256Digest(checkpoint.system_manifest_sha256().to_owned()),
+            original_operator: ReceiptWorkerPrincipal::from_worker_principal(
+                checkpoint.original_operator(),
+            ),
+            target_principal: ReceiptWorkerPrincipal::from_worker_principal(
+                checkpoint.target_principal(),
+            ),
+            selector_sha256: Sha256Digest(checkpoint.selector_sha256().to_owned()),
+            promotion_intent_id: ReceiptEntryId(checkpoint.promotion_intent_id().to_string()),
+        };
+        value.validate()?;
+        Ok(value)
+    }
+
+    fn validate(&self) -> Result<(), ReceiptError> {
+        self.action_id.validate()?;
+        self.machine_id.validate()?;
+        self.user_manifest_path.validate()?;
+        self.user_manifest_sha256.validate()?;
+        self.system_manifest_path.validate()?;
+        self.system_manifest_sha256.validate()?;
+        self.original_operator.validate()?;
+        self.target_principal.validate()?;
+        self.selector_sha256.validate()?;
+        self.promotion_intent_id.validate()?;
+        if self.action_id.0 != "identity.scope-promotion"
+            || self.source_scope != InstallationScope::User
+            || self.target_scope != InstallationScope::System
+            || self.user_manifest_path == self.system_manifest_path
+            || self.original_operator.account_policy != WorkerAccountPolicy::CurrentUser
+            || self.target_principal.account_policy != WorkerAccountPolicy::Dedicated
+            || self.original_operator == self.target_principal
+            || manifest_digest(self.target_principal.name.as_bytes()) != self.selector_sha256
+        {
+            return Err(ReceiptError::InvalidScopePromotion);
+        }
+        Ok(())
+    }
+
+    #[cfg(not(any(action_core_fixture, action_compile_fixture)))]
+    fn to_checkpoint(
+        &self,
+        authority: &crate::setup::promotion::ScopePromotionAuthority,
+    ) -> Result<crate::setup::promotion::ScopePromotionCheckpoint, ReceiptError> {
+        self.validate()?;
+        crate::setup::promotion::ScopePromotionCheckpoint::from_durable_receipt(
+            Uuid::parse_str(&self.machine_id.0).map_err(|_| ReceiptError::InvalidScopePromotion)?,
+            &self.original_operator.to_worker_principal()?,
+            &self.target_principal.to_worker_principal()?,
+            &self.selector_sha256.0,
+            &self.user_manifest_path.0,
+            &self.user_manifest_sha256.0,
+            &self.system_manifest_path.0,
+            &self.system_manifest_sha256.0,
+            Uuid::parse_str(&self.promotion_intent_id.0)
+                .map_err(|_| ReceiptError::InvalidScopePromotion)?,
+            authority,
+        )
+        .map_err(|_| ReceiptError::InvalidScopePromotion)
+    }
 }
 
 impl DeferredSystemActionParameters {
@@ -4148,6 +4661,8 @@ pub(crate) enum ReceiptError {
     InvalidDedicatedAccountPrerequisite,
     #[error("setup receipt deferred system action is invalid")]
     InvalidDeferredSystemAction,
+    #[error("setup receipt scope promotion is invalid")]
+    InvalidScopePromotion,
     #[error("setup receipt worker principal is invalid")]
     InvalidWorkerPrincipal,
     #[error("setup receipt timestamp is not canonical UTC RFC 3339")]

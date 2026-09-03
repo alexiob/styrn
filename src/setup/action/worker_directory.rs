@@ -72,7 +72,7 @@ pub(in crate::setup) fn dedicated_system_worker_directory_plan(
 }
 
 #[cfg(test)]
-pub(super) fn dedicated_system_worker_directory_plan_for_test(
+pub(in crate::setup) fn dedicated_system_worker_directory_plan_for_test(
     ready: &super::dedicated_account::DedicatedAccountReady,
     root: PathBuf,
     creation_anchor: Option<PathBuf>,

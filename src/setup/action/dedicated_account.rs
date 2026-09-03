@@ -28,15 +28,15 @@ pub(crate) struct DedicatedAccountReady {
 }
 
 impl DedicatedAccountReady {
-    pub(super) fn original_operator(&self) -> &crate::platform::WorkerPrincipal {
+    pub(in crate::setup) fn original_operator(&self) -> &crate::platform::WorkerPrincipal {
         &self.original_operator
     }
 
-    pub(super) fn selector(&self) -> &str {
+    pub(in crate::setup) fn selector(&self) -> &str {
         &self.selector
     }
 
-    pub(super) fn reverify_target<Output>(
+    pub(in crate::setup) fn reverify_target<Output>(
         &self,
         bind: impl for<'binding> FnOnce(&'binding crate::platform::WorkerPrincipal) -> Output,
     ) -> Result<Output, crate::platform::DedicatedAccountIssue> {
@@ -44,6 +44,7 @@ impl DedicatedAccountReady {
         self.target.reverify_and_bind_for_action(&authority, bind)
     }
 
+    #[cfg(not(any(action_core_fixture, action_compile_fixture)))]
     pub(in crate::setup) fn manifest_candidate(
         &self,
         base: &crate::manifest::MachineManifestDraft,
@@ -52,8 +53,8 @@ impl DedicatedAccountReady {
         crate::manifest::DedicatedWorkerManifestCandidate::derive(base, &self.target)
     }
 
-    #[cfg(test)]
-    pub(super) fn manifest_candidate_with_layout_for_test(
+    #[cfg(all(test, not(any(action_core_fixture, action_compile_fixture))))]
+    pub(in crate::setup) fn manifest_candidate_with_layout_for_test(
         &self,
         base: &crate::manifest::MachineManifestDraft,
         layout: &crate::platform::WorkerDirectoryLayout,

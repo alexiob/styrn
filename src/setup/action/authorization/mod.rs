@@ -894,7 +894,7 @@ pub(super) fn run_privileged_request(
     }
 
     system_store
-        .reserve_authorization(&request.request_id)
+        .reserve_authorization(&request.request_id, expected_request_digest)
         .map_err(AuthorizationError::RequestConsumed)?;
     crate::platform::consume_verified_private_file(removal)
         .map_err(AuthorizationError::RequestRead)?;

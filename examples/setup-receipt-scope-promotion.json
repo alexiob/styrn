@@ -1,0 +1,47 @@
+{
+  "schema_version": 1,
+  "installation_scope": "user",
+  "entries": [
+    {
+      "entry_id": "019cad99-54a0-7000-8000-000000000041",
+      "action": {
+        "type": "scope_promotion",
+        "parameters": {
+          "action_id": "identity.scope-promotion",
+          "machine_id": "019cad99-54a0-7000-8000-000000000040",
+          "source_scope": "user",
+          "target_scope": "system",
+          "user_manifest_path": "/home/alex/.config/styrn/machine.toml",
+          "user_manifest_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "system_manifest_path": "/etc/styrn/machine.toml",
+          "system_manifest_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+          "original_operator": {
+            "account_policy": "current-user",
+            "principal_kind": "unix-uid",
+            "principal_id": "501",
+            "name": "alex"
+          },
+          "target_principal": {
+            "account_policy": "dedicated",
+            "principal_kind": "unix-uid",
+            "principal_id": "2001",
+            "name": "build-agent"
+          },
+          "selector_sha256": "7f81291a9c35cb94e74c8794e4c1ea1c0966b92fc67a72490ef0df956320a394",
+          "promotion_intent_id": "019cad99-54a0-7000-8000-000000000042"
+        }
+      },
+      "timestamp": "2026-09-03T12:00:00Z",
+      "privilege_used": "none",
+      "directories_created": [],
+      "files_created": [],
+      "files_modified": [],
+      "services": [],
+      "accounts": [],
+      "registry_keys": [],
+      "firewall_rules": [],
+      "download_provenance": null,
+      "status": "applied"
+    }
+  ]
+}

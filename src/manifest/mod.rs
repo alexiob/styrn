@@ -193,6 +193,7 @@ fn dedicated_manifest_binding_authority() -> DedicatedManifestBindingAuthority {
 struct DedicatedWorkerManifestProjection {
     operating_system: OperatingSystem,
     principal: platform::WorkerPrincipal,
+    #[allow(dead_code)] // Windows cannot consume runnable dedicated projection before T0.18.
     worker_identity: WorkerIdentity,
     transport_user: String,
     paths: Paths,
@@ -378,6 +379,7 @@ impl CurrentUserWorkerManifestCandidate {
 
 impl DedicatedWorkerManifestCandidate {
     #[allow(dead_code)] // T0.20 supplies the selected opaque ready handle.
+    #[allow(clippy::needless_return)] // cfg branches must remain separately type-checkable.
     pub(crate) fn derive(
         base: &MachineManifestDraft,
         handle: &platform::DedicatedAccountHandle,
@@ -407,6 +409,8 @@ impl DedicatedWorkerManifestCandidate {
     }
 
     #[cfg(test)]
+    #[allow(dead_code)] // Windows refuses runnable dedicated publication until T0.18.
+    #[allow(clippy::needless_return)] // cfg branches must remain separately type-checkable.
     pub(crate) fn derive_with_layout_for_test(
         base: &MachineManifestDraft,
         handle: &platform::DedicatedAccountHandle,
@@ -430,6 +434,7 @@ impl DedicatedWorkerManifestCandidate {
         }
     }
 
+    #[allow(dead_code)] // Windows refuses runnable dedicated publication until T0.18.
     fn from_projection(
         base: &MachineManifestDraft,
         handle: &platform::DedicatedAccountHandle,
@@ -461,6 +466,36 @@ impl DedicatedWorkerManifestCandidate {
     pub(crate) fn draft(&self) -> &MachineManifestDraft {
         &self.draft
     }
+
+    #[allow(dead_code)] // Source-including manifest fixtures omit setup promotion.
+    pub(crate) fn scope_promotion_canonical(
+        &self,
+        machine_id: Uuid,
+        _authority: &ScopePromotionAuthority,
+    ) -> Result<String, ManifestError> {
+        if machine_id.get_version_num() != 7 || machine_id.get_variant() != uuid::Variant::RFC4122 {
+            return invalid("scope promotion machine ID is invalid");
+        }
+        let authority = dedicated_manifest_binding_authority();
+        self.handle
+            .reverify_and_bind_for_manifest(&authority, |principal| {
+                if principal != &self.projection.principal {
+                    return invalid(DEDICATED_PRINCIPAL_ERROR);
+                }
+                let manifest = self.draft.with_machine_id(machine_id);
+                manifest.validate()?;
+                let identity = manifest.worker_identity.as_ref().ok_or_else(|| {
+                    ManifestError::Validation("worker_identity is required".to_owned())
+                })?;
+                validate_dedicated_worker_manifest_projection(
+                    &manifest,
+                    identity,
+                    &self.projection,
+                )?;
+                manifest.to_toml()
+            })
+            .map_err(|_| projection_validation(DEDICATED_PRINCIPAL_ERROR))?
+    }
 }
 
 impl DedicatedWorkerManifestProjection {
@@ -485,6 +520,7 @@ impl DedicatedWorkerManifestProjection {
     }
 }
 
+#[allow(dead_code)] // Windows refuses runnable dedicated publication until T0.18.
 fn validate_dedicated_projection_base(base: &MachineManifestDraft) -> Result<(), ManifestError> {
     if base
         .installation
@@ -559,6 +595,7 @@ const USER_WORKER_PATHS_ERROR: &str =
     "user worker manifest paths do not match the store's canonical layout";
 const USER_WORKER_PLATFORM_ERROR: &str =
     "user worker manifest platform does not match the native host";
+#[allow(dead_code)] // Windows refuses runnable dedicated publication until T0.18.
 const DEDICATED_WORKER_DRAFT_ERROR: &str =
     "dedicated worker manifest projection requires a system-scope worker draft";
 const DEDICATED_PRINCIPAL_ERROR: &str =
@@ -1091,6 +1128,55 @@ pub(crate) struct PendingManifestCandidate {
     canonical: String,
 }
 
+#[allow(dead_code)] // Source-including manifest fixtures omit setup promotion recovery.
+pub(crate) struct PromotionManifestSnapshot {
+    path: PathBuf,
+    machine_id: Uuid,
+    canonical: String,
+    sha256: String,
+    identity: platform::PrivateFileIdentity,
+}
+
+#[cfg(test)]
+pub(crate) struct TestScopePromotionAuthority(());
+
+#[cfg(test)]
+impl TestScopePromotionAuthority {
+    #[allow(dead_code)] // Source-including manifest fixtures do not construct promotion authority.
+    pub(crate) const fn new() -> Self {
+        Self(())
+    }
+}
+
+#[cfg(test)]
+type ScopePromotionAuthority = TestScopePromotionAuthority;
+
+#[cfg(not(test))]
+type ScopePromotionAuthority = crate::setup::promotion::ScopePromotionAuthority;
+
+#[allow(dead_code)] // Source-including manifest fixtures omit setup promotion recovery.
+impl PromotionManifestSnapshot {
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub(crate) fn machine_id(&self) -> Uuid {
+        self.machine_id
+    }
+
+    pub(crate) fn canonical(&self) -> &str {
+        &self.canonical
+    }
+
+    pub(crate) fn sha256(&self) -> &str {
+        &self.sha256
+    }
+
+    pub(crate) fn identity_sha256(&self) -> String {
+        self.identity.binding_sha256()
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum DestinationOrigin {
     Canonical,
@@ -1210,7 +1296,97 @@ pub(crate) fn configured_manifest_store_for(
     }
 }
 
+#[allow(dead_code)] // Source-including manifest fixtures omit setup promotion recovery.
 impl MachineManifestStore {
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub(crate) fn installation_scope(&self) -> platform::InstallationScope {
+        self.scope
+    }
+
+    pub(crate) fn worker_principal(&self) -> &platform::WorkerPrincipal {
+        &self.principal
+    }
+
+    pub(crate) fn promotion_snapshot(
+        &self,
+        _authority: &ScopePromotionAuthority,
+    ) -> Result<Option<PromotionManifestSnapshot>, ManifestError> {
+        match fs::symlink_metadata(&self.path) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(ManifestError::Read(error)),
+        }
+        self.validate_destination_policy()?;
+        self.verify_bound_principal()?;
+        let expected_identity =
+            platform::private_file_identity(&self.path).map_err(ManifestError::Security)?;
+        let mut file = platform::open_verified_manifest_file_for_read(
+            &self.path,
+            self.platform_owner(),
+            &self.principal,
+            &self.trusted_root,
+        )
+        .map_err(ManifestError::Security)?;
+        if platform::private_file_identity_from_handle(&file).map_err(ManifestError::Security)?
+            != expected_identity
+        {
+            return Err(ManifestError::Security(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "manifest identity changed during promotion verification",
+            )));
+        }
+        let mut input = String::new();
+        file.read_to_string(&mut input)
+            .map_err(ManifestError::Read)?;
+        let manifest = MachineManifest::parse_toml(&input)?;
+        self.validate_manifest_binding(&manifest)?;
+        let canonical = manifest.to_toml()?;
+        if canonical != input {
+            return invalid("promotion manifest is not canonical");
+        }
+        Ok(Some(PromotionManifestSnapshot {
+            path: self.path.clone(),
+            machine_id: manifest.machine_id,
+            sha256: sha256_hex(canonical.as_bytes()),
+            canonical,
+            identity: expected_identity,
+        }))
+    }
+
+    pub(crate) fn retire_promotion_source(
+        &self,
+        expected: &PromotionManifestSnapshot,
+        _authority: &ScopePromotionAuthority,
+    ) -> Result<(), ManifestError> {
+        if self.scope != platform::InstallationScope::User || expected.path != self.path {
+            return invalid("promotion source manifest does not match its store");
+        }
+        let current = self.promotion_snapshot(_authority)?.ok_or_else(|| {
+            ManifestError::Validation("promotion source manifest is absent".into())
+        })?;
+        if current.machine_id != expected.machine_id
+            || current.sha256 != expected.sha256
+            || current.identity != expected.identity
+        {
+            return invalid("promotion source manifest identity changed");
+        }
+        let removal = platform::prepare_verified_private_file_removal(
+            &self.path,
+            self.platform_owner(),
+            &self.principal,
+            expected.identity,
+        )
+        .map_err(ManifestError::Security)?;
+        platform::consume_verified_private_file(removal).map_err(ManifestError::Write)?;
+        platform::sync_parent_directory(self.path.parent().ok_or_else(|| {
+            ManifestError::Validation("manifest path has no parent directory".into())
+        })?)
+        .map_err(ManifestError::Write)
+    }
+
     #[cfg(test)]
     #[allow(dead_code)]
     pub(crate) fn new(path: impl Into<PathBuf>) -> Self {
@@ -2377,6 +2553,28 @@ impl PendingManifestPublicationSession<'_> {
         })
     }
 
+    pub(crate) fn promotion_candidate(
+        &self,
+        draft: &MachineManifestDraft,
+        machine_id: Uuid,
+        _authority: &ScopePromotionAuthority,
+    ) -> Result<PendingManifestCandidate, ManifestError> {
+        if self.store.scope != platform::InstallationScope::System
+            || machine_id.get_version_num() != 7
+            || machine_id.get_variant() != uuid::Variant::RFC4122
+        {
+            return invalid("scope promotion candidate is invalid");
+        }
+        let manifest = draft.with_machine_id(machine_id);
+        manifest.validate()?;
+        self.store.validate_manifest_binding(&manifest)?;
+        let canonical = manifest.to_toml()?;
+        Ok(PendingManifestCandidate {
+            manifest,
+            canonical,
+        })
+    }
+
     pub(crate) fn stored_candidate(
         &self,
         canonical: &str,
@@ -2424,6 +2622,18 @@ impl PendingManifestCandidate {
     pub(crate) fn canonical(&self) -> &str {
         &self.canonical
     }
+}
+
+#[allow(dead_code)] // Source-including manifest fixtures omit setup promotion recovery.
+fn sha256_hex(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    use std::fmt::Write as _;
+
+    let mut output = String::with_capacity(64);
+    for byte in Sha256::digest(bytes) {
+        write!(&mut output, "{byte:02x}").expect("writing hexadecimal cannot fail");
+    }
+    output
 }
 
 fn is_broad_system_root(path: &std::path::Path) -> bool {

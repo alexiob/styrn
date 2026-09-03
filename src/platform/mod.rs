@@ -1,3 +1,5 @@
+#![allow(unexpected_cfgs)] // Exact rustc compile-boundary fixtures use private cfg names.
+
 #[cfg(target_os = "linux")]
 mod linux;
 
@@ -1455,6 +1457,45 @@ pub(crate) struct EstablishedDedicatedAccountEvidence {
     principal: WorkerPrincipal,
 }
 
+#[cfg(all(not(test), not(any(action_core_fixture, action_compile_fixture))))]
+#[allow(dead_code)] // Source-including platform fixtures omit setup promotion recovery.
+pub(crate) fn established_dedicated_account_evidence_from_promotion(
+    selector: &str,
+    principal: WorkerPrincipal,
+    _authority: &crate::setup::promotion::ScopePromotionAuthority,
+) -> std::io::Result<EstablishedDedicatedAccountEvidence> {
+    established_dedicated_account_evidence(selector, principal)
+}
+
+#[cfg(all(test, not(any(action_core_fixture, action_compile_fixture))))]
+#[allow(dead_code)] // Source-including platform fixtures omit setup promotion recovery.
+pub(crate) fn established_dedicated_account_evidence_from_promotion(
+    selector: &str,
+    principal: WorkerPrincipal,
+) -> std::io::Result<EstablishedDedicatedAccountEvidence> {
+    established_dedicated_account_evidence(selector, principal)
+}
+
+#[allow(dead_code)] // Source-including platform fixtures omit setup promotion recovery.
+fn established_dedicated_account_evidence(
+    selector: &str,
+    principal: WorkerPrincipal,
+) -> std::io::Result<EstablishedDedicatedAccountEvidence> {
+    let spec = DedicatedAccountSpec::new(selector)?;
+    if principal.account_policy() != WorkerAccountPolicy::Dedicated
+        || principal.name() != spec.name()
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "dedicated account promotion evidence is invalid",
+        ));
+    }
+    Ok(EstablishedDedicatedAccountEvidence {
+        selector: spec.name().into(),
+        principal,
+    })
+}
+
 #[allow(dead_code)] // Retained only through the opaque public-in-crate handle.
 struct DedicatedAccountBinding {
     spec: DedicatedAccountSpec,
@@ -1569,11 +1610,11 @@ type DedicatedAccountActionAuthority = TestDedicatedAccountActionAuthority;
 #[cfg(not(test))]
 type DedicatedAccountActionAuthority = crate::setup::action::DedicatedAccountActionAuthority;
 
-#[cfg(test)]
+#[cfg(any(test, action_core_fixture, action_compile_fixture))]
 #[allow(dead_code)]
 pub(crate) struct TestDedicatedManifestBindingAuthority(());
 
-#[cfg(test)]
+#[cfg(any(test, action_core_fixture, action_compile_fixture))]
 #[allow(dead_code)]
 impl TestDedicatedManifestBindingAuthority {
     pub(crate) const fn for_test() -> Self {
@@ -1581,10 +1622,10 @@ impl TestDedicatedManifestBindingAuthority {
     }
 }
 
-#[cfg(test)]
+#[cfg(any(test, action_core_fixture, action_compile_fixture))]
 type DedicatedManifestBindingAuthority = TestDedicatedManifestBindingAuthority;
 
-#[cfg(not(test))]
+#[cfg(not(any(test, action_core_fixture, action_compile_fixture)))]
 type DedicatedManifestBindingAuthority = crate::manifest::DedicatedManifestBindingAuthority;
 
 #[cfg(test)]
@@ -1675,7 +1716,7 @@ pub(crate) fn inspect_established_dedicated_account(
 }
 
 #[cfg(test)]
-fn inspect_established_dedicated_account_for_test(
+pub(crate) fn inspect_established_dedicated_account_for_test(
     spec: DedicatedAccountSpec,
     evidence: &EstablishedDedicatedAccountEvidence,
     observation: NativeDedicatedAccountObservation,
@@ -6029,6 +6070,22 @@ pub(crate) struct PrivateFileIdentity {
 impl PrivateFileIdentity {
     fn new(first: u64, second: u64) -> Self {
         Self { first, second }
+    }
+
+    #[allow(dead_code)] // Source-including manifest fixtures omit setup promotion recovery.
+    pub(crate) fn binding_sha256(self) -> String {
+        use sha2::{Digest, Sha256};
+        use std::fmt::Write as _;
+
+        let mut hasher = Sha256::new();
+        hasher.update(b"styrn.private-file-identity.v1\0");
+        hasher.update(self.first.to_le_bytes());
+        hasher.update(self.second.to_le_bytes());
+        let mut output = String::with_capacity(64);
+        for byte in hasher.finalize() {
+            write!(&mut output, "{byte:02x}").expect("writing hexadecimal cannot fail");
+        }
+        output
     }
 }
 
