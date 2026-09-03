@@ -1382,6 +1382,305 @@ pub(crate) enum WorkerIsolation {
     DedicatedAccount,
 }
 
+#[allow(dead_code)] // Consumed by the T0.14 dedicated-adoption action follow-up.
+pub(crate) const DEDICATED_ACCOUNT_NAME_ERROR: &str =
+    "dedicated account name is invalid or ambiguous";
+
+/// A validated, explicit local-account selector.
+///
+/// This value carries no lookup authority. Native account observation is the
+/// only route from a configured name to a dedicated-account binding.
+#[allow(dead_code)] // Consumed by the T0.14 dedicated-adoption action follow-up.
+pub(crate) struct DedicatedAccountSpec {
+    name: Box<str>,
+}
+
+#[allow(dead_code)] // Consumed by the T0.14 dedicated-adoption action follow-up.
+impl DedicatedAccountSpec {
+    pub(crate) fn new(name: &str) -> std::io::Result<Self> {
+        let first = name.as_bytes().first().copied();
+        let last = name.as_bytes().last().copied();
+        let valid = !name.is_empty()
+            && name.len() <= 256
+            && name != "."
+            && name != ".."
+            && !matches!(first, Some(b'-' | b'.'))
+            && !matches!(last, Some(b'.' | b' '))
+            && name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'.'))
+            && platform_impl::dedicated_account_name_is_valid(name);
+        if !valid {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                DEDICATED_ACCOUNT_NAME_ERROR,
+            ));
+        }
+        Ok(Self { name: name.into() })
+    }
+
+    pub(crate) fn name(&self) -> &str {
+        &self.name
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code)] // Consumed by the T0.14 dedicated-adoption action follow-up.
+pub(crate) enum DedicatedAccountIssue {
+    IncompatiblePosture,
+    ObservationUnavailable,
+    IdentityDrift,
+}
+
+#[allow(dead_code)] // Consumed by the T0.14 dedicated-adoption action follow-up.
+pub(crate) enum DedicatedAccountObservation {
+    Absent,
+    PresentHealthy(DedicatedAccountHandle),
+    PresentBroken(DedicatedAccountIssue),
+    Unknowable(DedicatedAccountIssue),
+}
+
+#[derive(Clone)]
+#[allow(dead_code)] // Consumed by the T0.14 dedicated-adoption action follow-up.
+pub(crate) struct DedicatedAccountHandle(std::sync::Arc<DedicatedAccountBinding>);
+
+/// Protected proof that an already-adopted selector and stable principal may
+/// be observed with established-home rules.
+///
+/// No generic caller can construct, clone, serialize, or inspect this value.
+/// The later promotion verifier owns the authority-gated constructor.
+#[allow(dead_code)] // Constructed by the later protected promotion verifier.
+pub(crate) struct EstablishedDedicatedAccountEvidence {
+    selector: Box<str>,
+    principal: WorkerPrincipal,
+}
+
+#[allow(dead_code)] // Retained only through the opaque public-in-crate handle.
+struct DedicatedAccountBinding {
+    spec: DedicatedAccountSpec,
+    principal: WorkerPrincipal,
+    #[cfg(test)]
+    revalidation: Option<NativeDedicatedAccountObservation>,
+}
+
+#[allow(dead_code)] // Constructed only by the later sealed dedicated factories.
+struct DedicatedAccountFactoryAuthority(());
+
+#[allow(dead_code)] // Borrowed only within the sealed factory callback.
+struct VerifiedDedicatedAccount<'binding> {
+    binding: &'binding DedicatedAccountBinding,
+}
+
+#[allow(dead_code)]
+impl VerifiedDedicatedAccount<'_> {
+    fn principal(&self) -> &WorkerPrincipal {
+        &self.binding.principal
+    }
+}
+
+#[cfg(test)]
+impl DedicatedAccountFactoryAuthority {
+    fn for_test() -> Self {
+        Self(())
+    }
+
+    fn established_evidence_for_test(
+        &self,
+        spec: &DedicatedAccountSpec,
+        principal: WorkerPrincipal,
+    ) -> EstablishedDedicatedAccountEvidence {
+        EstablishedDedicatedAccountEvidence {
+            selector: spec.name().into(),
+            principal,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(super) enum NativeDedicatedAccountObservation {
+    Absent,
+    PresentHealthy(WorkerPrincipal),
+    PresentBroken,
+    Unknowable,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(super) enum NativeDedicatedAccountInspection {
+    Initial,
+    Established,
+}
+
+#[cfg(test)]
+fn dedicated_account_observation_for_test(
+    spec: DedicatedAccountSpec,
+    observation: NativeDedicatedAccountObservation,
+    revalidation: Option<NativeDedicatedAccountObservation>,
+) -> DedicatedAccountObservation {
+    match observation {
+        NativeDedicatedAccountObservation::Absent => DedicatedAccountObservation::Absent,
+        NativeDedicatedAccountObservation::PresentHealthy(principal)
+            if principal.account_policy() == WorkerAccountPolicy::Dedicated
+                && principal.name() == spec.name() =>
+        {
+            DedicatedAccountObservation::PresentHealthy(DedicatedAccountHandle(
+                std::sync::Arc::new(DedicatedAccountBinding {
+                    spec,
+                    principal,
+                    revalidation,
+                }),
+            ))
+        }
+        NativeDedicatedAccountObservation::PresentHealthy(_)
+        | NativeDedicatedAccountObservation::PresentBroken => {
+            DedicatedAccountObservation::PresentBroken(DedicatedAccountIssue::IncompatiblePosture)
+        }
+        NativeDedicatedAccountObservation::Unknowable => {
+            DedicatedAccountObservation::Unknowable(DedicatedAccountIssue::ObservationUnavailable)
+        }
+    }
+}
+
+fn established_dedicated_account_observation(
+    spec: DedicatedAccountSpec,
+    evidence: &EstablishedDedicatedAccountEvidence,
+    observation: NativeDedicatedAccountObservation,
+    #[cfg(test)] revalidation: Option<NativeDedicatedAccountObservation>,
+) -> DedicatedAccountObservation {
+    if evidence.selector.as_ref() != spec.name()
+        || evidence.principal.account_policy() != WorkerAccountPolicy::Dedicated
+        || evidence.principal.name() != spec.name()
+    {
+        return DedicatedAccountObservation::PresentBroken(
+            DedicatedAccountIssue::IncompatiblePosture,
+        );
+    }
+    match observation {
+        NativeDedicatedAccountObservation::PresentHealthy(principal)
+            if principal == evidence.principal =>
+        {
+            DedicatedAccountObservation::PresentHealthy(DedicatedAccountHandle(
+                std::sync::Arc::new(DedicatedAccountBinding {
+                    spec,
+                    principal,
+                    #[cfg(test)]
+                    revalidation,
+                }),
+            ))
+        }
+        NativeDedicatedAccountObservation::Absent
+        | NativeDedicatedAccountObservation::PresentHealthy(_) => {
+            DedicatedAccountObservation::PresentBroken(DedicatedAccountIssue::IdentityDrift)
+        }
+        NativeDedicatedAccountObservation::PresentBroken => {
+            DedicatedAccountObservation::PresentBroken(DedicatedAccountIssue::IncompatiblePosture)
+        }
+        NativeDedicatedAccountObservation::Unknowable => {
+            DedicatedAccountObservation::Unknowable(DedicatedAccountIssue::ObservationUnavailable)
+        }
+    }
+}
+
+#[allow(dead_code)] // Consumed by the later protected promotion verifier.
+pub(crate) fn inspect_established_dedicated_account(
+    spec: DedicatedAccountSpec,
+    evidence: &EstablishedDedicatedAccountEvidence,
+) -> DedicatedAccountObservation {
+    let observation = platform_impl::inspect_dedicated_account(
+        &spec,
+        NativeDedicatedAccountInspection::Established,
+    );
+    established_dedicated_account_observation(
+        spec,
+        evidence,
+        observation,
+        #[cfg(test)]
+        None,
+    )
+}
+
+#[cfg(test)]
+fn inspect_established_dedicated_account_for_test(
+    spec: DedicatedAccountSpec,
+    evidence: &EstablishedDedicatedAccountEvidence,
+    observation: NativeDedicatedAccountObservation,
+) -> DedicatedAccountObservation {
+    established_dedicated_account_observation(
+        spec,
+        evidence,
+        observation.clone(),
+        Some(observation),
+    )
+}
+
+impl DedicatedAccountHandle {
+    #[allow(dead_code)] // Invoked by the later sealed dedicated factories.
+    fn reverify_and_bind<Output>(
+        &self,
+        _authority: &DedicatedAccountFactoryAuthority,
+        bind: impl for<'binding> FnOnce(VerifiedDedicatedAccount<'binding>) -> Output,
+    ) -> Result<Output, DedicatedAccountIssue> {
+        #[cfg(test)]
+        let observation = self.0.revalidation.as_ref().cloned().unwrap_or_else(|| {
+            platform_impl::inspect_dedicated_account(
+                &self.0.spec,
+                NativeDedicatedAccountInspection::Established,
+            )
+        });
+        #[cfg(not(test))]
+        let observation = platform_impl::inspect_dedicated_account(
+            &self.0.spec,
+            NativeDedicatedAccountInspection::Established,
+        );
+        match observation {
+            NativeDedicatedAccountObservation::PresentHealthy(principal)
+                if principal == self.0.principal
+                    && principal.account_policy() == WorkerAccountPolicy::Dedicated
+                    && principal.name() == self.0.spec.name() =>
+            {
+                Ok(bind(VerifiedDedicatedAccount { binding: &self.0 }))
+            }
+            NativeDedicatedAccountObservation::Absent
+            | NativeDedicatedAccountObservation::PresentHealthy(_) => {
+                Err(DedicatedAccountIssue::IdentityDrift)
+            }
+            NativeDedicatedAccountObservation::PresentBroken => {
+                Err(DedicatedAccountIssue::IncompatiblePosture)
+            }
+            NativeDedicatedAccountObservation::Unknowable => {
+                Err(DedicatedAccountIssue::ObservationUnavailable)
+            }
+        }
+    }
+}
+
+#[allow(dead_code)] // Consumed by the T0.14 dedicated-adoption action follow-up.
+pub(crate) fn inspect_dedicated_account(spec: DedicatedAccountSpec) -> DedicatedAccountObservation {
+    match platform_impl::inspect_dedicated_account(&spec, NativeDedicatedAccountInspection::Initial)
+    {
+        NativeDedicatedAccountObservation::Absent => DedicatedAccountObservation::Absent,
+        NativeDedicatedAccountObservation::PresentHealthy(principal)
+            if principal.account_policy() == WorkerAccountPolicy::Dedicated
+                && principal.name() == spec.name() =>
+        {
+            DedicatedAccountObservation::PresentHealthy(DedicatedAccountHandle(
+                std::sync::Arc::new(DedicatedAccountBinding {
+                    spec,
+                    principal,
+                    #[cfg(test)]
+                    revalidation: None,
+                }),
+            ))
+        }
+        NativeDedicatedAccountObservation::PresentHealthy(_)
+        | NativeDedicatedAccountObservation::PresentBroken => {
+            DedicatedAccountObservation::PresentBroken(DedicatedAccountIssue::IncompatiblePosture)
+        }
+        NativeDedicatedAccountObservation::Unknowable => {
+            DedicatedAccountObservation::Unknowable(DedicatedAccountIssue::ObservationUnavailable)
+        }
+    }
+}
+
 /// A validated, stable native account identity.
 ///
 /// Keep this type free of `Display`: callers must choose deliberately whether
@@ -2237,6 +2536,212 @@ mod principal_tests {
             serde_json::from_str::<WorkerPrincipal>(&serialized).unwrap(),
             dedicated
         );
+    }
+
+    #[test]
+    fn dedicated_account_spec_rejects_ambiguous_or_literal_assumptions() {
+        for valid in ["build-agent", "ci_worker", "worker7", "styrn"] {
+            let spec = DedicatedAccountSpec::new(valid).unwrap();
+            assert_eq!(spec.name(), valid);
+        }
+
+        let oversized = "a".repeat(257);
+        for invalid in [
+            "",
+            ".",
+            "..",
+            "-worker",
+            " worker",
+            "worker ",
+            "worker\0name",
+            "worker/name",
+            "worker\\name",
+            "worker:name",
+            "worker@example",
+            oversized.as_str(),
+        ] {
+            let error = match DedicatedAccountSpec::new(invalid) {
+                Ok(_) => panic!("{invalid:?} unexpectedly passed validation"),
+                Err(error) => error,
+            };
+            assert_eq!(
+                error.kind(),
+                std::io::ErrorKind::InvalidInput,
+                "{invalid:?}"
+            );
+            assert_eq!(
+                error.to_string(),
+                DEDICATED_ACCOUNT_NAME_ERROR,
+                "{invalid:?}"
+            );
+            if !invalid.is_empty() {
+                assert!(!error.to_string().contains(invalid), "{invalid:?}");
+            }
+        }
+    }
+
+    fn synthetic_dedicated_principal(id: u32, name: &str) -> WorkerPrincipal {
+        #[cfg(unix)]
+        let (kind, id) = (PrincipalKind::UnixUid, id.to_string());
+        #[cfg(target_os = "windows")]
+        let (kind, id) = (
+            PrincipalKind::WindowsSid,
+            format!("S-1-5-21-100-200-300-{id}"),
+        );
+        WorkerPrincipal::new(kind, id, name, WorkerAccountPolicy::Dedicated).unwrap()
+    }
+
+    #[test]
+    fn dedicated_account_observation_distinguishes_every_closed_state() {
+        let principal = synthetic_dedicated_principal(42001, "build-agent");
+
+        assert!(matches!(
+            dedicated_account_observation_for_test(
+                DedicatedAccountSpec::new("build-agent").unwrap(),
+                NativeDedicatedAccountObservation::Absent,
+                None,
+            ),
+            DedicatedAccountObservation::Absent,
+        ));
+        assert!(matches!(
+            dedicated_account_observation_for_test(
+                DedicatedAccountSpec::new("build-agent").unwrap(),
+                NativeDedicatedAccountObservation::PresentBroken,
+                None,
+            ),
+            DedicatedAccountObservation::PresentBroken(DedicatedAccountIssue::IncompatiblePosture),
+        ));
+        assert!(matches!(
+            dedicated_account_observation_for_test(
+                DedicatedAccountSpec::new("build-agent").unwrap(),
+                NativeDedicatedAccountObservation::Unknowable,
+                None,
+            ),
+            DedicatedAccountObservation::Unknowable(DedicatedAccountIssue::ObservationUnavailable),
+        ));
+
+        let observation = dedicated_account_observation_for_test(
+            DedicatedAccountSpec::new("build-agent").unwrap(),
+            NativeDedicatedAccountObservation::PresentHealthy(principal.clone()),
+            Some(NativeDedicatedAccountObservation::PresentHealthy(principal)),
+        );
+        let DedicatedAccountObservation::PresentHealthy(handle) = observation else {
+            panic!("healthy native posture did not produce an opaque handle");
+        };
+        let shared_handle = handle.clone();
+        let authority = DedicatedAccountFactoryAuthority::for_test();
+        handle
+            .reverify_and_bind(&authority, |verified| {
+                assert_eq!(verified.principal().name(), "build-agent");
+                assert_eq!(
+                    verified.principal().account_policy(),
+                    WorkerAccountPolicy::Dedicated
+                );
+            })
+            .unwrap();
+        shared_handle
+            .reverify_and_bind(&authority, |verified| {
+                assert_eq!(verified.principal().name(), "build-agent");
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn dedicated_account_binding_reverification_rejects_posture_and_identity_drift() {
+        let expected = synthetic_dedicated_principal(42001, "build-agent");
+        let replacement = synthetic_dedicated_principal(42002, "build-agent");
+        let authority = DedicatedAccountFactoryAuthority::for_test();
+
+        for (revalidation, expected_issue) in [
+            (
+                NativeDedicatedAccountObservation::PresentHealthy(replacement),
+                DedicatedAccountIssue::IdentityDrift,
+            ),
+            (
+                NativeDedicatedAccountObservation::Absent,
+                DedicatedAccountIssue::IdentityDrift,
+            ),
+            (
+                NativeDedicatedAccountObservation::PresentBroken,
+                DedicatedAccountIssue::IncompatiblePosture,
+            ),
+            (
+                NativeDedicatedAccountObservation::Unknowable,
+                DedicatedAccountIssue::ObservationUnavailable,
+            ),
+        ] {
+            let observation = dedicated_account_observation_for_test(
+                DedicatedAccountSpec::new("build-agent").unwrap(),
+                NativeDedicatedAccountObservation::PresentHealthy(expected.clone()),
+                Some(revalidation),
+            );
+            let DedicatedAccountObservation::PresentHealthy(handle) = observation else {
+                panic!("healthy native posture did not produce an opaque handle");
+            };
+            assert_eq!(
+                handle.reverify_and_bind(&authority, |_| ()).unwrap_err(),
+                expected_issue,
+            );
+        }
+    }
+
+    #[test]
+    fn dedicated_account_binding_requires_exact_established_evidence_on_a_new_inspection() {
+        let spec = DedicatedAccountSpec::new("build-agent").unwrap();
+        let principal = synthetic_dedicated_principal(1001, "build-agent");
+        let authority = DedicatedAccountFactoryAuthority::for_test();
+        let evidence = authority.established_evidence_for_test(&spec, principal.clone());
+        let observation = inspect_established_dedicated_account_for_test(
+            spec,
+            &evidence,
+            NativeDedicatedAccountObservation::PresentHealthy(principal.clone()),
+        );
+        let DedicatedAccountObservation::PresentHealthy(handle) = observation else {
+            panic!("exact protected evidence did not authorize established observation");
+        };
+        let extracted = handle
+            .reverify_and_bind(&authority, |verified| verified.principal().clone())
+            .unwrap();
+        assert_eq!(extracted, principal);
+
+        let wrong_principal = synthetic_dedicated_principal(1002, "build-agent");
+        let wrong_evidence =
+            authority.established_evidence_for_test(&evidence_spec(), wrong_principal);
+        assert!(matches!(
+            inspect_established_dedicated_account_for_test(
+                evidence_spec(),
+                &wrong_evidence,
+                NativeDedicatedAccountObservation::PresentHealthy(principal.clone()),
+            ),
+            DedicatedAccountObservation::PresentBroken(DedicatedAccountIssue::IdentityDrift),
+        ));
+
+        let other_spec = DedicatedAccountSpec::new("other-worker").unwrap();
+        let substituted_selector =
+            authority.established_evidence_for_test(&other_spec, principal.clone());
+        assert!(matches!(
+            inspect_established_dedicated_account_for_test(
+                evidence_spec(),
+                &substituted_selector,
+                NativeDedicatedAccountObservation::PresentHealthy(principal),
+            ),
+            DedicatedAccountObservation::PresentBroken(DedicatedAccountIssue::IncompatiblePosture),
+        ));
+    }
+
+    fn evidence_spec() -> DedicatedAccountSpec {
+        DedicatedAccountSpec::new("build-agent").unwrap()
+    }
+
+    #[test]
+    fn dedicated_account_observation_reports_authoritative_native_absence() {
+        let name = format!("s-miss-{:x}", std::process::id());
+        let spec = DedicatedAccountSpec::new(&name).unwrap();
+
+        assert!(matches!(
+            inspect_dedicated_account(spec),
+            DedicatedAccountObservation::Absent,
+        ));
     }
 
     #[test]

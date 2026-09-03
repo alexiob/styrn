@@ -2850,6 +2850,178 @@ pub(super) fn verify_worker_principal(principal: &WorkerPrincipal) -> io::Result
     Ok(())
 }
 
+pub(super) fn dedicated_account_name_is_valid(name: &str) -> bool {
+    name.len() <= 32
+}
+
+pub(super) fn inspect_dedicated_account(
+    spec: &super::DedicatedAccountSpec,
+    home_observation: super::NativeDedicatedAccountInspection,
+) -> super::NativeDedicatedAccountObservation {
+    let uid = match lookup_worker_uid(spec.name()) {
+        Ok(uid) => uid,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return super::NativeDedicatedAccountObservation::Absent;
+        }
+        Err(_) => return super::NativeDedicatedAccountObservation::Unknowable,
+    };
+    if uid == 0 {
+        return super::NativeDedicatedAccountObservation::PresentBroken;
+    }
+    let account = match account_details_for_uid(uid, WorkerAccountPolicy::Dedicated) {
+        Ok(account) => account,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return super::NativeDedicatedAccountObservation::PresentBroken;
+        }
+        Err(_) => return super::NativeDedicatedAccountObservation::Unknowable,
+    };
+    let groups = match supplementary_groups(account.principal.name(), account.gid) {
+        Ok(groups) => groups,
+        Err(_) => return super::NativeDedicatedAccountObservation::Unknowable,
+    };
+    let privileged_groups = match linux_privileged_group_ids() {
+        Ok(groups) => groups,
+        Err(_) => return super::NativeDedicatedAccountObservation::Unknowable,
+    };
+    let privileged_group_member = account.gid == 0
+        || groups.contains(&0)
+        || privileged_groups
+            .iter()
+            .any(|group| account.gid == *group || groups.contains(group));
+    let home = PathBuf::from(account.home);
+    let home_state = inspect_dedicated_home(&home, uid);
+    classify_dedicated_account_record(
+        spec,
+        LinuxDedicatedAccountRecord {
+            principal: account.principal,
+            privileged_group_member,
+            home,
+            shell: PathBuf::from(account.shell),
+            home_state,
+        },
+        home_observation,
+    )
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum DedicatedHomeState {
+    Missing,
+    EmptySafe,
+    PopulatedSafe,
+    Unsafe,
+    Unknowable,
+}
+
+#[derive(Clone)]
+struct LinuxDedicatedAccountRecord {
+    principal: WorkerPrincipal,
+    privileged_group_member: bool,
+    home: PathBuf,
+    shell: PathBuf,
+    home_state: DedicatedHomeState,
+}
+
+fn classify_dedicated_account_record(
+    spec: &super::DedicatedAccountSpec,
+    record: LinuxDedicatedAccountRecord,
+    home_observation: super::NativeDedicatedAccountInspection,
+) -> super::NativeDedicatedAccountObservation {
+    if record.home_state == DedicatedHomeState::Unknowable {
+        return super::NativeDedicatedAccountObservation::Unknowable;
+    }
+    let home_is_safe = match (home_observation, record.home_state) {
+        (_, DedicatedHomeState::EmptySafe)
+        | (
+            super::NativeDedicatedAccountInspection::Established,
+            DedicatedHomeState::PopulatedSafe,
+        ) => true,
+        (_, DedicatedHomeState::Missing | DedicatedHomeState::Unsafe)
+        | (super::NativeDedicatedAccountInspection::Initial, DedicatedHomeState::PopulatedSafe) => {
+            false
+        }
+        (_, DedicatedHomeState::Unknowable) => unreachable!(),
+    };
+    if record.principal.principal_kind() != PrincipalKind::UnixUid
+        || record.principal.account_policy() != WorkerAccountPolicy::Dedicated
+        || record.principal.name() != spec.name()
+        || record.privileged_group_member
+        || record.home != Path::new("/home").join(spec.name())
+        || record.shell != Path::new("/bin/bash")
+        || !home_is_safe
+    {
+        return super::NativeDedicatedAccountObservation::PresentBroken;
+    }
+    super::NativeDedicatedAccountObservation::PresentHealthy(record.principal)
+}
+
+fn inspect_dedicated_home(path: &Path, expected_uid: u32) -> DedicatedHomeState {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return DedicatedHomeState::Missing
+        }
+        Err(_) => return DedicatedHomeState::Unknowable,
+    };
+    if !metadata.file_type().is_dir()
+        || metadata.uid() != expected_uid
+        || metadata.permissions().mode() & 0o022 != 0
+    {
+        return DedicatedHomeState::Unsafe;
+    }
+    let directory = match fs::File::open(path) {
+        Ok(directory) => directory,
+        Err(_) => return DedicatedHomeState::Unknowable,
+    };
+    match (
+        posix_acl_present(&directory, c"system.posix_acl_access"),
+        posix_acl_present(&directory, c"system.posix_acl_default"),
+    ) {
+        (Ok(false), Ok(false)) => {}
+        (Ok(true), _) | (_, Ok(true)) => return DedicatedHomeState::Unsafe,
+        (Err(_), _) | (_, Err(_)) => return DedicatedHomeState::Unknowable,
+    }
+    match fs::read_dir(path) {
+        Ok(mut entries) => match entries.next() {
+            None => DedicatedHomeState::EmptySafe,
+            Some(Ok(_)) => DedicatedHomeState::PopulatedSafe,
+            Some(Err(_)) => DedicatedHomeState::Unknowable,
+        },
+        Err(_) => DedicatedHomeState::Unknowable,
+    }
+}
+
+fn linux_privileged_group_ids() -> io::Result<Vec<libc::gid_t>> {
+    let mut groups = vec![0];
+    for name in ["sudo", "wheel"] {
+        if let Some(group) = lookup_group_gid(name)? {
+            groups.push(group);
+        }
+    }
+    groups.sort_unstable();
+    groups.dedup();
+    Ok(groups)
+}
+
+fn lookup_group_gid(name: &str) -> io::Result<Option<libc::gid_t>> {
+    let name = CString::new(name).map_err(|_| invalid_data("group name contains NUL"))?;
+    let mut entry = unsafe { std::mem::zeroed::<libc::group>() };
+    let mut result = std::ptr::null_mut();
+    let mut buffer = vec![0_u8; 16 * 1024];
+    let status = unsafe {
+        libc::getgrnam_r(
+            name.as_ptr(),
+            &mut entry,
+            buffer.as_mut_ptr().cast(),
+            buffer.len(),
+            &mut result,
+        )
+    };
+    if status != 0 {
+        return Err(io::Error::from_raw_os_error(status));
+    }
+    Ok((!result.is_null()).then_some(entry.gr_gid))
+}
+
 fn principal_for_uid(uid: u32, account_policy: WorkerAccountPolicy) -> io::Result<WorkerPrincipal> {
     account_for_uid(uid, account_policy).map(|(principal, _)| principal)
 }
@@ -2866,6 +3038,7 @@ struct UnixAccountDetails {
     principal: WorkerPrincipal,
     gid: u32,
     home: OsString,
+    shell: OsString,
 }
 
 fn account_details_for_uid(
@@ -2890,7 +3063,11 @@ fn account_details_for_uid(
     if status != 0 {
         return Err(io::Error::from_raw_os_error(status));
     }
-    if result.is_null() || entry.pw_name.is_null() || entry.pw_dir.is_null() {
+    if result.is_null()
+        || entry.pw_name.is_null()
+        || entry.pw_dir.is_null()
+        || entry.pw_shell.is_null()
+    {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
             "worker uid has no native account mapping",
@@ -2901,6 +3078,11 @@ fn account_details_for_uid(
         .map_err(|_| invalid_data("worker account name is not UTF-8"))?;
     let home = OsString::from_vec(
         unsafe { std::ffi::CStr::from_ptr(entry.pw_dir) }
+            .to_bytes()
+            .to_vec(),
+    );
+    let shell = OsString::from_vec(
+        unsafe { std::ffi::CStr::from_ptr(entry.pw_shell) }
             .to_bytes()
             .to_vec(),
     );
@@ -2916,6 +3098,7 @@ fn account_details_for_uid(
         )?,
         gid: entry.pw_gid,
         home,
+        shell,
     })
 }
 
@@ -3857,6 +4040,154 @@ fn invalid_data(message: &str) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn dedicated_account_spec_applies_linux_name_rules() {
+        for valid in ["build-agent", "ci_worker", "worker7"] {
+            assert!(super::super::DedicatedAccountSpec::new(valid).is_ok());
+        }
+        let oversized = "a".repeat(33);
+        let error = match super::super::DedicatedAccountSpec::new(&oversized) {
+            Ok(_) => panic!("Linux-invalid dedicated account name was accepted"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error.to_string(),
+            super::super::DEDICATED_ACCOUNT_NAME_ERROR
+        );
+    }
+
+    fn healthy_dedicated_account_record() -> LinuxDedicatedAccountRecord {
+        LinuxDedicatedAccountRecord {
+            principal: WorkerPrincipal::new(
+                PrincipalKind::UnixUid,
+                "1001",
+                "build-agent",
+                WorkerAccountPolicy::Dedicated,
+            )
+            .unwrap(),
+            privileged_group_member: false,
+            home: PathBuf::from("/home/build-agent"),
+            shell: PathBuf::from("/bin/bash"),
+            home_state: DedicatedHomeState::EmptySafe,
+        }
+    }
+
+    fn assert_dedicated_account_broken(record: LinuxDedicatedAccountRecord) {
+        let spec = super::super::DedicatedAccountSpec::new("build-agent").unwrap();
+        assert!(matches!(
+            classify_dedicated_account_record(
+                &spec,
+                record,
+                super::super::NativeDedicatedAccountInspection::Initial,
+            ),
+            super::super::NativeDedicatedAccountObservation::PresentBroken,
+        ));
+    }
+
+    #[test]
+    fn dedicated_account_observation_rejects_each_unsafe_linux_posture() {
+        let spec = super::super::DedicatedAccountSpec::new("build-agent").unwrap();
+        assert!(matches!(
+            classify_dedicated_account_record(
+                &spec,
+                healthy_dedicated_account_record(),
+                super::super::NativeDedicatedAccountInspection::Initial,
+            ),
+            super::super::NativeDedicatedAccountObservation::PresentHealthy(_),
+        ));
+
+        let mut cases = Vec::new();
+        let mut wrong_kind = healthy_dedicated_account_record();
+        wrong_kind.principal = WorkerPrincipal::new(
+            PrincipalKind::WindowsSid,
+            "S-1-5-21-100-200-300-1001",
+            "build-agent",
+            WorkerAccountPolicy::Dedicated,
+        )
+        .unwrap();
+        cases.push(wrong_kind);
+        let mut privileged_group = healthy_dedicated_account_record();
+        privileged_group.privileged_group_member = true;
+        cases.push(privileged_group);
+        let mut wrong_home = healthy_dedicated_account_record();
+        wrong_home.home = PathBuf::from("/srv/unrelated");
+        cases.push(wrong_home);
+        let mut wrong_shell = healthy_dedicated_account_record();
+        wrong_shell.shell = PathBuf::from("/usr/sbin/nologin");
+        cases.push(wrong_shell);
+        let mut missing_home = healthy_dedicated_account_record();
+        missing_home.home_state = DedicatedHomeState::Missing;
+        cases.push(missing_home);
+        let mut unsafe_home = healthy_dedicated_account_record();
+        unsafe_home.home_state = DedicatedHomeState::Unsafe;
+        cases.push(unsafe_home);
+        let mut populated_home = healthy_dedicated_account_record();
+        populated_home.home_state = DedicatedHomeState::PopulatedSafe;
+        cases.push(populated_home);
+
+        for record in cases {
+            assert_dedicated_account_broken(record);
+        }
+
+        let mut unavailable_home = healthy_dedicated_account_record();
+        unavailable_home.home_state = DedicatedHomeState::Unknowable;
+        assert!(matches!(
+            classify_dedicated_account_record(
+                &spec,
+                unavailable_home,
+                super::super::NativeDedicatedAccountInspection::Initial,
+            ),
+            super::super::NativeDedicatedAccountObservation::Unknowable,
+        ));
+    }
+
+    #[test]
+    fn dedicated_account_binding_allows_safe_linux_home_contents_after_adoption() {
+        let spec = super::super::DedicatedAccountSpec::new("build-agent").unwrap();
+        let mut populated = healthy_dedicated_account_record();
+        populated.home_state = DedicatedHomeState::PopulatedSafe;
+        assert!(matches!(
+            classify_dedicated_account_record(
+                &spec,
+                populated.clone(),
+                super::super::NativeDedicatedAccountInspection::Initial,
+            ),
+            super::super::NativeDedicatedAccountObservation::PresentBroken,
+        ));
+        assert!(matches!(
+            classify_dedicated_account_record(
+                &spec,
+                populated,
+                super::super::NativeDedicatedAccountInspection::Established,
+            ),
+            super::super::NativeDedicatedAccountObservation::PresentHealthy(_),
+        ));
+    }
+
+    #[test]
+    #[ignore = "environmental: requires native Linux and STYRN_TEST_DISTINCT_UNIX_WORKER naming a non-administrator local account with an empty safe /home directory"]
+    fn native_dedicated_account_observation_adopts_a_distinct_local_account() {
+        let name = std::env::var("STYRN_TEST_DISTINCT_UNIX_WORKER")
+            .expect("STYRN_TEST_DISTINCT_UNIX_WORKER must name a disposable local account");
+        assert_ne!(name, "styrn");
+        let observation = super::super::inspect_dedicated_account(
+            super::super::DedicatedAccountSpec::new(&name).unwrap(),
+        );
+        let super::super::DedicatedAccountObservation::PresentHealthy(handle) = observation else {
+            panic!("the configured Linux account did not satisfy dedicated adoption posture");
+        };
+        let authority = super::super::DedicatedAccountFactoryAuthority::for_test();
+        handle
+            .reverify_and_bind(&authority, |verified| {
+                assert_eq!(verified.principal().name(), name);
+                assert_eq!(
+                    verified.principal().account_policy(),
+                    WorkerAccountPolicy::Dedicated
+                );
+            })
+            .unwrap();
+    }
 
     #[test]
     fn post_mkdir_substitution_is_never_reported_as_a_created_worker_node() {

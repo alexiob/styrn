@@ -2,7 +2,7 @@ use super::{
     ManifestOwner, PrincipalKind, PrivateFileIdentity, SetupExecutionContext, SetupHostPrivilege,
     UnixCallerIds, WorkerAccountPolicy, WorkerPrincipal,
 };
-use std::ffi::{CString, OsString};
+use std::ffi::{c_void, CString, OsString};
 use std::fs;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd};
@@ -2833,6 +2833,340 @@ pub(super) fn verify_worker_principal(principal: &WorkerPrincipal) -> io::Result
     Ok(())
 }
 
+pub(super) fn dedicated_account_name_is_valid(name: &str) -> bool {
+    name.len() <= 255
+}
+
+pub(super) fn inspect_dedicated_account(
+    spec: &super::DedicatedAccountSpec,
+    home_observation: super::NativeDedicatedAccountInspection,
+) -> super::NativeDedicatedAccountObservation {
+    let identity = match local_identity(spec.name(), CS_IDENTITY_CLASS_USER) {
+        Ok(Some(identity)) => identity,
+        Ok(None) => return super::NativeDedicatedAccountObservation::Absent,
+        Err(_) => return super::NativeDedicatedAccountObservation::Unknowable,
+    };
+    let uid = unsafe { CSIdentityGetPosixID(identity.0) };
+    if uid == 0 {
+        return super::NativeDedicatedAccountObservation::PresentBroken;
+    }
+    let posix_name = match cf_string_to_string(unsafe { CSIdentityGetPosixName(identity.0) }) {
+        Ok(name) => name,
+        Err(_) => return super::NativeDedicatedAccountObservation::Unknowable,
+    };
+    let local_uid = match lookup_worker_uid(spec.name()) {
+        Ok(uid) => uid,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return super::NativeDedicatedAccountObservation::PresentBroken;
+        }
+        Err(_) => return super::NativeDedicatedAccountObservation::Unknowable,
+    };
+    let account = match account_details_for_uid(uid, WorkerAccountPolicy::Dedicated) {
+        Ok(account) => account,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return super::NativeDedicatedAccountObservation::PresentBroken;
+        }
+        Err(_) => return super::NativeDedicatedAccountObservation::Unknowable,
+    };
+    let groups = match supplementary_groups(account.principal.name(), account.gid) {
+        Ok(groups) => groups,
+        Err(_) => return super::NativeDedicatedAccountObservation::Unknowable,
+    };
+    let admin = match local_identity("admin", CS_IDENTITY_CLASS_GROUP) {
+        Ok(Some(admin)) => unsafe { CSIdentityIsMemberOfGroup(identity.0, admin.0) != 0 },
+        Ok(None) | Err(_) => return super::NativeDedicatedAccountObservation::Unknowable,
+    };
+    let home = PathBuf::from(account.home);
+    let home_state = inspect_dedicated_home(&home, uid);
+    classify_dedicated_account_record(
+        spec,
+        MacDedicatedAccountRecord {
+            principal: account.principal,
+            is_local_user: unsafe { CSIdentityGetClass(identity.0) } == CS_IDENTITY_CLASS_USER
+                && local_uid == uid
+                && posix_name == spec.name(),
+            is_enabled: unsafe { CSIdentityIsEnabled(identity.0) != 0 },
+            is_hidden: unsafe { CSIdentityIsHidden(identity.0) != 0 },
+            is_administrator: admin,
+            primary_gid: account.gid,
+            supplementary_groups: groups,
+            home,
+            shell: PathBuf::from(account.shell),
+            home_state,
+        },
+        home_observation,
+    )
+}
+
+const CS_IDENTITY_CLASS_USER: isize = 1;
+const CS_IDENTITY_CLASS_GROUP: isize = 2;
+const CS_IDENTITY_QUERY_STRING_EQUALS: isize = 1;
+const CS_IDENTITY_QUERY_INCLUDE_HIDDEN: usize = 0x0002;
+const CF_STRING_ENCODING_UTF8: u32 = 0x0800_0100;
+
+struct OwnedCoreFoundation(*const c_void);
+
+impl Drop for OwnedCoreFoundation {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe { CFRelease(self.0) };
+        }
+    }
+}
+
+fn local_identity(name: &str, class: isize) -> io::Result<Option<OwnedCoreFoundation>> {
+    let name = cf_string(name)?;
+    let authority = unsafe { CSGetLocalIdentityAuthority() };
+    if authority.is_null() {
+        return Err(io::Error::other(
+            "native local identity authority is unavailable",
+        ));
+    }
+    let query = unsafe {
+        CSIdentityQueryCreateForName(
+            std::ptr::null(),
+            name.0,
+            CS_IDENTITY_QUERY_STRING_EQUALS,
+            class,
+            authority,
+        )
+    };
+    if query.is_null() {
+        return Err(io::Error::other(
+            "native local identity query is unavailable",
+        ));
+    }
+    let query = OwnedCoreFoundation(query);
+    let mut native_error = std::ptr::null();
+    if unsafe {
+        CSIdentityQueryExecute(query.0, CS_IDENTITY_QUERY_INCLUDE_HIDDEN, &mut native_error)
+    } == 0
+    {
+        if !native_error.is_null() {
+            unsafe { CFRelease(native_error) };
+        }
+        return Err(io::Error::other("native local identity query failed"));
+    }
+    let results = unsafe { CSIdentityQueryCopyResults(query.0) };
+    if results.is_null() {
+        return Err(io::Error::other(
+            "native local identity query returned no result set",
+        ));
+    }
+    let results = OwnedCoreFoundation(results);
+    let mut exact = None;
+    let count = unsafe { CFArrayGetCount(results.0) };
+    for index in 0..count {
+        let identity = unsafe { CFArrayGetValueAtIndex(results.0, index) };
+        if identity.is_null()
+            || unsafe { CSIdentityGetClass(identity) } != class
+            || cf_string_to_string(unsafe { CSIdentityGetPosixName(identity) })?
+                != name_from_cf(&name)?
+        {
+            continue;
+        }
+        if exact.is_some() {
+            return Err(io::Error::other(
+                "native local identity query was ambiguous",
+            ));
+        }
+        exact = Some(OwnedCoreFoundation(unsafe { CFRetain(identity) }));
+    }
+    Ok(exact)
+}
+
+fn cf_string(value: &str) -> io::Result<OwnedCoreFoundation> {
+    let string = unsafe {
+        CFStringCreateWithBytes(
+            std::ptr::null(),
+            value.as_ptr(),
+            value
+                .len()
+                .try_into()
+                .map_err(|_| invalid_data("native local identity name length is out of range"))?,
+            CF_STRING_ENCODING_UTF8,
+            0,
+        )
+    };
+    if string.is_null() {
+        return Err(io::Error::other(
+            "native local identity name allocation failed",
+        ));
+    }
+    Ok(OwnedCoreFoundation(string))
+}
+
+fn name_from_cf(value: &OwnedCoreFoundation) -> io::Result<String> {
+    cf_string_to_string(value.0)
+}
+
+fn cf_string_to_string(value: *const c_void) -> io::Result<String> {
+    if value.is_null() {
+        return Err(invalid_data("native local identity name is unavailable"));
+    }
+    let length = unsafe { CFStringGetLength(value) };
+    let maximum = unsafe { CFStringGetMaximumSizeForEncoding(length, CF_STRING_ENCODING_UTF8) };
+    if !(0..=4096).contains(&maximum) {
+        return Err(invalid_data("native local identity name length is invalid"));
+    }
+    let mut bytes = vec![0_u8; maximum as usize + 1];
+    if unsafe {
+        CFStringGetCString(
+            value,
+            bytes.as_mut_ptr().cast(),
+            bytes.len().try_into().unwrap_or(isize::MAX),
+            CF_STRING_ENCODING_UTF8,
+        )
+    } == 0
+    {
+        return Err(invalid_data("native local identity name is invalid"));
+    }
+    let end = bytes
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(bytes.len());
+    String::from_utf8(bytes[..end].to_vec())
+        .map_err(|_| invalid_data("native local identity name is not UTF-8"))
+}
+
+fn inspect_dedicated_home(path: &Path, expected_uid: u32) -> DedicatedHomeState {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return DedicatedHomeState::Missing
+        }
+        Err(_) => return DedicatedHomeState::Unknowable,
+    };
+    if !metadata.file_type().is_dir()
+        || metadata.uid() != expected_uid
+        || metadata.permissions().mode() & 0o022 != 0
+    {
+        return DedicatedHomeState::Unsafe;
+    }
+    if verify_no_extended_acl(path).is_err() {
+        return DedicatedHomeState::Unsafe;
+    }
+    match fs::read_dir(path) {
+        Ok(mut entries) => match entries.next() {
+            None => DedicatedHomeState::EmptySafe,
+            Some(Ok(_)) => DedicatedHomeState::PopulatedSafe,
+            Some(Err(_)) => DedicatedHomeState::Unknowable,
+        },
+        Err(_) => DedicatedHomeState::Unknowable,
+    }
+}
+
+#[link(name = "CoreFoundation", kind = "framework")]
+unsafe extern "C" {
+    fn CFRetain(value: *const c_void) -> *const c_void;
+    fn CFRelease(value: *const c_void);
+    fn CFArrayGetCount(array: *const c_void) -> isize;
+    fn CFArrayGetValueAtIndex(array: *const c_void, index: isize) -> *const c_void;
+    fn CFStringCreateWithBytes(
+        allocator: *const c_void,
+        bytes: *const u8,
+        length: isize,
+        encoding: u32,
+        is_external_representation: u8,
+    ) -> *const c_void;
+    fn CFStringGetLength(string: *const c_void) -> isize;
+    fn CFStringGetMaximumSizeForEncoding(length: isize, encoding: u32) -> isize;
+    fn CFStringGetCString(
+        string: *const c_void,
+        buffer: *mut i8,
+        buffer_size: isize,
+        encoding: u32,
+    ) -> u8;
+}
+
+#[link(name = "CoreServices", kind = "framework")]
+unsafe extern "C" {
+    fn CSGetLocalIdentityAuthority() -> *const c_void;
+    fn CSIdentityQueryCreateForName(
+        allocator: *const c_void,
+        name: *const c_void,
+        comparison_method: isize,
+        identity_class: isize,
+        authority: *const c_void,
+    ) -> *const c_void;
+    fn CSIdentityQueryExecute(query: *const c_void, flags: usize, error: *mut *const c_void) -> u8;
+    fn CSIdentityQueryCopyResults(query: *const c_void) -> *const c_void;
+    fn CSIdentityGetClass(identity: *const c_void) -> isize;
+    fn CSIdentityGetPosixID(identity: *const c_void) -> u32;
+    fn CSIdentityGetPosixName(identity: *const c_void) -> *const c_void;
+    fn CSIdentityIsMemberOfGroup(identity: *const c_void, group: *const c_void) -> u8;
+    fn CSIdentityIsHidden(identity: *const c_void) -> u8;
+    fn CSIdentityIsEnabled(identity: *const c_void) -> u8;
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum DedicatedHomeState {
+    Missing,
+    EmptySafe,
+    PopulatedSafe,
+    Unsafe,
+    Unknowable,
+}
+
+#[derive(Clone)]
+struct MacDedicatedAccountRecord {
+    principal: WorkerPrincipal,
+    is_local_user: bool,
+    is_enabled: bool,
+    is_hidden: bool,
+    is_administrator: bool,
+    primary_gid: u32,
+    supplementary_groups: Vec<libc::gid_t>,
+    home: PathBuf,
+    shell: PathBuf,
+    home_state: DedicatedHomeState,
+}
+
+fn classify_dedicated_account_record(
+    spec: &super::DedicatedAccountSpec,
+    record: MacDedicatedAccountRecord,
+    home_observation: super::NativeDedicatedAccountInspection,
+) -> super::NativeDedicatedAccountObservation {
+    if record.home_state == DedicatedHomeState::Unknowable {
+        return super::NativeDedicatedAccountObservation::Unknowable;
+    }
+    let expected_home = Path::new("/Users").join(spec.name());
+    let supported_shell = matches!(record.shell.to_str(), Some("/bin/zsh" | "/bin/bash"));
+    let privileged_group = record.primary_gid == 0
+        || record.primary_gid == 80
+        || record
+            .supplementary_groups
+            .iter()
+            .any(|group| matches!(*group, 0 | 80));
+    let home_is_safe = match (home_observation, record.home_state) {
+        (_, DedicatedHomeState::EmptySafe)
+        | (
+            super::NativeDedicatedAccountInspection::Established,
+            DedicatedHomeState::PopulatedSafe,
+        ) => true,
+        (_, DedicatedHomeState::Missing | DedicatedHomeState::Unsafe)
+        | (super::NativeDedicatedAccountInspection::Initial, DedicatedHomeState::PopulatedSafe) => {
+            false
+        }
+        (_, DedicatedHomeState::Unknowable) => unreachable!(),
+    };
+    if record.principal.principal_kind() != PrincipalKind::UnixUid
+        || record.principal.account_policy() != WorkerAccountPolicy::Dedicated
+        || record.principal.name() != spec.name()
+        || !record.is_local_user
+        || !record.is_enabled
+        || record.is_hidden
+        || record.is_administrator
+        || privileged_group
+        || record.home != expected_home
+        || !supported_shell
+        || !home_is_safe
+    {
+        return super::NativeDedicatedAccountObservation::PresentBroken;
+    }
+    super::NativeDedicatedAccountObservation::PresentHealthy(record.principal)
+}
+
 fn principal_for_uid(uid: u32, account_policy: WorkerAccountPolicy) -> io::Result<WorkerPrincipal> {
     account_for_uid(uid, account_policy).map(|(principal, _)| principal)
 }
@@ -2849,6 +3183,7 @@ struct UnixAccountDetails {
     principal: WorkerPrincipal,
     gid: u32,
     home: OsString,
+    shell: OsString,
 }
 
 fn account_details_for_uid(
@@ -2873,7 +3208,11 @@ fn account_details_for_uid(
     if status != 0 {
         return Err(io::Error::from_raw_os_error(status));
     }
-    if result.is_null() || entry.pw_name.is_null() || entry.pw_dir.is_null() {
+    if result.is_null()
+        || entry.pw_name.is_null()
+        || entry.pw_dir.is_null()
+        || entry.pw_shell.is_null()
+    {
         return Err(io::Error::new(
             io::ErrorKind::NotFound,
             "worker uid has no native account mapping",
@@ -2884,6 +3223,11 @@ fn account_details_for_uid(
         .map_err(|_| invalid_data("worker account name is not UTF-8"))?;
     let home = OsString::from_vec(
         unsafe { std::ffi::CStr::from_ptr(entry.pw_dir) }
+            .to_bytes()
+            .to_vec(),
+    );
+    let shell = OsString::from_vec(
+        unsafe { std::ffi::CStr::from_ptr(entry.pw_shell) }
             .to_bytes()
             .to_vec(),
     );
@@ -2899,6 +3243,7 @@ fn account_details_for_uid(
         )?,
         gid: entry.pw_gid,
         home,
+        shell,
     })
 }
 
@@ -4031,8 +4376,174 @@ fn invalid_data(message: &str) -> io::Error {
 mod tests {
     use super::*;
 
+    #[test]
+    fn dedicated_account_spec_applies_macos_name_rules() {
+        for valid in ["build-agent", "ci_worker", "worker7"] {
+            assert!(super::super::DedicatedAccountSpec::new(valid).is_ok());
+        }
+        let oversized = "a".repeat(256);
+        let error = match super::super::DedicatedAccountSpec::new(&oversized) {
+            Ok(_) => panic!("macOS-invalid dedicated account name was accepted"),
+            Err(error) => error,
+        };
+        assert_eq!(
+            error.to_string(),
+            super::super::DEDICATED_ACCOUNT_NAME_ERROR
+        );
+    }
+
     fn test_principal() -> WorkerPrincipal {
         resolve_current_worker_principal().unwrap()
+    }
+
+    fn healthy_dedicated_account_record() -> MacDedicatedAccountRecord {
+        MacDedicatedAccountRecord {
+            principal: WorkerPrincipal::new(
+                PrincipalKind::UnixUid,
+                "501",
+                "build-agent",
+                WorkerAccountPolicy::Dedicated,
+            )
+            .unwrap(),
+            is_local_user: true,
+            is_enabled: true,
+            is_hidden: false,
+            is_administrator: false,
+            primary_gid: 20,
+            supplementary_groups: vec![],
+            home: PathBuf::from("/Users/build-agent"),
+            shell: PathBuf::from("/bin/zsh"),
+            home_state: DedicatedHomeState::EmptySafe,
+        }
+    }
+
+    fn assert_dedicated_account_broken(record: MacDedicatedAccountRecord) {
+        let spec = super::super::DedicatedAccountSpec::new("build-agent").unwrap();
+        assert!(matches!(
+            classify_dedicated_account_record(
+                &spec,
+                record,
+                super::super::NativeDedicatedAccountInspection::Initial,
+            ),
+            super::super::NativeDedicatedAccountObservation::PresentBroken,
+        ));
+    }
+
+    #[test]
+    fn dedicated_account_observation_rejects_each_unsafe_macos_posture() {
+        let spec = super::super::DedicatedAccountSpec::new("build-agent").unwrap();
+        assert!(matches!(
+            classify_dedicated_account_record(
+                &spec,
+                healthy_dedicated_account_record(),
+                super::super::NativeDedicatedAccountInspection::Initial,
+            ),
+            super::super::NativeDedicatedAccountObservation::PresentHealthy(_),
+        ));
+
+        let mut cases = Vec::new();
+        let mut wrong_kind = healthy_dedicated_account_record();
+        wrong_kind.principal = WorkerPrincipal::new(
+            PrincipalKind::WindowsSid,
+            "S-1-5-21-100-200-300-501",
+            "build-agent",
+            WorkerAccountPolicy::Dedicated,
+        )
+        .unwrap();
+        cases.push(wrong_kind);
+        let mut nonlocal = healthy_dedicated_account_record();
+        nonlocal.is_local_user = false;
+        cases.push(nonlocal);
+        let mut disabled = healthy_dedicated_account_record();
+        disabled.is_enabled = false;
+        cases.push(disabled);
+        let mut hidden = healthy_dedicated_account_record();
+        hidden.is_hidden = true;
+        cases.push(hidden);
+        let mut administrator = healthy_dedicated_account_record();
+        administrator.is_administrator = true;
+        cases.push(administrator);
+        let mut privileged_primary = healthy_dedicated_account_record();
+        privileged_primary.primary_gid = 80;
+        cases.push(privileged_primary);
+        let mut privileged_supplementary = healthy_dedicated_account_record();
+        privileged_supplementary.supplementary_groups = vec![80];
+        cases.push(privileged_supplementary);
+        let mut wrong_home = healthy_dedicated_account_record();
+        wrong_home.home = PathBuf::from("/Users/unrelated");
+        cases.push(wrong_home);
+        let mut wrong_shell = healthy_dedicated_account_record();
+        wrong_shell.shell = PathBuf::from("/usr/bin/false");
+        cases.push(wrong_shell);
+        let mut unsafe_home = healthy_dedicated_account_record();
+        unsafe_home.home_state = DedicatedHomeState::Unsafe;
+        cases.push(unsafe_home);
+        let mut populated_home = healthy_dedicated_account_record();
+        populated_home.home_state = DedicatedHomeState::PopulatedSafe;
+        cases.push(populated_home);
+
+        for record in cases {
+            assert_dedicated_account_broken(record);
+        }
+
+        let mut unavailable_home = healthy_dedicated_account_record();
+        unavailable_home.home_state = DedicatedHomeState::Unknowable;
+        assert!(matches!(
+            classify_dedicated_account_record(
+                &spec,
+                unavailable_home,
+                super::super::NativeDedicatedAccountInspection::Initial,
+            ),
+            super::super::NativeDedicatedAccountObservation::Unknowable,
+        ));
+    }
+
+    #[test]
+    fn dedicated_account_binding_allows_safe_contents_only_after_initial_adoption() {
+        let spec = super::super::DedicatedAccountSpec::new("build-agent").unwrap();
+        let mut populated = healthy_dedicated_account_record();
+        populated.home_state = DedicatedHomeState::PopulatedSafe;
+
+        assert!(matches!(
+            classify_dedicated_account_record(
+                &spec,
+                populated.clone(),
+                super::super::NativeDedicatedAccountInspection::Initial,
+            ),
+            super::super::NativeDedicatedAccountObservation::PresentBroken,
+        ));
+        assert!(matches!(
+            classify_dedicated_account_record(
+                &spec,
+                populated,
+                super::super::NativeDedicatedAccountInspection::Established,
+            ),
+            super::super::NativeDedicatedAccountObservation::PresentHealthy(_),
+        ));
+    }
+
+    #[test]
+    #[ignore = "environmental: requires native macOS and STYRN_TEST_DISTINCT_UNIX_WORKER naming a visible enabled non-administrator local account with an empty safe /Users directory"]
+    fn native_dedicated_account_observation_adopts_a_distinct_local_account() {
+        let name = std::env::var("STYRN_TEST_DISTINCT_UNIX_WORKER")
+            .expect("STYRN_TEST_DISTINCT_UNIX_WORKER must name a disposable local account");
+        assert_ne!(name, "styrn");
+        let observation = super::super::inspect_dedicated_account(
+            super::super::DedicatedAccountSpec::new(&name).unwrap(),
+        );
+        let super::super::DedicatedAccountObservation::PresentHealthy(handle) = observation else {
+            panic!("the configured macOS account did not satisfy dedicated adoption posture");
+        };
+        let authority = super::super::DedicatedAccountFactoryAuthority::for_test();
+        handle
+            .reverify_and_bind(&authority, |verified| {
+                assert_eq!(verified.principal().name(), name);
+                assert_eq!(
+                    verified.principal().account_policy(),
+                    WorkerAccountPolicy::Dedicated
+                );
+            })
+            .unwrap();
     }
 
     #[test]

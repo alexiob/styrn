@@ -174,6 +174,13 @@ const PROTECTED_DACL_SECURITY_INFORMATION: u32 = 0x8000_0000;
 const SE_DACL_PROTECTED: u16 = 0x1000;
 const SE_FILE_OBJECT: u32 = 1;
 const ERROR_INSUFFICIENT_BUFFER: u32 = 122;
+const NERR_USER_NOT_FOUND: u32 = 2221;
+const MAX_PREFERRED_LENGTH: u32 = u32::MAX;
+const USER_PRIV_USER: u32 = 1;
+const UF_ACCOUNTDISABLE: u32 = 0x0000_0002;
+const UF_LOCKOUT: u32 = 0x0000_0010;
+const UF_NORMAL_ACCOUNT: u32 = 0x0000_0200;
+const LG_INCLUDE_INDIRECT: u32 = 0x0000_0001;
 const TOKEN_QUERY: u32 = 0x0008;
 const TOKEN_ADJUST_PRIVILEGES: u32 = 0x0020;
 const TOKEN_IMPERSONATE: u32 = 0x0004;
@@ -370,6 +377,44 @@ struct LuidAndAttributes {
 struct TokenPrivileges {
     privilege_count: u32,
     privileges: [LuidAndAttributes; 1],
+}
+
+#[repr(C)]
+struct UserInfo4 {
+    name: *mut u16,
+    password: *mut u16,
+    password_age: u32,
+    privilege: u32,
+    home_dir: *mut u16,
+    comment: *mut u16,
+    flags: u32,
+    script_path: *mut u16,
+    auth_flags: u32,
+    full_name: *mut u16,
+    user_comment: *mut u16,
+    parameters: *mut u16,
+    workstations: *mut u16,
+    last_logon: u32,
+    last_logoff: u32,
+    account_expires: u32,
+    max_storage: u32,
+    units_per_week: u32,
+    logon_hours: *mut u8,
+    bad_password_count: u32,
+    logon_count: u32,
+    logon_server: *mut u16,
+    country_code: u32,
+    code_page: u32,
+    user_sid: *mut c_void,
+    primary_group_id: u32,
+    profile: *mut u16,
+    home_dir_drive: *mut u16,
+    password_expired: u32,
+}
+
+#[repr(C)]
+struct LocalGroupUsersInfo0 {
+    name: *mut u16,
 }
 
 #[repr(C)]
@@ -615,9 +660,383 @@ unsafe extern "system" {
     fn CoTaskMemFree(memory: *mut c_void);
 }
 
+#[link(name = "netapi32")]
+unsafe extern "system" {
+    fn NetUserGetInfo(
+        server_name: *const u16,
+        user_name: *const u16,
+        level: u32,
+        buffer: *mut *mut u8,
+    ) -> u32;
+    fn NetUserGetLocalGroups(
+        server_name: *const u16,
+        user_name: *const u16,
+        level: u32,
+        flags: u32,
+        buffer: *mut *mut u8,
+        preferred_maximum_length: u32,
+        entries_read: *mut u32,
+        total_entries: *mut u32,
+    ) -> u32;
+    fn NetApiBufferFree(buffer: *mut c_void) -> u32;
+}
+
+#[link(name = "userenv")]
+unsafe extern "system" {
+    fn GetProfilesDirectoryW(profile_directory: *mut u16, size: *mut u32) -> i32;
+}
+
 pub(super) fn resolve_current_worker_principal() -> io::Result<WorkerPrincipal> {
     let sid = current_user_sid()?;
     principal_for_sid(&sid, WorkerAccountPolicy::CurrentUser)
+}
+
+pub(super) fn dedicated_account_name_is_valid(name: &str) -> bool {
+    let length = name.encode_utf16().count();
+    let stem = name.split('.').next().unwrap_or(name).to_ascii_uppercase();
+    length <= 20
+        && !matches!(
+            stem.as_str(),
+            "CON"
+                | "PRN"
+                | "AUX"
+                | "NUL"
+                | "COM1"
+                | "COM2"
+                | "COM3"
+                | "COM4"
+                | "COM5"
+                | "COM6"
+                | "COM7"
+                | "COM8"
+                | "COM9"
+                | "LPT1"
+                | "LPT2"
+                | "LPT3"
+                | "LPT4"
+                | "LPT5"
+                | "LPT6"
+                | "LPT7"
+                | "LPT8"
+                | "LPT9"
+        )
+}
+
+pub(super) fn inspect_dedicated_account(
+    spec: &super::DedicatedAccountSpec,
+    profile_observation: super::NativeDedicatedAccountInspection,
+) -> super::NativeDedicatedAccountObservation {
+    let account = wide(spec.name());
+    let mut raw = std::ptr::null_mut();
+    let status = unsafe { NetUserGetInfo(std::ptr::null(), account.as_ptr(), 4, &mut raw) };
+    if status == NERR_USER_NOT_FOUND {
+        return super::NativeDedicatedAccountObservation::Absent;
+    }
+    if status != 0 || raw.is_null() {
+        return super::NativeDedicatedAccountObservation::Unknowable;
+    }
+    let allocation = NetApiAllocation(raw);
+    let information = unsafe { &*allocation.0.cast::<UserInfo4>() };
+    let native_name = match wide_pointer_to_string(information.name) {
+        Ok(name) => name,
+        Err(_) => return super::NativeDedicatedAccountObservation::Unknowable,
+    };
+    let sid = match copy_sid(information.user_sid) {
+        Ok(sid) => sid,
+        Err(_) => return super::NativeDedicatedAccountObservation::Unknowable,
+    };
+    let looked_up_sid = match lookup_account_sid(spec.name()) {
+        Ok(sid) => sid,
+        Err(_) => return super::NativeDedicatedAccountObservation::Unknowable,
+    };
+    if unsafe { EqualSid(sid.as_ptr().cast(), looked_up_sid.as_ptr().cast()) } == 0 {
+        return super::NativeDedicatedAccountObservation::PresentBroken;
+    }
+    let principal = match principal_for_sid(&sid, WorkerAccountPolicy::Dedicated) {
+        Ok(principal) => principal,
+        Err(_) => return super::NativeDedicatedAccountObservation::PresentBroken,
+    };
+    let is_administrator = match account_is_local_administrator(spec.name()) {
+        Ok(is_administrator) => is_administrator,
+        Err(_) => return super::NativeDedicatedAccountObservation::Unknowable,
+    };
+    let expected_profile = match expected_dedicated_profile(spec.name()) {
+        Ok(profile) => profile,
+        Err(_) => return super::NativeDedicatedAccountObservation::Unknowable,
+    };
+    let configured_profile = match wide_pointer_to_string(information.profile) {
+        Ok(profile) => profile,
+        Err(_) => return super::NativeDedicatedAccountObservation::Unknowable,
+    };
+    let profile_configuration_matches = configured_profile.is_empty()
+        || windows_paths_equal(Path::new(&configured_profile), &expected_profile).unwrap_or(false);
+    let profile_state = match inspect_dedicated_profile(&expected_profile, &sid) {
+        Ok(state) => state,
+        Err(_) => DedicatedProfileState::Unknowable,
+    };
+    classify_dedicated_account_record(
+        spec,
+        WindowsDedicatedAccountRecord {
+            principal,
+            is_local_user: information.privilege == USER_PRIV_USER
+                && information.flags & UF_NORMAL_ACCOUNT != 0
+                && native_name == spec.name(),
+            is_enabled: information.flags & UF_ACCOUNTDISABLE == 0,
+            is_locked: information.flags & UF_LOCKOUT != 0,
+            is_administrator,
+            profile_configuration_matches,
+            profile_state,
+        },
+        profile_observation,
+    )
+}
+
+#[derive(Clone)]
+struct WindowsDedicatedAccountRecord {
+    principal: WorkerPrincipal,
+    is_local_user: bool,
+    is_enabled: bool,
+    is_locked: bool,
+    is_administrator: bool,
+    profile_configuration_matches: bool,
+    profile_state: DedicatedProfileState,
+}
+
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum DedicatedProfileState {
+    Missing,
+    EmptySafe,
+    PopulatedSafe,
+    Unsafe,
+    Unknowable,
+}
+
+fn classify_dedicated_account_record(
+    spec: &super::DedicatedAccountSpec,
+    record: WindowsDedicatedAccountRecord,
+    profile_observation: super::NativeDedicatedAccountInspection,
+) -> super::NativeDedicatedAccountObservation {
+    if record.profile_state == DedicatedProfileState::Unknowable {
+        return super::NativeDedicatedAccountObservation::Unknowable;
+    }
+    let profile_is_eligible = match profile_observation {
+        super::NativeDedicatedAccountInspection::Initial => matches!(
+            record.profile_state,
+            DedicatedProfileState::Missing | DedicatedProfileState::EmptySafe
+        ),
+        super::NativeDedicatedAccountInspection::Established => matches!(
+            record.profile_state,
+            DedicatedProfileState::Missing
+                | DedicatedProfileState::EmptySafe
+                | DedicatedProfileState::PopulatedSafe
+        ),
+    };
+    if record.principal.principal_kind() != PrincipalKind::WindowsSid
+        || record.principal.account_policy() != WorkerAccountPolicy::Dedicated
+        || record.principal.name() != spec.name()
+        || !record.is_local_user
+        || !record.is_enabled
+        || record.is_locked
+        || record.is_administrator
+        || !record.profile_configuration_matches
+        || !profile_is_eligible
+    {
+        return super::NativeDedicatedAccountObservation::PresentBroken;
+    }
+    super::NativeDedicatedAccountObservation::PresentHealthy(record.principal)
+}
+
+fn account_is_local_administrator(name: &str) -> io::Result<bool> {
+    let administrators = account_name_for_sid(&well_known_sid(WIN_BUILTIN_ADMINISTRATORS_SID)?)?;
+    let name = wide(name);
+    let mut raw = std::ptr::null_mut();
+    let mut entries_read = 0;
+    let mut total_entries = 0;
+    let status = unsafe {
+        NetUserGetLocalGroups(
+            std::ptr::null(),
+            name.as_ptr(),
+            0,
+            LG_INCLUDE_INDIRECT,
+            &mut raw,
+            MAX_PREFERRED_LENGTH,
+            &mut entries_read,
+            &mut total_entries,
+        )
+    };
+    if status != 0 {
+        if !raw.is_null() {
+            let _allocation = NetApiAllocation(raw);
+        }
+        return Err(io::Error::from_raw_os_error(status as i32));
+    }
+    if entries_read != total_entries {
+        if !raw.is_null() {
+            let _allocation = NetApiAllocation(raw);
+        }
+        return Err(invalid_data(
+            "Windows local-group observation returned incomplete data",
+        ));
+    }
+    let allocation = NetApiAllocation(raw);
+    if entries_read == 0 {
+        return Ok(false);
+    }
+    if allocation.0.is_null() {
+        return Err(invalid_data("Windows returned a null local-group list"));
+    }
+    let groups = unsafe {
+        std::slice::from_raw_parts(
+            allocation.0.cast::<LocalGroupUsersInfo0>(),
+            entries_read as usize,
+        )
+    };
+    for group in groups {
+        if windows_names_equal(&wide_pointer_to_string(group.name)?, &administrators) {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+fn expected_dedicated_profile(name: &str) -> io::Result<PathBuf> {
+    let mut size = 0;
+    unsafe {
+        GetProfilesDirectoryW(std::ptr::null_mut(), &mut size);
+    }
+    if size == 0
+        || io::Error::last_os_error().raw_os_error() != Some(ERROR_INSUFFICIENT_BUFFER as i32)
+    {
+        return Err(io::Error::last_os_error());
+    }
+    let mut profile_root = vec![0_u16; size as usize];
+    if unsafe { GetProfilesDirectoryW(profile_root.as_mut_ptr(), &mut size) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let length = profile_root
+        .iter()
+        .position(|unit| *unit == 0)
+        .unwrap_or(profile_root.len());
+    let root = PathBuf::from(std::ffi::OsString::from_wide(&profile_root[..length]));
+    Ok(root.join(name))
+}
+
+fn windows_paths_equal(left: &Path, right: &Path) -> io::Result<bool> {
+    let left = WindowsWorkerPath::parse(left)?;
+    let right = WindowsWorkerPath::parse(right)?;
+    Ok(left.components.len() == right.components.len()
+        && left.has_component_prefix(&right)
+        && right.has_component_prefix(&left))
+}
+
+fn inspect_dedicated_profile(path: &Path, owner_sid: &[u8]) -> io::Result<DedicatedProfileState> {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {
+            return Ok(DedicatedProfileState::Missing)
+        }
+        Err(error) => return Err(error),
+    };
+    let attributes = unsafe { GetFileAttributesW(wide_os(path).as_ptr()) };
+    if attributes == INVALID_FILE_ATTRIBUTES {
+        return Err(io::Error::last_os_error());
+    }
+    if !metadata.file_type().is_dir()
+        || attributes & FILE_ATTRIBUTE_DIRECTORY == 0
+        || attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+    {
+        return Ok(DedicatedProfileState::Unsafe);
+    }
+
+    let mut wide_path = wide_os(path);
+    let mut owner = std::ptr::null_mut();
+    let mut dacl = std::ptr::null_mut();
+    let mut descriptor = std::ptr::null_mut();
+    let status = unsafe {
+        GetNamedSecurityInfoW(
+            wide_path.as_mut_ptr(),
+            SE_FILE_OBJECT,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            &mut owner,
+            std::ptr::null_mut(),
+            &mut dacl,
+            std::ptr::null_mut(),
+            &mut descriptor,
+        )
+    };
+    if status != 0 {
+        return Err(io::Error::from_raw_os_error(status as i32));
+    }
+    let _descriptor = LocalAllocation(descriptor);
+    if owner.is_null() || dacl.is_null() {
+        return Ok(DedicatedProfileState::Unsafe);
+    }
+    if unsafe { EqualSid(owner, owner_sid.as_ptr().cast()) } == 0 {
+        return Ok(DedicatedProfileState::Unsafe);
+    }
+    let system = well_known_sid(WIN_LOCAL_SYSTEM_SID)?;
+    let administrators = well_known_sid(WIN_BUILTIN_ADMINISTRATORS_SID)?;
+    let trusted_installer = lookup_account_sid("NT SERVICE\\TrustedInstaller")?;
+    let entries = inspect_aces(
+        dacl,
+        &system,
+        &administrators,
+        &trusted_installer,
+        owner_sid,
+    )?;
+    if entries.iter().any(|entry| {
+        entry.allowed
+            && entry.flags & INHERIT_ONLY_ACE == 0
+            && entry.principal == Principal::Unexpected
+            && entry.mask & FILE_MUTATION_ACCESS != 0
+    }) {
+        return Ok(DedicatedProfileState::Unsafe);
+    }
+    if std::fs::read_dir(path)?.next().is_some() {
+        Ok(DedicatedProfileState::PopulatedSafe)
+    } else {
+        Ok(DedicatedProfileState::EmptySafe)
+    }
+}
+
+fn copy_sid(source: *const c_void) -> io::Result<Vec<u8>> {
+    if source.is_null() {
+        return Err(invalid_data("Windows returned a null account SID"));
+    }
+    let length = unsafe { GetLengthSid(source) };
+    if length == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut sid = vec![0_u8; length as usize];
+    if unsafe { CopySid(length, sid.as_mut_ptr().cast(), source) } == 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(sid)
+}
+
+fn wide_pointer_to_string(value: *const u16) -> io::Result<String> {
+    if value.is_null() {
+        return Ok(String::new());
+    }
+    let length = (0..)
+        .take_while(|index| unsafe { *value.add(*index) } != 0)
+        .count();
+    String::from_utf16(unsafe { std::slice::from_raw_parts(value, length) })
+        .map_err(|_| invalid_data("Windows returned a non-UTF-16 account attribute"))
+}
+
+fn windows_names_equal(left: &str, right: &str) -> bool {
+    let left = left.encode_utf16().collect::<Vec<_>>();
+    let right = right.encode_utf16().collect::<Vec<_>>();
+    let (Ok(left_length), Ok(right_length)) =
+        (i32::try_from(left.len()), i32::try_from(right.len()))
+    else {
+        return false;
+    };
+    unsafe {
+        CompareStringOrdinal(left.as_ptr(), left_length, right.as_ptr(), right_length, 1)
+            == CSTR_EQUAL
+    }
 }
 
 #[allow(dead_code)] // Consumed by the T0.14 setup action integration follow-up.
@@ -5100,6 +5519,18 @@ impl Drop for LocalAllocation {
     }
 }
 
+struct NetApiAllocation(*mut u8);
+
+impl Drop for NetApiAllocation {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe {
+                NetApiBufferFree(self.0.cast());
+            }
+        }
+    }
+}
+
 struct LocalWideString(*mut u16);
 
 impl Drop for LocalWideString {
@@ -5130,6 +5561,160 @@ mod tests {
 
     fn test_principal() -> WorkerPrincipal {
         resolve_current_worker_principal().unwrap()
+    }
+
+    #[test]
+    fn dedicated_account_spec_applies_windows_name_rules() {
+        for valid in ["build-agent", "ci_worker", "worker7"] {
+            assert!(super::super::DedicatedAccountSpec::new(valid).is_ok());
+        }
+        for invalid in ["CON", "lpt1", "abcdefghijklmnopqrstu"] {
+            let error = match super::super::DedicatedAccountSpec::new(invalid) {
+                Ok(_) => panic!("Windows-invalid dedicated account name was accepted"),
+                Err(error) => error,
+            };
+            assert_eq!(
+                error.to_string(),
+                super::super::DEDICATED_ACCOUNT_NAME_ERROR
+            );
+        }
+    }
+
+    fn healthy_dedicated_account_record() -> WindowsDedicatedAccountRecord {
+        WindowsDedicatedAccountRecord {
+            principal: WorkerPrincipal::new(
+                PrincipalKind::WindowsSid,
+                "S-1-5-21-100-200-300-1001",
+                "build-agent",
+                WorkerAccountPolicy::Dedicated,
+            )
+            .unwrap(),
+            is_local_user: true,
+            is_enabled: true,
+            is_locked: false,
+            is_administrator: false,
+            profile_configuration_matches: true,
+            profile_state: DedicatedProfileState::Missing,
+        }
+    }
+
+    fn assert_dedicated_account_broken(record: WindowsDedicatedAccountRecord) {
+        let spec = super::super::DedicatedAccountSpec::new("build-agent").unwrap();
+        assert!(matches!(
+            classify_dedicated_account_record(
+                &spec,
+                record,
+                super::super::NativeDedicatedAccountInspection::Initial,
+            ),
+            super::super::NativeDedicatedAccountObservation::PresentBroken,
+        ));
+    }
+
+    #[test]
+    fn dedicated_account_observation_rejects_each_unsafe_windows_posture() {
+        let spec = super::super::DedicatedAccountSpec::new("build-agent").unwrap();
+        assert!(matches!(
+            classify_dedicated_account_record(
+                &spec,
+                healthy_dedicated_account_record(),
+                super::super::NativeDedicatedAccountInspection::Initial,
+            ),
+            super::super::NativeDedicatedAccountObservation::PresentHealthy(_),
+        ));
+
+        let mut cases = Vec::new();
+        let mut wrong_kind = healthy_dedicated_account_record();
+        wrong_kind.principal = WorkerPrincipal::new(
+            PrincipalKind::UnixUid,
+            "1001",
+            "build-agent",
+            WorkerAccountPolicy::Dedicated,
+        )
+        .unwrap();
+        cases.push(wrong_kind);
+        let mut nonlocal = healthy_dedicated_account_record();
+        nonlocal.is_local_user = false;
+        cases.push(nonlocal);
+        let mut disabled = healthy_dedicated_account_record();
+        disabled.is_enabled = false;
+        cases.push(disabled);
+        let mut locked = healthy_dedicated_account_record();
+        locked.is_locked = true;
+        cases.push(locked);
+        let mut administrator = healthy_dedicated_account_record();
+        administrator.is_administrator = true;
+        cases.push(administrator);
+        let mut wrong_profile = healthy_dedicated_account_record();
+        wrong_profile.profile_configuration_matches = false;
+        cases.push(wrong_profile);
+        let mut unsafe_profile = healthy_dedicated_account_record();
+        unsafe_profile.profile_state = DedicatedProfileState::Unsafe;
+        cases.push(unsafe_profile);
+        let mut populated_profile = healthy_dedicated_account_record();
+        populated_profile.profile_state = DedicatedProfileState::PopulatedSafe;
+        cases.push(populated_profile);
+
+        for record in cases {
+            assert_dedicated_account_broken(record);
+        }
+
+        let mut unavailable_profile = healthy_dedicated_account_record();
+        unavailable_profile.profile_state = DedicatedProfileState::Unknowable;
+        assert!(matches!(
+            classify_dedicated_account_record(
+                &spec,
+                unavailable_profile,
+                super::super::NativeDedicatedAccountInspection::Initial,
+            ),
+            super::super::NativeDedicatedAccountObservation::Unknowable,
+        ));
+    }
+
+    #[test]
+    fn dedicated_account_binding_allows_safe_windows_profile_only_after_adoption() {
+        let spec = super::super::DedicatedAccountSpec::new("build-agent").unwrap();
+        let mut populated = healthy_dedicated_account_record();
+        populated.profile_state = DedicatedProfileState::PopulatedSafe;
+        assert!(matches!(
+            classify_dedicated_account_record(
+                &spec,
+                populated.clone(),
+                super::super::NativeDedicatedAccountInspection::Initial,
+            ),
+            super::super::NativeDedicatedAccountObservation::PresentBroken,
+        ));
+        assert!(matches!(
+            classify_dedicated_account_record(
+                &spec,
+                populated,
+                super::super::NativeDedicatedAccountInspection::Established,
+            ),
+            super::super::NativeDedicatedAccountObservation::PresentHealthy(_),
+        ));
+    }
+
+    #[test]
+    #[ignore = "environmental: requires native Windows and STYRN_TEST_DISTINCT_LOCAL_WORKER naming an enabled unlocked non-administrator local account with a missing or empty safe default profile"]
+    fn native_dedicated_account_observation_adopts_a_distinct_local_account() {
+        let name = std::env::var("STYRN_TEST_DISTINCT_LOCAL_WORKER")
+            .expect("STYRN_TEST_DISTINCT_LOCAL_WORKER must name a disposable local account");
+        assert_ne!(name, "styrn");
+        let observation = super::super::inspect_dedicated_account(
+            super::super::DedicatedAccountSpec::new(&name).unwrap(),
+        );
+        let super::super::DedicatedAccountObservation::PresentHealthy(handle) = observation else {
+            panic!("the configured Windows account did not satisfy dedicated adoption posture");
+        };
+        let authority = super::super::DedicatedAccountFactoryAuthority::for_test();
+        handle
+            .reverify_and_bind(&authority, |verified| {
+                assert_eq!(verified.principal().name(), name);
+                assert_eq!(
+                    verified.principal().account_policy(),
+                    WorkerAccountPolicy::Dedicated
+                );
+            })
+            .unwrap();
     }
 
     #[test]
