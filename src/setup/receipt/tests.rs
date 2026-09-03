@@ -73,6 +73,86 @@ fn worker_directory_receipt_value() -> serde_json::Value {
     })
 }
 
+fn succeeded_intent_fixture(
+    store: &ReceiptStore,
+    fixture: &ReceiptFixture,
+) -> (crate::setup::action::JournalAuthority, ReceiptIntent) {
+    let authority = crate::setup::action::JournalAuthority::for_test();
+    let entry = entry_with_id("019cafd0-5c00-7000-8000-000000000001");
+    let path = fixture
+        .receipt_path()
+        .parent()
+        .unwrap()
+        .join(".receipt.json.transaction.019cafd0-5c00-7000-8000-000000000001.json");
+    let document = ReceiptIntentDocument {
+        schema_version: SCHEMA_VERSION,
+        installation_scope: InstallationScope::System,
+        phase: ReceiptIntentPhase::Succeeded,
+        entry: entry.clone(),
+    };
+    let mut file =
+        crate::platform::create_private_file(&path, store.owner, store.worker_principal()).unwrap();
+    file.write_all(&document.to_json().unwrap()).unwrap();
+    file.sync_all().unwrap();
+    (
+        authority,
+        ReceiptIntent {
+            entry,
+            path,
+            phase: ReceiptIntentPhase::Succeeded,
+        },
+    )
+}
+
+#[test]
+fn receipt_succeeded_append_precedes_intent_retirement() {
+    let fixture = ReceiptFixture::new("succeeded-append-before-retire");
+    let store = ReceiptStore::new_for_test(fixture.receipt_path());
+    let (authority, intent) = succeeded_intent_fixture(&store, &fixture);
+    let session = store.begin_apply(&authority).unwrap();
+
+    session
+        .append_succeeded_intent(&intent, &authority)
+        .unwrap();
+
+    assert!(intent.path.exists());
+    assert_eq!(store.read_snapshot().unwrap().entry_count(), 1);
+    session
+        .retire_finalized_intent(&intent, &authority)
+        .unwrap();
+    assert!(!intent.path.exists());
+}
+
+#[test]
+fn receipt_wire_is_unchanged_by_finalize_split() {
+    let fixture = ReceiptFixture::new("succeeded-split-wire");
+    let store = ReceiptStore::new_for_test(fixture.receipt_path());
+    let (authority, intent) = succeeded_intent_fixture(&store, &fixture);
+    let intent_wire_before = fs::read(&intent.path).unwrap();
+    let expected_receipt_wire = ReceiptDocument::from_json(COMPLETE_RECEIPT.as_bytes())
+        .unwrap()
+        .to_json()
+        .unwrap();
+    let session = store.begin_apply(&authority).unwrap();
+
+    session
+        .append_succeeded_intent(&intent, &authority)
+        .unwrap();
+
+    assert_eq!(
+        fs::read(fixture.receipt_path()).unwrap(),
+        expected_receipt_wire
+    );
+    assert_eq!(fs::read(&intent.path).unwrap(), intent_wire_before);
+    session
+        .retire_finalized_intent(&intent, &authority)
+        .unwrap();
+    assert_eq!(
+        fs::read(fixture.receipt_path()).unwrap(),
+        expected_receipt_wire
+    );
+}
+
 #[cfg(not(target_os = "windows"))]
 const COMPLETE_RECEIPT: &str = r#"{
   "schema_version": 1,

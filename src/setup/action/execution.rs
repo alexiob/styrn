@@ -1,7 +1,8 @@
 //! Action-owned setup execution and receipt orchestration.
 
 use super::{
-    Action, ActionCheck, ActionEffect, ActionError, ActionName, JournalAuthority, PendingAction,
+    Action, ActionCheck, ActionEffect, ActionError, ActionName, JournalAuthority,
+    MutationCompletion, PendingAction, PreparedExecutionError, VerifiedActionEffect,
 };
 use crate::setup::receipt::{PendingReceiptOccurrence, ReceiptExecutionWitness, ReceiptStoreError};
 use std::collections::HashSet;
@@ -228,22 +229,53 @@ pub(super) fn complete_authorized_execution(
 }
 
 pub(super) trait PreparedActionRunner {
-    fn execute_prepared(
+    fn execute_prepared_and_bind<Bind>(
         &mut self,
         action: &mut Action,
         expected: &ActionEffect,
-    ) -> Result<ActionEffect, ActionError>;
+        bind: Bind,
+    ) -> Result<(MutationCompletion, DurableReceiptBinding), ApplyPlanError>
+    where
+        Bind: for<'authority> FnOnce(
+            VerifiedActionEffect<'authority>,
+        ) -> Result<DurableReceiptBinding, ReceiptStoreError>;
+}
+
+#[derive(Debug)]
+pub(super) enum DurableReceiptBinding {
+    Appended,
+    SucceededOnly(ReceiptStoreError),
 }
 
 struct DirectPreparedActionRunner;
 
 impl PreparedActionRunner for DirectPreparedActionRunner {
-    fn execute_prepared(
+    fn execute_prepared_and_bind<Bind>(
         &mut self,
         action: &mut Action,
         _expected: &ActionEffect,
-    ) -> Result<ActionEffect, ActionError> {
-        action.execute_prepared()
+        bind: Bind,
+    ) -> Result<(MutationCompletion, DurableReceiptBinding), ApplyPlanError>
+    where
+        Bind: for<'authority> FnOnce(
+            VerifiedActionEffect<'authority>,
+        ) -> Result<DurableReceiptBinding, ReceiptStoreError>,
+    {
+        action
+            .execute_prepared_and_bind(bind)
+            .map_err(map_prepared_execution_error)
+    }
+}
+
+fn map_prepared_execution_error(
+    error: PreparedExecutionError<ReceiptStoreError>,
+) -> ApplyPlanError {
+    match error {
+        PreparedExecutionError::Action(error) => ApplyPlanError::Action(error),
+        PreparedExecutionError::ReceiptConflict => {
+            ApplyPlanError::Receipt(ReceiptStoreError::IntentConflict)
+        }
+        PreparedExecutionError::Binding(error) => ApplyPlanError::Receipt(error),
     }
 }
 
@@ -264,6 +296,7 @@ pub(super) fn apply_plan_with_runner<R: PreparedActionRunner>(
         store.validate_action_privilege(action.privilege())?;
     }
     let authority = JournalAuthority(());
+    let native_authority = super::native_mutation_authority();
     let session = store.begin_apply(&authority)?;
     let mut summary = ApplySummary {
         applied_count: 0,
@@ -275,7 +308,13 @@ pub(super) fn apply_plan_with_runner<R: PreparedActionRunner>(
     for intent in session.pending_intents(&authority)? {
         match session.intent_phase(&intent, &authority) {
             crate::setup::receipt::ReceiptIntentPhase::Succeeded => {
-                session.finalize_intent(&intent, &authority)?;
+                session.append_succeeded_intent(&intent, &authority)?;
+                session.retire_succeeded_worker_directory_evidence(
+                    &intent,
+                    &authority,
+                    &native_authority,
+                )?;
+                session.retire_finalized_intent(&intent, &authority)?;
                 summary.recovered_count += 1;
             }
             crate::setup::receipt::ReceiptIntentPhase::Prepared => {
@@ -290,15 +329,22 @@ pub(super) fn apply_plan_with_runner<R: PreparedActionRunner>(
                 }
                 match action.check()? {
                     ActionCheck::Todo => {
-                        let finalized = runner.execute_prepared(action, prepared.effect())?;
-                        if &finalized != prepared.effect() {
-                            return Err(
-                                crate::setup::receipt::ReceiptStoreError::IntentConflict.into()
-                            );
-                        }
                         let mut intent = intent;
-                        session.mark_intent_succeeded(&mut intent, &authority)?;
-                        session.finalize_intent(&intent, &authority)?;
+                        let (completion, binding) = runner.execute_prepared_and_bind(
+                            action,
+                            prepared.effect(),
+                            |verified| {
+                                if verified.effect() != prepared.effect() {
+                                    return Err(ReceiptStoreError::IntentConflict);
+                                }
+                                session.mark_intent_succeeded(&mut intent, &authority)?;
+                                match session.append_succeeded_intent(&intent, &authority) {
+                                    Ok(()) => Ok(DurableReceiptBinding::Appended),
+                                    Err(error) => Ok(DurableReceiptBinding::SucceededOnly(error)),
+                                }
+                            },
+                        )?;
+                        finish_bound_mutation(&session, &intent, &authority, completion, binding)?;
                         summary.applied_count += 1;
                     }
                     ActionCheck::Done | ActionCheck::NeedsHuman(_) => {
@@ -316,12 +362,18 @@ pub(super) fn apply_plan_with_runner<R: PreparedActionRunner>(
                 let mut intent =
                     session.prepare_intent(action.privilege(), &prepared, metadata, &authority)?;
                 session.interruption_after_prepare(&authority)?;
-                let finalized = runner.execute_prepared(action, prepared.effect())?;
-                if &finalized != prepared.effect() {
-                    return Err(crate::setup::receipt::ReceiptStoreError::IntentConflict.into());
-                }
-                session.mark_intent_succeeded(&mut intent, &authority)?;
-                session.finalize_intent(&intent, &authority)?;
+                let (completion, binding) =
+                    runner.execute_prepared_and_bind(action, prepared.effect(), |verified| {
+                        if verified.effect() != prepared.effect() {
+                            return Err(ReceiptStoreError::IntentConflict);
+                        }
+                        session.mark_intent_succeeded(&mut intent, &authority)?;
+                        match session.append_succeeded_intent(&intent, &authority) {
+                            Ok(()) => Ok(DurableReceiptBinding::Appended),
+                            Err(error) => Ok(DurableReceiptBinding::SucceededOnly(error)),
+                        }
+                    })?;
+                finish_bound_mutation(&session, &intent, &authority, completion, binding)?;
                 summary.applied_count += 1;
             }
             ActionCheck::NeedsHuman(needs_human) => {
@@ -337,4 +389,23 @@ pub(super) fn apply_plan_with_runner<R: PreparedActionRunner>(
         summary,
         completion: CompletedExecutionToken::new(pending, occurrences, receipt)?,
     })
+}
+
+fn finish_bound_mutation(
+    session: &crate::setup::receipt::ReceiptApplySession<'_>,
+    intent: &crate::setup::receipt::ReceiptIntent,
+    authority: &JournalAuthority,
+    completion: MutationCompletion,
+    binding: DurableReceiptBinding,
+) -> Result<(), ApplyPlanError> {
+    match binding {
+        DurableReceiptBinding::Appended => {
+            session.retire_finalized_intent(intent, authority)?;
+        }
+        DurableReceiptBinding::SucceededOnly(error) => return Err(error.into()),
+    }
+    match completion {
+        MutationCompletion::Applied => Ok(()),
+        MutationCompletion::AppliedThenFailed(error) => Err(error.into()),
+    }
 }

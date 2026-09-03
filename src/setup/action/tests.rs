@@ -1,7 +1,11 @@
 use super::{
-    apply_plan_with_journal, Action, ActionDescription, ActionEffect, ActionError, ActionName,
-    ApplyOutcome, HumanInstructions, NeedsHuman, PendingSeverity, Privilege, ScriptFragment,
-    TestMetrics, WorkerDirectoryNode,
+    apply_plan_with_journal,
+    execution::{
+        apply_plan_with_runner, ApplyPlanError, DurableReceiptBinding, PreparedActionRunner,
+    },
+    Action, ActionDescription, ActionEffect, ActionError, ActionName, ApplyOutcome,
+    HumanInstructions, MutationCompletion, NeedsHuman, PendingSeverity, Privilege, ScriptFragment,
+    TestMetrics, VerifiedActionEffect, WorkerDirectoryNode,
 };
 use crate::setup::receipt::{ReceiptMetadataSource, ReceiptStore, ReceiptStoreError};
 use chrono::{TimeZone, Utc};
@@ -91,6 +95,229 @@ const LEGACY_PENDING_PUBLICATION_RECEIPT: &str = r#"{
   ]
 }
 "#;
+
+#[test]
+fn verified_effect_is_bound_before_native_authority_release() {
+    let state = Arc::new(Mutex::new(Vec::new()));
+    let (mut action, metrics) = state_driven(Arc::clone(&state));
+    let prepared = action.prepare().unwrap();
+    let mut callback_calls = 0;
+
+    let (completion, value) = action
+        .execute_prepared_and_bind(|verified| {
+            callback_calls += 1;
+            assert_eq!(verified.effect(), prepared.effect());
+            Ok::<_, ()>("durable receipt binding")
+        })
+        .unwrap();
+
+    assert_eq!(completion, MutationCompletion::Applied);
+    assert_eq!(value, "durable receipt binding");
+    assert_eq!(callback_calls, 1);
+    assert_eq!(metrics.mutation_calls(), 1);
+    assert_eq!(*state.lock().unwrap(), vec![1]);
+}
+
+#[test]
+fn prepared_runner_rejects_effect_drift_before_the_succeeded_transition() {
+    struct DriftRunner;
+
+    impl PreparedActionRunner for DriftRunner {
+        fn execute_prepared_and_bind<Bind>(
+            &mut self,
+            action: &mut Action,
+            _expected: &ActionEffect,
+            bind: Bind,
+        ) -> Result<(MutationCompletion, DurableReceiptBinding), ApplyPlanError>
+        where
+            Bind: for<'authority> FnOnce(
+                VerifiedActionEffect<'authority>,
+            )
+                -> Result<DurableReceiptBinding, ReceiptStoreError>,
+        {
+            action
+                .execute_prepared_and_bind(|_| {
+                    let drifted = ActionEffect::test_fixture(99);
+                    bind(VerifiedActionEffect {
+                        effect: &drifted,
+                        _authority: std::marker::PhantomData,
+                    })
+                })
+                .map_err(|error| match error {
+                    super::PreparedExecutionError::Action(error) => ApplyPlanError::Action(error),
+                    super::PreparedExecutionError::ReceiptConflict => {
+                        ApplyPlanError::Receipt(ReceiptStoreError::IntentConflict)
+                    }
+                    super::PreparedExecutionError::Binding(error) => ApplyPlanError::Receipt(error),
+                })
+        }
+    }
+
+    let fixture = JournalFixture::new("prepared-runner-effect-drift");
+    let store = ReceiptStore::new_for_test(fixture.receipt_path());
+    let state = Arc::new(Mutex::new(Vec::new()));
+    let mut plan = vec![state_driven(Arc::clone(&state)).0];
+
+    let error = apply_plan_with_runner(
+        &mut plan,
+        &store,
+        &mut ReceiptMetadataSource::for_test([(
+            "019cafd0-5c00-7000-8000-000000000001",
+            "2026-09-02T10:00:00Z",
+        )]),
+        &mut DriftRunner,
+    )
+    .unwrap_err();
+
+    assert_eq!(error.error_code(), "setup.receipt_conflict");
+    assert_eq!(error.exit_code(), 13);
+    assert_eq!(*state.lock().unwrap(), vec![1]);
+    assert!(store.read_snapshot().unwrap().is_empty());
+    let intent = fs::read(fixture.only_transaction_path()).unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&intent).unwrap()["phase"],
+        "prepared"
+    );
+}
+
+#[test]
+fn prepared_runner_orders_durable_binding_before_native_authority_release() {
+    struct NativeTraceRunner<'a> {
+        fixture: &'a JournalFixture,
+        layout: crate::platform::WorkerDirectoryLayout,
+        trace: Arc<Mutex<Vec<&'static str>>>,
+    }
+
+    impl PreparedActionRunner for NativeTraceRunner<'_> {
+        fn execute_prepared_and_bind<Bind>(
+            &mut self,
+            _action: &mut Action,
+            expected: &ActionEffect,
+            bind: Bind,
+        ) -> Result<(MutationCompletion, DurableReceiptBinding), ApplyPlanError>
+        where
+            Bind: for<'authority> FnOnce(
+                VerifiedActionEffect<'authority>,
+            )
+                -> Result<DurableReceiptBinding, ReceiptStoreError>,
+        {
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(
+                    &fs::read(self.fixture.only_transaction_path()).unwrap()
+                )
+                .unwrap()["phase"],
+                "prepared"
+            );
+            self.trace.lock().unwrap().push("prepared-durable");
+            let authority = crate::platform::TestNativeMutationAuthority::for_test();
+            let crate::platform::WorkerDirectoryNodeCreateOutcome::Created(creation) =
+                crate::platform::create_worker_directory_node(
+                    &self.layout,
+                    WorkerDirectoryNode::Root,
+                    &authority,
+                )
+                .unwrap()
+            else {
+                panic!("fresh trace root was not created")
+            };
+            self.trace.lock().unwrap().push("native-created");
+            let trace = Arc::clone(&self.trace);
+            let fixture = self.fixture;
+            let bound = creation
+                .bind_after_reverify(|_| {
+                    trace.lock().unwrap().push("native-reverified");
+                    trace.lock().unwrap().push("effect-equal");
+                    let result = bind(VerifiedActionEffect {
+                        effect: expected,
+                        _authority: std::marker::PhantomData,
+                    });
+                    let intent: serde_json::Value =
+                        serde_json::from_slice(&fs::read(fixture.only_transaction_path()).unwrap())
+                            .unwrap();
+                    assert_eq!(intent["phase"], "succeeded");
+                    trace.lock().unwrap().push("intent-succeeded-durable");
+                    assert_eq!(
+                        ReceiptStore::new_for_test(fixture.receipt_path())
+                            .read_snapshot()
+                            .unwrap()
+                            .entry_count(),
+                        1
+                    );
+                    trace.lock().unwrap().push("receipt-appended-durable");
+                    result
+                })
+                .map_err(|error| match error {
+                    crate::platform::WorkerDirectoryBindingError::Reverification(_) => {
+                        ApplyPlanError::Action(ActionError::apply_failed(
+                            ActionName::parse("test.trace").unwrap(),
+                        ))
+                    }
+                    crate::platform::WorkerDirectoryBindingError::Binding(error) => {
+                        ApplyPlanError::Receipt(error)
+                    }
+                    crate::platform::WorkerDirectoryBindingError::AuthorityRetirement(_) => {
+                        ApplyPlanError::Action(ActionError::apply_failed(
+                            ActionName::parse("test.trace").unwrap(),
+                        ))
+                    }
+                })?;
+            match bound {
+                crate::platform::WorkerDirectoryBound::Bound(binding) => {
+                    self.trace.lock().unwrap().push("native-evidence-retired");
+                    Ok((MutationCompletion::Applied, binding))
+                }
+                crate::platform::WorkerDirectoryBound::BoundWithRetirementFailure { .. } => {
+                    Err(ActionError::apply_failed(ActionName::parse("test.trace").unwrap()).into())
+                }
+            }
+        }
+    }
+
+    let fixture = JournalFixture::new("prepared-runner-native-order");
+    let principal = crate::platform::resolve_current_worker_principal().unwrap();
+    let layout = crate::platform::resolve_worker_directory_layout(
+        crate::platform::InstallationScope::System,
+        &principal,
+        Some(&fixture.root.join("worker-root")),
+    )
+    .unwrap();
+    let trace = Arc::new(Mutex::new(Vec::new()));
+    let mut runner = NativeTraceRunner {
+        fixture: &fixture,
+        layout,
+        trace: Arc::clone(&trace),
+    };
+    let state = Arc::new(Mutex::new(Vec::new()));
+    let mut plan = vec![Action::test_journaled_state("test.trace", 1, Privilege::None, state).0];
+    let mut metadata = ReceiptMetadataSource::for_test([(
+        "019cafd0-5c00-7000-8000-000000000001",
+        "2026-09-02T10:00:00Z",
+    )]);
+
+    apply_plan_with_runner(
+        &mut plan,
+        &ReceiptStore::new_for_test(fixture.receipt_path()),
+        &mut metadata,
+        &mut runner,
+    )
+    .unwrap();
+    assert!(fixture.only_transaction_path_if_present().is_none());
+    trace.lock().unwrap().push("intent-retired");
+
+    assert_eq!(
+        trace.lock().unwrap().as_slice(),
+        [
+            "prepared-durable",
+            "native-created",
+            "native-reverified",
+            "effect-equal",
+            "intent-succeeded-durable",
+            "receipt-appended-durable",
+            "native-evidence-retired",
+            "intent-retired",
+        ]
+    );
+}
 
 #[test]
 fn three_todo_actions_append_complete_applied_entries_in_order_then_converge_without_mutation() {
@@ -295,6 +522,270 @@ fn receipt_publication_failure_stops_after_mutation_and_rerun_recovers_ownership
 }
 
 #[test]
+fn receipt_retirement_failure_retains_appended_receipt_and_succeeded_intent_for_recovery() {
+    let fixture = JournalFixture::new("intent-retirement-failure");
+    let failing_store =
+        ReceiptStore::new_for_test_failing_before_intent_retirement(fixture.receipt_path());
+    let state = Arc::new(Mutex::new(Vec::new()));
+    let (action, metrics) =
+        Action::test_journaled_state("test.first", 1, Privilege::Root, Arc::clone(&state));
+    let mut plan = vec![action];
+    let mut metadata = ReceiptMetadataSource::for_test([(
+        "019cafd0-5c00-7000-8000-000000000001",
+        "2026-09-02T10:00:00Z",
+    )]);
+
+    let error = apply_plan_with_journal(&mut plan, &failing_store, &mut metadata).unwrap_err();
+
+    assert_eq!(error.error_code(), "setup.receipt_conflict");
+    assert_eq!(error.exit_code(), 13);
+    assert_eq!(metrics.mutation_calls(), 1);
+    assert_eq!(*state.lock().unwrap(), vec![1]);
+    assert_eq!(failing_store.read_snapshot().unwrap().entry_count(), 1);
+    let intent_path = fixture.only_transaction_path();
+    let intent = fs::read(&intent_path).unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&intent).unwrap()["phase"],
+        "succeeded"
+    );
+
+    let mut empty_plan = Vec::new();
+    let recovery = apply_plan_with_journal(
+        &mut empty_plan,
+        &ReceiptStore::new_for_test(fixture.receipt_path()),
+        &mut ReceiptMetadataSource::for_test([]),
+    )
+    .unwrap();
+
+    assert_eq!(recovery.recovered_count(), 1);
+    assert_eq!(
+        ReceiptStore::new_for_test(fixture.receipt_path())
+            .read_snapshot()
+            .unwrap()
+            .entry_count(),
+        1
+    );
+    assert!(!intent_path.exists());
+}
+
+#[test]
+fn applied_then_failed_is_receipted_before_the_typed_action_error_stops_the_plan() {
+    struct AppliedThenFailedRunner;
+
+    impl PreparedActionRunner for AppliedThenFailedRunner {
+        fn execute_prepared_and_bind<Bind>(
+            &mut self,
+            action: &mut Action,
+            _expected: &ActionEffect,
+            bind: Bind,
+        ) -> Result<(MutationCompletion, DurableReceiptBinding), ApplyPlanError>
+        where
+            Bind: for<'authority> FnOnce(
+                VerifiedActionEffect<'authority>,
+            )
+                -> Result<DurableReceiptBinding, ReceiptStoreError>,
+        {
+            let (_, binding) =
+                action
+                    .execute_prepared_and_bind(bind)
+                    .map_err(|error| match error {
+                        super::PreparedExecutionError::Action(error) => {
+                            ApplyPlanError::Action(error)
+                        }
+                        super::PreparedExecutionError::ReceiptConflict => {
+                            ApplyPlanError::Receipt(ReceiptStoreError::IntentConflict)
+                        }
+                        super::PreparedExecutionError::Binding(error) => {
+                            ApplyPlanError::Receipt(error)
+                        }
+                    })?;
+            Ok((
+                MutationCompletion::AppliedThenFailed(ActionError::apply_failed(
+                    action.name().clone(),
+                )),
+                binding,
+            ))
+        }
+    }
+
+    let fixture = JournalFixture::new("applied-then-failed");
+    let store = ReceiptStore::new_for_test(fixture.receipt_path());
+    let state = Arc::new(Mutex::new(Vec::new()));
+    let (first, first_metrics) =
+        Action::test_journaled_state("test.first", 1, Privilege::Root, Arc::clone(&state));
+    let (second, second_metrics) =
+        Action::test_journaled_state("test.second", 2, Privilege::Root, Arc::clone(&state));
+    let mut plan = vec![first, second];
+    let mut metadata = ReceiptMetadataSource::for_test([(
+        "019cafd0-5c00-7000-8000-000000000001",
+        "2026-09-02T10:00:00Z",
+    )]);
+
+    let error = apply_plan_with_runner(
+        &mut plan,
+        &store,
+        &mut metadata,
+        &mut AppliedThenFailedRunner,
+    )
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        ApplyPlanError::Action(ActionError::ApplyFailed { .. })
+    ));
+    assert_eq!(error.error_code(), "setup.apply_failed");
+    assert_eq!(error.exit_code(), 13);
+    assert_eq!(*state.lock().unwrap(), vec![1]);
+    assert_eq!(first_metrics.mutation_calls(), 1);
+    assert_eq!(second_metrics.check_calls(), 0);
+    assert_eq!(second_metrics.mutation_calls(), 0);
+    assert_eq!(store.read_snapshot().unwrap().entry_count(), 1);
+    assert!(fixture.only_transaction_path_if_present().is_none());
+}
+
+#[cfg(unix)]
+#[test]
+fn native_retirement_failure_preserves_the_appended_binding_and_succeeded_intent() {
+    use std::os::unix::fs::PermissionsExt;
+
+    struct RetirementFailureRunner<'a> {
+        fixture: &'a JournalFixture,
+        layout: crate::platform::WorkerDirectoryLayout,
+        marker: Option<PathBuf>,
+        saved_marker: Option<PathBuf>,
+    }
+
+    impl PreparedActionRunner for RetirementFailureRunner<'_> {
+        fn execute_prepared_and_bind<Bind>(
+            &mut self,
+            action: &mut Action,
+            expected: &ActionEffect,
+            bind: Bind,
+        ) -> Result<(MutationCompletion, DurableReceiptBinding), ApplyPlanError>
+        where
+            Bind: for<'authority> FnOnce(
+                VerifiedActionEffect<'authority>,
+            )
+                -> Result<DurableReceiptBinding, ReceiptStoreError>,
+        {
+            let authority = crate::platform::TestNativeMutationAuthority::for_test();
+            let crate::platform::WorkerDirectoryNodeCreateOutcome::Created(creation) =
+                crate::platform::create_worker_directory_node(
+                    &self.layout,
+                    WorkerDirectoryNode::Support { ordinal: 0 },
+                    &authority,
+                )
+                .unwrap()
+            else {
+                panic!("fresh synthetic support node was not created")
+            };
+            let marker = fs::read_dir(&self.fixture.root)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .find(|path| {
+                    path.file_name()
+                        .unwrap()
+                        .to_string_lossy()
+                        .starts_with(".styrn-worker-provenance-")
+                })
+                .expect("native creation retained one provenance marker");
+            let saved_marker = self.fixture.root.join("saved-retirement-evidence");
+            let bound = creation
+                .bind_after_reverify(|_| {
+                    let binding = bind(VerifiedActionEffect {
+                        effect: expected,
+                        _authority: std::marker::PhantomData,
+                    })?;
+                    assert!(matches!(binding, DurableReceiptBinding::Appended));
+                    fs::rename(&marker, &saved_marker).unwrap();
+                    fs::create_dir(&marker).unwrap();
+                    fs::set_permissions(&marker, fs::Permissions::from_mode(0o700)).unwrap();
+                    Ok::<_, ReceiptStoreError>(binding)
+                })
+                .map_err(|error| match error {
+                    crate::platform::WorkerDirectoryBindingError::Reverification(_) => {
+                        ApplyPlanError::Action(ActionError::apply_failed(action.name().clone()))
+                    }
+                    crate::platform::WorkerDirectoryBindingError::Binding(error) => {
+                        ApplyPlanError::Receipt(error)
+                    }
+                    crate::platform::WorkerDirectoryBindingError::AuthorityRetirement(_) => {
+                        ApplyPlanError::Action(ActionError::apply_failed(action.name().clone()))
+                    }
+                })?;
+            match bound {
+                crate::platform::WorkerDirectoryBound::BoundWithRetirementFailure {
+                    value,
+                    error,
+                } => {
+                    assert!(matches!(value, DurableReceiptBinding::Appended));
+                    assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+                    self.marker = Some(marker);
+                    self.saved_marker = Some(saved_marker);
+                    Err(ActionError::apply_failed(action.name().clone()).into())
+                }
+                crate::platform::WorkerDirectoryBound::Bound(_) => {
+                    panic!("altered native evidence unexpectedly retired")
+                }
+            }
+        }
+    }
+
+    let fixture = JournalFixture::new("native-retirement-binding");
+    harden_user_journal_fixture(&fixture);
+    let principal = crate::platform::resolve_current_worker_principal().unwrap();
+    let root = fixture.root.join("worker-support").join("worker-root");
+    let layout = crate::platform::worker_directory_layout_for_test(
+        crate::platform::InstallationScope::User,
+        principal,
+        root.clone(),
+        Some(fixture.root.clone()),
+    );
+    let node = WorkerDirectoryNode::Support { ordinal: 0 };
+    let path = layout.path_for_node(node).unwrap();
+    let store =
+        ReceiptStore::new_user_for_test_with_worker_layout(fixture.receipt_path(), layout.clone());
+    let mut runner = RetirementFailureRunner {
+        fixture: &fixture,
+        layout: layout.clone(),
+        marker: None,
+        saved_marker: None,
+    };
+    let mut plan =
+        vec![worker_directory_action(&root, node, &path, Arc::new(Mutex::new(Vec::new()))).0];
+
+    let error = apply_plan_with_runner(
+        &mut plan,
+        &store,
+        &mut ReceiptMetadataSource::for_test([(
+            "019cafd0-5c00-7000-8000-000000000001",
+            "2026-09-02T10:00:00Z",
+        )]),
+        &mut runner,
+    )
+    .unwrap_err();
+
+    assert_eq!(error.error_code(), "setup.apply_failed");
+    assert_eq!(error.exit_code(), 13);
+    assert_eq!(store.read_snapshot().unwrap().entry_count(), 1);
+    let intent_path = fixture.only_transaction_path();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&fs::read(&intent_path).unwrap()).unwrap()
+            ["phase"],
+        "succeeded"
+    );
+    let marker = runner.marker.take().unwrap();
+    let saved_marker = runner.saved_marker.take().unwrap();
+    fs::remove_dir(&marker).unwrap();
+    fs::rename(saved_marker, marker).unwrap();
+
+    let recovery =
+        apply_plan_with_journal(&mut [], &store, &mut ReceiptMetadataSource::for_test([])).unwrap();
+    assert_eq!(recovery.recovered_count(), 1);
+    assert!(!intent_path.exists());
+}
+
+#[test]
 fn crash_after_durable_prepare_before_mutation_retries_under_the_same_intent() {
     let fixture = JournalFixture::new("prepared-recovery");
     let failing_store = ReceiptStore::new_for_test_failing_after_prepare(fixture.receipt_path());
@@ -496,13 +987,45 @@ fn succeeded_intent_recovers_stored_dynamic_before_hash_without_recomputation() 
 
 #[test]
 fn worker_directory_receipt_recovery_succeeded_is_plan_independent() {
-    let fixture = JournalFixture::new("worker-directory-succeeded-plan-independent");
+    assert_worker_directory_succeeded_recovery_retires_exact_native_evidence(
+        "worker-directory-succeeded-plan-independent",
+    );
+}
+
+#[test]
+fn worker_directory_succeeded_recovery_retires_exact_native_evidence() {
+    assert_worker_directory_succeeded_recovery_retires_exact_native_evidence(
+        "worker-directory-succeeded-native-retirement",
+    );
+}
+
+fn assert_worker_directory_succeeded_recovery_retires_exact_native_evidence(label: &str) {
+    let fixture = JournalFixture::new(label);
     harden_user_journal_fixture(&fixture);
-    let root = native_user_worker_root();
-    let path = root.join("jobs");
+    let principal = crate::platform::resolve_current_worker_principal().unwrap();
+    let root = fixture.root.join("worker-support").join("worker-root");
+    let layout = crate::platform::worker_directory_layout_for_test(
+        crate::platform::InstallationScope::User,
+        principal,
+        root.clone(),
+        Some(fixture.root.clone()),
+    );
+    let node = WorkerDirectoryNode::Support { ordinal: 0 };
+    let path = layout.path_for_node(node).unwrap();
+    let authority = crate::platform::TestNativeMutationAuthority::for_test();
+    let crate::platform::WorkerDirectoryNodeCreateOutcome::Created(creation) =
+        crate::platform::create_worker_directory_node(&layout, node, &authority).unwrap()
+    else {
+        panic!("fresh synthetic support node was not created")
+    };
+    drop(creation);
+    #[cfg(unix)]
+    assert!(matches!(
+        crate::platform::inspect_worker_directory_node(&layout, node),
+        crate::platform::WorkerDirectoryNodeInspection::Conflict(_)
+    ));
     let state = Arc::new(Mutex::new(Vec::new()));
-    let (action, metrics) =
-        worker_directory_action(&root, WorkerDirectoryNode::Jobs, &path, Arc::clone(&state));
+    let (action, metrics) = worker_directory_action(&root, node, &path, Arc::clone(&state));
     let mut interrupted = vec![action];
     let mut metadata = ReceiptMetadataSource::for_test([(
         "019cafd0-5c00-7000-8000-000000000001",
@@ -511,7 +1034,10 @@ fn worker_directory_receipt_recovery_succeeded_is_plan_independent() {
 
     let error = apply_plan_with_journal(
         &mut interrupted,
-        &ReceiptStore::new_user_for_test_failing_before_replace(fixture.receipt_path()),
+        &ReceiptStore::new_user_for_test_with_worker_layout_failing_before_replace(
+            fixture.receipt_path(),
+            layout.clone(),
+        ),
         &mut metadata,
     )
     .unwrap_err();
@@ -527,7 +1053,8 @@ fn worker_directory_receipt_recovery_succeeded_is_plan_independent() {
 
     let mut empty_plan = Vec::new();
     let mut no_metadata = ReceiptMetadataSource::for_test([]);
-    let store = ReceiptStore::new_user_for_test(fixture.receipt_path());
+    let store =
+        ReceiptStore::new_user_for_test_with_worker_layout(fixture.receipt_path(), layout.clone());
     let report = apply_plan_with_journal(&mut empty_plan, &store, &mut no_metadata).unwrap();
 
     assert_eq!(report.recovered_count(), 1);
@@ -539,11 +1066,11 @@ fn worker_directory_receipt_recovery_succeeded_is_plan_independent() {
     assert_eq!(receipt["entries"][0]["action"]["type"], "worker_directory");
     assert_eq!(
         receipt["entries"][0]["action"]["parameters"]["action_id"],
-        "identity.directory.jobs"
+        "identity.directory.support-0"
     );
     assert_eq!(
         receipt["entries"][0]["action"]["parameters"]["node"],
-        serde_json::json!({ "type": "jobs" })
+        serde_json::json!({ "type": "support", "ordinal": 0 })
     );
     assert_eq!(
         receipt["entries"][0]["directories_created"],
@@ -556,6 +1083,97 @@ fn worker_directory_receipt_recovery_succeeded_is_plan_independent() {
             .file_name()
             .to_string_lossy()
             .contains("transaction")));
+    assert_eq!(
+        crate::platform::inspect_worker_directory_node(&layout, node),
+        crate::platform::WorkerDirectoryNodeInspection::Healthy
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn worker_directory_succeeded_recovery_rejects_altered_native_evidence_without_deleting_it() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let fixture = JournalFixture::new("worker-directory-succeeded-altered-evidence");
+    harden_user_journal_fixture(&fixture);
+    let principal = crate::platform::resolve_current_worker_principal().unwrap();
+    let root = fixture.root.join("worker-support").join("worker-root");
+    let layout = crate::platform::worker_directory_layout_for_test(
+        crate::platform::InstallationScope::User,
+        principal,
+        root.clone(),
+        Some(fixture.root.clone()),
+    );
+    let node = WorkerDirectoryNode::Support { ordinal: 0 };
+    let path = layout.path_for_node(node).unwrap();
+    let authority = crate::platform::TestNativeMutationAuthority::for_test();
+    let crate::platform::WorkerDirectoryNodeCreateOutcome::Created(creation) =
+        crate::platform::create_worker_directory_node(&layout, node, &authority).unwrap()
+    else {
+        panic!("fresh synthetic support node was not created")
+    };
+    drop(creation);
+    let marker = fs::read_dir(&fixture.root)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .find(|path| {
+            path.file_name()
+                .unwrap()
+                .to_string_lossy()
+                .starts_with(".styrn-worker-provenance-")
+        })
+        .expect("native creation retained one provenance marker");
+
+    let state = Arc::new(Mutex::new(Vec::new()));
+    let mut interrupted = vec![worker_directory_action(&root, node, &path, state).0];
+    apply_plan_with_journal(
+        &mut interrupted,
+        &ReceiptStore::new_user_for_test_with_worker_layout_failing_before_replace(
+            fixture.receipt_path(),
+            layout.clone(),
+        ),
+        &mut ReceiptMetadataSource::for_test([(
+            "019cafd0-5c00-7000-8000-000000000001",
+            "2026-09-02T10:00:00Z",
+        )]),
+    )
+    .unwrap_err();
+    let intent_path = fixture.only_transaction_path();
+    let intent_before = fs::read(&intent_path).unwrap();
+
+    let saved_marker = fixture.root.join("saved-native-provenance");
+    fs::rename(&marker, &saved_marker).unwrap();
+    fs::create_dir(&marker).unwrap();
+    fs::set_permissions(&marker, fs::Permissions::from_mode(0o700)).unwrap();
+    let replacement = fs::symlink_metadata(&marker).unwrap();
+    let saved = fs::symlink_metadata(&saved_marker).unwrap();
+    let store =
+        ReceiptStore::new_user_for_test_with_worker_layout(fixture.receipt_path(), layout.clone());
+
+    let error = apply_plan_with_journal(&mut [], &store, &mut ReceiptMetadataSource::for_test([]))
+        .unwrap_err();
+
+    assert_eq!(error.error_code(), "setup.apply_failed");
+    assert_eq!(error.exit_code(), 13);
+    assert_eq!(store.read_snapshot().unwrap().entry_count(), 1);
+    assert_eq!(fs::read(&intent_path).unwrap(), intent_before);
+    let retained_replacement = fs::symlink_metadata(&marker).unwrap();
+    let retained_saved = fs::symlink_metadata(&saved_marker).unwrap();
+    assert_eq!(
+        (retained_replacement.dev(), retained_replacement.ino()),
+        (replacement.dev(), replacement.ino())
+    );
+    assert_eq!(
+        (retained_saved.dev(), retained_saved.ino()),
+        (saved.dev(), saved.ino())
+    );
+
+    fs::remove_dir(&marker).unwrap();
+    fs::rename(&saved_marker, &marker).unwrap();
+    let recovery =
+        apply_plan_with_journal(&mut [], &store, &mut ReceiptMetadataSource::for_test([])).unwrap();
+    assert_eq!(recovery.recovered_count(), 1);
+    assert!(!intent_path.exists());
 }
 
 #[test]
@@ -4167,6 +4785,22 @@ impl JournalFixture {
             .collect::<Vec<_>>();
         assert_eq!(paths.len(), 1);
         paths.into_iter().next().unwrap()
+    }
+
+    fn only_transaction_path_if_present(&self) -> Option<PathBuf> {
+        let paths = fs::read_dir(self.receipt.parent().unwrap())
+            .unwrap()
+            .filter_map(|entry| {
+                let path = entry.unwrap().path();
+                path.file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .contains("transaction")
+                    .then_some(path)
+            })
+            .collect::<Vec<_>>();
+        assert!(paths.len() <= 1);
+        paths.into_iter().next()
     }
 
     fn pending_publication_intent_path(&self) -> PathBuf {

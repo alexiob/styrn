@@ -4,11 +4,14 @@
 //! request. The parent process can ask one native adapter to launch the exact
 //! current executable, but it never dispatches a privileged action itself.
 
-#[cfg(test)]
-use super::{execution::PreparedActionRunner, ActionEffect, ActionError};
 use super::{
     execution::{ApplyReport, ApplySummary, CompletedExecutionToken},
     Action, ActionCheck, HumanInstructions, NeedsHuman, PendingAction, PlanOperation, Privilege,
+};
+#[cfg(test)]
+use super::{
+    execution::{DurableReceiptBinding, PreparedActionRunner},
+    ActionEffect, ActionError, MutationCompletion, PreparedExecutionError, VerifiedActionEffect,
 };
 #[cfg(test)]
 use crate::platform::{SetupExecutionContext, SetupHostPrivilege};
@@ -862,17 +865,36 @@ fn execute_system_plan_with_test_user_runner<U: PreparedActionRunner>(
     }
 
     impl<U: PreparedActionRunner> PreparedActionRunner for SplitRunner<'_, U> {
-        fn execute_prepared(
+        fn execute_prepared_and_bind<Bind>(
             &mut self,
             action: &mut Action,
             expected: &ActionEffect,
-        ) -> Result<ActionEffect, ActionError> {
+            bind: Bind,
+        ) -> Result<(MutationCompletion, DurableReceiptBinding), super::execution::ApplyPlanError>
+        where
+            Bind: for<'authority> FnOnce(
+                VerifiedActionEffect<'authority>,
+            ) -> Result<
+                DurableReceiptBinding,
+                crate::setup::receipt::ReceiptStoreError,
+            >,
+        {
             if action.privilege() == Privilege::None {
-                self.user.execute_prepared(action, expected)
+                self.user.execute_prepared_and_bind(action, expected, bind)
             } else if action.privilege() == self.host_privilege {
-                action.execute_prepared()
+                action
+                    .execute_prepared_and_bind(bind)
+                    .map_err(|error| match error {
+                        PreparedExecutionError::Action(error) => {
+                            super::execution::ApplyPlanError::Action(error)
+                        }
+                        PreparedExecutionError::ReceiptConflict => {
+                            crate::setup::receipt::ReceiptStoreError::IntentConflict.into()
+                        }
+                        PreparedExecutionError::Binding(error) => error.into(),
+                    })
             } else {
-                Err(ActionError::apply_failed(action.name().clone()))
+                Err(ActionError::apply_failed(action.name().clone()).into())
             }
         }
     }

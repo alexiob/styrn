@@ -273,6 +273,10 @@ pub(crate) struct ReceiptStore {
     #[cfg(test)]
     interrupt_after_prepare: bool,
     #[cfg(test)]
+    interrupt_before_intent_retirement: bool,
+    #[cfg(test)]
+    worker_directory_layout_override: Option<crate::platform::WorkerDirectoryLayout>,
+    #[cfg(test)]
     intent_read_interruption: Option<IntentReadInterruption>,
     #[cfg(test)]
     pending_publication_intent_interruption: Option<PendingPublicationIntentInterruption>,
@@ -785,6 +789,10 @@ impl ReceiptStore {
             #[cfg(test)]
             interrupt_after_prepare: false,
             #[cfg(test)]
+            interrupt_before_intent_retirement: false,
+            #[cfg(test)]
+            worker_directory_layout_override: None,
+            #[cfg(test)]
             intent_read_interruption: None,
             #[cfg(test)]
             pending_publication_intent_interruption: None,
@@ -815,6 +823,10 @@ impl ReceiptStore {
             #[cfg(test)]
             interrupt_after_prepare: false,
             #[cfg(test)]
+            interrupt_before_intent_retirement: false,
+            #[cfg(test)]
+            worker_directory_layout_override: None,
+            #[cfg(test)]
             intent_read_interruption: None,
             #[cfg(test)]
             pending_publication_intent_interruption: None,
@@ -836,6 +848,8 @@ impl ReceiptStore {
             worker: fixture_worker_principal(),
             interruption: None,
             interrupt_after_prepare: false,
+            interrupt_before_intent_retirement: false,
+            worker_directory_layout_override: None,
             intent_read_interruption: None,
             pending_publication_intent_interruption: None,
         }
@@ -857,9 +871,31 @@ impl ReceiptStore {
             worker: fixture_worker_principal(),
             interruption: None,
             interrupt_after_prepare: false,
+            interrupt_before_intent_retirement: false,
+            worker_directory_layout_override: None,
             intent_read_interruption: None,
             pending_publication_intent_interruption: None,
         }
+    }
+
+    #[cfg(test)]
+    pub(in crate::setup) fn new_user_for_test_with_worker_layout(
+        path: impl Into<PathBuf>,
+        layout: crate::platform::WorkerDirectoryLayout,
+    ) -> Self {
+        let mut store = Self::new_user_for_test(path);
+        store.worker_directory_layout_override = Some(layout);
+        store
+    }
+
+    #[cfg(test)]
+    pub(in crate::setup) fn new_user_for_test_with_worker_layout_failing_before_replace(
+        path: impl Into<PathBuf>,
+        layout: crate::platform::WorkerDirectoryLayout,
+    ) -> Self {
+        let mut store = Self::new_user_for_test_with_worker_layout(path, layout);
+        store.interruption = Some(PublicationInterruption::BeforeReplace);
+        store
     }
 
     #[cfg(test)]
@@ -890,6 +926,15 @@ impl ReceiptStore {
     pub(in crate::setup) fn new_for_test_failing_after_prepare(path: impl Into<PathBuf>) -> Self {
         let mut store = Self::new_for_test(path);
         store.interrupt_after_prepare = true;
+        store
+    }
+
+    #[cfg(test)]
+    pub(in crate::setup) fn new_for_test_failing_before_intent_retirement(
+        path: impl Into<PathBuf>,
+    ) -> Self {
+        let mut store = Self::new_for_test(path);
+        store.interrupt_before_intent_retirement = true;
         store
     }
 
@@ -1764,9 +1809,7 @@ impl ReceiptStore {
         if !document.has_worker_directory_action() {
             return Ok(());
         }
-        let layout =
-            crate::platform::resolve_worker_directory_layout(self.scope, &self.worker, None)
-                .map_err(|_| ReceiptError::InvalidWorkerDirectoryAction)?;
+        let layout = self.worker_directory_layout()?;
         document.validate_worker_directory_layout(&layout)?;
         Ok(())
     }
@@ -1785,11 +1828,20 @@ impl ReceiptStore {
         if !action.is_worker_directory() {
             return Ok(());
         }
-        let layout =
-            crate::platform::resolve_worker_directory_layout(self.scope, &self.worker, None)
-                .map_err(|_| ReceiptError::InvalidWorkerDirectoryAction)?;
+        let layout = self.worker_directory_layout()?;
         action.validate_worker_directory_layout(&layout)?;
         Ok(())
+    }
+
+    fn worker_directory_layout(
+        &self,
+    ) -> Result<crate::platform::WorkerDirectoryLayout, ReceiptStoreError> {
+        #[cfg(test)]
+        if let Some(layout) = &self.worker_directory_layout_override {
+            return Ok(layout.clone());
+        }
+        crate::platform::resolve_worker_directory_layout(self.scope, &self.worker, None)
+            .map_err(|_| ReceiptError::InvalidWorkerDirectoryAction.into())
     }
 
     fn parse_for_scope_with_pending_publication_intent(
@@ -2023,7 +2075,7 @@ impl ReceiptApplySession<'_> {
         Ok(())
     }
 
-    pub(in crate::setup) fn finalize_intent(
+    pub(in crate::setup) fn append_succeeded_intent(
         &self,
         intent: &ReceiptIntent,
         _authority: &crate::setup::action::JournalAuthority,
@@ -2053,6 +2105,51 @@ impl ReceiptApplySession<'_> {
                 &candidate,
                 publication_intent.as_ref().map(|intent| &intent.document),
             )?;
+        }
+        Ok(())
+    }
+
+    pub(in crate::setup) fn retire_succeeded_worker_directory_evidence(
+        &self,
+        intent: &ReceiptIntent,
+        _journal_authority: &crate::setup::action::JournalAuthority,
+        native_authority: &crate::setup::action::NativeMutationAuthority,
+    ) -> Result<(), crate::setup::action::ActionError> {
+        let ReceiptAction::WorkerDirectory(parameters) = &intent.entry.action else {
+            return Ok(());
+        };
+        let action = crate::setup::action::ActionName::parse(parameters.action_id.0.as_str())
+            .expect("validated receipt action IDs must remain valid");
+        let layout = self
+            .store
+            .worker_directory_layout()
+            .map_err(|_| crate::setup::action::ActionError::apply_failed(action.clone()))?;
+        let node = parameters
+            .node
+            .platform_node()
+            .map_err(|_| crate::setup::action::ActionError::apply_failed(action.clone()))?;
+        intent
+            .entry
+            .validate_worker_directory_layout(&layout)
+            .map_err(|_| crate::setup::action::ActionError::apply_failed(action.clone()))?;
+        crate::platform::retire_succeeded_worker_directory_evidence(&layout, node, native_authority)
+            .map_err(|_| crate::setup::action::ActionError::apply_failed(action))
+    }
+
+    pub(in crate::setup) fn retire_finalized_intent(
+        &self,
+        intent: &ReceiptIntent,
+        _authority: &crate::setup::action::JournalAuthority,
+    ) -> Result<(), ReceiptStoreError> {
+        if intent.phase != ReceiptIntentPhase::Succeeded {
+            return Err(ReceiptStoreError::IntentConflict);
+        }
+        #[cfg(test)]
+        if self.store.interrupt_before_intent_retirement {
+            return Err(ReceiptStoreError::Write(std::io::Error::new(
+                std::io::ErrorKind::Interrupted,
+                "injected interruption before receipt intent retirement",
+            )));
         }
         fs::remove_file(&intent.path).map_err(ReceiptStoreError::Write)?;
         crate::platform::sync_parent_directory(

@@ -9,6 +9,7 @@
 #[cfg(not(action_core_fixture))]
 pub(crate) use crate::platform::WorkerDirectoryNode;
 use std::fmt;
+use std::marker::PhantomData;
 #[cfg(not(action_core_fixture))]
 use std::path::PathBuf;
 use thiserror::Error;
@@ -16,6 +17,13 @@ use thiserror::Error;
 /// Unforgeable authority required by receipt mutation sessions. Its field is
 /// private to this module, so read-only plan descendants cannot mint one.
 pub(crate) struct JournalAuthority(());
+
+#[cfg(test)]
+impl JournalAuthority {
+    pub(in crate::setup) const fn for_test() -> Self {
+        Self(())
+    }
+}
 
 /// Unforgeable authority required by native setup mutation.
 ///
@@ -28,6 +36,17 @@ pub(crate) struct NativeMutationAuthority(());
 
 #[cfg(test)]
 pub(crate) type NativeMutationAuthority = crate::platform::TestNativeMutationAuthority;
+
+pub(in crate::setup::action) fn native_mutation_authority() -> NativeMutationAuthority {
+    #[cfg(not(test))]
+    {
+        NativeMutationAuthority(())
+    }
+    #[cfg(test)]
+    {
+        crate::platform::TestNativeMutationAuthority::for_test()
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ActionCheck {
@@ -57,6 +76,34 @@ pub(crate) struct ActionEffect {
     registry_keys: Vec<String>,
     firewall_rules: Vec<String>,
     download_provenance: Option<DownloadProvenanceEffect>,
+}
+
+/// A finalized action effect whose lifetime is bounded by the native mutation
+/// authority that verified it. The wrapper cannot be cloned, copied, or
+/// serialized, so callers can only consume the borrowed effect inside the
+/// durable receipt callback.
+pub(crate) struct VerifiedActionEffect<'authority> {
+    effect: &'authority ActionEffect,
+    _authority: PhantomData<&'authority mut ()>,
+}
+
+impl VerifiedActionEffect<'_> {
+    pub(in crate::setup) fn effect(&self) -> &ActionEffect {
+        self.effect
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum MutationCompletion {
+    Applied,
+    AppliedThenFailed(ActionError),
+}
+
+#[derive(Debug)]
+pub(crate) enum PreparedExecutionError<BindingError> {
+    Action(ActionError),
+    ReceiptConflict,
+    Binding(BindingError),
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -510,7 +557,7 @@ impl ActionError {
         Self::CheckFailed { action }
     }
 
-    pub(in crate::setup::action) fn apply_failed(action: ActionName) -> Self {
+    pub(in crate::setup) fn apply_failed(action: ActionName) -> Self {
         Self::ApplyFailed { action }
     }
 }
@@ -920,10 +967,19 @@ mod gate {
             })
         }
 
-        pub(in crate::setup::action) fn execute_prepared(
+        pub(in crate::setup::action) fn execute_prepared_and_bind<Value, BindingError>(
             &mut self,
-        ) -> Result<ActionEffect, ActionError> {
-            execute(self)
+            bind: impl for<'authority> FnOnce(
+                VerifiedActionEffect<'authority>,
+            ) -> Result<Value, BindingError>,
+        ) -> Result<(MutationCompletion, Value), PreparedExecutionError<BindingError>> {
+            let effect = execute(self).map_err(PreparedExecutionError::Action)?;
+            let value = bind(VerifiedActionEffect {
+                effect: &effect,
+                _authority: PhantomData,
+            })
+            .map_err(PreparedExecutionError::Binding)?;
+            Ok((MutationCompletion::Applied, value))
         }
 
         pub(crate) fn revert(&mut self, _effect: &ActionEffect) -> Result<(), ActionError> {

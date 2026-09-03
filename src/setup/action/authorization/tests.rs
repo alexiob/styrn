@@ -1,8 +1,9 @@
 use super::*;
 use crate::setup::{
     action::{
-        execution::PreparedActionRunner, Action, ActionEffect, ActionError, HumanInstructions,
-        NeedsHuman, PendingSeverity, Privilege, ScriptFragment,
+        execution::{ApplyPlanError, DurableReceiptBinding, PreparedActionRunner},
+        Action, ActionEffect, ActionError, HumanInstructions, MutationCompletion, NeedsHuman,
+        PendingSeverity, PreparedExecutionError, Privilege, ScriptFragment, VerifiedActionEffect,
     },
     receipt::{ReceiptMetadataSource, ReceiptStore, ReceiptStoreError},
 };
@@ -2214,16 +2215,29 @@ impl SpyPreparedRunner {
 }
 
 impl PreparedActionRunner for SpyPreparedRunner {
-    fn execute_prepared(
+    fn execute_prepared_and_bind<Bind>(
         &mut self,
         action: &mut Action,
         expected: &ActionEffect,
-    ) -> Result<ActionEffect, ActionError> {
+        bind: Bind,
+    ) -> Result<(MutationCompletion, DurableReceiptBinding), ApplyPlanError>
+    where
+        Bind: for<'authority> FnOnce(
+            VerifiedActionEffect<'authority>,
+        ) -> Result<DurableReceiptBinding, ReceiptStoreError>,
+    {
         assert_eq!(action.privilege(), self.expected_privilege);
         self.calls += 1;
-        let finalized = action.execute_prepared()?;
-        assert_eq!(&finalized, expected);
-        Ok(finalized)
+        action
+            .execute_prepared_and_bind(|verified| {
+                assert_eq!(verified.effect(), expected);
+                bind(verified)
+            })
+            .map_err(|error| match error {
+                PreparedExecutionError::Action(error) => error.into(),
+                PreparedExecutionError::ReceiptConflict => ReceiptStoreError::IntentConflict.into(),
+                PreparedExecutionError::Binding(error) => error.into(),
+            })
     }
 }
 
@@ -2233,18 +2247,31 @@ struct FailOncePreparedRunner {
 }
 
 impl PreparedActionRunner for FailOncePreparedRunner {
-    fn execute_prepared(
+    fn execute_prepared_and_bind<Bind>(
         &mut self,
         action: &mut Action,
         expected: &ActionEffect,
-    ) -> Result<ActionEffect, ActionError> {
+        bind: Bind,
+    ) -> Result<(MutationCompletion, DurableReceiptBinding), ApplyPlanError>
+    where
+        Bind: for<'authority> FnOnce(
+            VerifiedActionEffect<'authority>,
+        ) -> Result<DurableReceiptBinding, ReceiptStoreError>,
+    {
         self.calls += 1;
         if self.calls == 1 {
-            return Err(ActionError::apply_failed(action.name().clone()));
+            return Err(ActionError::apply_failed(action.name().clone()).into());
         }
-        let finalized = action.execute_prepared()?;
-        assert_eq!(&finalized, expected);
-        Ok(finalized)
+        action
+            .execute_prepared_and_bind(|verified| {
+                assert_eq!(verified.effect(), expected);
+                bind(verified)
+            })
+            .map_err(|error| match error {
+                PreparedExecutionError::Action(error) => error.into(),
+                PreparedExecutionError::ReceiptConflict => ReceiptStoreError::IntentConflict.into(),
+                PreparedExecutionError::Binding(error) => error.into(),
+            })
     }
 }
 
