@@ -275,6 +275,8 @@ pub(crate) struct ReceiptStore {
     #[cfg(test)]
     interrupt_before_intent_retirement: bool,
     #[cfg(test)]
+    interrupt_after_completed_nodes: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
+    #[cfg(test)]
     worker_directory_layout_override: Option<crate::platform::WorkerDirectoryLayout>,
     #[cfg(test)]
     intent_read_interruption: Option<IntentReadInterruption>,
@@ -792,6 +794,8 @@ impl ReceiptStore {
             #[cfg(test)]
             interrupt_before_intent_retirement: false,
             #[cfg(test)]
+            interrupt_after_completed_nodes: None,
+            #[cfg(test)]
             worker_directory_layout_override: None,
             #[cfg(test)]
             intent_read_interruption: None,
@@ -826,6 +830,8 @@ impl ReceiptStore {
             #[cfg(test)]
             interrupt_before_intent_retirement: false,
             #[cfg(test)]
+            interrupt_after_completed_nodes: None,
+            #[cfg(test)]
             worker_directory_layout_override: None,
             #[cfg(test)]
             intent_read_interruption: None,
@@ -850,6 +856,7 @@ impl ReceiptStore {
             interruption: None,
             interrupt_after_prepare: false,
             interrupt_before_intent_retirement: false,
+            interrupt_after_completed_nodes: None,
             worker_directory_layout_override: None,
             intent_read_interruption: None,
             pending_publication_intent_interruption: None,
@@ -873,6 +880,7 @@ impl ReceiptStore {
             interruption: None,
             interrupt_after_prepare: false,
             interrupt_before_intent_retirement: false,
+            interrupt_after_completed_nodes: None,
             worker_directory_layout_override: None,
             intent_read_interruption: None,
             pending_publication_intent_interruption: None,
@@ -896,6 +904,29 @@ impl ReceiptStore {
     ) -> Self {
         let mut store = Self::new_user_for_test_with_worker_layout(path, layout);
         store.interruption = Some(PublicationInterruption::BeforeReplace);
+        store
+    }
+
+    #[cfg(test)]
+    pub(in crate::setup) fn new_user_for_test_with_worker_layout_failing_before_intent_retirement(
+        path: impl Into<PathBuf>,
+        layout: crate::platform::WorkerDirectoryLayout,
+    ) -> Self {
+        let mut store = Self::new_user_for_test_with_worker_layout(path, layout);
+        store.interrupt_before_intent_retirement = true;
+        store
+    }
+
+    #[cfg(test)]
+    pub(in crate::setup) fn new_user_for_test_with_worker_layout_failing_after_completed_nodes(
+        path: impl Into<PathBuf>,
+        layout: crate::platform::WorkerDirectoryLayout,
+        completed_nodes: usize,
+    ) -> Self {
+        let mut store = Self::new_user_for_test_with_worker_layout(path, layout);
+        store.interrupt_after_completed_nodes = Some(std::sync::Arc::new(
+            std::sync::atomic::AtomicUsize::new(completed_nodes),
+        ));
         store
     }
 
@@ -2185,7 +2216,23 @@ impl ReceiptApplySession<'_> {
                 .parent()
                 .ok_or(ReceiptStoreError::InvalidDestination)?,
         )
-        .map_err(ReceiptStoreError::Write)
+        .map_err(ReceiptStoreError::Write)?;
+        #[cfg(test)]
+        if let Some(remaining) = &self.store.interrupt_after_completed_nodes {
+            use std::sync::atomic::Ordering;
+            if remaining
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |remaining| {
+                    remaining.checked_sub(1)
+                })
+                .is_ok_and(|remaining| remaining == 1)
+            {
+                return Err(ReceiptStoreError::Write(std::io::Error::new(
+                    std::io::ErrorKind::Interrupted,
+                    "injected interruption after completed worker-directory node",
+                )));
+            }
+        }
+        Ok(())
     }
 
     pub(in crate::setup) fn intent_matches(

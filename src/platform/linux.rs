@@ -2587,6 +2587,52 @@ fn posix_acl_present(directory: &std::fs::File, name: &std::ffi::CStr) -> io::Re
     }
 }
 
+#[cfg(test)]
+pub(super) fn seed_incompatible_worker_directory_acl_for_action_test(
+    path: &Path,
+    _principal: &WorkerPrincipal,
+) -> io::Result<()> {
+    let path = CString::new(path.as_os_str().as_bytes()).unwrap();
+    let mut value = 2_u32.to_le_bytes().to_vec();
+    for (tag, permissions, id) in [
+        (0x01_u16, 0x07_u16, u32::MAX),
+        (
+            0x02_u16,
+            0x07_u16,
+            unsafe { libc::geteuid() }.wrapping_add(1),
+        ),
+        (0x04_u16, 0x00_u16, u32::MAX),
+        (0x10_u16, 0x07_u16, u32::MAX),
+        (0x20_u16, 0x00_u16, u32::MAX),
+    ] {
+        value.extend_from_slice(&tag.to_le_bytes());
+        value.extend_from_slice(&permissions.to_le_bytes());
+        value.extend_from_slice(&id.to_le_bytes());
+    }
+    if unsafe {
+        libc::setxattr(
+            path.as_ptr(),
+            c"system.posix_acl_access".as_ptr(),
+            value.as_ptr().cast(),
+            value.len(),
+            0,
+        )
+    } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(super) fn worker_directory_acl_is_incompatible_for_action_test(
+    path: &Path,
+    _principal: &WorkerPrincipal,
+) -> io::Result<bool> {
+    let directory = std::fs::File::open(path)?;
+    posix_acl_present(&directory, c"system.posix_acl_access")
+}
+
 fn clear_posix_acl(directory: &std::fs::File, name: &std::ffi::CStr) -> io::Result<()> {
     if unsafe { libc::fremovexattr(directory.as_raw_fd(), name.as_ptr()) } == 0 {
         return Ok(());

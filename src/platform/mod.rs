@@ -190,6 +190,55 @@ impl TestNativeMutationAuthority {
 #[cfg(test)]
 type NativeMutationAuthority = TestNativeMutationAuthority;
 
+#[cfg(test)]
+std::thread_local! {
+    static WORKER_NODE_BINDING_INTERRUPTION: std::cell::Cell<bool> = const {
+        std::cell::Cell::new(false)
+    };
+    static WORKER_NODE_POST_BINDING_INTERRUPTION: std::cell::Cell<bool> = const {
+        std::cell::Cell::new(false)
+    };
+    static WORKER_NODE_INSPECTION_UNAVAILABLE: std::cell::Cell<bool> = const {
+        std::cell::Cell::new(false)
+    };
+}
+
+#[cfg(test)]
+#[allow(dead_code)] // The source-inclusion contract binary omits action tests.
+pub(crate) fn set_worker_node_binding_interruption_for_action_test(interrupt: bool) {
+    WORKER_NODE_BINDING_INTERRUPTION.with(|slot| slot.set(interrupt));
+}
+
+#[cfg(test)]
+#[allow(dead_code)] // The source-inclusion contract binary omits action tests.
+pub(crate) fn set_worker_node_post_binding_interruption_for_action_test(interrupt: bool) {
+    WORKER_NODE_POST_BINDING_INTERRUPTION.with(|slot| slot.set(interrupt));
+}
+
+#[cfg(test)]
+#[allow(dead_code)] // The source-inclusion contract binary omits action tests.
+pub(crate) fn set_worker_node_inspection_unavailable_for_action_test(unavailable: bool) {
+    WORKER_NODE_INSPECTION_UNAVAILABLE.with(|slot| slot.set(unavailable));
+}
+
+#[cfg(test)]
+#[allow(dead_code)] // Native-only action fixtures are absent from source-inclusion tests.
+pub(crate) fn seed_incompatible_worker_directory_acl_for_action_test(
+    path: &Path,
+    principal: &WorkerPrincipal,
+) -> std::io::Result<()> {
+    platform_impl::seed_incompatible_worker_directory_acl_for_action_test(path, principal)
+}
+
+#[cfg(test)]
+#[allow(dead_code)] // Native-only action fixtures are absent from source-inclusion tests.
+pub(crate) fn worker_directory_acl_is_incompatible_for_action_test(
+    path: &Path,
+    principal: &WorkerPrincipal,
+) -> std::io::Result<bool> {
+    platform_impl::worker_directory_acl_is_incompatible_for_action_test(path, principal)
+}
+
 #[cfg(all(test, unix))]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum WorkerNodePostPublishFault {
@@ -497,11 +546,25 @@ impl WorkerDirectoryNodeCreation {
     ) -> Result<WorkerDirectoryBound<Value>, WorkerDirectoryBindingError<BindingError>> {
         platform_impl::reverify_worker_directory_node_lease(&self.lease, &self.observation)
             .map_err(WorkerDirectoryBindingError::Reverification)?;
+        #[cfg(test)]
+        WORKER_NODE_BINDING_INTERRUPTION.with(|slot| {
+            assert!(
+                !slot.get(),
+                "injected interruption before verified worker-directory binding"
+            );
+        });
         let value = bind(VerifiedWorkerDirectoryNodeBinding {
             observation: &self.observation,
             lease: &self.lease,
         })
         .map_err(WorkerDirectoryBindingError::Binding)?;
+        #[cfg(test)]
+        WORKER_NODE_POST_BINDING_INTERRUPTION.with(|slot| {
+            assert!(
+                !slot.get(),
+                "injected interruption after verified worker-directory binding"
+            );
+        });
         Ok(
             match platform_impl::retire_worker_directory_node_authority(&self.lease) {
                 Ok(()) => WorkerDirectoryBound::Bound(value),
@@ -1097,6 +1160,12 @@ pub(crate) fn inspect_worker_directory_node(
     if !layout.materialization_nodes().contains(&node) {
         return WorkerDirectoryNodeInspection::Conflict(
             WorkerDirectoryInspectionIssue::UnsafeOrConflictingState,
+        );
+    }
+    #[cfg(test)]
+    if WORKER_NODE_INSPECTION_UNAVAILABLE.with(std::cell::Cell::get) {
+        return WorkerDirectoryNodeInspection::Unknowable(
+            WorkerDirectoryInspectionIssue::ObservationUnavailable,
         );
     }
     platform_impl::inspect_worker_directory_node(layout, node)
@@ -3185,6 +3254,147 @@ mod worker_directory_tests {
                 WorkerDirectoryInspectionIssue::UnsafeOrConflictingState,
             ),
         );
+
+        std::fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn succeeded_worker_evidence_rejects_a_copied_v2_record_without_mutation() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let principal = resolve_current_worker_principal().unwrap();
+        let parent = unique_test_directory("node-retire-copied-v2-record");
+        std::fs::create_dir(&parent).unwrap();
+        let root = parent.join("chosen-root");
+        let layout =
+            resolve_worker_directory_layout(InstallationScope::System, &principal, Some(&root))
+                .unwrap();
+        let authority = TestNativeMutationAuthority::for_test();
+        let WorkerDirectoryNodeCreateOutcome::Created(creation) =
+            create_worker_directory_node(&layout, WorkerDirectoryNode::Root, &authority).unwrap()
+        else {
+            panic!("fresh root was not created");
+        };
+        drop(creation);
+
+        let marker = only_worker_evidence_path(&parent, ".styrn-worker-provenance-");
+        let displaced = parent.join(".styrn-test-displaced-active-marker");
+        let original_record = std::fs::read(marker.join("record")).unwrap();
+        std::fs::rename(&marker, &displaced).unwrap();
+        std::fs::create_dir(&marker).unwrap();
+        std::fs::set_permissions(&marker, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::write(marker.join("record"), &original_record).unwrap();
+        std::fs::set_permissions(
+            marker.join("record"),
+            std::fs::Permissions::from_mode(0o600),
+        )
+        .unwrap();
+
+        let identity = |path: &Path| {
+            let metadata = std::fs::symlink_metadata(path).unwrap();
+            (metadata.dev(), metadata.ino())
+        };
+        let root_identity = identity(&root);
+        let replacement_marker_identity = identity(&marker);
+        let replacement_record_identity = identity(&marker.join("record"));
+        let displaced_marker_identity = identity(&displaced);
+        let displaced_record_identity = identity(&displaced.join("record"));
+
+        let error = retire_succeeded_worker_directory_evidence(
+            &layout,
+            WorkerDirectoryNode::Root,
+            &authority,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(identity(&root), root_identity);
+        assert_eq!(identity(&marker), replacement_marker_identity);
+        assert_eq!(
+            identity(&marker.join("record")),
+            replacement_record_identity
+        );
+        assert_eq!(identity(&displaced), displaced_marker_identity);
+        assert_eq!(
+            identity(&displaced.join("record")),
+            displaced_record_identity
+        );
+        assert_eq!(
+            std::fs::read(marker.join("record")).unwrap(),
+            original_record
+        );
+        assert_eq!(
+            std::fs::read(displaced.join("record")).unwrap(),
+            original_record
+        );
+
+        std::fs::remove_dir_all(parent).unwrap();
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn succeeded_worker_evidence_rejects_a_hardlinked_v2_record_without_mutation() {
+        use std::os::unix::fs::MetadataExt;
+
+        let principal = resolve_current_worker_principal().unwrap();
+        let parent = unique_test_directory("node-retire-hardlinked-v2-record");
+        std::fs::create_dir(&parent).unwrap();
+        let root = parent.join("chosen-root");
+        let layout =
+            resolve_worker_directory_layout(InstallationScope::System, &principal, Some(&root))
+                .unwrap();
+        let authority = TestNativeMutationAuthority::for_test();
+        let WorkerDirectoryNodeCreateOutcome::Created(creation) =
+            create_worker_directory_node(&layout, WorkerDirectoryNode::Root, &authority).unwrap()
+        else {
+            panic!("fresh root was not created");
+        };
+        platform_impl::set_worker_provenance_retirement_fault_for_test(Some(
+            WorkerProvenanceRetirementFault::AfterMarkerRename,
+        ));
+        let bound = creation
+            .bind_after_reverify(|_| Ok::<_, ()>("durable receipt value"))
+            .unwrap();
+        platform_impl::set_worker_provenance_retirement_fault_for_test(None);
+        assert!(matches!(
+            bound,
+            WorkerDirectoryBound::BoundWithRetirementFailure { value, .. }
+                if value == "durable receipt value"
+        ));
+
+        let marker = only_worker_evidence_path(&parent, ".styrn-worker-retired-");
+        let record = marker.join("record");
+        let displaced_record = parent.join(".styrn-test-displaced-v2-record");
+        let record_bytes = std::fs::read(&record).unwrap();
+        std::fs::rename(&record, &displaced_record).unwrap();
+        std::fs::hard_link(&displaced_record, &record).unwrap();
+
+        let identity = |path: &Path| {
+            let metadata = std::fs::symlink_metadata(path).unwrap();
+            (metadata.dev(), metadata.ino())
+        };
+        let root_identity = identity(&root);
+        let marker_identity = identity(&marker);
+        let record_identity = identity(&record);
+        assert_eq!(record_identity, identity(&displaced_record));
+        assert_eq!(std::fs::symlink_metadata(&record).unwrap().nlink(), 2);
+
+        let error = retire_succeeded_worker_directory_evidence(
+            &layout,
+            WorkerDirectoryNode::Root,
+            &authority,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert_eq!(identity(&root), root_identity);
+        assert_eq!(identity(&marker), marker_identity);
+        assert_eq!(identity(&record), record_identity);
+        assert_eq!(identity(&displaced_record), record_identity);
+        assert_eq!(std::fs::symlink_metadata(&record).unwrap().nlink(), 2);
+        assert_eq!(std::fs::read(&record).unwrap(), record_bytes);
+        assert_eq!(std::fs::read(&displaced_record).unwrap(), record_bytes);
 
         std::fs::remove_dir_all(parent).unwrap();
     }

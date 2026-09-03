@@ -481,6 +481,11 @@ fn current_user_worker_directory_conflict_is_pending_and_secret_free() {
 
     assert_eq!(report.applied_count(), 0);
     assert_eq!(report.pending_count(), 1);
+    assert_eq!(
+        report.pending()[0].needs_human().instructions().as_str(),
+        "Inspect and repair this worker directory node, then rerun setup."
+    );
+    assert!(report.pending()[0].needs_human().fragment().is_none());
     assert_eq!(report.pending()[0].id().as_str(), "identity.directory.root");
     let ActionParameters::WorkerDirectory(parameters) = report.pending()[0].parameters() else {
         panic!("pending worker-directory conflict lost typed parameters")
@@ -505,6 +510,561 @@ fn current_user_worker_directory_conflict_is_pending_and_secret_free() {
         assert_eq!(entry[field], serde_json::json!([]));
     }
     assert_eq!(fs::read(&root).unwrap(), secret.as_bytes());
+}
+
+#[test]
+fn worker_directory_broken_node_needs_human_without_takeover() {
+    #[derive(Clone, Copy, Debug)]
+    enum BrokenNode {
+        File,
+        #[cfg(unix)]
+        Symlink,
+        #[cfg(unix)]
+        Fifo,
+        #[cfg(unix)]
+        Socket,
+        #[cfg(unix)]
+        WrongMode,
+    }
+
+    let cases = [
+        BrokenNode::File,
+        #[cfg(unix)]
+        BrokenNode::Symlink,
+        #[cfg(unix)]
+        BrokenNode::Fifo,
+        #[cfg(unix)]
+        BrokenNode::Socket,
+        #[cfg(unix)]
+        BrokenNode::WrongMode,
+    ];
+
+    for kind in cases {
+        let fixture = JournalFixture::new(&format!("worker-directory-broken-{kind:?}"));
+        harden_user_journal_fixture(&fixture);
+        let principal = crate::platform::resolve_current_worker_principal().unwrap();
+        let context = crate::platform::SetupExecutionContext::new_for_test(
+            crate::platform::SetupHostPrivilege::Ordinary,
+            principal,
+        );
+        #[cfg(unix)]
+        let short_socket_parent = matches!(kind, BrokenNode::Socket).then(|| {
+            use std::os::unix::fs::PermissionsExt as _;
+            let parent = fs::canonicalize("/tmp").unwrap().join(format!(
+                "styrn-wd-{}-{}",
+                std::process::id(),
+                uuid::Uuid::now_v7().simple()
+            ));
+            fs::create_dir(&parent).unwrap();
+            fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+            parent
+        });
+        #[cfg(unix)]
+        let layout_parent = short_socket_parent
+            .as_ref()
+            .unwrap_or(&fixture.root)
+            .to_path_buf();
+        #[cfg(not(unix))]
+        let layout_parent = fixture.root.clone();
+        let root = layout_parent.join("worker-root");
+        let (mut plan, layout) = current_user_worker_directory_plan_for_test(
+            &context,
+            root.clone(),
+            Some(layout_parent.clone()),
+        )
+        .unwrap();
+        let authority = crate::platform::TestNativeMutationAuthority::for_test();
+        let crate::platform::WorkerDirectoryNodeCreateOutcome::Created(creation) =
+            crate::platform::create_worker_directory_node(
+                &layout,
+                WorkerDirectoryNode::Root,
+                &authority,
+            )
+            .unwrap()
+        else {
+            panic!("fresh root was not created")
+        };
+        assert!(matches!(
+            creation.bind_after_reverify(|_| Ok::<_, ()>(())),
+            Ok(crate::platform::WorkerDirectoryBound::Bound(()))
+        ));
+        plan.retain(|action| action.name().as_str() == "identity.directory.jobs");
+
+        let target = layout.jobs().to_path_buf();
+        let sibling = root.join("operator-sentinel.txt");
+        fs::write(&sibling, b"preserve sibling bytes\n").unwrap();
+        #[cfg(unix)]
+        let mut socket = None;
+        #[cfg(unix)]
+        let mut descendant: Option<PathBuf> = None;
+        #[cfg(not(unix))]
+        let descendant: Option<PathBuf> = None;
+        let secret = "sk_live_worker_directory_fixture_must_not_escape";
+        match kind {
+            BrokenNode::File => fs::write(&target, secret.as_bytes()).unwrap(),
+            #[cfg(unix)]
+            BrokenNode::Symlink => {
+                let outside = fixture.root.join("outside-target");
+                fs::create_dir(&outside).unwrap();
+                let outside_sentinel = outside.join("outside-sentinel.txt");
+                fs::write(&outside_sentinel, b"preserve symlink target bytes\n").unwrap();
+                std::os::unix::fs::symlink(&outside, &target).unwrap();
+                descendant = Some(outside_sentinel);
+            }
+            #[cfg(unix)]
+            BrokenNode::Fifo => {
+                use std::os::unix::ffi::OsStrExt as _;
+                let path = std::ffi::CString::new(target.as_os_str().as_bytes()).unwrap();
+                assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+            }
+            #[cfg(unix)]
+            BrokenNode::Socket => {
+                socket = Some(std::os::unix::net::UnixListener::bind(&target).unwrap());
+            }
+            #[cfg(unix)]
+            BrokenNode::WrongMode => {
+                use std::os::unix::fs::PermissionsExt as _;
+                fs::create_dir(&target).unwrap();
+                fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).unwrap();
+                let child = target.join("operator-descendant.txt");
+                fs::write(&child, b"preserve descendant bytes\n").unwrap();
+                fs::set_permissions(&child, fs::Permissions::from_mode(0o640)).unwrap();
+                descendant = Some(child);
+            }
+        }
+        let target_before = preserved_path(&target);
+        let sibling_before = preserved_path(&sibling);
+        let descendant_before = descendant
+            .as_deref()
+            .map(|path| (path.to_path_buf(), preserved_path(path)));
+        let root_entries_before = fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<std::collections::BTreeSet<_>>();
+        let store = ReceiptStore::new_user_for_test_with_worker_layout(
+            fixture.receipt_path(),
+            layout.clone(),
+        );
+
+        let report = apply_plan_with_journal(
+            &mut plan,
+            &store,
+            &mut ReceiptMetadataSource::for_test([(
+                "019cb090-3400-7000-8000-000000000201",
+                "2026-09-03T12:50:00Z",
+            )]),
+        )
+        .unwrap();
+
+        assert_eq!(report.applied_count(), 0, "{kind:?}");
+        assert_eq!(report.pending_count(), 1, "{kind:?}");
+        assert_eq!(report.pending()[0].id().as_str(), "identity.directory.jobs");
+        assert_eq!(
+            report.pending()[0].needs_human().instructions().as_str(),
+            "Inspect and repair this worker directory node, then rerun setup."
+        );
+        assert!(report.pending()[0].needs_human().fragment().is_none());
+        assert_eq!(preserved_path(&target), target_before, "{kind:?}");
+        assert_eq!(preserved_path(&sibling), sibling_before, "{kind:?}");
+        if let Some((path, before)) = descendant_before {
+            assert_eq!(preserved_path(&path), before, "{kind:?}");
+        }
+        assert_eq!(
+            fs::read_dir(&root)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<std::collections::BTreeSet<_>>(),
+            root_entries_before,
+            "{kind:?}",
+        );
+        for node in [
+            WorkerDirectoryNode::Repos,
+            WorkerDirectoryNode::Cache,
+            WorkerDirectoryNode::Artifacts,
+            WorkerDirectoryNode::Logs,
+        ] {
+            assert!(!layout.path_for_node(node).unwrap().exists(), "{kind:?}");
+        }
+        let receipt_bytes = store.read_snapshot().unwrap().to_json().unwrap();
+        assert!(!String::from_utf8_lossy(&receipt_bytes).contains(secret));
+        let receipt = serde_json::from_slice::<serde_json::Value>(&receipt_bytes).unwrap();
+        assert_eq!(receipt["entries"].as_array().unwrap().len(), 1, "{kind:?}");
+        assert_eq!(receipt["entries"][0]["status"], "pending", "{kind:?}");
+        assert_eq!(
+            receipt["entries"][0]["directories_created"],
+            serde_json::json!([]),
+            "{kind:?}",
+        );
+        assert!(fixture.only_transaction_path_if_present().is_none());
+        #[cfg(unix)]
+        drop(socket);
+        #[cfg(unix)]
+        if let Some(parent) = short_socket_parent {
+            fs::remove_dir_all(parent).unwrap();
+        }
+    }
+}
+
+#[test]
+fn worker_directory_unknowable_node_needs_human_without_mutation() {
+    let fixture = JournalFixture::new("worker-directory-unknowable");
+    harden_user_journal_fixture(&fixture);
+    let principal = crate::platform::resolve_current_worker_principal().unwrap();
+    let context = crate::platform::SetupExecutionContext::new_for_test(
+        crate::platform::SetupHostPrivilege::Ordinary,
+        principal,
+    );
+    let root = fixture.root.join("worker-root");
+    let (mut plan, layout) = current_user_worker_directory_plan_for_test(
+        &context,
+        root.clone(),
+        Some(fixture.root.clone()),
+    )
+    .unwrap();
+    let authority = crate::platform::TestNativeMutationAuthority::for_test();
+    let crate::platform::WorkerDirectoryNodeCreateOutcome::Created(creation) =
+        crate::platform::create_worker_directory_node(
+            &layout,
+            WorkerDirectoryNode::Root,
+            &authority,
+        )
+        .unwrap()
+    else {
+        panic!("fresh root was not created")
+    };
+    assert!(matches!(
+        creation.bind_after_reverify(|_| Ok::<_, ()>(())),
+        Ok(crate::platform::WorkerDirectoryBound::Bound(()))
+    ));
+    plan.retain(|action| action.name().as_str() == "identity.directory.jobs");
+    let sentinel_directory = root.join("operator-directory");
+    fs::create_dir(&sentinel_directory).unwrap();
+    let sentinel = sentinel_directory.join("sentinel.txt");
+    fs::write(&sentinel, b"preserve unknowable sibling bytes\n").unwrap();
+    set_distinct_test_metadata(&sentinel, &sentinel_directory, &sentinel);
+    let root_before = preserved_path(&root);
+    let sentinel_directory_before = preserved_path(&sentinel_directory);
+    let sentinel_before = preserved_path(&sentinel);
+    let root_entries_before = fs::read_dir(&root)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<std::collections::BTreeSet<_>>();
+    let store =
+        ReceiptStore::new_user_for_test_with_worker_layout(fixture.receipt_path(), layout.clone());
+    crate::platform::set_worker_node_inspection_unavailable_for_action_test(true);
+
+    let report = apply_plan_with_journal(
+        &mut plan,
+        &store,
+        &mut ReceiptMetadataSource::for_test([(
+            "019cb090-3400-7000-8000-000000000211",
+            "2026-09-03T12:51:00Z",
+        )]),
+    )
+    .unwrap();
+    crate::platform::set_worker_node_inspection_unavailable_for_action_test(false);
+
+    assert_eq!(report.applied_count(), 0);
+    assert_eq!(report.pending_count(), 1);
+    assert!(!layout.jobs().exists());
+    assert_eq!(preserved_path(&root), root_before);
+    assert_eq!(
+        preserved_path(&sentinel_directory),
+        sentinel_directory_before
+    );
+    assert_eq!(preserved_path(&sentinel), sentinel_before);
+    assert_eq!(
+        fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<std::collections::BTreeSet<_>>(),
+        root_entries_before,
+    );
+    let receipt = serde_json::from_slice::<serde_json::Value>(
+        &store.read_snapshot().unwrap().to_json().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(receipt["entries"].as_array().unwrap().len(), 1);
+    assert_eq!(receipt["entries"][0]["status"], "pending");
+    assert_eq!(
+        receipt["entries"][0]["directories_created"],
+        serde_json::json!([]),
+    );
+    assert!(fixture.only_transaction_path_if_present().is_none());
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", target_os = "windows"))]
+#[test]
+#[cfg_attr(
+    target_os = "linux",
+    ignore = "environmental: requires native Linux filesystem POSIX ACL support"
+)]
+fn worker_directory_native_acl_conflict_is_pending_without_metadata_reset() {
+    let fixture = JournalFixture::new("worker-directory-native-acl-conflict");
+    harden_user_journal_fixture(&fixture);
+    let principal = crate::platform::resolve_current_worker_principal().unwrap();
+    let context = crate::platform::SetupExecutionContext::new_for_test(
+        crate::platform::SetupHostPrivilege::Ordinary,
+        principal.clone(),
+    );
+    let root = fixture.root.join("worker-root");
+    let (mut plan, layout) = current_user_worker_directory_plan_for_test(
+        &context,
+        root.clone(),
+        Some(fixture.root.clone()),
+    )
+    .unwrap();
+    let authority = crate::platform::TestNativeMutationAuthority::for_test();
+    let crate::platform::WorkerDirectoryNodeCreateOutcome::Created(creation) =
+        crate::platform::create_worker_directory_node(
+            &layout,
+            WorkerDirectoryNode::Root,
+            &authority,
+        )
+        .unwrap()
+    else {
+        panic!("fresh root was not created")
+    };
+    assert!(matches!(
+        creation.bind_after_reverify(|_| Ok::<_, ()>(())),
+        Ok(crate::platform::WorkerDirectoryBound::Bound(()))
+    ));
+    plan.retain(|action| action.name().as_str() == "identity.directory.jobs");
+    let target = layout.jobs().to_path_buf();
+    fs::create_dir(&target).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let descendant = target.join("operator-descendant.txt");
+    fs::write(&descendant, b"preserve native ACL descendant\n").unwrap();
+    crate::platform::seed_incompatible_worker_directory_acl_for_action_test(&target, &principal)
+        .unwrap();
+    assert!(
+        crate::platform::worker_directory_acl_is_incompatible_for_action_test(&target, &principal,)
+            .unwrap()
+    );
+    let target_before = preserved_path(&target);
+    let descendant_before = preserved_path(&descendant);
+    let root_entries_before = fs::read_dir(&root)
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<std::collections::BTreeSet<_>>();
+    let store =
+        ReceiptStore::new_user_for_test_with_worker_layout(fixture.receipt_path(), layout.clone());
+
+    let report = apply_plan_with_journal(
+        &mut plan,
+        &store,
+        &mut ReceiptMetadataSource::for_test([(
+            "019cb090-3400-7000-8000-000000000221",
+            "2026-09-03T12:52:00Z",
+        )]),
+    )
+    .unwrap();
+
+    assert_eq!(report.applied_count(), 0);
+    assert_eq!(report.pending_count(), 1);
+    assert_eq!(preserved_path(&target), target_before);
+    assert_eq!(preserved_path(&descendant), descendant_before);
+    assert!(
+        crate::platform::worker_directory_acl_is_incompatible_for_action_test(&target, &principal,)
+            .unwrap()
+    );
+    assert_eq!(
+        fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<std::collections::BTreeSet<_>>(),
+        root_entries_before,
+    );
+    assert_eq!(store.read_snapshot().unwrap().entry_count(), 1);
+    assert!(fixture.only_transaction_path_if_present().is_none());
+}
+
+#[cfg(unix)]
+#[test]
+#[ignore = "environmental: requires root on a disposable Unix host for wrong-owner and device fixtures"]
+fn worker_directory_privileged_hostile_nodes_are_pending_without_takeover() {
+    use std::os::unix::ffi::OsStrExt as _;
+    use std::os::unix::fs::{FileTypeExt as _, MetadataExt as _, PermissionsExt as _};
+
+    assert_eq!(
+        unsafe { libc::geteuid() },
+        0,
+        "this environmental test requires root"
+    );
+    #[derive(Clone, Copy, Debug)]
+    enum PrivilegedNode {
+        WrongOwner,
+        Device,
+    }
+
+    for kind in [PrivilegedNode::WrongOwner, PrivilegedNode::Device] {
+        let fixture = JournalFixture::new(&format!("worker-directory-privileged-hostile-{kind:?}"));
+        harden_user_journal_fixture(&fixture);
+        let principal = crate::platform::resolve_current_worker_principal().unwrap();
+        let context = crate::platform::SetupExecutionContext::new_for_test(
+            crate::platform::SetupHostPrivilege::Ordinary,
+            principal,
+        );
+        let root = fixture.root.join("worker-root");
+        let (mut plan, layout) = current_user_worker_directory_plan_for_test(
+            &context,
+            root.clone(),
+            Some(fixture.root.clone()),
+        )
+        .unwrap();
+        let authority = crate::platform::TestNativeMutationAuthority::for_test();
+        let crate::platform::WorkerDirectoryNodeCreateOutcome::Created(creation) =
+            crate::platform::create_worker_directory_node(
+                &layout,
+                WorkerDirectoryNode::Root,
+                &authority,
+            )
+            .unwrap()
+        else {
+            panic!("fresh root was not created")
+        };
+        assert!(matches!(
+            creation.bind_after_reverify(|_| Ok::<_, ()>(())),
+            Ok(crate::platform::WorkerDirectoryBound::Bound(()))
+        ));
+        plan.retain(|action| action.name().as_str() == "identity.directory.jobs");
+        let target = layout.jobs().to_path_buf();
+        match kind {
+            PrivilegedNode::WrongOwner => {
+                fs::create_dir(&target).unwrap();
+                fs::set_permissions(&target, fs::Permissions::from_mode(0o700)).unwrap();
+                let path = std::ffi::CString::new(target.as_os_str().as_bytes()).unwrap();
+                assert_eq!(
+                    unsafe { libc::chown(path.as_ptr(), 1, libc::gid_t::MAX) },
+                    0
+                );
+            }
+            PrivilegedNode::Device => {
+                let path = std::ffi::CString::new(target.as_os_str().as_bytes()).unwrap();
+                let device = fs::metadata("/dev/null").unwrap().rdev();
+                assert_eq!(
+                    unsafe {
+                        libc::mknod(
+                            path.as_ptr(),
+                            (libc::S_IFCHR | 0o600) as libc::mode_t,
+                            device as libc::dev_t,
+                        )
+                    },
+                    0
+                );
+            }
+        }
+        let sibling = root.join("operator-sentinel.txt");
+        fs::write(&sibling, b"preserve privileged fixture sibling\n").unwrap();
+        let target_before = preserved_path(&target);
+        let sibling_before = preserved_path(&sibling);
+        let root_entries_before = fs::read_dir(&root)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<std::collections::BTreeSet<_>>();
+        let store =
+            ReceiptStore::new_user_for_test_with_worker_layout(fixture.receipt_path(), layout);
+
+        let report = apply_plan_with_journal(
+            &mut plan,
+            &store,
+            &mut ReceiptMetadataSource::for_test([(
+                "019cb090-3400-7000-8000-000000000231",
+                "2026-09-03T12:53:00Z",
+            )]),
+        )
+        .unwrap();
+
+        assert_eq!(report.applied_count(), 0, "{kind:?}");
+        assert_eq!(report.pending_count(), 1, "{kind:?}");
+        assert_eq!(preserved_path(&target), target_before, "{kind:?}");
+        assert_eq!(preserved_path(&sibling), sibling_before, "{kind:?}");
+        assert_eq!(
+            fs::read_dir(&root)
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect::<std::collections::BTreeSet<_>>(),
+            root_entries_before,
+            "{kind:?}",
+        );
+        match kind {
+            PrivilegedNode::WrongOwner => {
+                assert_eq!(fs::symlink_metadata(&target).unwrap().uid(), 1)
+            }
+            PrivilegedNode::Device => assert!(fs::symlink_metadata(&target)
+                .unwrap()
+                .file_type()
+                .is_char_device()),
+        }
+        assert_eq!(store.read_snapshot().unwrap().entry_count(), 1);
+        assert!(fixture.only_transaction_path_if_present().is_none());
+    }
+}
+
+#[cfg(target_os = "windows")]
+#[test]
+#[ignore = "environmental: requires native Windows symlink privilege or Developer Mode"]
+fn worker_directory_windows_reparse_node_is_pending_without_target_mutation() {
+    let fixture = JournalFixture::new("worker-directory-windows-reparse");
+    harden_user_journal_fixture(&fixture);
+    let principal = crate::platform::resolve_current_worker_principal().unwrap();
+    let context = crate::platform::SetupExecutionContext::new_for_test(
+        crate::platform::SetupHostPrivilege::Ordinary,
+        principal,
+    );
+    let root = fixture.root.join("worker-root");
+    let (mut plan, layout) = current_user_worker_directory_plan_for_test(
+        &context,
+        root.clone(),
+        Some(fixture.root.clone()),
+    )
+    .unwrap();
+    let authority = crate::platform::TestNativeMutationAuthority::for_test();
+    let crate::platform::WorkerDirectoryNodeCreateOutcome::Created(creation) =
+        crate::platform::create_worker_directory_node(
+            &layout,
+            WorkerDirectoryNode::Root,
+            &authority,
+        )
+        .unwrap()
+    else {
+        panic!("fresh root was not created")
+    };
+    assert!(matches!(
+        creation.bind_after_reverify(|_| Ok::<_, ()>(())),
+        Ok(crate::platform::WorkerDirectoryBound::Bound(()))
+    ));
+    plan.retain(|action| action.name().as_str() == "identity.directory.jobs");
+    let outside = fixture.root.join("outside-reparse-target");
+    fs::create_dir(&outside).unwrap();
+    let outside_sentinel = outside.join("outside-sentinel.txt");
+    fs::write(&outside_sentinel, b"preserve Windows reparse target\n").unwrap();
+    std::os::windows::fs::symlink_dir(&outside, layout.jobs()).unwrap();
+    let target_before = preserved_path(layout.jobs());
+    let outside_before = preserved_path(&outside_sentinel);
+    let store =
+        ReceiptStore::new_user_for_test_with_worker_layout(fixture.receipt_path(), layout.clone());
+
+    let report = apply_plan_with_journal(
+        &mut plan,
+        &store,
+        &mut ReceiptMetadataSource::for_test([(
+            "019cb090-3400-7000-8000-000000000241",
+            "2026-09-03T12:54:00Z",
+        )]),
+    )
+    .unwrap();
+
+    assert_eq!(report.applied_count(), 0);
+    assert_eq!(report.pending_count(), 1);
+    assert_eq!(preserved_path(layout.jobs()), target_before);
+    assert_eq!(preserved_path(&outside_sentinel), outside_before);
+    assert_eq!(store.read_snapshot().unwrap().entry_count(), 1);
+    assert!(fixture.only_transaction_path_if_present().is_none());
 }
 
 #[test]
@@ -652,6 +1212,162 @@ fn current_user_worker_directory_fresh_plan_has_exact_receipt_prefix_and_idempot
     assert_eq!(preserved_path(&unrelated), unrelated_before);
     assert_eq!(preserved_path(&nested), nested_before);
     assert_eq!(preserved_path(&sentinel), sentinel_before);
+}
+
+#[test]
+fn worker_directory_crash_after_each_node_leaves_exact_receipt_prefix() {
+    for completed in 1..=7 {
+        let fixture = JournalFixture::new(&format!("worker-directory-prefix-{completed}"));
+        harden_user_journal_fixture(&fixture);
+        let principal = crate::platform::resolve_current_worker_principal().unwrap();
+        let context = crate::platform::SetupExecutionContext::new_for_test(
+            crate::platform::SetupHostPrivilege::Ordinary,
+            principal,
+        );
+        let root = fixture.root.join("support").join("worker-root");
+        let (mut plan, layout) =
+            current_user_worker_directory_plan_for_test(&context, root, Some(fixture.root.clone()))
+                .unwrap();
+        let nodes = layout.materialization_nodes();
+        assert_eq!(nodes.len(), 7, "fixture must exercise one support node");
+        let interrupted_store =
+            ReceiptStore::new_user_for_test_with_worker_layout_failing_after_completed_nodes(
+                fixture.receipt_path(),
+                layout.clone(),
+                completed,
+            );
+
+        let error = apply_plan_with_journal(
+            &mut plan,
+            &interrupted_store,
+            &mut ReceiptMetadataSource::for_test([
+                (
+                    "019cb090-3400-7000-8000-000000000031",
+                    "2026-09-03T12:10:00Z",
+                ),
+                (
+                    "019cb090-3400-7000-8000-000000000032",
+                    "2026-09-03T12:10:01Z",
+                ),
+                (
+                    "019cb090-3400-7000-8000-000000000033",
+                    "2026-09-03T12:10:02Z",
+                ),
+                (
+                    "019cb090-3400-7000-8000-000000000034",
+                    "2026-09-03T12:10:03Z",
+                ),
+                (
+                    "019cb090-3400-7000-8000-000000000035",
+                    "2026-09-03T12:10:04Z",
+                ),
+                (
+                    "019cb090-3400-7000-8000-000000000036",
+                    "2026-09-03T12:10:05Z",
+                ),
+                (
+                    "019cb090-3400-7000-8000-000000000037",
+                    "2026-09-03T12:10:06Z",
+                ),
+            ]),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.error_code(), "setup.receipt_conflict", "{completed}");
+        assert_eq!(error.exit_code(), 13, "{completed}");
+        let receipt = serde_json::from_slice::<serde_json::Value>(
+            &interrupted_store
+                .read_snapshot()
+                .unwrap()
+                .to_json()
+                .unwrap(),
+        )
+        .unwrap();
+        let entries = receipt["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), completed, "{completed}");
+        assert_eq!(
+            entries
+                .iter()
+                .map(|entry| entry["action"]["parameters"]["action_id"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            nodes[..completed]
+                .iter()
+                .map(|node| node.action_id())
+                .collect::<Vec<_>>(),
+            "{completed}",
+        );
+        for (index, node) in nodes.iter().copied().enumerate() {
+            assert_eq!(
+                layout.path_for_node(node).unwrap().is_dir(),
+                index < completed,
+                "completed {completed} changed node {index}",
+            );
+        }
+        assert!(fixture.only_transaction_path_if_present().is_none());
+
+        let rerun_layout = layout.clone();
+        let store =
+            ReceiptStore::new_user_for_test_with_worker_layout(fixture.receipt_path(), layout);
+        let rerun = apply_plan_with_journal(
+            &mut plan,
+            &store,
+            &mut ReceiptMetadataSource::for_test([
+                (
+                    "019cb090-3400-7000-8000-000000000131",
+                    "2026-09-03T12:11:00Z",
+                ),
+                (
+                    "019cb090-3400-7000-8000-000000000132",
+                    "2026-09-03T12:11:01Z",
+                ),
+                (
+                    "019cb090-3400-7000-8000-000000000133",
+                    "2026-09-03T12:11:02Z",
+                ),
+                (
+                    "019cb090-3400-7000-8000-000000000134",
+                    "2026-09-03T12:11:03Z",
+                ),
+                (
+                    "019cb090-3400-7000-8000-000000000135",
+                    "2026-09-03T12:11:04Z",
+                ),
+                (
+                    "019cb090-3400-7000-8000-000000000136",
+                    "2026-09-03T12:11:05Z",
+                ),
+                (
+                    "019cb090-3400-7000-8000-000000000137",
+                    "2026-09-03T12:11:06Z",
+                ),
+            ]),
+        )
+        .unwrap();
+
+        assert_eq!(rerun.applied_count(), nodes.len() - completed);
+        assert_eq!(rerun.noop_count(), completed);
+        assert!(nodes
+            .iter()
+            .copied()
+            .all(|node| rerun_layout.path_for_node(node).unwrap().is_dir()));
+        let completed_receipt = serde_json::from_slice::<serde_json::Value>(
+            &store.read_snapshot().unwrap().to_json().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            completed_receipt["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|entry| entry["action"]["parameters"]["action_id"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            nodes
+                .iter()
+                .map(|node| node.action_id())
+                .collect::<Vec<_>>()
+        );
+        assert!(fixture.only_transaction_path_if_present().is_none());
+    }
 }
 
 #[derive(Debug, Eq, PartialEq)]
@@ -810,6 +1526,483 @@ fn current_user_worker_directory_existing_race_is_receipt_conflict() {
         serde_json::from_slice::<serde_json::Value>(&intent).unwrap()["phase"],
         "prepared"
     );
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WorkerDirectoryRaceRole {
+    Winner,
+    Loser,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum WorkerDirectoryRaceEvent {
+    Prepared(WorkerDirectoryRaceRole),
+    WinnerBound,
+    LoserNativeAttempt,
+}
+
+struct WorkerDirectoryRaceRunner {
+    role: WorkerDirectoryRaceRole,
+    events: std::sync::mpsc::Sender<WorkerDirectoryRaceEvent>,
+    start: std::sync::mpsc::Receiver<()>,
+    finish_winner_binding: Option<std::sync::mpsc::Receiver<()>>,
+}
+
+impl PreparedActionRunner for WorkerDirectoryRaceRunner {
+    fn execute_prepared_and_bind<Bind>(
+        &mut self,
+        action: &mut Action,
+        _expected: &ActionEffect,
+        bind: Bind,
+    ) -> Result<(MutationCompletion, DurableReceiptBinding), ApplyPlanError>
+    where
+        Bind: for<'authority> FnOnce(
+            VerifiedActionEffect<'authority>,
+        ) -> Result<DurableReceiptBinding, ReceiptStoreError>,
+    {
+        self.events
+            .send(WorkerDirectoryRaceEvent::Prepared(self.role))
+            .unwrap();
+        self.start.recv().unwrap();
+        if self.role == WorkerDirectoryRaceRole::Loser {
+            self.events
+                .send(WorkerDirectoryRaceEvent::LoserNativeAttempt)
+                .unwrap();
+        }
+        let role = self.role;
+        let events = self.events.clone();
+        let finish_winner_binding = self.finish_winner_binding.as_ref();
+        action
+            .execute_prepared_and_bind(|verified| {
+                let binding = bind(verified)?;
+                if role == WorkerDirectoryRaceRole::Winner {
+                    events.send(WorkerDirectoryRaceEvent::WinnerBound).unwrap();
+                    finish_winner_binding.unwrap().recv().unwrap();
+                }
+                Ok(binding)
+            })
+            .map_err(|error| match error {
+                super::PreparedExecutionError::Action(error) => ApplyPlanError::Action(error),
+                super::PreparedExecutionError::ReceiptConflict => {
+                    ApplyPlanError::Receipt(ReceiptStoreError::IntentConflict)
+                }
+                super::PreparedExecutionError::Binding(error) => ApplyPlanError::Receipt(error),
+            })
+    }
+}
+
+#[test]
+fn separate_receipt_stores_racing_one_layout_have_one_owner_and_one_conflict() {
+    let fixture = JournalFixture::new("worker-directory-two-store-race");
+    harden_user_journal_fixture(&fixture);
+    let principal = crate::platform::resolve_current_worker_principal().unwrap();
+    let context = crate::platform::SetupExecutionContext::new_for_test(
+        crate::platform::SetupHostPrivilege::Ordinary,
+        principal.clone(),
+    );
+    let root = fixture.root.join("worker-root");
+    let (mut winner_plan, layout) = current_user_worker_directory_plan_for_test(
+        &context,
+        root.clone(),
+        Some(fixture.root.clone()),
+    )
+    .unwrap();
+    let (mut loser_plan, loser_layout) = current_user_worker_directory_plan_for_test(
+        &context,
+        root.clone(),
+        Some(fixture.root.clone()),
+    )
+    .unwrap();
+    winner_plan.retain(|action| action.name().as_str() == "identity.directory.root");
+    loser_plan.retain(|action| action.name().as_str() == "identity.directory.root");
+    assert_eq!(layout, loser_layout);
+    let winner_directory = fixture.root.join("winner-state");
+    let loser_directory = fixture.root.join("loser-state");
+    fs::create_dir(&winner_directory).unwrap();
+    fs::create_dir(&loser_directory).unwrap();
+    crate::platform::harden_manifest_directory(
+        &winner_directory,
+        crate::platform::ManifestOwner::User,
+        &principal,
+    )
+    .unwrap();
+    crate::platform::harden_manifest_directory(
+        &loser_directory,
+        crate::platform::ManifestOwner::User,
+        &principal,
+    )
+    .unwrap();
+    let winner_store = ReceiptStore::new_user_for_test_with_worker_layout(
+        winner_directory.join("receipt.json"),
+        layout,
+    );
+    let loser_store = ReceiptStore::new_user_for_test_with_worker_layout(
+        loser_directory.join("receipt.json"),
+        loser_layout,
+    );
+    let winner_snapshot_store = winner_store.clone();
+    let loser_snapshot_store = loser_store.clone();
+    let loser_intent =
+        loser_directory.join(".receipt.json.transaction.019cb090-3400-7000-8000-000000000062.json");
+    let (events_tx, events_rx) = std::sync::mpsc::channel();
+    let (winner_start_tx, winner_start_rx) = std::sync::mpsc::channel();
+    let (loser_start_tx, loser_start_rx) = std::sync::mpsc::channel();
+    let (winner_finish_tx, winner_finish_rx) = std::sync::mpsc::channel();
+    let (completed_tx, completed_rx) = std::sync::mpsc::channel();
+
+    let (winner_result, loser_result) = std::thread::scope(|scope| {
+        let winner_completed = completed_tx.clone();
+        let winner_events = events_tx.clone();
+        let winner = scope.spawn(move || {
+            let mut runner = WorkerDirectoryRaceRunner {
+                role: WorkerDirectoryRaceRole::Winner,
+                events: winner_events,
+                start: winner_start_rx,
+                finish_winner_binding: Some(winner_finish_rx),
+            };
+            let result = apply_plan_with_runner(
+                &mut winner_plan,
+                &winner_store,
+                &mut ReceiptMetadataSource::for_test([(
+                    "019cb090-3400-7000-8000-000000000061",
+                    "2026-09-03T12:40:00Z",
+                )]),
+                &mut runner,
+            );
+            winner_completed
+                .send(WorkerDirectoryRaceRole::Winner)
+                .unwrap();
+            result
+        });
+        let loser_completed = completed_tx.clone();
+        let loser = scope.spawn(move || {
+            let mut runner = WorkerDirectoryRaceRunner {
+                role: WorkerDirectoryRaceRole::Loser,
+                events: events_tx,
+                start: loser_start_rx,
+                finish_winner_binding: None,
+            };
+            let result = apply_plan_with_runner(
+                &mut loser_plan,
+                &loser_store,
+                &mut ReceiptMetadataSource::for_test([(
+                    "019cb090-3400-7000-8000-000000000062",
+                    "2026-09-03T12:40:01Z",
+                )]),
+                &mut runner,
+            );
+            loser_completed
+                .send(WorkerDirectoryRaceRole::Loser)
+                .unwrap();
+            result
+        });
+
+        let mut prepared = [events_rx.recv().unwrap(), events_rx.recv().unwrap()];
+        prepared.sort_by_key(|event| match event {
+            WorkerDirectoryRaceEvent::Prepared(WorkerDirectoryRaceRole::Winner) => 0,
+            WorkerDirectoryRaceEvent::Prepared(WorkerDirectoryRaceRole::Loser) => 1,
+            _ => 2,
+        });
+        assert_eq!(
+            prepared,
+            [
+                WorkerDirectoryRaceEvent::Prepared(WorkerDirectoryRaceRole::Winner),
+                WorkerDirectoryRaceEvent::Prepared(WorkerDirectoryRaceRole::Loser),
+            ]
+        );
+        winner_start_tx.send(()).unwrap();
+        assert_eq!(
+            events_rx.recv().unwrap(),
+            WorkerDirectoryRaceEvent::WinnerBound
+        );
+        loser_start_tx.send(()).unwrap();
+        assert_eq!(
+            events_rx.recv().unwrap(),
+            WorkerDirectoryRaceEvent::LoserNativeAttempt
+        );
+        assert!(matches!(
+            completed_rx.recv_timeout(std::time::Duration::from_millis(100)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        winner_finish_tx.send(()).unwrap();
+        (winner.join().unwrap(), loser.join().unwrap())
+    });
+
+    assert_eq!(winner_result.unwrap().applied_count(), 1);
+    let loser_error = loser_result.unwrap_err();
+    assert_eq!(loser_error.error_code(), "setup.receipt_conflict");
+    assert_eq!(loser_error.exit_code(), 13);
+    assert_eq!(
+        winner_snapshot_store.read_snapshot().unwrap().entry_count(),
+        1
+    );
+    assert!(loser_snapshot_store.read_snapshot().unwrap().is_empty());
+    assert!(loser_intent.exists());
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&fs::read(loser_intent).unwrap()).unwrap()
+            ["phase"],
+        "prepared"
+    );
+    assert!(root.is_dir());
+}
+
+#[test]
+fn same_receipt_store_serializes_worker_directory_before_the_second_check() {
+    let fixture = JournalFixture::new("worker-directory-same-store-race");
+    harden_user_journal_fixture(&fixture);
+    let principal = crate::platform::resolve_current_worker_principal().unwrap();
+    let context = crate::platform::SetupExecutionContext::new_for_test(
+        crate::platform::SetupHostPrivilege::Ordinary,
+        principal,
+    );
+    let root = fixture.root.join("worker-root");
+    let (mut first_plan, layout) = current_user_worker_directory_plan_for_test(
+        &context,
+        root.clone(),
+        Some(fixture.root.clone()),
+    )
+    .unwrap();
+    let (mut second_plan, _) = current_user_worker_directory_plan_for_test(
+        &context,
+        root.clone(),
+        Some(fixture.root.clone()),
+    )
+    .unwrap();
+    first_plan.retain(|action| action.name().as_str() == "identity.directory.root");
+    second_plan.retain(|action| action.name().as_str() == "identity.directory.root");
+    let store = ReceiptStore::new_user_for_test_with_worker_layout(fixture.receipt_path(), layout);
+    let snapshot_store = store.clone();
+    let start = Arc::new(Barrier::new(2));
+
+    let reports = std::thread::scope(|scope| {
+        let first_store = store.clone();
+        let first_start = Arc::clone(&start);
+        let first = scope.spawn(move || {
+            first_start.wait();
+            apply_plan_with_journal(
+                &mut first_plan,
+                &first_store,
+                &mut ReceiptMetadataSource::for_test([(
+                    "019cb090-3400-7000-8000-000000000071",
+                    "2026-09-03T12:41:00Z",
+                )]),
+            )
+            .unwrap()
+        });
+        let second = scope.spawn(move || {
+            start.wait();
+            apply_plan_with_journal(
+                &mut second_plan,
+                &store,
+                &mut ReceiptMetadataSource::for_test([(
+                    "019cb090-3400-7000-8000-000000000072",
+                    "2026-09-03T12:41:01Z",
+                )]),
+            )
+            .unwrap()
+        });
+        [first.join().unwrap(), second.join().unwrap()]
+    });
+
+    assert_eq!(
+        reports
+            .iter()
+            .map(|report| report.applied_count())
+            .sum::<usize>(),
+        1
+    );
+    assert_eq!(
+        reports
+            .iter()
+            .map(|report| report.noop_count())
+            .sum::<usize>(),
+        1
+    );
+    assert_eq!(
+        reports
+            .iter()
+            .filter(|report| report.is_nothing_to_do())
+            .count(),
+        1
+    );
+    assert_eq!(snapshot_store.read_snapshot().unwrap().entry_count(), 1);
+    assert!(fixture.only_transaction_path_if_present().is_none());
+    assert!(root.is_dir());
+}
+
+#[test]
+fn current_user_unbound_worker_directory_evidence_is_not_adopted() {
+    let fixture = JournalFixture::new("worker-directory-unbound-publication");
+    harden_user_journal_fixture(&fixture);
+    let principal = crate::platform::resolve_current_worker_principal().unwrap();
+    let context = crate::platform::SetupExecutionContext::new_for_test(
+        crate::platform::SetupHostPrivilege::Ordinary,
+        principal,
+    );
+    let root = fixture.root.join("worker-root");
+    let (mut plan, layout) = current_user_worker_directory_plan_for_test(
+        &context,
+        root.clone(),
+        Some(fixture.root.clone()),
+    )
+    .unwrap();
+    plan.retain(|action| action.name().as_str() == "identity.directory.root");
+    let store =
+        ReceiptStore::new_user_for_test_with_worker_layout(fixture.receipt_path(), layout.clone());
+    crate::platform::set_worker_node_binding_interruption_for_action_test(true);
+
+    let interrupted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        apply_plan_with_journal(
+            &mut plan,
+            &store,
+            &mut ReceiptMetadataSource::for_test([(
+                "019cb090-3400-7000-8000-000000000041",
+                "2026-09-03T12:20:00Z",
+            )]),
+        )
+    }));
+    crate::platform::set_worker_node_binding_interruption_for_action_test(false);
+
+    assert!(interrupted.is_err());
+    assert!(root.is_dir());
+    assert!(store.read_snapshot().unwrap().is_empty());
+    let root_before = preserved_path(&root);
+    let intent_path = fixture.only_transaction_path();
+    let intent_before = fs::read(&intent_path).unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&intent_before).unwrap()["phase"],
+        "prepared"
+    );
+
+    let error =
+        apply_plan_with_journal(&mut plan, &store, &mut ReceiptMetadataSource::for_test([]))
+            .unwrap_err();
+
+    assert_eq!(error.error_code(), "setup.receipt_conflict");
+    assert_eq!(error.exit_code(), 13);
+    assert!(store.read_snapshot().unwrap().is_empty());
+    assert_eq!(preserved_path(&root), root_before);
+    assert_eq!(fs::read(&intent_path).unwrap(), intent_before);
+    for node in [
+        WorkerDirectoryNode::Repos,
+        WorkerDirectoryNode::Jobs,
+        WorkerDirectoryNode::Cache,
+        WorkerDirectoryNode::Artifacts,
+        WorkerDirectoryNode::Logs,
+    ] {
+        assert!(!layout.path_for_node(node).unwrap().exists());
+    }
+}
+
+#[test]
+fn worker_directory_succeeded_recovery_is_plan_independent_at_every_boundary() {
+    #[derive(Clone, Copy, Debug)]
+    enum Boundary {
+        BeforeAppend,
+        AfterAppend,
+        AfterNativeRetirement,
+    }
+
+    for boundary in [
+        Boundary::BeforeAppend,
+        Boundary::AfterAppend,
+        Boundary::AfterNativeRetirement,
+    ] {
+        let fixture =
+            JournalFixture::new(&format!("worker-directory-succeeded-boundary-{boundary:?}"));
+        harden_user_journal_fixture(&fixture);
+        let principal = crate::platform::resolve_current_worker_principal().unwrap();
+        let context = crate::platform::SetupExecutionContext::new_for_test(
+            crate::platform::SetupHostPrivilege::Ordinary,
+            principal,
+        );
+        let root = fixture.root.join("worker-root");
+        let (mut plan, layout) = current_user_worker_directory_plan_for_test(
+            &context,
+            root.clone(),
+            Some(fixture.root.clone()),
+        )
+        .unwrap();
+        plan.retain(|action| action.name().as_str() == "identity.directory.root");
+        let interrupted_store = match boundary {
+            Boundary::BeforeAppend => {
+                ReceiptStore::new_user_for_test_with_worker_layout_failing_before_replace(
+                    fixture.receipt_path(),
+                    layout.clone(),
+                )
+            }
+            Boundary::AfterAppend => ReceiptStore::new_user_for_test_with_worker_layout(
+                fixture.receipt_path(),
+                layout.clone(),
+            ),
+            Boundary::AfterNativeRetirement => {
+                ReceiptStore::new_user_for_test_with_worker_layout_failing_before_intent_retirement(
+                    fixture.receipt_path(),
+                    layout.clone(),
+                )
+            }
+        };
+
+        if matches!(boundary, Boundary::AfterAppend) {
+            crate::platform::set_worker_node_post_binding_interruption_for_action_test(true);
+            let interrupted = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                apply_plan_with_journal(
+                    &mut plan,
+                    &interrupted_store,
+                    &mut ReceiptMetadataSource::for_test([(
+                        "019cb090-3400-7000-8000-000000000051",
+                        "2026-09-03T12:30:00Z",
+                    )]),
+                )
+            }));
+            crate::platform::set_worker_node_post_binding_interruption_for_action_test(false);
+            assert!(interrupted.is_err(), "{boundary:?}");
+        } else {
+            let error = apply_plan_with_journal(
+                &mut plan,
+                &interrupted_store,
+                &mut ReceiptMetadataSource::for_test([(
+                    "019cb090-3400-7000-8000-000000000051",
+                    "2026-09-03T12:30:00Z",
+                )]),
+            )
+            .unwrap_err();
+            assert_eq!(error.error_code(), "setup.receipt_conflict", "{boundary:?}");
+            assert_eq!(error.exit_code(), 13, "{boundary:?}");
+        }
+
+        assert!(root.is_dir(), "{boundary:?}");
+        let intent_path = fixture.only_transaction_path();
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(&fs::read(&intent_path).unwrap()).unwrap()
+                ["phase"],
+            "succeeded",
+            "{boundary:?}",
+        );
+        assert_eq!(
+            interrupted_store.read_snapshot().unwrap().entry_count(),
+            usize::from(!matches!(boundary, Boundary::BeforeAppend)),
+            "{boundary:?}",
+        );
+
+        let store = ReceiptStore::new_user_for_test_with_worker_layout(
+            fixture.receipt_path(),
+            layout.clone(),
+        );
+        let recovery =
+            apply_plan_with_journal(&mut [], &store, &mut ReceiptMetadataSource::for_test([]))
+                .unwrap();
+
+        assert_eq!(recovery.recovered_count(), 1, "{boundary:?}");
+        assert_eq!(recovery.applied_count(), 0, "{boundary:?}");
+        assert_eq!(store.read_snapshot().unwrap().entry_count(), 1);
+        assert!(!intent_path.exists(), "{boundary:?}");
+        assert_eq!(
+            crate::platform::inspect_worker_directory_node(&layout, WorkerDirectoryNode::Root),
+            crate::platform::WorkerDirectoryNodeInspection::Healthy,
+            "{boundary:?}",
+        );
+    }
 }
 
 #[test]

@@ -4364,6 +4364,28 @@ fn apply_sddl(path: &Path, sddl: &str) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(test)]
+pub(super) fn seed_incompatible_worker_directory_acl_for_action_test(
+    path: &Path,
+    principal: &WorkerPrincipal,
+) -> io::Result<()> {
+    apply_sddl(
+        path,
+        &format!(
+            "O:{0}D:P(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)(A;OICI;FA;;;{0})(A;OICI;FA;;;WD)",
+            principal.principal_id()
+        ),
+    )
+}
+
+#[cfg(test)]
+pub(super) fn worker_directory_acl_is_incompatible_for_action_test(
+    path: &Path,
+    principal: &WorkerPrincipal,
+) -> io::Result<bool> {
+    Ok(inspect_user_acl(path, principal, AclKind::UserDirectory).is_err())
+}
+
 fn acl_sddl(worker_sid: &str, kind: AclKind) -> String {
     match kind {
         AclKind::Manifest => {

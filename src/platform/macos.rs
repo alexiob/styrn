@@ -3854,6 +3854,53 @@ fn verify_no_extended_acl(path: &Path) -> io::Result<()> {
     verify_no_extended_acl_c_path(&c_path(path)?)
 }
 
+#[cfg(test)]
+pub(super) fn seed_incompatible_worker_directory_acl_for_action_test(
+    path: &Path,
+    _principal: &WorkerPrincipal,
+) -> io::Result<()> {
+    let mut acl = unsafe { acl_init(1) };
+    if acl.is_null() {
+        return Err(io::Error::last_os_error());
+    }
+    let mut entry = std::ptr::null_mut();
+    if unsafe { acl_create_entry(&mut acl, &mut entry) } != 0 {
+        unsafe {
+            acl_free(acl);
+        }
+        return Err(io::Error::last_os_error());
+    }
+    let owned = OwnedAcl(acl);
+    if unsafe { acl_set_tag_type(entry, ACL_EXTENDED_ALLOW) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let mut uuid = [0_u8; 16];
+    if unsafe { mbr_uid_to_uuid(libc::geteuid(), uuid.as_mut_ptr()) } != 0
+        || unsafe { acl_set_qualifier(entry, uuid.as_ptr().cast()) } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    let mut permissions = std::ptr::null_mut();
+    if unsafe { acl_get_permset(entry, &mut permissions) } != 0
+        || unsafe { acl_add_perm(permissions, ACL_WRITE_DATA) } != 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    let path = c_path(path)?;
+    if unsafe { acl_set_file(path.as_ptr(), ACL_TYPE_EXTENDED, owned.0) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(super) fn worker_directory_acl_is_incompatible_for_action_test(
+    path: &Path,
+    _principal: &WorkerPrincipal,
+) -> io::Result<bool> {
+    Ok(verify_no_extended_acl(path).is_err())
+}
+
 #[allow(dead_code)] // Source-including manifest tests do not include receipt reads.
 fn verify_no_extended_acl_fd(fd: i32) -> io::Result<()> {
     verify_no_extended_acl_value(unsafe { acl_get_fd_np(fd, ACL_TYPE_EXTENDED) })
