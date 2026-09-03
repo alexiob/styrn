@@ -847,7 +847,7 @@ fn execution_witness_binding_compares_scope_principal_and_normalized_path() {
     #[cfg(windows)]
     let other_principal = crate::platform::WorkerPrincipal::new(
         crate::platform::PrincipalKind::WindowsSid,
-        "S-1-5-18",
+        "S-1-5-21-1-2-3-4242",
         "other-worker",
         crate::platform::WorkerAccountPolicy::CurrentUser,
     )
