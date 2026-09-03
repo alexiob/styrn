@@ -1,11 +1,13 @@
 use super::{
-    apply_plan_with_journal,
+    apply_plan_with_journal, current_user_worker_directory_plan,
+    current_user_worker_directory_plan_for_test,
     execution::{
         apply_plan_with_runner, ApplyPlanError, DurableReceiptBinding, PreparedActionRunner,
     },
-    Action, ActionDescription, ActionEffect, ActionError, ActionName, ApplyOutcome,
-    HumanInstructions, MutationCompletion, NeedsHuman, PendingSeverity, Privilege, ScriptFragment,
-    TestMetrics, VerifiedActionEffect, WorkerDirectoryNode,
+    Action, ActionDescription, ActionEffect, ActionError, ActionName, ActionParameters,
+    ApplyOutcome, HumanInstructions, MutationCompletion, NeedsHuman, PendingSeverity,
+    PlanOperation, Privilege, ScriptFragment, TestMetrics, VerifiedActionEffect,
+    WorkerDirectoryNode,
 };
 use crate::setup::receipt::{ReceiptMetadataSource, ReceiptStore, ReceiptStoreError};
 use chrono::{TimeZone, Utc};
@@ -95,6 +97,777 @@ const LEGACY_PENDING_PUBLICATION_RECEIPT: &str = r#"{
   ]
 }
 "#;
+
+#[test]
+fn current_user_worker_directory_plan_is_closed_ordered_and_unprivileged() {
+    for (label, support_count) in [("zero", 0), ("one", 1), ("many", 3)] {
+        let fixture = JournalFixture::new(&format!("worker-directory-plan-{label}"));
+        let principal = crate::platform::resolve_current_worker_principal().unwrap();
+        let context = crate::platform::SetupExecutionContext::new_for_test(
+            crate::platform::SetupHostPrivilege::Ordinary,
+            principal.clone(),
+        );
+        let mut root = fixture.root.clone();
+        for ordinal in 0..support_count {
+            root.push(format!("support-{ordinal}"));
+        }
+        root.push("worker-root");
+        let (plan, layout) = current_user_worker_directory_plan_for_test(
+            &context,
+            root.clone(),
+            Some(fixture.root.clone()),
+        )
+        .unwrap();
+        let nodes = layout.materialization_nodes();
+
+        assert_eq!(
+            plan.iter()
+                .map(|action| action.name().as_str())
+                .collect::<Vec<_>>(),
+            nodes
+                .iter()
+                .map(|node| node.action_id())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(nodes.len(), support_count + 6);
+        assert!(plan
+            .iter()
+            .all(|action| action.privilege() == Privilege::None));
+        assert!(plan
+            .iter()
+            .all(|action| action.plan_operation() == PlanOperation::Create));
+
+        for (action, node) in plan.iter().zip(nodes) {
+            let action_parameters = action.parameters();
+            let ActionParameters::WorkerDirectory(parameters) = &action_parameters else {
+                panic!("current-user worker-directory plan emitted a non-directory action")
+            };
+            assert_eq!(parameters.action_id().as_str(), node.action_id());
+            assert_eq!(
+                parameters.installation_scope(),
+                crate::platform::InstallationScope::User
+            );
+            assert_eq!(parameters.principal(), &principal);
+            assert_eq!(parameters.root(), root);
+            assert_eq!(parameters.node(), node);
+            assert_eq!(
+                parameters.path(),
+                layout.path_for_node(node).unwrap().as_path()
+            );
+
+            let prepared = action.prepare().unwrap();
+            assert_eq!(prepared.parameters(), &action_parameters);
+            assert_eq!(prepared.effect().directories_created().len(), 1);
+            assert_eq!(
+                prepared.effect().directories_created()[0].path(),
+                parameters.path().to_str().unwrap()
+            );
+            assert!(prepared.effect().files_created().is_empty());
+            assert!(prepared.effect().files_modified().is_empty());
+            assert!(prepared.effect().services().is_empty());
+            assert!(prepared.effect().accounts().is_empty());
+            assert!(prepared.effect().registry_keys().is_empty());
+            assert!(prepared.effect().firewall_rules().is_empty());
+            assert!(prepared.effect().download_provenance().is_none());
+        }
+    }
+
+    let current = crate::platform::resolve_current_worker_principal().unwrap();
+    let production_context = crate::platform::SetupExecutionContext::new_for_test(
+        crate::platform::SetupHostPrivilege::Ordinary,
+        current,
+    );
+    let production = current_user_worker_directory_plan(&production_context).unwrap();
+    assert!(!production.is_empty());
+    assert!(production
+        .iter()
+        .all(|action| action.privilege() == Privilege::None));
+}
+
+#[test]
+fn current_user_worker_directory_plan_rejects_host_or_principal_drift_before_actions() {
+    let current = crate::platform::resolve_current_worker_principal().unwrap();
+    let elevated = crate::platform::SetupExecutionContext::new_for_test(
+        non_ordinary_setup_privilege(),
+        current.clone(),
+    );
+    assert_worker_directory_factory_rejected(current_user_worker_directory_plan(&elevated));
+
+    let drifted = crate::platform::SetupExecutionContext::new_for_test(
+        crate::platform::SetupHostPrivilege::Ordinary,
+        current.clone(),
+    )
+    .with_original_principal_for_test(different_current_user_principal());
+    assert_worker_directory_factory_rejected(current_user_worker_directory_plan(&drifted));
+
+    let dedicated = crate::platform::WorkerPrincipal::new(
+        current.principal_kind(),
+        current.principal_id(),
+        current.name(),
+        crate::platform::WorkerAccountPolicy::Dedicated,
+    )
+    .unwrap();
+    let wrong_policy = crate::platform::SetupExecutionContext::new_for_test(
+        crate::platform::SetupHostPrivilege::Ordinary,
+        current,
+    )
+    .with_original_principal_for_test(dedicated);
+    assert_worker_directory_factory_rejected(current_user_worker_directory_plan(&wrong_policy));
+}
+
+#[test]
+fn current_user_worker_directory_test_seam_binds_layout_to_validated_context() {
+    let fixture = JournalFixture::new("worker-directory-bound-test-layout");
+    let principal = crate::platform::resolve_current_worker_principal().unwrap();
+    let context = crate::platform::SetupExecutionContext::new_for_test(
+        crate::platform::SetupHostPrivilege::Ordinary,
+        principal.clone(),
+    );
+    let root = fixture.root.join("support").join("worker-root");
+
+    let (plan, layout) = current_user_worker_directory_plan_for_test(
+        &context,
+        root.clone(),
+        Some(fixture.root.clone()),
+    )
+    .unwrap();
+
+    assert_eq!(layout.root(), root);
+    for action in plan {
+        let ActionParameters::WorkerDirectory(parameters) = action.parameters() else {
+            panic!("test seam produced a non-directory action")
+        };
+        assert_eq!(
+            parameters.installation_scope(),
+            crate::platform::InstallationScope::User
+        );
+        assert_eq!(parameters.principal(), &principal);
+        assert_eq!(parameters.root(), layout.root());
+        assert_eq!(
+            parameters.path(),
+            layout.path_for_node(parameters.node()).unwrap()
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn current_user_worker_directory_plan_rejects_non_unicode_paths_before_actions() {
+    use std::os::unix::ffi::OsStringExt;
+
+    let fixture = JournalFixture::new("worker-directory-plan-non-unicode");
+    let principal = crate::platform::resolve_current_worker_principal().unwrap();
+    let context = crate::platform::SetupExecutionContext::new_for_test(
+        crate::platform::SetupHostPrivilege::Ordinary,
+        principal.clone(),
+    );
+    let root = fixture
+        .root
+        .join(std::ffi::OsString::from_vec(vec![b'w', 0xff, b'r']))
+        .join("worker-root");
+    assert_worker_directory_factory_rejected(current_user_worker_directory_plan_for_test(
+        &context,
+        root,
+        Some(fixture.root.clone()),
+    ));
+}
+
+#[test]
+fn current_user_worker_directory_windows_paths_match_receipt_v1_normalization() {
+    for accepted in [
+        r"C:\Users\worker\AppData\Local\Styrn",
+        r"d:\styrn\worker-root",
+    ] {
+        let action =
+            super::worker_directory::windows_recorded_path_is_normalized_for_test(accepted);
+        let receipt = crate::setup::receipt::recorded_windows_path_is_normalized_for_test(accepted);
+        assert_eq!(action, receipt);
+        assert!(action);
+    }
+    for rejected in [
+        r"\\server\share\Styrn",
+        r"\\?\C:\Styrn",
+        r"\\.\C:\Styrn",
+        r"C:/Styrn",
+        "C:\\Styrn\\",
+        r"C:\Styrn\\worker-root",
+        r"C:\Styrn\.\worker-root",
+        r"C:\Styrn\..\worker-root",
+        r"C:\Styrn\name:stream\worker-root",
+        r"C:\Styrn\trailing.\worker-root",
+        r"C:\Styrn\trailing \worker-root",
+        r"C:\Styrn\CON\worker-root",
+        r"C:\Styrn\COM1.txt\worker-root",
+        r"C:\Styrn\bad*name\worker-root",
+    ] {
+        let action =
+            super::worker_directory::windows_recorded_path_is_normalized_for_test(rejected);
+        let receipt = crate::setup::receipt::recorded_windows_path_is_normalized_for_test(rejected);
+        assert_eq!(action, receipt);
+        assert!(!action, "accepted invalid receipt path {rejected:?}");
+    }
+}
+
+fn assert_worker_directory_factory_rejected<T>(result: Result<T, ActionError>) {
+    let error = match result {
+        Ok(_) => panic!("invalid current-user context produced a plan"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        ActionError::CheckFailed { ref action }
+            if action.as_str() == "identity.directory.root"
+    ));
+}
+
+fn non_ordinary_setup_privilege() -> crate::platform::SetupHostPrivilege {
+    #[cfg(target_os = "windows")]
+    {
+        crate::platform::SetupHostPrivilege::Administrator
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        crate::platform::SetupHostPrivilege::Root
+    }
+}
+
+fn different_current_user_principal() -> crate::platform::WorkerPrincipal {
+    #[cfg(unix)]
+    {
+        let current = crate::platform::resolve_current_worker_principal().unwrap();
+        crate::platform::WorkerPrincipal::new(
+            crate::platform::PrincipalKind::UnixUid,
+            current
+                .unix_uid()
+                .unwrap()
+                .saturating_add(1)
+                .max(1)
+                .to_string(),
+            "different-current-user",
+            crate::platform::WorkerAccountPolicy::CurrentUser,
+        )
+        .unwrap()
+    }
+    #[cfg(windows)]
+    {
+        crate::platform::WorkerPrincipal::new(
+            crate::platform::PrincipalKind::WindowsSid,
+            "S-1-5-21-1-2-3-4242",
+            "different-current-user",
+            crate::platform::WorkerAccountPolicy::CurrentUser,
+        )
+        .unwrap()
+    }
+}
+
+#[test]
+fn current_user_worker_directory_check_maps_exact_state_without_leaking_details() {
+    let fixture = JournalFixture::new("worker-directory-check");
+    harden_user_journal_fixture(&fixture);
+    let principal = crate::platform::resolve_current_worker_principal().unwrap();
+    let context = crate::platform::SetupExecutionContext::new_for_test(
+        crate::platform::SetupHostPrivilege::Ordinary,
+        principal.clone(),
+    );
+    let root = fixture.root.join("worker-root");
+    let (mut plan, layout) = current_user_worker_directory_plan_for_test(
+        &context,
+        root.clone(),
+        Some(fixture.root.clone()),
+    )
+    .unwrap();
+    let root_action = plan
+        .iter_mut()
+        .find(|action| action.name().as_str() == "identity.directory.root")
+        .unwrap();
+
+    assert_eq!(root_action.check().unwrap(), super::ActionCheck::Todo);
+
+    let authority = crate::platform::TestNativeMutationAuthority::for_test();
+    let crate::platform::WorkerDirectoryNodeCreateOutcome::Created(creation) =
+        crate::platform::create_worker_directory_node(
+            &layout,
+            WorkerDirectoryNode::Root,
+            &authority,
+        )
+        .unwrap()
+    else {
+        panic!("fresh exact root was not created")
+    };
+    assert!(matches!(
+        creation.bind_after_reverify(|binding| {
+            assert_eq!(binding.observation().path(), root);
+            Ok::<_, ()>(())
+        }),
+        Ok(crate::platform::WorkerDirectoryBound::Bound(()))
+    ));
+    assert_eq!(root_action.check().unwrap(), super::ActionCheck::Done);
+
+    let Action::WorkerDirectory(worker_action) = root_action else {
+        panic!("closed factory returned the wrong action variant")
+    };
+    let unsafe_state = super::worker_directory::check_inspection_for_test(
+        worker_action,
+        crate::platform::WorkerDirectoryNodeInspection::Conflict(
+            crate::platform::WorkerDirectoryInspectionIssue::UnsafeOrConflictingState,
+        ),
+    );
+    for inspection in [
+        crate::platform::WorkerDirectoryNodeInspection::Conflict(
+            crate::platform::WorkerDirectoryInspectionIssue::PrincipalDrift,
+        ),
+        crate::platform::WorkerDirectoryNodeInspection::Conflict(
+            crate::platform::WorkerDirectoryInspectionIssue::ObservationUnavailable,
+        ),
+        crate::platform::WorkerDirectoryNodeInspection::Unknowable(
+            crate::platform::WorkerDirectoryInspectionIssue::UnsafeOrConflictingState,
+        ),
+        crate::platform::WorkerDirectoryNodeInspection::Unknowable(
+            crate::platform::WorkerDirectoryInspectionIssue::PrincipalDrift,
+        ),
+        crate::platform::WorkerDirectoryNodeInspection::Unknowable(
+            crate::platform::WorkerDirectoryInspectionIssue::ObservationUnavailable,
+        ),
+    ] {
+        assert_eq!(
+            super::worker_directory::check_inspection_for_test(worker_action, inspection),
+            unsafe_state
+        );
+    }
+    let super::ActionCheck::NeedsHuman(needs_human) = unsafe_state else {
+        panic!("unsafe exact-node state was not deferred to a human")
+    };
+    assert_eq!(needs_human.severity(), PendingSeverity::Warning);
+    assert!(needs_human.fragment().is_none());
+    assert_eq!(
+        needs_human.instructions().as_str(),
+        "Inspect and repair this worker directory node, then rerun setup."
+    );
+    assert!(!needs_human
+        .instructions()
+        .as_str()
+        .contains(&root.display().to_string()));
+}
+
+#[test]
+fn current_user_worker_directory_conflict_is_pending_and_secret_free() {
+    let fixture = JournalFixture::new("worker-directory-conflict-pending");
+    harden_user_journal_fixture(&fixture);
+    let principal = crate::platform::resolve_current_worker_principal().unwrap();
+    let context = crate::platform::SetupExecutionContext::new_for_test(
+        crate::platform::SetupHostPrivilege::Ordinary,
+        principal.clone(),
+    );
+    let root = fixture.root.join("worker-root");
+    let secret = "sk_live_native-error-must-not-escape";
+    fs::write(&root, secret.as_bytes()).unwrap();
+    let (mut plan, layout) = current_user_worker_directory_plan_for_test(
+        &context,
+        root.clone(),
+        Some(fixture.root.clone()),
+    )
+    .unwrap();
+    plan.retain(|action| action.name().as_str() == "identity.directory.root");
+    let store = ReceiptStore::new_user_for_test_with_worker_layout(fixture.receipt_path(), layout);
+    let report = apply_plan_with_journal(
+        &mut plan,
+        &store,
+        &mut ReceiptMetadataSource::for_test([(
+            "019cb090-3400-7000-8000-000000000001",
+            "2026-09-03T12:00:00Z",
+        )]),
+    )
+    .unwrap();
+
+    assert_eq!(report.applied_count(), 0);
+    assert_eq!(report.pending_count(), 1);
+    assert_eq!(report.pending()[0].id().as_str(), "identity.directory.root");
+    let ActionParameters::WorkerDirectory(parameters) = report.pending()[0].parameters() else {
+        panic!("pending worker-directory conflict lost typed parameters")
+    };
+    assert_eq!(parameters.node(), WorkerDirectoryNode::Root);
+    assert_eq!(parameters.path(), root);
+    let bytes = store.read_snapshot().unwrap().to_json().unwrap();
+    let json = String::from_utf8(bytes).unwrap();
+    assert!(!json.contains(secret));
+    let value = serde_json::from_str::<serde_json::Value>(&json).unwrap();
+    let entry = &value["entries"][0];
+    assert_eq!(entry["status"], "pending");
+    for field in [
+        "directories_created",
+        "files_created",
+        "files_modified",
+        "services",
+        "accounts",
+        "registry_keys",
+        "firewall_rules",
+    ] {
+        assert_eq!(entry[field], serde_json::json!([]));
+    }
+    assert_eq!(fs::read(&root).unwrap(), secret.as_bytes());
+}
+
+#[test]
+fn current_user_worker_directory_rejects_legacy_unjournaled_apply() {
+    let fixture = JournalFixture::new("worker-directory-legacy-apply");
+    harden_user_journal_fixture(&fixture);
+    let principal = crate::platform::resolve_current_worker_principal().unwrap();
+    let context = crate::platform::SetupExecutionContext::new_for_test(
+        crate::platform::SetupHostPrivilege::Ordinary,
+        principal.clone(),
+    );
+    let root = fixture.root.join("worker-root");
+    let (mut plan, _layout) = current_user_worker_directory_plan_for_test(
+        &context,
+        root.clone(),
+        Some(fixture.root.clone()),
+    )
+    .unwrap();
+    let root_action = plan
+        .iter_mut()
+        .find(|action| action.name().as_str() == "identity.directory.root")
+        .unwrap();
+
+    let error = root_action.apply().unwrap_err();
+
+    assert!(matches!(
+        error,
+        ActionError::ApplyFailed { ref action }
+            if action.as_str() == "identity.directory.root"
+    ));
+    assert!(!root.exists());
+}
+
+#[test]
+fn current_user_worker_directory_fresh_plan_has_exact_receipt_prefix_and_idempotent_rerun() {
+    let fixture = JournalFixture::new("worker-directory-fresh-plan");
+    harden_user_journal_fixture(&fixture);
+    let principal = crate::platform::resolve_current_worker_principal().unwrap();
+    let context = crate::platform::SetupExecutionContext::new_for_test(
+        crate::platform::SetupHostPrivilege::Ordinary,
+        principal.clone(),
+    );
+    let root = fixture.root.join("support").join("worker-root");
+    let (mut plan, layout) = current_user_worker_directory_plan_for_test(
+        &context,
+        root.clone(),
+        Some(fixture.root.clone()),
+    )
+    .unwrap();
+    let nodes = layout.materialization_nodes();
+    assert_eq!(nodes.len(), 7, "fixture must exercise one support node");
+    let store =
+        ReceiptStore::new_user_for_test_with_worker_layout(fixture.receipt_path(), layout.clone());
+    let mut metadata = ReceiptMetadataSource::for_test([
+        (
+            "019cb090-3400-7000-8000-000000000011",
+            "2026-09-03T12:00:00Z",
+        ),
+        (
+            "019cb090-3400-7000-8000-000000000012",
+            "2026-09-03T12:00:01Z",
+        ),
+        (
+            "019cb090-3400-7000-8000-000000000013",
+            "2026-09-03T12:00:02Z",
+        ),
+        (
+            "019cb090-3400-7000-8000-000000000014",
+            "2026-09-03T12:00:03Z",
+        ),
+        (
+            "019cb090-3400-7000-8000-000000000015",
+            "2026-09-03T12:00:04Z",
+        ),
+        (
+            "019cb090-3400-7000-8000-000000000016",
+            "2026-09-03T12:00:05Z",
+        ),
+        (
+            "019cb090-3400-7000-8000-000000000017",
+            "2026-09-03T12:00:06Z",
+        ),
+    ]);
+
+    for (index, action) in plan.iter_mut().enumerate() {
+        let report =
+            apply_plan_with_journal(std::slice::from_mut(action), &store, &mut metadata).unwrap();
+        assert_eq!(report.applied_count(), 1);
+        assert_eq!(report.pending_count(), 0);
+        for (node_index, node) in nodes.iter().copied().enumerate() {
+            assert_eq!(
+                layout.path_for_node(node).unwrap().is_dir(),
+                node_index <= index,
+                "action {index} changed non-prefix node {node_index}"
+            );
+        }
+
+        let receipt = serde_json::from_slice::<serde_json::Value>(
+            &store.read_snapshot().unwrap().to_json().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(receipt["entries"].as_array().unwrap().len(), index + 1);
+        let entry = &receipt["entries"][index];
+        let expected_node = nodes[index];
+        let expected_path = layout.path_for_node(expected_node).unwrap();
+        assert_eq!(
+            entry["action"]["parameters"]["action_id"],
+            expected_node.action_id()
+        );
+        assert_eq!(
+            entry["action"]["parameters"]["path"],
+            expected_path.to_str().unwrap()
+        );
+        assert_eq!(entry["privilege_used"], "none");
+        assert_eq!(
+            entry["directories_created"],
+            serde_json::json!([{ "path": expected_path.to_str().unwrap() }])
+        );
+        assert_eq!(entry["accounts"], serde_json::json!([]));
+    }
+
+    let first_receipt_bytes = fs::read(fixture.receipt_path()).unwrap();
+    let unrelated = root.join("unrelated.txt");
+    fs::write(&unrelated, b"unrelated bytes\n").unwrap();
+    let nested = layout.jobs().join("preserved-nested");
+    fs::create_dir(&nested).unwrap();
+    let sentinel = nested.join("sentinel.txt");
+    fs::write(&sentinel, b"sentinel bytes\n").unwrap();
+    set_distinct_test_metadata(&unrelated, &nested, &sentinel);
+    let unrelated_before = preserved_path(&unrelated);
+    let nested_before = preserved_path(&nested);
+    let sentinel_before = preserved_path(&sentinel);
+
+    let second =
+        apply_plan_with_journal(&mut plan, &store, &mut ReceiptMetadataSource::for_test([]))
+            .unwrap();
+
+    assert!(second.is_nothing_to_do());
+    assert_eq!(second.message(), "nothing to do");
+    assert_eq!(second.noop_count(), nodes.len());
+    assert_eq!(
+        fs::read(fixture.receipt_path()).unwrap(),
+        first_receipt_bytes
+    );
+    assert_eq!(preserved_path(&unrelated), unrelated_before);
+    assert_eq!(preserved_path(&nested), nested_before);
+    assert_eq!(preserved_path(&sentinel), sentinel_before);
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct PreservedPath {
+    bytes: Option<Vec<u8>>,
+    len: u64,
+    readonly: bool,
+    modified: std::time::SystemTime,
+    #[cfg(unix)]
+    device: u64,
+    #[cfg(unix)]
+    inode: u64,
+    #[cfg(unix)]
+    uid: u32,
+    #[cfg(unix)]
+    gid: u32,
+    #[cfg(unix)]
+    mode: u32,
+    #[cfg(target_os = "windows")]
+    file_attributes: u32,
+    #[cfg(target_os = "windows")]
+    creation_time: u64,
+    #[cfg(target_os = "windows")]
+    last_write_time: u64,
+}
+
+fn preserved_path(path: &Path) -> PreservedPath {
+    let metadata = fs::symlink_metadata(path).unwrap();
+    #[cfg(unix)]
+    use std::os::unix::fs::MetadataExt as _;
+    #[cfg(target_os = "windows")]
+    use std::os::windows::fs::MetadataExt as _;
+    PreservedPath {
+        bytes: metadata.is_file().then(|| fs::read(path).unwrap()),
+        len: metadata.len(),
+        readonly: metadata.permissions().readonly(),
+        modified: metadata.modified().unwrap(),
+        #[cfg(unix)]
+        device: metadata.dev(),
+        #[cfg(unix)]
+        inode: metadata.ino(),
+        #[cfg(unix)]
+        uid: metadata.uid(),
+        #[cfg(unix)]
+        gid: metadata.gid(),
+        #[cfg(unix)]
+        mode: metadata.mode(),
+        #[cfg(target_os = "windows")]
+        file_attributes: metadata.file_attributes(),
+        #[cfg(target_os = "windows")]
+        creation_time: metadata.creation_time(),
+        #[cfg(target_os = "windows")]
+        last_write_time: metadata.last_write_time(),
+    }
+}
+
+fn set_distinct_test_metadata(unrelated: &Path, nested: &Path, sentinel: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        fs::set_permissions(unrelated, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::set_permissions(nested, fs::Permissions::from_mode(0o711)).unwrap();
+        fs::set_permissions(sentinel, fs::Permissions::from_mode(0o640)).unwrap();
+    }
+    #[cfg(target_os = "windows")]
+    {
+        let mut permissions = fs::metadata(sentinel).unwrap().permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(sentinel, permissions).unwrap();
+        let _ = (unrelated, nested);
+    }
+}
+
+#[test]
+fn current_user_worker_directory_existing_race_is_receipt_conflict() {
+    struct RaceWinnerRunner {
+        layout: crate::platform::WorkerDirectoryLayout,
+        node: WorkerDirectoryNode,
+    }
+
+    impl PreparedActionRunner for RaceWinnerRunner {
+        fn execute_prepared_and_bind<Bind>(
+            &mut self,
+            action: &mut Action,
+            _expected: &ActionEffect,
+            bind: Bind,
+        ) -> Result<(MutationCompletion, DurableReceiptBinding), ApplyPlanError>
+        where
+            Bind: for<'authority> FnOnce(
+                VerifiedActionEffect<'authority>,
+            )
+                -> Result<DurableReceiptBinding, ReceiptStoreError>,
+        {
+            let authority = crate::platform::TestNativeMutationAuthority::for_test();
+            let crate::platform::WorkerDirectoryNodeCreateOutcome::Created(creation) =
+                crate::platform::create_worker_directory_node(&self.layout, self.node, &authority)
+                    .unwrap()
+            else {
+                panic!("race stand-in did not win exact-node creation")
+            };
+            assert!(matches!(
+                creation.bind_after_reverify(|_| Ok::<_, ()>(())),
+                Ok(crate::platform::WorkerDirectoryBound::Bound(()))
+            ));
+            action
+                .execute_prepared_and_bind(bind)
+                .map_err(|error| match error {
+                    super::PreparedExecutionError::Action(error) => ApplyPlanError::Action(error),
+                    super::PreparedExecutionError::ReceiptConflict => {
+                        ApplyPlanError::Receipt(ReceiptStoreError::IntentConflict)
+                    }
+                    super::PreparedExecutionError::Binding(error) => ApplyPlanError::Receipt(error),
+                })
+        }
+    }
+
+    let fixture = JournalFixture::new("worker-directory-existing-race");
+    harden_user_journal_fixture(&fixture);
+    let principal = crate::platform::resolve_current_worker_principal().unwrap();
+    let context = crate::platform::SetupExecutionContext::new_for_test(
+        crate::platform::SetupHostPrivilege::Ordinary,
+        principal.clone(),
+    );
+    let root = fixture.root.join("worker-root");
+    let (mut plan, layout) = current_user_worker_directory_plan_for_test(
+        &context,
+        root.clone(),
+        Some(fixture.root.clone()),
+    )
+    .unwrap();
+    plan.retain(|action| action.name().as_str() == "identity.directory.root");
+    let store =
+        ReceiptStore::new_user_for_test_with_worker_layout(fixture.receipt_path(), layout.clone());
+    let mut runner = RaceWinnerRunner {
+        layout,
+        node: WorkerDirectoryNode::Root,
+    };
+
+    let error = apply_plan_with_runner(
+        &mut plan,
+        &store,
+        &mut ReceiptMetadataSource::for_test([(
+            "019cb090-3400-7000-8000-000000000021",
+            "2026-09-03T12:01:00Z",
+        )]),
+        &mut runner,
+    )
+    .unwrap_err();
+
+    assert_eq!(error.error_code(), "setup.receipt_conflict");
+    assert_eq!(error.exit_code(), 13);
+    assert!(root.is_dir());
+    assert!(store.read_snapshot().unwrap().is_empty());
+    let intent = fs::read(fixture.only_transaction_path()).unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&intent).unwrap()["phase"],
+        "prepared"
+    );
+}
+
+#[test]
+fn current_user_worker_directory_typed_failure_evidence_is_applied_then_failed() {
+    let fixture = JournalFixture::new("worker-directory-failure-evidence-map");
+    let principal = crate::platform::resolve_current_worker_principal().unwrap();
+    let context = crate::platform::SetupExecutionContext::new_for_test(
+        crate::platform::SetupHostPrivilege::Ordinary,
+        principal.clone(),
+    );
+    let (plan, _layout) = current_user_worker_directory_plan_for_test(
+        &context,
+        fixture.root.join("worker-root"),
+        Some(fixture.root.clone()),
+    )
+    .unwrap();
+    let action = plan
+        .iter()
+        .find_map(|action| match action {
+            Action::WorkerDirectory(action)
+                if action.name().as_str() == "identity.directory.root" =>
+            {
+                Some(action.as_ref())
+            }
+            _ => None,
+        })
+        .unwrap();
+
+    let (completion, value) = super::worker_directory::map_failure_bound_for_test::<_, ()>(
+        action,
+        crate::platform::WorkerDirectoryNodeFailureBound::Bound {
+            value: "durable binding",
+            primary: std::io::Error::other("injected post-create failure"),
+        },
+    )
+    .unwrap();
+    assert_eq!(value, "durable binding");
+    assert!(matches!(
+        completion,
+        MutationCompletion::AppliedThenFailed(ActionError::ApplyFailed { ref action })
+            if action.as_str() == "identity.directory.root"
+    ));
+
+    let retirement_error = super::worker_directory::map_failure_bound_for_test::<_, ()>(
+        action,
+        crate::platform::WorkerDirectoryNodeFailureBound::BoundWithRetirementFailure {
+            value: "durable binding",
+            primary: std::io::Error::other("injected post-create failure"),
+            error: std::io::Error::other("injected evidence-retirement failure"),
+        },
+    )
+    .unwrap_err();
+    assert!(matches!(
+        retirement_error,
+        super::PreparedExecutionError::Action(ActionError::ApplyFailed { ref action })
+            if action.as_str() == "identity.directory.root"
+    ));
+}
 
 #[test]
 fn verified_effect_is_bound_before_native_authority_release() {

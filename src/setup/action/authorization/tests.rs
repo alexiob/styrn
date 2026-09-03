@@ -122,6 +122,106 @@ fn production_native_entrypoint_applies_user_plan_without_authorization() {
 }
 
 #[test]
+fn current_user_worker_directory_never_requests_authorization() {
+    let fixture = AuthorizationFixture::new("worker-directory-zero-authorization");
+    let principal = crate::platform::resolve_current_worker_principal().unwrap();
+    let setup_context = crate::platform::SetupExecutionContext::new_for_test(
+        crate::platform::SetupHostPrivilege::Ordinary,
+        principal.clone(),
+    );
+    let root = fixture.root.join("worker-root");
+    let (mut plan, layout) = super::super::current_user_worker_directory_plan_for_test(
+        &setup_context,
+        root,
+        Some(fixture.root.clone()),
+    )
+    .unwrap();
+    assert_eq!(plan.len(), 6);
+    assert!(plan
+        .iter()
+        .all(|action| action.privilege() == Privilege::None));
+    let store = ReceiptStore::new_user_for_test_with_worker_layout(fixture.user_receipt(), layout);
+    let mut metadata = ReceiptMetadataSource::for_test([
+        (
+            "019cb090-3400-7000-8000-000000000101",
+            "2026-09-03T12:10:00Z",
+        ),
+        (
+            "019cb090-3400-7000-8000-000000000102",
+            "2026-09-03T12:10:01Z",
+        ),
+        (
+            "019cb090-3400-7000-8000-000000000103",
+            "2026-09-03T12:10:02Z",
+        ),
+        (
+            "019cb090-3400-7000-8000-000000000104",
+            "2026-09-03T12:10:03Z",
+        ),
+        (
+            "019cb090-3400-7000-8000-000000000105",
+            "2026-09-03T12:10:04Z",
+        ),
+        (
+            "019cb090-3400-7000-8000-000000000106",
+            "2026-09-03T12:10:05Z",
+        ),
+    ]);
+    let mut invoker = SpyInvoker::default();
+
+    let report = execute_with_authorization(
+        &mut plan,
+        &store,
+        &mut metadata,
+        &fixture.context(),
+        AuthorizationOptions::noninteractive_yes(),
+        &mut invoker,
+    )
+    .unwrap();
+
+    assert_eq!(report.ordinary().applied_count(), 6);
+    assert_eq!(report.privileged_status(), PrivilegedStatus::NotNeeded);
+    assert!(report.everything_ready());
+    assert_eq!(invoker.calls(), 0);
+    assert!(!fixture.request_path().exists());
+}
+
+#[test]
+fn current_user_worker_directory_creates_no_account() {
+    let fixture = AuthorizationFixture::new("worker-directory-zero-account");
+    let principal = crate::platform::resolve_current_worker_principal().unwrap();
+    let setup_context = crate::platform::SetupExecutionContext::new_for_test(
+        crate::platform::SetupHostPrivilege::Ordinary,
+        principal.clone(),
+    );
+    let (plan, _layout) = super::super::current_user_worker_directory_plan_for_test(
+        &setup_context,
+        fixture.root.join("worker-root"),
+        Some(fixture.root.clone()),
+    )
+    .unwrap();
+
+    for action in &plan {
+        let prepared = action.prepare().unwrap();
+        assert!(prepared.effect().accounts().is_empty());
+        assert!(prepared.effect().services().is_empty());
+        assert!(prepared.effect().registry_keys().is_empty());
+        let super::super::ActionParameters::WorkerDirectory(parameters) = prepared.parameters()
+        else {
+            panic!("worker-directory action lost its closed parameters")
+        };
+        assert_eq!(
+            parameters.principal().account_policy(),
+            crate::platform::WorkerAccountPolicy::CurrentUser
+        );
+    }
+    let source = include_str!("../worker_directory.rs");
+    assert!(!source.contains("resolve_named_worker_principal"));
+    assert!(!source.contains("create_worker_account"));
+    assert!(!source.contains("invoke_setup_authorization"));
+}
+
+#[test]
 fn ordinary_user_plan_applies_and_reruns_without_authorization() {
     let fixture = AuthorizationFixture::new("ordinary-only");
     let store = ReceiptStore::new_user_for_test(fixture.user_receipt());

@@ -740,6 +740,9 @@ fn requested_action(action: &Action) -> RequestedAction {
                 PlanOperation::Remove => RequestedOperation::Remove,
             },
         },
+        Action::WorkerDirectory(_) => {
+            unreachable!("ordinary worker-directory actions cannot enter authorization requests")
+        }
         #[cfg(test)]
         Action::Test(action) => RequestedAction::TestState {
             action_id: action.name.as_str().to_owned(),

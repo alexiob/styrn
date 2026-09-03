@@ -3635,6 +3635,11 @@ fn is_normalized_windows_path(value: &str) -> bool {
     })
 }
 
+#[cfg(test)]
+pub(in crate::setup) fn recorded_windows_path_is_normalized_for_test(value: &str) -> bool {
+    is_normalized_windows_path(value)
+}
+
 #[cfg(any(test, target_os = "windows"))]
 fn is_reserved_windows_device_name(segment: &str) -> bool {
     let stem = segment

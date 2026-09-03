@@ -566,6 +566,8 @@ impl ActionError {
 /// enum; there is no open implementation trait or raw mutation entry point.
 pub(crate) enum Action {
     Foundation(FoundationAction),
+    #[cfg(not(action_core_fixture))]
+    WorkerDirectory(Box<worker_directory::WorkerDirectoryAction>),
     #[cfg(test)]
     Test(TestAction),
 }
@@ -869,6 +871,8 @@ mod gate {
         pub(crate) fn name(&self) -> &ActionName {
             match self {
                 Self::Foundation(action) => &action.name,
+                #[cfg(not(action_core_fixture))]
+                Self::WorkerDirectory(action) => action.name(),
                 #[cfg(test)]
                 Self::Test(action) => &action.name,
             }
@@ -877,6 +881,8 @@ mod gate {
         pub(in crate::setup::action) fn parameters(&self) -> ActionParameters {
             match self {
                 Self::Foundation(action) => ActionParameters::Foundation(action.name.clone()),
+                #[cfg(not(action_core_fixture))]
+                Self::WorkerDirectory(action) => action.parameters(),
                 #[cfg(test)]
                 Self::Test(action) => action.parameters.clone(),
             }
@@ -885,6 +891,8 @@ mod gate {
         pub(crate) fn check(&self) -> Result<ActionCheck, ActionError> {
             match self {
                 Self::Foundation(action) => Ok(action.check.clone()),
+                #[cfg(not(action_core_fixture))]
+                Self::WorkerDirectory(action) => Ok(action.check()),
                 #[cfg(test)]
                 Self::Test(action) => {
                     action.metrics.check_calls.fetch_add(1, Ordering::SeqCst);
@@ -919,6 +927,8 @@ mod gate {
         pub(crate) fn privilege(&self) -> Privilege {
             match self {
                 Self::Foundation(action) => action.privilege,
+                #[cfg(not(action_core_fixture))]
+                Self::WorkerDirectory(_) => Privilege::None,
                 #[cfg(test)]
                 Self::Test(action) => action.privilege,
             }
@@ -927,6 +937,8 @@ mod gate {
         pub(crate) fn plan_operation(&self) -> PlanOperation {
             match self {
                 Self::Foundation(action) => action.operation,
+                #[cfg(not(action_core_fixture))]
+                Self::WorkerDirectory(_) => PlanOperation::Create,
                 #[cfg(test)]
                 Self::Test(_) => PlanOperation::Reconfigure,
             }
@@ -935,12 +947,18 @@ mod gate {
         pub(crate) fn describe(&self) -> &ActionDescription {
             match self {
                 Self::Foundation(action) => &action.description,
+                #[cfg(not(action_core_fixture))]
+                Self::WorkerDirectory(action) => action.description(),
                 #[cfg(test)]
                 Self::Test(action) => &action.description,
             }
         }
 
         pub(in crate::setup::action) fn apply(&mut self) -> Result<ApplyOutcome, ActionError> {
+            #[cfg(not(action_core_fixture))]
+            if let Self::WorkerDirectory(action) = self {
+                return Err(ActionError::apply_failed(action.name().clone()));
+            }
             match self.check()? {
                 ActionCheck::Done => Ok(ApplyOutcome::Noop),
                 ActionCheck::Todo => execute(self).map(ApplyOutcome::Applied),
@@ -951,6 +969,8 @@ mod gate {
         pub(in crate::setup::action) fn prepare(&self) -> Result<PreparedAction, ActionError> {
             let effect = match self {
                 Self::Foundation(action) => Err(ActionError::apply_failed(action.name.clone())),
+                #[cfg(not(action_core_fixture))]
+                Self::WorkerDirectory(action) => Ok(action.expected_effect()),
                 #[cfg(test)]
                 Self::Test(action) => {
                     action.metrics.prepare_calls.fetch_add(1, Ordering::SeqCst);
@@ -973,13 +993,19 @@ mod gate {
                 VerifiedActionEffect<'authority>,
             ) -> Result<Value, BindingError>,
         ) -> Result<(MutationCompletion, Value), PreparedExecutionError<BindingError>> {
-            let effect = execute(self).map_err(PreparedExecutionError::Action)?;
-            let value = bind(VerifiedActionEffect {
-                effect: &effect,
-                _authority: PhantomData,
-            })
-            .map_err(PreparedExecutionError::Binding)?;
-            Ok((MutationCompletion::Applied, value))
+            match self {
+                #[cfg(not(action_core_fixture))]
+                Self::WorkerDirectory(action) => action.execute_prepared_and_bind(bind),
+                _ => {
+                    let effect = execute(self).map_err(PreparedExecutionError::Action)?;
+                    let value = bind(VerifiedActionEffect {
+                        effect: &effect,
+                        _authority: PhantomData,
+                    })
+                    .map_err(PreparedExecutionError::Binding)?;
+                    Ok((MutationCompletion::Applied, value))
+                }
+            }
         }
 
         pub(crate) fn revert(&mut self, _effect: &ActionEffect) -> Result<(), ActionError> {
@@ -1007,6 +1033,10 @@ mod gate {
     fn execute(action: &mut Action) -> Result<ActionEffect, ActionError> {
         match action {
             Action::Foundation(action) => Err(ActionError::apply_failed(action.name.clone())),
+            #[cfg(not(action_core_fixture))]
+            Action::WorkerDirectory(action) => {
+                Err(ActionError::apply_failed(action.name().clone()))
+            }
             #[cfg(test)]
             Action::Test(action) => {
                 action.metrics.mutation_calls.fetch_add(1, Ordering::SeqCst);
@@ -1059,6 +1089,13 @@ mod gate {
     }
 }
 
+#[cfg(not(action_core_fixture))]
+mod worker_directory;
+#[cfg(not(action_core_fixture))]
+#[allow(unused_imports)] // T0.20 consumes the production constructor.
+pub(in crate::setup) use worker_directory::current_user_worker_directory_plan;
+#[cfg(test)]
+pub(in crate::setup::action) use worker_directory::current_user_worker_directory_plan_for_test;
 #[cfg(not(action_core_fixture))]
 mod authorization;
 #[cfg(not(action_core_fixture))]
