@@ -320,6 +320,175 @@ fn prepared_runner_orders_durable_binding_before_native_authority_release() {
 }
 
 #[test]
+fn substituted_succeeded_intent_after_native_retirement_is_retained_for_recovery() {
+    #[derive(Default)]
+    struct SubstitutionEvidence {
+        original_bytes: Vec<u8>,
+        original_identity: Option<crate::platform::PrivateFileIdentity>,
+        victim_identity: Option<crate::platform::PrivateFileIdentity>,
+    }
+
+    struct SubstituteAfterNativeRetirementRunner<'a> {
+        fixture: &'a JournalFixture,
+        layout: crate::platform::WorkerDirectoryLayout,
+        displaced_intent: PathBuf,
+        evidence: Arc<Mutex<SubstitutionEvidence>>,
+    }
+
+    impl PreparedActionRunner for SubstituteAfterNativeRetirementRunner<'_> {
+        fn execute_prepared_and_bind<Bind>(
+            &mut self,
+            action: &mut Action,
+            expected: &ActionEffect,
+            bind: Bind,
+        ) -> Result<(MutationCompletion, DurableReceiptBinding), ApplyPlanError>
+        where
+            Bind: for<'authority> FnOnce(
+                VerifiedActionEffect<'authority>,
+            )
+                -> Result<DurableReceiptBinding, ReceiptStoreError>,
+        {
+            let authority = crate::platform::TestNativeMutationAuthority::for_test();
+            let crate::platform::WorkerDirectoryNodeCreateOutcome::Created(creation) =
+                crate::platform::create_worker_directory_node(
+                    &self.layout,
+                    WorkerDirectoryNode::Root,
+                    &authority,
+                )
+                .unwrap()
+            else {
+                panic!("fresh synthetic root was not created")
+            };
+            let bound = creation
+                .bind_after_reverify(|_| {
+                    bind(VerifiedActionEffect {
+                        effect: expected,
+                        _authority: std::marker::PhantomData,
+                    })
+                })
+                .map_err(|error| match error {
+                    crate::platform::WorkerDirectoryBindingError::Reverification(_) => {
+                        ApplyPlanError::Action(ActionError::apply_failed(action.name().clone()))
+                    }
+                    crate::platform::WorkerDirectoryBindingError::Binding(error) => {
+                        ApplyPlanError::Receipt(error)
+                    }
+                    crate::platform::WorkerDirectoryBindingError::AuthorityRetirement(_) => {
+                        ApplyPlanError::Action(ActionError::apply_failed(action.name().clone()))
+                    }
+                })?;
+            let binding = match bound {
+                crate::platform::WorkerDirectoryBound::Bound(binding) => binding,
+                crate::platform::WorkerDirectoryBound::BoundWithRetirementFailure { .. } => {
+                    return Err(ActionError::apply_failed(action.name().clone()).into());
+                }
+            };
+
+            // `Bound` is returned only after native evidence retirement. Substitute
+            // the transaction pathname in the remaining window before finalization.
+            let intent_path = self.fixture.only_transaction_path();
+            let original_bytes = fs::read(&intent_path).unwrap();
+            let original_identity = crate::platform::private_file_identity(&intent_path).unwrap();
+            fs::rename(&intent_path, &self.displaced_intent).unwrap();
+            let store = ReceiptStore::new_for_test(self.fixture.receipt_path());
+            let mut victim = crate::platform::create_private_file(
+                &intent_path,
+                crate::platform::ManifestOwner::CurrentProcess,
+                store.worker_principal(),
+            )
+            .unwrap();
+            use std::io::Write as _;
+            victim.write_all(b"unrelated private file\n").unwrap();
+            victim.sync_all().unwrap();
+            let victim_identity = crate::platform::private_file_identity(&intent_path).unwrap();
+            *self.evidence.lock().unwrap() = SubstitutionEvidence {
+                original_bytes,
+                original_identity: Some(original_identity),
+                victim_identity: Some(victim_identity),
+            };
+            Ok((MutationCompletion::Applied, binding))
+        }
+    }
+
+    let fixture = JournalFixture::new("substituted-succeeded-intent-retirement");
+    let principal = crate::platform::resolve_current_worker_principal().unwrap();
+    let layout = crate::platform::resolve_worker_directory_layout(
+        crate::platform::InstallationScope::System,
+        &principal,
+        Some(&fixture.root.join("worker-root")),
+    )
+    .unwrap();
+    let displaced_intent = fixture.root.join("displaced-succeeded-intent.json");
+    let evidence = Arc::new(Mutex::new(SubstitutionEvidence::default()));
+    let mut runner = SubstituteAfterNativeRetirementRunner {
+        fixture: &fixture,
+        layout,
+        displaced_intent: displaced_intent.clone(),
+        evidence: Arc::clone(&evidence),
+    };
+    let mut plan = vec![
+        Action::test_journaled_state(
+            "test.substituted-intent",
+            1,
+            Privilege::None,
+            Arc::new(Mutex::new(Vec::new())),
+        )
+        .0,
+    ];
+
+    let error = apply_plan_with_runner(
+        &mut plan,
+        &ReceiptStore::new_for_test(fixture.receipt_path()),
+        &mut ReceiptMetadataSource::for_test([(
+            "019cafd0-5c00-7000-8000-000000000001",
+            "2026-09-02T10:00:00Z",
+        )]),
+        &mut runner,
+    )
+    .unwrap_err();
+
+    assert_eq!(error.error_code(), "setup.receipt_conflict");
+    assert_eq!(error.exit_code(), 13);
+    let intent_path = fixture.transaction_path("019cafd0-5c00-7000-8000-000000000001");
+    let evidence = evidence.lock().unwrap();
+    assert_eq!(fs::read(&intent_path).unwrap(), b"unrelated private file\n");
+    assert_eq!(
+        crate::platform::private_file_identity(&intent_path).unwrap(),
+        evidence.victim_identity.unwrap()
+    );
+    assert_eq!(
+        fs::read(&displaced_intent).unwrap(),
+        evidence.original_bytes
+    );
+    assert_eq!(
+        crate::platform::private_file_identity(&displaced_intent).unwrap(),
+        evidence.original_identity.unwrap()
+    );
+    drop(evidence);
+    assert_eq!(
+        ReceiptStore::new_for_test(fixture.receipt_path())
+            .read_snapshot()
+            .unwrap()
+            .entry_count(),
+        1
+    );
+
+    let unrelated = fixture.root.join("unrelated-private-file");
+    fs::rename(&intent_path, &unrelated).unwrap();
+    fs::rename(&displaced_intent, &intent_path).unwrap();
+    let recovery = apply_plan_with_journal(
+        &mut Vec::new(),
+        &ReceiptStore::new_for_test(fixture.receipt_path()),
+        &mut ReceiptMetadataSource::for_test([]),
+    )
+    .unwrap();
+
+    assert_eq!(recovery.recovered_count(), 1);
+    assert!(!intent_path.exists());
+    assert_eq!(fs::read(unrelated).unwrap(), b"unrelated private file\n");
+}
+
+#[test]
 fn three_todo_actions_append_complete_applied_entries_in_order_then_converge_without_mutation() {
     let fixture = JournalFixture::new("ordered-apply");
     let store = ReceiptStore::new_for_test(fixture.receipt_path());

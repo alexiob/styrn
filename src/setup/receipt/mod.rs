@@ -660,6 +660,7 @@ pub(crate) struct ReceiptIntent {
     entry: ReceiptEntry,
     path: PathBuf,
     phase: ReceiptIntentPhase,
+    identity: crate::platform::PrivateFileIdentity,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -2029,14 +2030,24 @@ impl ReceiptApplySession<'_> {
             entry: entry.clone(),
         };
         let serialized = document.to_json()?;
+        let mut file =
+            crate::platform::create_private_file(&path, self.store.owner, &self.store.worker)
+                .map_err(ReceiptStoreError::Write)?;
+        let identity = crate::platform::private_file_identity_from_handle(&file)
+            .map_err(ReceiptStoreError::Security)?;
         let result = (|| {
-            let mut file =
-                crate::platform::create_private_file(&path, self.store.owner, &self.store.worker)
-                    .map_err(ReceiptStoreError::Write)?;
             file.write_all(&serialized)
                 .map_err(ReceiptStoreError::Write)?;
             file.flush().map_err(ReceiptStoreError::Write)?;
             file.sync_all().map_err(ReceiptStoreError::Write)?;
+            let named = crate::platform::open_verified_private_file_for_read(
+                &path,
+                self.store.owner,
+                &self.store.worker,
+                identity,
+            )
+            .map_err(ReceiptStoreError::Security)?;
+            drop(named);
             crate::platform::sync_parent_directory(
                 self.store
                     .path
@@ -2046,13 +2057,21 @@ impl ReceiptApplySession<'_> {
             .map_err(ReceiptStoreError::Write)
         })();
         if result.is_err() {
-            let _ = fs::remove_file(&path);
+            if let Ok(removal) = crate::platform::prepare_verified_private_file_removal(
+                &path,
+                self.store.owner,
+                &self.store.worker,
+                identity,
+            ) {
+                let _ = crate::platform::consume_verified_private_file(removal);
+            }
         }
         result?;
         Ok(ReceiptIntent {
             entry,
             path,
             phase: ReceiptIntentPhase::Prepared,
+            identity,
         })
     }
 
@@ -2070,7 +2089,7 @@ impl ReceiptApplySession<'_> {
             phase: ReceiptIntentPhase::Succeeded,
             entry: intent.entry.clone(),
         };
-        self.replace_intent(&intent.path, &document.to_json()?)?;
+        intent.identity = self.replace_intent(&intent.path, &document.to_json()?)?;
         intent.phase = ReceiptIntentPhase::Succeeded;
         Ok(())
     }
@@ -2151,7 +2170,15 @@ impl ReceiptApplySession<'_> {
                 "injected interruption before receipt intent retirement",
             )));
         }
-        fs::remove_file(&intent.path).map_err(ReceiptStoreError::Write)?;
+        let removal = crate::platform::prepare_verified_private_file_removal(
+            &intent.path,
+            self.store.owner,
+            &self.store.worker,
+            intent.identity,
+        )
+        .map_err(ReceiptStoreError::Security)?;
+        crate::platform::consume_verified_private_file(removal)
+            .map_err(ReceiptStoreError::Write)?;
         crate::platform::sync_parent_directory(
             self.store
                 .path
@@ -2238,6 +2265,7 @@ impl ReceiptApplySession<'_> {
             entry,
             path: path.to_path_buf(),
             phase: document.phase,
+            identity: expected_identity,
         })
     }
 
@@ -2288,7 +2316,11 @@ impl ReceiptApplySession<'_> {
         Ok(())
     }
 
-    fn replace_intent(&self, path: &Path, serialized: &[u8]) -> Result<(), ReceiptStoreError> {
+    fn replace_intent(
+        &self,
+        path: &Path,
+        serialized: &[u8],
+    ) -> Result<crate::platform::PrivateFileIdentity, ReceiptStoreError> {
         let directory = path.parent().ok_or(ReceiptStoreError::InvalidDestination)?;
         let temporary = directory.join(format!(".receipt.json.intent.{}.tmp", Uuid::now_v7()));
         let result = (|| {
@@ -2298,18 +2330,23 @@ impl ReceiptApplySession<'_> {
                 &self.store.worker,
             )
             .map_err(ReceiptStoreError::Write)?;
+            let identity = crate::platform::private_file_identity_from_handle(&file)
+                .map_err(ReceiptStoreError::Security)?;
             file.write_all(serialized)
                 .map_err(ReceiptStoreError::Write)?;
             file.flush().map_err(ReceiptStoreError::Write)?;
             file.sync_all().map_err(ReceiptStoreError::Write)?;
             crate::platform::replace_file(&temporary, path).map_err(ReceiptStoreError::Write)?;
-            crate::platform::verify_private_file_security(
+            let named = crate::platform::open_verified_private_file_for_read(
                 path,
                 self.store.owner,
                 &self.store.worker,
+                identity,
             )
             .map_err(ReceiptStoreError::PostReplaceSecurity)?;
-            crate::platform::sync_parent_directory(directory).map_err(ReceiptStoreError::Write)
+            drop(named);
+            crate::platform::sync_parent_directory(directory).map_err(ReceiptStoreError::Write)?;
+            Ok(identity)
         })();
         if result.is_err() {
             let _ = fs::remove_file(&temporary);

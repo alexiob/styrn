@@ -92,6 +92,7 @@ fn succeeded_intent_fixture(
     };
     let mut file =
         crate::platform::create_private_file(&path, store.owner, store.worker_principal()).unwrap();
+    let identity = crate::platform::private_file_identity_from_handle(&file).unwrap();
     file.write_all(&document.to_json().unwrap()).unwrap();
     file.sync_all().unwrap();
     (
@@ -100,6 +101,7 @@ fn succeeded_intent_fixture(
             entry,
             path,
             phase: ReceiptIntentPhase::Succeeded,
+            identity,
         },
     )
 }

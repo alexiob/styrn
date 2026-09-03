@@ -5212,6 +5212,13 @@ pub(crate) fn create_private_file(
     platform_impl::create_private_file(path, owner, principal)
 }
 
+#[allow(dead_code)] // Source-including manifest tests omit receipt transactions.
+pub(crate) fn private_file_identity_from_handle(
+    file: &std::fs::File,
+) -> std::io::Result<PrivateFileIdentity> {
+    platform_impl::private_file_identity_from_handle(file)
+}
+
 #[allow(dead_code)] // Consumed by the T0.13 receipt durability follow-up.
 pub(crate) fn create_private_publication_file(
     path: &Path,
