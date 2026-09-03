@@ -2,10 +2,11 @@ use super::*;
 use crate::setup::{
     action::{
         execution::PreparedActionRunner, Action, ActionEffect, ActionError, HumanInstructions,
-        NeedsHuman, PendingSeverity, Privilege,
+        NeedsHuman, PendingSeverity, Privilege, ScriptFragment,
     },
-    receipt::{ReceiptMetadataSource, ReceiptStore},
+    receipt::{ReceiptMetadataSource, ReceiptStore, ReceiptStoreError},
 };
+use chrono::{TimeZone, Utc};
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -159,7 +160,9 @@ fn ordinary_user_plan_applies_and_reruns_without_authorization() {
         &mut invoker,
     )
     .unwrap();
-    assert!(second.ordinary().is_nothing_to_do());
+    assert_eq!(second.ordinary().applied_count(), 0);
+    assert_eq!(second.ordinary().recovered_count(), 0);
+    assert!(second.everything_ready());
     assert_eq!(invoker.calls(), 0);
     assert_eq!(metrics.mutation_calls(), 1);
 }
@@ -178,10 +181,16 @@ fn mixed_plan_decline_applies_ordinary_prefix_and_preserves_system_delta() {
     let (ordinary, ordinary_metrics) =
         Action::test_journaled_state("test.user-action", 1, Privilege::None, Arc::clone(&state));
     let mut plan = vec![privileged, ordinary];
-    let mut metadata = receipt_metadata(&[(
-        "019cb047-3c00-7000-8000-000000000001",
-        "2026-09-02T12:00:00Z",
-    )]);
+    let mut metadata = receipt_metadata(&[
+        (
+            "019cb047-3c00-7000-8000-000000000001",
+            "2026-09-02T12:00:00Z",
+        ),
+        (
+            "019cb047-3c00-7000-8000-000000000002",
+            "2026-09-02T12:00:01Z",
+        ),
+    ]);
     let mut invoker = SpyInvoker::default();
 
     let report = execute_with_authorization(
@@ -199,12 +208,23 @@ fn mixed_plan_decline_applies_ordinary_prefix_and_preserves_system_delta() {
         report.privileged_status(),
         PrivilegedStatus::Pending { count: 1 }
     );
+    assert_eq!(report.pending().len(), 1);
+    assert_eq!(report.pending()[0].id().as_str(), "test.system-action");
+    assert_eq!(
+        report.pending()[0].needs_human().instructions().as_str(),
+        "Authorize the displayed system change, then rerun setup.",
+    );
     assert!(!report.everything_ready());
     assert_eq!(invoker.calls(), 0);
     assert_eq!(ordinary_metrics.mutation_calls(), 1);
     assert_eq!(privileged_metrics.mutation_calls(), 0);
     assert_eq!(*state.lock().unwrap(), vec![1]);
-    assert_eq!(store.read_snapshot().unwrap().entry_count(), 1);
+    let receipt = serde_json::from_slice::<serde_json::Value>(
+        &store.read_snapshot().unwrap().to_json().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(receipt["entries"].as_array().unwrap().len(), 2);
+    assert_eq!(receipt["entries"][1]["status"], "pending");
 }
 
 #[test]
@@ -226,7 +246,10 @@ fn yes_no_elevate_and_noninteractive_default_never_invoke_authorization() {
             Arc::clone(&state),
         );
         let mut plan = vec![action];
-        let mut metadata = receipt_metadata(&[]);
+        let mut metadata = receipt_metadata(&[(
+            "019cb047-3c00-7000-8000-000000000001",
+            "2026-09-02T12:00:00Z",
+        )]);
         let mut invoker = SpyInvoker::default();
 
         let report = execute_with_authorization(
@@ -243,10 +266,203 @@ fn yes_no_elevate_and_noninteractive_default_never_invoke_authorization() {
             report.privileged_status(),
             PrivilegedStatus::Pending { count: 1 }
         );
+        assert_eq!(report.pending().len(), 1);
+        assert_eq!(report.pending()[0].id().as_str(), "test.system-action");
         assert_eq!(invoker.calls(), 0);
         assert_eq!(metrics.mutation_calls(), 0);
         assert!(state.lock().unwrap().is_empty());
         assert!(!fixture.request_path().exists());
+        let receipt = serde_json::from_slice::<serde_json::Value>(
+            &store.read_snapshot().unwrap().to_json().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(receipt["entries"].as_array().unwrap().len(), 1);
+        assert_eq!(receipt["entries"][0]["status"], "pending");
+    }
+}
+
+#[test]
+fn cancelled_authorization_keeps_deferred_actions_journaled_and_reuses_them_on_rerun() {
+    let fixture = AuthorizationFixture::new("cancelled-authorization-pending");
+    let store = ReceiptStore::new_user_for_test(fixture.user_receipt());
+    let state = Arc::new(Mutex::new(Vec::new()));
+    let (ordinary, ordinary_metrics) =
+        Action::test_journaled_state("test.user-action", 1, Privilege::None, Arc::clone(&state));
+    let (privileged, privileged_metrics) = Action::test_journaled_state(
+        "test.system-action",
+        2,
+        host_privilege(),
+        Arc::clone(&state),
+    );
+    let mut plan = vec![ordinary, privileged];
+    let mut metadata = receipt_metadata(&[
+        (
+            "019cb047-3c00-7000-8000-000000000011",
+            "2026-09-02T12:00:00Z",
+        ),
+        (
+            "019cb047-3c00-7000-8000-000000000012",
+            "2026-09-02T12:00:01Z",
+        ),
+    ]);
+    let mut cancelled = SpyInvoker::failing();
+
+    let error = match execute_with_authorization(
+        &mut plan,
+        &store,
+        &mut metadata,
+        &fixture.context(),
+        AuthorizationOptions::interactive_accept(),
+        &mut cancelled,
+    ) {
+        Ok(_) => panic!("cancelled authorization unexpectedly succeeded"),
+        Err(error) => error,
+    };
+
+    assert_eq!(error.error_code(), "setup.elevation_required");
+    assert_eq!(error.exit_code(), 13);
+    assert_eq!(cancelled.calls(), 1);
+    assert!(!fixture.request_path().exists());
+    assert_eq!(ordinary_metrics.mutation_calls(), 1);
+    assert_eq!(privileged_metrics.mutation_calls(), 0);
+    assert_eq!(*state.lock().unwrap(), vec![1]);
+    let first_receipt = fs::read(fixture.user_receipt()).unwrap();
+    let receipt = serde_json::from_slice::<serde_json::Value>(&first_receipt).unwrap();
+    assert_eq!(receipt["entries"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        receipt["entries"][1]["entry_id"],
+        "019cb047-3c00-7000-8000-000000000012"
+    );
+    assert_eq!(receipt["entries"][1]["status"], "pending");
+
+    let mut no_metadata = receipt_metadata(&[]);
+    let mut declined = SpyInvoker::default();
+    let rerun = execute_with_authorization(
+        &mut plan,
+        &store,
+        &mut no_metadata,
+        &fixture.context(),
+        AuthorizationOptions::interactive_decline(),
+        &mut declined,
+    )
+    .unwrap();
+
+    assert_eq!(
+        rerun.privileged_status(),
+        PrivilegedStatus::Pending { count: 1 }
+    );
+    assert_eq!(rerun.pending().len(), 1);
+    assert_eq!(rerun.pending()[0].id().as_str(), "test.system-action");
+    assert_eq!(fs::read(fixture.user_receipt()).unwrap(), first_receipt);
+    assert_eq!(declined.calls(), 0);
+
+    let manifest_path = fixture.manifest_path();
+    let principal = crate::platform::resolve_current_worker_principal().unwrap();
+    let manifest_store =
+        crate::manifest::MachineManifestStore::new_user(&manifest_path, principal).unwrap();
+    let mut draft = pending_manifest_draft_for_current_user();
+    crate::setup::pending::publish_manifest(
+        &manifest_store,
+        &store,
+        &mut draft,
+        rerun.completion(),
+        &mut receipt_metadata(&[(
+            "019cb047-3c00-7000-8000-000000000013",
+            "2026-09-02T12:00:02Z",
+        )]),
+    )
+    .unwrap();
+
+    let published = manifest_store.read().unwrap().manifest;
+    let pending = published.pending_actions.as_ref().unwrap();
+    assert_eq!(pending.len(), 1);
+    assert_eq!(pending[0].id, "test.system-action");
+    assert_eq!(pending[0].message, AUTHORIZATION_PENDING_INSTRUCTIONS);
+}
+
+#[test]
+fn launcher_and_child_failures_keep_deferred_actions_repairable() {
+    for (label, failure) in [
+        ("launcher-failure", SpyInvocationFailure::Launch),
+        ("child-failure", SpyInvocationFailure::Child),
+    ] {
+        let fixture = AuthorizationFixture::new(label);
+        let store = ReceiptStore::new_user_for_test(fixture.user_receipt());
+        let state = Arc::new(Mutex::new(Vec::new()));
+        let (action, metrics) = Action::test_journaled_state(
+            "test.system-action",
+            1,
+            host_privilege(),
+            Arc::clone(&state),
+        );
+        let mut plan = vec![action];
+        let mut metadata = receipt_metadata(&[(
+            "019cb047-3c00-7000-8000-000000000014",
+            "2026-09-02T12:00:00Z",
+        )]);
+        let mut failing = SpyInvoker::failing_with(failure);
+
+        let error = match execute_with_authorization(
+            &mut plan,
+            &store,
+            &mut metadata,
+            &fixture.context(),
+            AuthorizationOptions::interactive_accept(),
+            &mut failing,
+        ) {
+            Ok(_) => panic!("authorization failure unexpectedly succeeded"),
+            Err(error) => error,
+        };
+
+        assert_eq!(error.error_code(), "setup.elevation_required", "{label}");
+        assert_eq!(error.exit_code(), 13, "{label}");
+        assert_eq!(failing.calls(), 1, "{label}");
+        assert_eq!(metrics.mutation_calls(), 0, "{label}");
+        assert!(state.lock().unwrap().is_empty(), "{label}");
+        assert!(!fixture.request_path().exists(), "{label}");
+        let receipt_before = fs::read(fixture.user_receipt()).unwrap();
+        let receipt = serde_json::from_slice::<serde_json::Value>(&receipt_before).unwrap();
+        assert_eq!(receipt["entries"].as_array().unwrap().len(), 1, "{label}");
+        assert_eq!(receipt["entries"][0]["status"], "pending", "{label}");
+
+        let mut no_metadata = receipt_metadata(&[]);
+        let mut declined = SpyInvoker::default();
+        let repair = execute_with_authorization(
+            &mut plan,
+            &store,
+            &mut no_metadata,
+            &fixture.context(),
+            AuthorizationOptions::interactive_decline(),
+            &mut declined,
+        )
+        .unwrap();
+        assert_eq!(fs::read(fixture.user_receipt()).unwrap(), receipt_before);
+        assert_eq!(repair.pending().len(), 1);
+
+        let manifest_path = fixture.manifest_path();
+        let principal = crate::platform::resolve_current_worker_principal().unwrap();
+        let manifest_store =
+            crate::manifest::MachineManifestStore::new_user(&manifest_path, principal).unwrap();
+        let mut draft = pending_manifest_draft_for_current_user();
+        crate::setup::pending::publish_manifest(
+            &manifest_store,
+            &store,
+            &mut draft,
+            repair.completion(),
+            &mut receipt_metadata(&[(
+                "019cb047-3c00-7000-8000-000000000015",
+                "2026-09-02T12:00:01Z",
+            )]),
+        )
+        .unwrap();
+        let pending = manifest_store
+            .read()
+            .unwrap()
+            .manifest
+            .pending_actions
+            .unwrap();
+        assert_eq!(pending.len(), 1, "{label}");
+        assert_eq!(pending[0].id, "test.system-action", "{label}");
     }
 }
 
@@ -269,7 +485,10 @@ fn explicit_interactive_or_noninteractive_consent_invokes_exactly_once() {
             Arc::clone(&state),
         );
         let mut plan = vec![action];
-        let mut metadata = receipt_metadata(&[]);
+        let mut metadata = receipt_metadata(&[(
+            "019cb047-3c00-7000-8000-000000000001",
+            "2026-09-02T12:00:00Z",
+        )]);
         let mut invoker = SpyInvoker::default();
 
         let report = execute_with_authorization(
@@ -285,6 +504,12 @@ fn explicit_interactive_or_noninteractive_consent_invokes_exactly_once() {
         assert_eq!(
             report.privileged_status(),
             PrivilegedStatus::AuthorizationLaunched { count: 1 }
+        );
+        assert_eq!(report.pending().len(), 1);
+        assert_eq!(report.pending()[0].id().as_str(), "test.system-action");
+        assert_eq!(
+            report.pending()[0].needs_human().instructions().as_str(),
+            AUTHORIZATION_PENDING_INSTRUCTIONS
         );
         assert!(!report.everything_ready());
         assert_eq!(invoker.calls(), 1);
@@ -302,7 +527,336 @@ fn explicit_interactive_or_noninteractive_consent_invokes_exactly_once() {
                     .bytes()
                     .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
         }));
+        let receipt = serde_json::from_slice::<serde_json::Value>(
+            &store.read_snapshot().unwrap().to_json().unwrap(),
+        )
+        .unwrap();
+        assert_eq!(receipt["entries"][0]["status"], "pending");
     }
+}
+
+#[test]
+fn authorized_completion_projects_the_complete_pending_set_for_both_grant_policies() {
+    for (label, options) in [
+        (
+            "interactive",
+            AuthorizationOptions::from_policy(SystemAuthorizationPolicy::InteractiveConsent, false)
+                .unwrap(),
+        ),
+        (
+            "explicit-noninteractive",
+            AuthorizationOptions::from_policy(
+                SystemAuthorizationPolicy::ExplicitNoninteractive,
+                false,
+            )
+            .unwrap(),
+        ),
+    ] {
+        assert_complete_pending_projection(
+            label,
+            options,
+            PrivilegedStatus::AuthorizationLaunched { count: 1 },
+            1,
+        );
+    }
+}
+
+#[test]
+fn declined_authorization_projects_the_complete_pending_set_without_invocation() {
+    assert_complete_pending_projection(
+        "declined",
+        AuthorizationOptions::from_policy(SystemAuthorizationPolicy::NotGranted, false).unwrap(),
+        PrivilegedStatus::Pending { count: 1 },
+        0,
+    );
+}
+
+#[test]
+fn authorization_completion_rejects_invalid_display_order_before_pending_append() {
+    let fixture = AuthorizationFixture::new("invalid-completion-order");
+    let store = ReceiptStore::new_user_for_test(fixture.user_receipt());
+    let ordinary = super::super::execution::apply_plan_with_journal(
+        &mut [],
+        &store,
+        &mut receipt_metadata(&[]),
+    )
+    .unwrap();
+    let state = Arc::new(Mutex::new(Vec::new()));
+    let privileged =
+        Action::test_journaled_state("test.system-action", 1, host_privilege(), state).0;
+    let pending = vec![deferred_authorization_pending(&privileged)];
+    let error = match super::super::execution::complete_authorized_execution(
+        ordinary,
+        pending,
+        &[],
+        &store,
+        &mut receipt_metadata(&[(
+            "019cb047-3c00-7000-8000-000000000040",
+            "2026-09-02T12:00:00Z",
+        )]),
+    ) {
+        Ok(_) => panic!("invalid display order unexpectedly produced a completion token"),
+        Err(error) => error,
+    };
+
+    assert_eq!(error.error_code(), "setup.receipt_conflict");
+    assert_eq!(error.exit_code(), 13);
+    assert!(!fixture.user_receipt().exists());
+}
+
+#[test]
+fn ordinary_only_token_is_stale_after_authorization_reissues_completion() {
+    let fixture = AuthorizationFixture::new("stale-ordinary-token");
+    let store = ReceiptStore::new_user_for_test(fixture.user_receipt());
+    let stale_ordinary = super::super::execution::apply_plan_with_journal(
+        &mut [],
+        &store,
+        &mut receipt_metadata(&[]),
+    )
+    .unwrap();
+    let ordinary_to_consume = super::super::execution::apply_plan_with_journal(
+        &mut [],
+        &store,
+        &mut receipt_metadata(&[]),
+    )
+    .unwrap();
+    let state = Arc::new(Mutex::new(Vec::new()));
+    let privileged =
+        Action::test_journaled_state("test.system-action", 1, host_privilege(), state).0;
+    let displayed_order = vec![privileged.name().clone()];
+    let pending = vec![deferred_authorization_pending(&privileged)];
+    let (_, replacement) = super::super::execution::complete_authorized_execution(
+        ordinary_to_consume,
+        pending,
+        &displayed_order,
+        &store,
+        &mut receipt_metadata(&[(
+            "019cb047-3c00-7000-8000-000000000041",
+            "2026-09-02T12:00:00Z",
+        )]),
+    )
+    .unwrap();
+
+    let manifest_path = fixture.manifest_path();
+    let principal = crate::platform::resolve_current_worker_principal().unwrap();
+    let manifest_store =
+        crate::manifest::MachineManifestStore::new_user(&manifest_path, principal).unwrap();
+    let mut draft = pending_manifest_draft_for_current_user();
+    let receipt_before = fs::read(fixture.user_receipt()).unwrap();
+    let error = crate::setup::pending::publish_manifest(
+        &manifest_store,
+        &store,
+        &mut draft,
+        stale_ordinary.completion(),
+        &mut receipt_metadata(&[]),
+    )
+    .unwrap_err();
+
+    assert!(matches!(
+        error,
+        crate::setup::pending::PendingError::Receipt(ReceiptStoreError::IntentConflict)
+    ));
+    assert_eq!(error.error_code(), "setup.receipt_conflict");
+    assert_eq!(error.exit_code().as_i32(), 13);
+    assert!(draft.pending_actions.is_none());
+    assert!(!manifest_path.exists());
+    assert_eq!(fs::read(fixture.user_receipt()).unwrap(), receipt_before);
+
+    crate::setup::pending::publish_manifest(
+        &manifest_store,
+        &store,
+        &mut draft,
+        &replacement,
+        &mut receipt_metadata(&[(
+            "019cb047-3c00-7000-8000-000000000042",
+            "2026-09-02T12:00:01Z",
+        )]),
+    )
+    .unwrap();
+    assert_eq!(
+        manifest_store
+            .read()
+            .unwrap()
+            .manifest
+            .pending_actions
+            .unwrap()[0]
+            .id,
+        "test.system-action"
+    );
+}
+
+#[test]
+fn verified_reprobe_omits_only_the_resolved_privileged_occurrence() {
+    let fixture = AuthorizationFixture::new("verified-reprobe-resolution");
+    let store = ReceiptStore::new_user_for_test(fixture.user_receipt());
+    let state = Arc::new(Mutex::new(Vec::new()));
+    let first = Action::test_journaled_state(
+        "test.first-system-action",
+        1,
+        host_privilege(),
+        Arc::clone(&state),
+    )
+    .0;
+    let second = Action::test_journaled_state(
+        "test.second-system-action",
+        2,
+        host_privilege(),
+        Arc::clone(&state),
+    )
+    .0;
+    let mut plan = vec![first, second];
+    let mut invoker = SpyInvoker::default();
+    let first_report = execute_with_authorization(
+        &mut plan,
+        &store,
+        &mut receipt_metadata(&[
+            (
+                "019cb047-3c00-7000-8000-000000000051",
+                "2026-09-02T12:00:00Z",
+            ),
+            (
+                "019cb047-3c00-7000-8000-000000000052",
+                "2026-09-02T12:00:01Z",
+            ),
+        ]),
+        &fixture.context(),
+        AuthorizationOptions::interactive_decline(),
+        &mut invoker,
+    )
+    .unwrap();
+    assert_eq!(first_report.pending().len(), 2);
+    assert_eq!(invoker.calls(), 0);
+
+    let manifest_path = fixture.manifest_path();
+    let principal = crate::platform::resolve_current_worker_principal().unwrap();
+    let manifest_store =
+        crate::manifest::MachineManifestStore::new_user(&manifest_path, principal).unwrap();
+    let mut draft = pending_manifest_draft_for_current_user();
+    crate::setup::pending::publish_manifest(
+        &manifest_store,
+        &store,
+        &mut draft,
+        first_report.completion(),
+        &mut receipt_metadata(&[(
+            "019cb047-3c00-7000-8000-000000000053",
+            "2026-09-02T12:00:02Z",
+        )]),
+    )
+    .unwrap();
+
+    state.lock().unwrap().push(1);
+    let resolved = execute_with_authorization(
+        &mut plan,
+        &store,
+        &mut receipt_metadata(&[]),
+        &fixture.context(),
+        AuthorizationOptions::interactive_decline(),
+        &mut invoker,
+    )
+    .unwrap();
+    assert_eq!(
+        resolved
+            .pending()
+            .iter()
+            .map(|pending| pending.id().as_str())
+            .collect::<Vec<_>>(),
+        ["test.second-system-action"]
+    );
+    assert_eq!(
+        resolved.privileged_status(),
+        PrivilegedStatus::Pending { count: 1 }
+    );
+    crate::setup::pending::publish_manifest(
+        &manifest_store,
+        &store,
+        &mut draft,
+        resolved.completion(),
+        &mut receipt_metadata(&[(
+            "019cb047-3c00-7000-8000-000000000054",
+            "2026-09-02T12:00:03Z",
+        )]),
+    )
+    .unwrap();
+    assert_eq!(
+        manifest_store
+            .read()
+            .unwrap()
+            .manifest
+            .pending_actions
+            .unwrap()
+            .iter()
+            .map(|pending| pending.id.as_str())
+            .collect::<Vec<_>>(),
+        ["test.second-system-action"]
+    );
+
+    state.lock().unwrap().clear();
+    let recurring = execute_with_authorization(
+        &mut plan,
+        &store,
+        &mut receipt_metadata(&[(
+            "019cb047-3c00-7000-8000-000000000055",
+            "2026-09-02T12:00:04Z",
+        )]),
+        &fixture.context(),
+        AuthorizationOptions::interactive_decline(),
+        &mut invoker,
+    )
+    .unwrap();
+    assert_eq!(
+        recurring
+            .pending()
+            .iter()
+            .map(|pending| pending.id().as_str())
+            .collect::<Vec<_>>(),
+        ["test.first-system-action", "test.second-system-action"]
+    );
+    crate::setup::pending::publish_manifest(
+        &manifest_store,
+        &store,
+        &mut draft,
+        recurring.completion(),
+        &mut receipt_metadata(&[(
+            "019cb047-3c00-7000-8000-000000000056",
+            "2026-09-02T12:00:05Z",
+        )]),
+    )
+    .unwrap();
+
+    let receipt = serde_json::from_slice::<serde_json::Value>(
+        &store.read_snapshot().unwrap().to_json().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(receipt["entries"].as_array().unwrap().len(), 3);
+    assert!(receipt["entries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|entry| entry["status"] == "pending"));
+    assert_eq!(
+        receipt["entries"][2]["entry_id"],
+        "019cb047-3c00-7000-8000-000000000055"
+    );
+    assert_eq!(
+        receipt["pending_publications"][1]["pending"],
+        serde_json::json!([{
+            "action_id": "test.second-system-action",
+            "entry_id": "019cb047-3c00-7000-8000-000000000052"
+        }])
+    );
+    assert_eq!(
+        receipt["pending_publications"][2]["pending"],
+        serde_json::json!([
+            {
+                "action_id": "test.first-system-action",
+                "entry_id": "019cb047-3c00-7000-8000-000000000055"
+            },
+            {
+                "action_id": "test.second-system-action",
+                "entry_id": "019cb047-3c00-7000-8000-000000000052"
+            }
+        ])
+    );
 }
 
 #[test]
@@ -1023,6 +1577,7 @@ fn generated_request_is_size_bounded_before_private_file_creation() {
     assert_eq!(metrics.mutation_calls(), 0);
     assert!(state.lock().unwrap().is_empty());
     assert!(!fixture.request_path().exists());
+    assert!(!fixture.user_receipt().exists());
 }
 
 #[test]
@@ -1292,6 +1847,276 @@ fn runner_rejects_symlink_fifo_directory_and_insecure_request_nodes() {
     }
 }
 
+fn assert_complete_pending_projection(
+    label: &str,
+    options: AuthorizationOptions,
+    expected_status: PrivilegedStatus,
+    expected_invocations: usize,
+) {
+    let fixture = AuthorizationFixture::new(label);
+    let store = ReceiptStore::new_user_for_test(fixture.user_receipt());
+    let state = Arc::new(Mutex::new(Vec::new()));
+    let (privileged_intrinsic, privileged_intrinsic_metrics) = Action::test_named_needs_human(
+        "test.system-approval",
+        host_privilege(),
+        Arc::clone(&state),
+        NeedsHuman::new(
+            HumanInstructions::new("Approve the protected system setting, then rerun setup.")
+                .unwrap(),
+            Some(ScriptFragment::DeferredAction(
+                crate::setup::action::ActionName::parse("test.system-fragment").unwrap(),
+            )),
+        )
+        .with_severity(PendingSeverity::Info),
+    );
+    let (ordinary_todo, ordinary_todo_metrics) =
+        Action::test_journaled_state("test.user-action", 1, Privilege::None, Arc::clone(&state));
+    let (ordinary_pending, ordinary_pending_metrics) = Action::test_named_needs_human(
+        "test.user-approval",
+        Privilege::None,
+        Arc::clone(&state),
+        NeedsHuman::new(
+            HumanInstructions::new("Approve the user setting, then rerun setup.").unwrap(),
+            None,
+        ),
+    );
+    let (privileged_todo, privileged_todo_metrics) = Action::test_journaled_state(
+        "test.system-action",
+        2,
+        host_privilege(),
+        Arc::clone(&state),
+    );
+    let mut plan = vec![
+        privileged_intrinsic,
+        ordinary_todo,
+        ordinary_pending,
+        privileged_todo,
+    ];
+    let mut metadata = ReceiptMetadataSource::for_test([
+        (
+            "019cb047-3c00-7000-8000-000000000021",
+            "2026-09-02T12:00:00Z",
+        ),
+        (
+            "019cb047-3c00-7000-8000-000000000022",
+            "2026-09-02T12:00:01Z",
+        ),
+        (
+            "019cb047-3c00-7000-8000-000000000023",
+            "2026-09-02T12:00:02Z",
+        ),
+        (
+            "019cb047-3c00-7000-8000-000000000024",
+            "2026-09-02T12:00:03Z",
+        ),
+    ]);
+    let mut invoker = SpyInvoker::default();
+
+    let report = execute_with_authorization(
+        &mut plan,
+        &store,
+        &mut metadata,
+        &fixture.context(),
+        options,
+        &mut invoker,
+    )
+    .unwrap();
+
+    assert_eq!(report.privileged_status(), expected_status);
+    assert_eq!(invoker.calls(), expected_invocations);
+    assert!(!report.everything_ready());
+    assert_eq!(report.ordinary().applied_count(), 1);
+    assert_eq!(report.ordinary().recovered_count(), 0);
+    assert_eq!(report.ordinary().noop_count(), 0);
+    assert_eq!(
+        report
+            .pending()
+            .iter()
+            .map(|pending| pending.id().as_str())
+            .collect::<Vec<_>>(),
+        [
+            "test.system-approval",
+            "test.user-approval",
+            "test.system-action"
+        ]
+    );
+    assert_eq!(report.pending()[0].severity(), PendingSeverity::Info);
+    assert_eq!(
+        report.pending()[0].needs_human().instructions().as_str(),
+        "Approve the protected system setting, then rerun setup."
+    );
+    assert_eq!(
+        report.pending()[0].fragment_action_id(),
+        Some("test.system-fragment")
+    );
+    assert_eq!(report.pending()[1].severity(), PendingSeverity::Warning);
+    assert_eq!(
+        report.pending()[1].needs_human().instructions().as_str(),
+        "Approve the user setting, then rerun setup."
+    );
+    assert_eq!(report.pending()[2].severity(), PendingSeverity::Warning);
+    assert_eq!(
+        report.pending()[2].needs_human().instructions().as_str(),
+        AUTHORIZATION_PENDING_INSTRUCTIONS
+    );
+    assert_eq!(ordinary_todo_metrics.mutation_calls(), 1);
+    assert_eq!(privileged_intrinsic_metrics.mutation_calls(), 0);
+    assert_eq!(ordinary_pending_metrics.mutation_calls(), 0);
+    assert_eq!(privileged_todo_metrics.mutation_calls(), 0);
+    assert_eq!(*state.lock().unwrap(), vec![1]);
+
+    let timestamp = Utc.with_ymd_and_hms(2026, 9, 2, 12, 0, 4).unwrap();
+    let default = crate::setup::pending::PendingPolicy::default()
+        .evaluate(timestamp, report.completion())
+        .unwrap();
+    let strict = crate::setup::pending::PendingPolicy::new(true)
+        .evaluate(timestamp, report.completion())
+        .unwrap();
+    assert_eq!(default.exit_code().as_i32(), 0);
+    assert_eq!(strict.exit_code().as_i32(), 13);
+    let default_json: serde_json::Value =
+        serde_json::from_str(&crate::output::to_json(default.envelope()).unwrap()).unwrap();
+    let strict_json: serde_json::Value =
+        serde_json::from_str(&crate::output::to_json(strict.envelope()).unwrap()).unwrap();
+    let expected_pending = serde_json::json!([
+        {
+            "id": "test.system-approval",
+            "severity": "info",
+            "message": "Approve the protected system setting, then rerun setup.",
+            "deferred_action": "test.system-fragment"
+        },
+        {
+            "id": "test.user-approval",
+            "severity": "warning",
+            "message": "Approve the user setting, then rerun setup."
+        },
+        {
+            "id": "test.system-action",
+            "severity": "warning",
+            "message": AUTHORIZATION_PENDING_INSTRUCTIONS
+        }
+    ]);
+    assert_eq!(default_json["ok"], true);
+    assert_eq!(default_json["data"]["pending"], expected_pending);
+    assert_eq!(default_json["warnings"].as_array().unwrap().len(), 3);
+    assert!(default_json["warnings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|warning| warning["code"] == "setup.needs_human"));
+    assert_eq!(strict_json["ok"], false);
+    assert!(strict_json["data"].is_null());
+    assert_eq!(strict_json["errors"][0]["code"], "setup.needs_human");
+    assert_eq!(
+        strict_json["errors"][0]["details"]["pending"],
+        expected_pending
+    );
+    assert_eq!(strict_json["warnings"], default_json["warnings"]);
+
+    let mut human = Vec::new();
+    crate::setup::pending::render_human(&mut human, report.completion()).unwrap();
+    assert_eq!(
+        String::from_utf8(human).unwrap(),
+        concat!(
+            "Pending actions requiring your attention:\n",
+            "- [info] test.system-approval: Approve the protected system setting, then rerun setup.\n",
+            "  deferred action: test.system-fragment; not rendered or executed\n",
+            "- [warning] test.user-approval: Approve the user setting, then rerun setup.\n",
+            "- [warning] test.system-action: Authorize the displayed system change, then rerun setup.\n",
+        )
+    );
+
+    let manifest_path = fixture.manifest_path();
+    let principal = crate::platform::resolve_current_worker_principal().unwrap();
+    let manifest_store =
+        crate::manifest::MachineManifestStore::new_user(&manifest_path, principal).unwrap();
+    let mut draft = pending_manifest_draft_for_current_user();
+    crate::setup::pending::publish_manifest(
+        &manifest_store,
+        &store,
+        &mut draft,
+        report.completion(),
+        &mut receipt_metadata(&[(
+            "019cb047-3c00-7000-8000-000000000025",
+            "2026-09-02T12:00:04Z",
+        )]),
+    )
+    .unwrap();
+    let published = manifest_store.read().unwrap().manifest;
+    let manifest_pending = published.pending_actions.as_ref().unwrap();
+    assert_eq!(manifest_pending.len(), 3);
+    assert_eq!(
+        manifest_pending
+            .iter()
+            .map(|pending| pending.id.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "test.system-approval",
+            "test.user-approval",
+            "test.system-action"
+        ]
+    );
+    assert_eq!(
+        manifest_pending
+            .iter()
+            .map(|pending| pending.message.as_str())
+            .collect::<Vec<_>>(),
+        [
+            "Approve the protected system setting, then rerun setup.",
+            "Approve the user setting, then rerun setup.",
+            AUTHORIZATION_PENDING_INSTRUCTIONS
+        ]
+    );
+    assert_eq!(
+        manifest_pending[0].severity,
+        crate::manifest::PendingSeverity::Info
+    );
+    assert_eq!(
+        manifest_pending[1].severity,
+        crate::manifest::PendingSeverity::Warning
+    );
+    assert_eq!(
+        manifest_pending[2].severity,
+        crate::manifest::PendingSeverity::Warning
+    );
+
+    let receipt = serde_json::from_slice::<serde_json::Value>(
+        &store.read_snapshot().unwrap().to_json().unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        receipt["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|entry| entry["action"]["parameters"]["action_id"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        [
+            "test.user-action",
+            "test.user-approval",
+            "test.system-approval",
+            "test.system-action"
+        ]
+    );
+    assert_eq!(
+        receipt["pending_publications"][0]["pending"],
+        serde_json::json!([
+            {
+                "action_id": "test.system-approval",
+                "entry_id": "019cb047-3c00-7000-8000-000000000023"
+            },
+            {
+                "action_id": "test.user-approval",
+                "entry_id": "019cb047-3c00-7000-8000-000000000022"
+            },
+            {
+                "action_id": "test.system-action",
+                "entry_id": "019cb047-3c00-7000-8000-000000000024"
+            }
+        ])
+    );
+}
+
 fn receipt_metadata(values: &[(&str, &str)]) -> ReceiptMetadataSource {
     match values {
         [] => ReceiptMetadataSource::for_test([]),
@@ -1383,9 +2208,21 @@ struct SpyInvoker {
     executable: Option<PathBuf>,
     request_path: Option<PathBuf>,
     request_digest: Option<String>,
+    failure: Option<SpyInvocationFailure>,
 }
 
 impl SpyInvoker {
+    fn failing() -> Self {
+        Self::failing_with(SpyInvocationFailure::Cancelled)
+    }
+
+    fn failing_with(failure: SpyInvocationFailure) -> Self {
+        Self {
+            failure: Some(failure),
+            ..Self::default()
+        }
+    }
+
     fn calls(&self) -> usize {
         self.calls
     }
@@ -1414,8 +2251,24 @@ impl AuthorizationInvoker for SpyInvoker {
         self.executable = Some(executable.to_path_buf());
         self.request_path = Some(request_path.to_path_buf());
         self.request_digest = Some(request_digest.to_owned());
-        Ok(())
+        match self.failure {
+            None => Ok(()),
+            Some(SpyInvocationFailure::Cancelled) => Err(AuthorizationInvocationError::Failed),
+            Some(SpyInvocationFailure::Launch) => Err(AuthorizationInvocationError::Launch(
+                std::io::Error::other("injected launcher failure"),
+            )),
+            Some(SpyInvocationFailure::Child) => Err(AuthorizationInvocationError::ChildFailed {
+                exit_code: Some(13),
+            }),
+        }
     }
+}
+
+#[derive(Clone, Copy)]
+enum SpyInvocationFailure {
+    Cancelled,
+    Launch,
+    Child,
 }
 
 struct AuthorizationFixture {
@@ -1465,6 +2318,10 @@ impl AuthorizationFixture {
 
     fn request_path(&self) -> &Path {
         &self.request
+    }
+
+    fn manifest_path(&self) -> PathBuf {
+        self.request.with_file_name("machine.toml")
     }
 
     fn system_receipt(&self) -> &Path {
@@ -1525,4 +2382,52 @@ impl Drop for AuthorizationFixture {
     fn drop(&mut self) {
         let _ = fs::remove_dir_all(&self.root);
     }
+}
+
+fn pending_manifest_draft_for_current_user() -> crate::manifest::MachineManifestDraft {
+    let mut draft = crate::manifest::MachineManifest::parse_toml(include_str!(
+        "../../../../examples/machine.controller-worker.toml"
+    ))
+    .unwrap()
+    .without_machine_id();
+    let principal = crate::platform::resolve_current_worker_principal().unwrap();
+    let identity = draft.worker_identity.as_mut().unwrap();
+    identity.principal_kind = principal.principal_kind();
+    identity.principal_id = principal.principal_id().to_owned();
+    identity.name = principal.name().to_owned();
+    draft.transport.as_mut().unwrap().user = Some(principal.name().to_owned());
+
+    #[cfg(target_os = "linux")]
+    {
+        draft.platform.os = crate::manifest::OperatingSystem::Linux;
+        set_manifest_paths(&mut draft, "/home/styrn-test/.local/share/styrn", '/');
+    }
+    #[cfg(target_os = "macos")]
+    {
+        draft.platform.os = crate::manifest::OperatingSystem::Macos;
+        set_manifest_paths(
+            &mut draft,
+            "/Users/styrn-test/Library/Application Support/Styrn",
+            '/',
+        );
+    }
+    #[cfg(target_os = "windows")]
+    {
+        draft.platform.os = crate::manifest::OperatingSystem::Windows;
+        set_manifest_paths(&mut draft, r"C:\Users\styrn-test\AppData\Local\Styrn", '\\');
+    }
+    draft
+}
+
+fn set_manifest_paths(
+    draft: &mut crate::manifest::MachineManifestDraft,
+    root: &str,
+    separator: char,
+) {
+    draft.paths.root = root.to_owned();
+    draft.paths.repos = format!("{root}{separator}repos");
+    draft.paths.jobs = format!("{root}{separator}jobs");
+    draft.paths.cache = format!("{root}{separator}cache");
+    draft.paths.artifacts = format!("{root}{separator}artifacts");
+    draft.paths.logs = format!("{root}{separator}logs");
 }

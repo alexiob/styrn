@@ -151,15 +151,8 @@ pub(in crate::setup) fn publish_manifest(
     }
     let mut candidate = draft.clone();
     project_manifest(&mut candidate, pending)?;
-    let machine_id = session.publish_manifest(
-        manifest_store,
-        &candidate,
-        pending,
-        completed.occurrences(),
-        completed.receipt_witness(),
-        metadata,
-        &authority,
-    )?;
+    let machine_id =
+        session.publish_manifest(manifest_store, &candidate, completed, metadata, &authority)?;
     *draft = candidate;
     Ok(machine_id)
 }

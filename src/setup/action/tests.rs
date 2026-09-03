@@ -2414,27 +2414,6 @@ fn pending_projection_rejects_duplicate_ids_without_partial_state_and_empty_poli
     assert_eq!(json["warnings"], serde_json::json!([]));
 }
 
-#[test]
-fn pending_publication_boundary_accepts_the_complete_authorized_report_slice() {
-    fn publish_authorized(
-        report: &super::authorization::AuthorizedExecutionReport,
-        manifest_store: &crate::manifest::MachineManifestStore,
-        receipt_store: &ReceiptStore,
-        draft: &mut crate::manifest::MachineManifestDraft,
-        metadata: &mut ReceiptMetadataSource,
-    ) -> Result<uuid::Uuid, crate::setup::pending::PendingError> {
-        crate::setup::pending::publish_manifest(
-            manifest_store,
-            receipt_store,
-            draft,
-            report.ordinary().completion(),
-            metadata,
-        )
-    }
-
-    let _ = publish_authorized;
-}
-
 #[cfg(unix)]
 #[test]
 fn user_scope_rejects_privileged_actions_before_private_state_or_mutation() {

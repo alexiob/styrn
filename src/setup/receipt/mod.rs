@@ -2114,12 +2114,13 @@ impl ReceiptPendingPublicationSession<'_> {
         &self,
         manifest_store: &crate::manifest::MachineManifestStore,
         draft: &crate::manifest::MachineManifestDraft,
-        pending: &[crate::setup::action::PendingAction],
-        occurrences: &[PendingReceiptOccurrence],
-        witness: &ReceiptExecutionWitness,
+        completed: &crate::setup::action::CompletedExecutionToken,
         metadata: &mut ReceiptMetadataSource,
         _authority: &crate::setup::pending::PendingPublicationAuthority,
     ) -> Result<uuid::Uuid, PendingPublicationProtocolError> {
+        let pending = completed.pending();
+        let occurrences = completed.occurrences();
+        let witness = completed.receipt_witness();
         self.recover_pending_publication(manifest_store)?;
 
         let manifest_session = manifest_store.begin_pending_publication()?;

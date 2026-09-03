@@ -1,6 +1,8 @@
 //! Action-owned setup execution and receipt orchestration.
 
-use super::{Action, ActionCheck, ActionEffect, ActionError, JournalAuthority, PendingAction};
+use super::{
+    Action, ActionCheck, ActionEffect, ActionError, ActionName, JournalAuthority, PendingAction,
+};
 use crate::setup::receipt::{PendingReceiptOccurrence, ReceiptExecutionWitness, ReceiptStoreError};
 use std::collections::HashSet;
 use thiserror::Error;
@@ -168,20 +170,61 @@ pub(super) fn apply_plan_with_journal(
     apply_plan_with_runner(plan, store, metadata, &mut DirectPreparedActionRunner)
 }
 
-pub(super) fn record_pending_observations(
-    pending: &[PendingAction],
+pub(super) fn complete_authorized_execution(
+    ordinary: ApplyReport,
+    privileged_pending: Vec<PendingAction>,
+    displayed_order: &[ActionName],
     store: &crate::setup::receipt::ReceiptStore,
     metadata: &mut crate::setup::receipt::ReceiptMetadataSource,
-) -> Result<(), ApplyPlanError> {
-    if pending.is_empty() {
-        return Ok(());
+) -> Result<(ApplySummary, CompletedExecutionToken), ApplyPlanError> {
+    let (summary, ordinary_completion) = ordinary.into_parts();
+    let CompletedExecutionToken {
+        pending: ordinary_pending,
+        occurrences: ordinary_occurrences,
+        receipt: ordinary_receipt,
+    } = ordinary_completion;
+
+    let mut displayed_positions = std::collections::HashMap::with_capacity(displayed_order.len());
+    for (index, action) in displayed_order.iter().enumerate() {
+        if displayed_positions.insert(action.as_str(), index).is_some() {
+            return Err(ReceiptStoreError::PrefixConflict.into());
+        }
     }
+    let mut pending_ids = HashSet::with_capacity(ordinary_pending.len() + privileged_pending.len());
+    for action in ordinary_pending.iter().chain(&privileged_pending) {
+        if !pending_ids.insert(action.id().as_str()) {
+            return Err(ReceiptStoreError::PrefixConflict.into());
+        }
+        if !displayed_positions.contains_key(action.id().as_str()) {
+            return Err(ReceiptStoreError::IntentConflict.into());
+        }
+    }
+
     let authority = JournalAuthority(());
     let session = store.begin_apply(&authority)?;
-    for action in pending {
-        session.record_pending(action.id(), metadata, &authority)?;
+
+    let current_receipt = session.complete_execution(&ordinary_occurrences, &authority)?;
+    if current_receipt != ordinary_receipt {
+        return Err(ReceiptStoreError::IntentConflict.into());
     }
-    Ok(())
+
+    let mut pending_with_occurrences = ordinary_pending
+        .into_iter()
+        .zip(ordinary_occurrences)
+        .collect::<Vec<_>>();
+    for action in privileged_pending {
+        let occurrence = session.record_pending(action.id(), metadata, &authority)?;
+        pending_with_occurrences.push((action, occurrence));
+    }
+
+    pending_with_occurrences.sort_by_key(|(action, _)| displayed_positions[action.id().as_str()]);
+
+    let (pending, occurrences): (Vec<_>, Vec<_>) = pending_with_occurrences.into_iter().unzip();
+    let receipt = session.complete_execution(&occurrences, &authority)?;
+    Ok((
+        summary,
+        CompletedExecutionToken::new(pending, occurrences, receipt)?,
+    ))
 }
 
 pub(super) trait PreparedActionRunner {

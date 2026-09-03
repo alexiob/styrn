@@ -4,9 +4,12 @@
 //! request. The parent process can ask one native adapter to launch the exact
 //! current executable, but it never dispatches a privileged action itself.
 
-use super::{execution::ApplyReport, Action, ActionCheck, PendingAction, PlanOperation, Privilege};
 #[cfg(test)]
 use super::{execution::PreparedActionRunner, ActionEffect, ActionError};
+use super::{
+    execution::{ApplyReport, ApplySummary, CompletedExecutionToken},
+    Action, ActionCheck, HumanInstructions, NeedsHuman, PendingAction, PlanOperation, Privilege,
+};
 #[cfg(test)]
 use crate::platform::{SetupExecutionContext, SetupHostPrivilege};
 use crate::{
@@ -17,7 +20,7 @@ use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     fs,
     io::{Read, Write},
     path::{Component, Path, PathBuf},
@@ -28,6 +31,14 @@ use uuid::Uuid;
 const REQUEST_SCHEMA_VERSION: u8 = 1;
 const REQUEST_LIFETIME: Duration = Duration::minutes(5);
 const MAX_REQUEST_BYTES: usize = 64 * 1024;
+const AUTHORIZATION_PENDING_INSTRUCTIONS: &str =
+    "Authorize the displayed system change, then rerun setup.";
+
+fn deferred_authorization_pending(action: &Action) -> PendingAction {
+    let instructions = HumanInstructions::new(AUTHORIZATION_PENDING_INSTRUCTIONS)
+        .expect("static authorization instructions are valid");
+    PendingAction::new(action.name().clone(), NeedsHuman::new(instructions, None))
+}
 
 pub(super) trait AuthorizationInvoker {
     fn invoke(
@@ -305,14 +316,18 @@ pub(in crate::setup) enum PrivilegedStatus {
 }
 
 pub(in crate::setup) struct AuthorizedExecutionReport {
-    ordinary: ApplyReport,
-    pending: Vec<PendingAction>,
+    ordinary: ApplySummary,
+    completion: CompletedExecutionToken,
     privileged_status: PrivilegedStatus,
 }
 
 impl AuthorizedExecutionReport {
-    pub(in crate::setup) fn ordinary(&self) -> &ApplyReport {
+    pub(in crate::setup) fn ordinary(&self) -> &ApplySummary {
         &self.ordinary
+    }
+
+    pub(in crate::setup) fn completion(&self) -> &CompletedExecutionToken {
+        &self.completion
     }
 
     pub(in crate::setup) fn privileged_status(&self) -> PrivilegedStatus {
@@ -320,11 +335,12 @@ impl AuthorizedExecutionReport {
     }
 
     pub(in crate::setup) fn pending(&self) -> &[PendingAction] {
-        &self.pending
+        self.completion.pending()
     }
 
     pub(in crate::setup) fn everything_ready(&self) -> bool {
-        self.pending.is_empty() && matches!(self.privileged_status, PrivilegedStatus::NotNeeded)
+        self.completion.pending().is_empty()
+            && matches!(self.privileged_status, PrivilegedStatus::NotNeeded)
     }
 }
 
@@ -388,6 +404,11 @@ struct AuthorizationRequest {
     principal: WorkerPrincipal,
     privilege_class: HostPrivilegeClass,
     displayed_actions: Vec<RequestedAction>,
+}
+
+struct PreparedAuthorizationRequest {
+    bytes: Vec<u8>,
+    digest: String,
 }
 
 #[derive(Clone, Debug, Deserialize, Hash, PartialEq, Eq, Serialize)]
@@ -491,7 +512,10 @@ pub(super) fn execute_with_authorization<I: AuthorizationInvoker>(
             .check()
             .map_err(super::execution::ApplyPlanError::Action)?
         {
-            ActionCheck::Todo => requested_privileged.push(requested_action(action)),
+            ActionCheck::Todo => {
+                requested_privileged.push(requested_action(action));
+                privileged_pending.push(deferred_authorization_pending(action));
+            }
             ActionCheck::Done => {}
             ActionCheck::NeedsHuman(needs_human) => {
                 privileged_pending.push(PendingAction::new(action.name().clone(), needs_human))
@@ -499,25 +523,26 @@ pub(super) fn execute_with_authorization<I: AuthorizationInvoker>(
         }
     }
     let privileged_count = requested_privileged.len();
-    let privileged_needs_human = privileged_pending.len();
-    super::execution::record_pending_observations(
-        &privileged_pending,
+    let privileged_needs_human = privileged_pending.len() - privileged_count;
+    let prepared_request = if privileged_count != 0 && options.should_invoke() {
+        Some(prepare_authorization_request(
+            &requested_privileged,
+            context,
+        )?)
+    } else {
+        None
+    };
+    let displayed_order = plan
+        .iter()
+        .map(|action| action.name().clone())
+        .collect::<Vec<_>>();
+    let (ordinary, completion) = super::execution::complete_authorized_execution(
+        ordinary,
+        privileged_pending,
+        &displayed_order,
         ordinary_store,
         ordinary_metadata,
     )?;
-    let mut pending = ordinary.pending().to_vec();
-    pending.extend(privileged_pending);
-    let action_order = plan
-        .iter()
-        .enumerate()
-        .map(|(index, action)| (action.name().as_str(), index))
-        .collect::<HashMap<_, _>>();
-    pending.sort_by_key(|action| {
-        action_order
-            .get(action.id().as_str())
-            .copied()
-            .unwrap_or(usize::MAX)
-    });
 
     let privileged_status = if privileged_count == 0 && privileged_needs_human == 0 {
         PrivilegedStatus::NotNeeded
@@ -530,7 +555,12 @@ pub(super) fn execute_with_authorization<I: AuthorizationInvoker>(
             count: privileged_count,
         }
     } else {
-        let request_digest = write_authorization_request(&requested_privileged, context)?;
+        let request_digest = write_prepared_authorization_request(
+            prepared_request
+                .as_ref()
+                .ok_or(AuthorizationError::RequestInvalid)?,
+            context,
+        )?;
         let invocation =
             invoker.invoke(&context.executable, &context.request_path, &request_digest);
         if invocation.is_err() {
@@ -547,7 +577,7 @@ pub(super) fn execute_with_authorization<I: AuthorizationInvoker>(
 
     Ok(AuthorizedExecutionReport {
         ordinary,
-        pending,
+        completion,
         privileged_status,
     })
 }
@@ -598,10 +628,19 @@ fn validate_plan(
     Ok(())
 }
 
+#[cfg(test)]
 fn write_authorization_request(
     displayed_actions: &[RequestedAction],
     context: &AuthorizationContext,
 ) -> Result<String, AuthorizationError> {
+    let prepared = prepare_authorization_request(displayed_actions, context)?;
+    write_prepared_authorization_request(&prepared, context)
+}
+
+fn prepare_authorization_request(
+    displayed_actions: &[RequestedAction],
+    context: &AuthorizationContext,
+) -> Result<PreparedAuthorizationRequest, AuthorizationError> {
     let executable = context
         .executable
         .to_str()
@@ -630,6 +669,14 @@ fn write_authorization_request(
     if bytes.len() > MAX_REQUEST_BYTES {
         return Err(AuthorizationError::RequestInvalid);
     }
+    let digest = request_digest(&bytes);
+    Ok(PreparedAuthorizationRequest { bytes, digest })
+}
+
+fn write_prepared_authorization_request(
+    prepared: &PreparedAuthorizationRequest,
+    context: &AuthorizationContext,
+) -> Result<String, AuthorizationError> {
     let parent = context
         .request_path
         .parent()
@@ -643,7 +690,7 @@ fn write_authorization_request(
     )
     .map_err(AuthorizationError::RequestWrite)?;
     let result = (|| {
-        file.write_all(&bytes)?;
+        file.write_all(&prepared.bytes)?;
         file.sync_all()?;
         crate::platform::verify_private_file_security(
             &context.request_path,
@@ -655,7 +702,7 @@ fn write_authorization_request(
         let _ = fs::remove_file(&context.request_path);
         return Err(AuthorizationError::RequestWrite(error));
     }
-    Ok(request_digest(&bytes))
+    Ok(prepared.digest.clone())
 }
 
 #[cfg(test)]
