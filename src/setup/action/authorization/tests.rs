@@ -1598,6 +1598,7 @@ fn generated_request_rejects_secret_shaped_principal_before_file_creation() {
         context.principal.principal_kind(),
         context.principal.principal_id(),
         "api_key=do-not-write",
+        context.principal.account_policy(),
     )
     .unwrap();
 
@@ -1606,6 +1607,51 @@ fn generated_request_rejects_secret_shaped_principal_before_file_creation() {
     assert_eq!(error.error_code(), "setup.plan_invalid");
     assert!(!error.to_string().contains("do-not-write"));
     assert!(!fixture.request_path().exists());
+}
+
+#[test]
+fn authorization_request_binds_worker_account_policy() {
+    let fixture = AuthorizationFixture::new("account-policy-binding");
+    let state = Arc::new(Mutex::new(Vec::new()));
+    let displayed = vec![
+        Action::test_journaled_state(
+            "test.system-action",
+            1,
+            host_privilege(),
+            Arc::clone(&state),
+        )
+        .0,
+    ];
+    let context = fixture.context();
+    write_request(&displayed, &context).unwrap();
+    let mut value =
+        serde_json::from_slice::<serde_json::Value>(&fs::read(fixture.request_path()).unwrap())
+            .unwrap();
+    assert_eq!(
+        value["principal"]["account_policy"],
+        serde_json::json!("current-user")
+    );
+    value["principal"]["account_policy"] = serde_json::json!("dedicated");
+    let altered = serde_json::to_vec(&value).unwrap();
+    let altered_digest = request_digest(&altered);
+    fs::write(fixture.request_path(), altered).unwrap();
+
+    let (action, metrics) = Action::test_journaled_state(
+        "test.system-action",
+        1,
+        host_privilege(),
+        Arc::clone(&state),
+    );
+    let mut plan = vec![action];
+    let store = ReceiptStore::new_for_test(fixture.system_receipt());
+    let mut metadata = receipt_metadata(&[]);
+
+    let error = run_privileged_request(&context, &altered_digest, &mut plan, &store, &mut metadata)
+        .unwrap_err();
+
+    assert_eq!(error.error_code(), "setup.plan_invalid");
+    assert_eq!(metrics.mutation_calls(), 0);
+    assert!(state.lock().unwrap().is_empty());
 }
 
 #[test]
@@ -2364,6 +2410,7 @@ fn different_principal() -> crate::platform::WorkerPrincipal {
             crate::platform::PrincipalKind::UnixUid,
             uid.to_string(),
             "different-principal",
+            crate::platform::WorkerAccountPolicy::CurrentUser,
         )
         .unwrap()
     }
@@ -2373,6 +2420,7 @@ fn different_principal() -> crate::platform::WorkerPrincipal {
             crate::platform::PrincipalKind::WindowsSid,
             "S-1-5-21-1-2-3-4242",
             "different-principal",
+            crate::platform::WorkerAccountPolicy::CurrentUser,
         )
         .unwrap()
     }

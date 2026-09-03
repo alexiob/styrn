@@ -73,7 +73,7 @@ fn system_manifest_for(principal: &platform::WorkerPrincipal) -> MachineManifest
     identity.principal_kind = principal.principal_kind();
     identity.principal_id = principal.principal_id().to_owned();
     identity.name = principal.name().to_owned();
-    identity.isolation = manifest::WorkerIsolation::DedicatedAccount;
+    identity.isolation = platform::WorkerIsolation::DedicatedAccount;
     manifest.transport.as_mut().unwrap().user = Some(principal.name().to_owned());
     #[cfg(target_os = "linux")]
     {
@@ -348,7 +348,7 @@ fn manifest_paths_are_platform_native_scope_bound_and_root_relative() {
         if scope == platform::InstallationScope::System {
             let identity = invalid.worker_identity.as_mut().unwrap();
             identity.mode = manifest::WorkerIdentityMode::Dedicated;
-            identity.isolation = manifest::WorkerIsolation::DedicatedAccount;
+            identity.isolation = platform::WorkerIsolation::DedicatedAccount;
         }
         set_manifest_paths_root(&mut invalid, root, '/');
         assert!(invalid.validate().is_err(), "accepted {root}");
@@ -398,7 +398,7 @@ fn manifest_windows_paths_reject_device_and_normalization_aliases() {
         if scope == platform::InstallationScope::System {
             let identity = invalid.worker_identity.as_mut().unwrap();
             identity.mode = manifest::WorkerIdentityMode::Dedicated;
-            identity.isolation = manifest::WorkerIsolation::DedicatedAccount;
+            identity.isolation = platform::WorkerIsolation::DedicatedAccount;
         }
         set_manifest_paths_root(&mut invalid, root, '\\');
         assert!(invalid.validate().is_err(), "accepted {root}");
@@ -1224,7 +1224,9 @@ fn system_destination_never_creates_missing_broad_ancestors() {
 fn generated_system_manifest_is_root_owned_and_not_worker_writable() {
     let worker = std::env::var("STYRN_UNIX_TEST_WORKER")
         .expect("STYRN_UNIX_TEST_WORKER must select a real unprivileged account");
-    let principal = platform::resolve_named_worker_principal(&worker).unwrap();
+    let principal =
+        platform::resolve_named_worker_principal(&worker, platform::WorkerAccountPolicy::Dedicated)
+            .unwrap();
     let temp = TestDir::new();
     let config = fs::canonicalize(temp.path()).unwrap().join("styrn");
     fs::create_dir(&config).unwrap();
@@ -1432,7 +1434,9 @@ fn real_selected_account_can_read_but_cannot_write_or_replace_manifest() {
     assert_eq!(unsafe { libc::geteuid() }, 0, "requires root privileges");
     let worker = std::env::var("STYRN_UNIX_TEST_WORKER")
         .expect("STYRN_UNIX_TEST_WORKER must select a real unprivileged account");
-    let principal = platform::resolve_named_worker_principal(&worker).unwrap();
+    let principal =
+        platform::resolve_named_worker_principal(&worker, platform::WorkerAccountPolicy::Dedicated)
+            .unwrap();
     let account = CString::new(worker).unwrap();
     let password = unsafe { libc::getpwnam(account.as_ptr()) };
     assert!(!password.is_null(), "selected worker account must exist");

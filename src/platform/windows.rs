@@ -6,7 +6,7 @@ pub(crate) fn platform_name() -> &'static str {
 use super::{
     select_windows_user_token, windows_token_posture_from_native, ManifestOwner, PrincipalKind,
     PrivateFileIdentity, SetupExecutionContext, SetupHostPrivilege, WindowsTokenElevationType,
-    WindowsTokenPosture, WindowsUserTokenChoice, WorkerPrincipal,
+    WindowsTokenPosture, WindowsUserTokenChoice, WorkerAccountPolicy, WorkerPrincipal,
 };
 use std::ffi::c_void;
 use std::io;
@@ -607,7 +607,7 @@ unsafe extern "system" {
 
 pub(super) fn resolve_current_worker_principal() -> io::Result<WorkerPrincipal> {
     let sid = current_user_sid()?;
-    principal_for_sid(&sid)
+    principal_for_sid(&sid, WorkerAccountPolicy::CurrentUser)
 }
 
 #[allow(dead_code)] // Consumed by the T0.14 setup action integration follow-up.
@@ -685,7 +685,7 @@ fn revalidate_worker_root_principal(
     let scope = layout.scope;
     let principal = &layout.principal;
     let sid = principal_sid(principal)?;
-    let resolved = principal_for_sid(&sid);
+    let resolved = principal_for_sid(&sid, principal.account_policy());
     let current = if scope == super::InstallationScope::User {
         Some(resolve_current_worker_principal()?)
     } else {
@@ -2452,7 +2452,7 @@ pub(super) fn capture_setup_execution_context() -> io::Result<SetupExecutionCont
             "Windows linked token belongs to a different user",
         ));
     }
-    let principal = principal_for_sid(&user_sid)?;
+    let principal = principal_for_sid(&user_sid, WorkerAccountPolicy::CurrentUser)?;
     let token = UserExecutionToken {
         handle: primary,
         principal: principal.clone(),
@@ -2839,10 +2839,13 @@ fn token_user_sid(token: &OwnedHandle) -> io::Result<Vec<u8>> {
 }
 
 #[allow(dead_code)] // Explicit system-account selection is exercised by environmental gates.
-pub(super) fn resolve_named_worker_principal(name: &str) -> io::Result<WorkerPrincipal> {
+pub(super) fn resolve_named_worker_principal(
+    name: &str,
+    account_policy: WorkerAccountPolicy,
+) -> io::Result<WorkerPrincipal> {
     // This is an explicit setup/test selection, never an authorization lookup.
     let sid = lookup_account_sid(name)?;
-    let principal = principal_for_sid(&sid)?;
+    let principal = principal_for_sid(&sid, account_policy)?;
     if principal.name() != name {
         return Err(permission_denied(
             "worker account name does not match its native SID",
@@ -2856,17 +2859,20 @@ pub(super) fn verify_worker_principal(principal: &WorkerPrincipal) -> io::Result
         return Err(invalid_data("worker principal kind does not match Windows"));
     }
     let sid = principal_sid(principal)?;
-    let current = principal_for_sid(&sid)?;
+    let current = principal_for_sid(&sid, principal.account_policy())?;
     if &current != principal {
         return Err(permission_denied("worker SID/name identity drift detected"));
     }
     Ok(())
 }
 
-fn principal_for_sid(sid: &[u8]) -> io::Result<WorkerPrincipal> {
+fn principal_for_sid(
+    sid: &[u8],
+    account_policy: WorkerAccountPolicy,
+) -> io::Result<WorkerPrincipal> {
     let id = sid_to_string(sid.as_ptr().cast())?;
     let name = account_name_for_sid(sid)?;
-    WorkerPrincipal::new(PrincipalKind::WindowsSid, id, name)
+    WorkerPrincipal::new(PrincipalKind::WindowsSid, id, name, account_policy)
 }
 
 fn principal_sid(principal: &WorkerPrincipal) -> io::Result<Vec<u8>> {
@@ -5157,7 +5163,8 @@ mod tests {
     fn native_windows_distinct_worker_owner_uses_restore_privilege_without_partial_state() {
         let worker_name = std::env::var("STYRN_TEST_DISTINCT_LOCAL_WORKER")
             .expect("STYRN_TEST_DISTINCT_LOCAL_WORKER must name a disposable local account");
-        let principal = resolve_named_worker_principal(&worker_name).unwrap();
+        let principal =
+            resolve_named_worker_principal(&worker_name, WorkerAccountPolicy::Dedicated).unwrap();
         assert_ne!(principal, test_principal());
         let parent = std::env::temp_dir().join(format!(
             "styrn-worker-dedicated-owner-{}-{}",
@@ -5206,7 +5213,8 @@ mod tests {
         assert!(!current_thread_has_impersonation_token().unwrap());
         let worker_name = std::env::var("STYRN_TEST_DISTINCT_LOCAL_WORKER")
             .expect("STYRN_TEST_DISTINCT_LOCAL_WORKER must name a disposable local account");
-        let principal = resolve_named_worker_principal(&worker_name).unwrap();
+        let principal =
+            resolve_named_worker_principal(&worker_name, WorkerAccountPolicy::Dedicated).unwrap();
         assert_ne!(principal, test_principal());
         let parent = std::env::temp_dir().join(format!(
             "styrn-worker-real-cleanup-evidence-{}-{}",
@@ -5433,18 +5441,21 @@ mod tests {
             PrincipalKind::WindowsSid,
             "S-1-5-21-1-2-3-1001",
             "build-agent",
+            WorkerAccountPolicy::CurrentUser,
         )
         .unwrap();
         let renamed = WorkerPrincipal::new(
             PrincipalKind::WindowsSid,
             "S-1-5-21-1-2-3-1001",
             "renamed-agent",
+            WorkerAccountPolicy::CurrentUser,
         )
         .unwrap();
         let replacement = WorkerPrincipal::new(
             PrincipalKind::WindowsSid,
             "S-1-5-21-1-2-3-1002",
             "build-agent",
+            WorkerAccountPolicy::CurrentUser,
         )
         .unwrap();
 
@@ -5760,7 +5771,8 @@ mod tests {
     fn real_windows_worker_can_read_but_cannot_mutate_or_take_over_manifest_and_receipt() {
         let worker = std::env::var("STYRN_WINDOWS_TEST_WORKER")
             .expect("STYRN_WINDOWS_TEST_WORKER must select a real unprivileged account");
-        let worker_principal = resolve_named_worker_principal(&worker).unwrap();
+        let worker_principal =
+            resolve_named_worker_principal(&worker, WorkerAccountPolicy::Dedicated).unwrap();
         let password = std::env::var("STYRN_WINDOWS_TEST_PASSWORD")
             .expect("STYRN_WINDOWS_TEST_PASSWORD is required for worker impersonation");
         let public = std::path::PathBuf::from(
@@ -5927,7 +5939,8 @@ mod tests {
     fn real_windows_worker_cannot_access_private_staging_or_files_before_publication() {
         let worker = std::env::var("STYRN_WINDOWS_TEST_WORKER")
             .expect("STYRN_WINDOWS_TEST_WORKER must select a real unprivileged account");
-        let worker_principal = resolve_named_worker_principal(&worker).unwrap();
+        let worker_principal =
+            resolve_named_worker_principal(&worker, WorkerAccountPolicy::Dedicated).unwrap();
         let password = std::env::var("STYRN_WINDOWS_TEST_PASSWORD")
             .expect("STYRN_WINDOWS_TEST_PASSWORD is required for worker impersonation");
         let public = std::path::PathBuf::from(

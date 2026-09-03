@@ -188,17 +188,29 @@ pub(crate) struct WorkerIdentity {
     pub(crate) principal_kind: platform::PrincipalKind,
     pub(crate) principal_id: String,
     pub(crate) name: String,
-    pub(crate) isolation: WorkerIsolation,
+    pub(crate) isolation: platform::WorkerIsolation,
 }
 
 impl WorkerIdentity {
     fn principal(&self) -> Result<platform::WorkerPrincipal, ManifestError> {
-        platform::WorkerPrincipal::new(
+        let account_policy = match self.mode {
+            WorkerIdentityMode::CurrentUser => platform::WorkerAccountPolicy::CurrentUser,
+            WorkerIdentityMode::Dedicated => platform::WorkerAccountPolicy::Dedicated,
+        };
+        let principal = platform::WorkerPrincipal::new(
             self.principal_kind,
             self.principal_id.clone(),
             self.name.clone(),
+            account_policy,
         )
-        .map_err(|error| ManifestError::Validation(error.to_string()))
+        .map_err(|error| ManifestError::Validation(error.to_string()))?;
+        if principal.isolation() != self.isolation {
+            return Err(ManifestError::Validation(
+                "worker_identity mode and isolation must describe the same account policy"
+                    .to_owned(),
+            ));
+        }
+        Ok(principal)
     }
 }
 
@@ -222,13 +234,6 @@ string_enum! { PendingSeverity { Info => "info", Warning => "warning", Error => 
 pub(crate) enum WorkerIdentityMode {
     CurrentUser,
     Dedicated,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
-#[serde(rename_all = "kebab-case")]
-pub(crate) enum WorkerIsolation {
-    SharedUser,
-    DedicatedAccount,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -306,8 +311,8 @@ impl MachineManifest {
                 return invalid("worker_identity.principal_kind does not match platform.os");
             }
             match (&identity.mode, &identity.isolation) {
-                (WorkerIdentityMode::CurrentUser, WorkerIsolation::SharedUser)
-                | (WorkerIdentityMode::Dedicated, WorkerIsolation::DedicatedAccount) => {}
+                (WorkerIdentityMode::CurrentUser, platform::WorkerIsolation::SharedUser)
+                | (WorkerIdentityMode::Dedicated, platform::WorkerIsolation::DedicatedAccount) => {}
                 _ => {
                     return invalid(
                         "worker_identity mode and isolation must describe the same account policy",

@@ -1,6 +1,6 @@
 use super::{
     ManifestOwner, PrincipalKind, PrivateFileIdentity, SetupExecutionContext, SetupHostPrivilege,
-    UnixCallerIds, WorkerPrincipal,
+    UnixCallerIds, WorkerAccountPolicy, WorkerPrincipal,
 };
 use std::ffi::{CString, OsString};
 use std::fs;
@@ -139,7 +139,10 @@ pub(crate) fn platform_name() -> &'static str {
 pub(super) fn resolve_current_worker_principal() -> io::Result<WorkerPrincipal> {
     let real_uid = unsafe { libc::getuid() };
     let effective_uid = unsafe { libc::geteuid() };
-    principal_for_uid(super::validate_unix_caller_ids(real_uid, effective_uid)?)
+    principal_for_uid(
+        super::validate_unix_caller_ids(real_uid, effective_uid)?,
+        WorkerAccountPolicy::CurrentUser,
+    )
 }
 
 #[allow(dead_code)] // Consumed by the T0.14 setup action integration follow-up.
@@ -158,7 +161,8 @@ pub(super) fn default_worker_root(
         super::InstallationScope::User => {
             let current = resolve_current_worker_principal()?;
             super::validate_user_scope_principal(principal, &current)?;
-            let account = account_details_for_uid(principal.unix_uid()?)?;
+            let account =
+                account_details_for_uid(principal.unix_uid()?, principal.account_policy())?;
             let home = PathBuf::from(account.home);
             Ok((
                 home.join("Library/Application Support/Styrn"),
@@ -204,7 +208,7 @@ fn revalidate_worker_root_principal(
     }
     let scope = layout.scope;
     let principal = &layout.principal;
-    let resolved = principal_for_uid(principal.unix_uid()?);
+    let resolved = principal_for_uid(principal.unix_uid()?, principal.account_policy());
     let current = if scope == super::InstallationScope::User {
         Some(resolve_current_worker_principal()?)
     } else {
@@ -1510,7 +1514,8 @@ pub(super) struct UserExecutionToken {
 
 #[cfg(test)]
 pub(super) fn test_user_execution_token(principal: &WorkerPrincipal) -> UserExecutionToken {
-    let account = account_details_for_uid(principal.unix_uid().unwrap()).unwrap();
+    let account =
+        account_details_for_uid(principal.unix_uid().unwrap(), principal.account_policy()).unwrap();
     UserExecutionToken {
         uid: principal.unix_uid().unwrap(),
         gid: account.gid,
@@ -1534,7 +1539,7 @@ pub(super) fn capture_setup_execution_context() -> io::Result<SetupExecutionCont
         original_name = Some(name);
         Ok(identity)
     })?;
-    let account = account_details_for_uid(selected.uid)?;
+    let account = account_details_for_uid(selected.uid, WorkerAccountPolicy::CurrentUser)?;
     if account.gid != selected.gid
         || (selected.privilege == SetupHostPrivilege::Root
             && original_name.as_deref() != Some(account.principal.name()))
@@ -1610,9 +1615,12 @@ pub(super) fn run_test_program_as_original(
 }
 
 #[allow(dead_code)] // Explicit system-account selection is exercised by environmental gates.
-pub(super) fn resolve_named_worker_principal(name: &str) -> io::Result<WorkerPrincipal> {
+pub(super) fn resolve_named_worker_principal(
+    name: &str,
+    account_policy: WorkerAccountPolicy,
+) -> io::Result<WorkerPrincipal> {
     let uid = lookup_worker_uid(name)?;
-    let principal = principal_for_uid(uid)?;
+    let principal = principal_for_uid(uid, account_policy)?;
     if principal.name() != name {
         return Err(permission_denied(
             "worker account name does not match its native uid",
@@ -1625,19 +1633,22 @@ pub(super) fn verify_worker_principal(principal: &WorkerPrincipal) -> io::Result
     if principal.principal_kind() != PrincipalKind::UnixUid {
         return Err(invalid_data("worker principal kind does not match Unix"));
     }
-    let current = principal_for_uid(principal.unix_uid()?)?;
+    let current = principal_for_uid(principal.unix_uid()?, principal.account_policy())?;
     if &current != principal {
         return Err(permission_denied("worker uid/name identity drift detected"));
     }
     Ok(())
 }
 
-fn principal_for_uid(uid: u32) -> io::Result<WorkerPrincipal> {
-    account_for_uid(uid).map(|(principal, _)| principal)
+fn principal_for_uid(uid: u32, account_policy: WorkerAccountPolicy) -> io::Result<WorkerPrincipal> {
+    account_for_uid(uid, account_policy).map(|(principal, _)| principal)
 }
 
-fn account_for_uid(uid: u32) -> io::Result<(WorkerPrincipal, u32)> {
-    let account = account_details_for_uid(uid)?;
+fn account_for_uid(
+    uid: u32,
+    account_policy: WorkerAccountPolicy,
+) -> io::Result<(WorkerPrincipal, u32)> {
+    let account = account_details_for_uid(uid, account_policy)?;
     Ok((account.principal, account.gid))
 }
 
@@ -1647,7 +1658,10 @@ struct UnixAccountDetails {
     home: OsString,
 }
 
-fn account_details_for_uid(uid: u32) -> io::Result<UnixAccountDetails> {
+fn account_details_for_uid(
+    uid: u32,
+    account_policy: WorkerAccountPolicy,
+) -> io::Result<UnixAccountDetails> {
     if uid == 0 {
         return Err(permission_denied("root cannot be a worker principal"));
     }
@@ -1684,7 +1698,12 @@ fn account_details_for_uid(uid: u32) -> io::Result<UnixAccountDetails> {
         return Err(invalid_data("worker home directory is not absolute"));
     }
     Ok(UnixAccountDetails {
-        principal: WorkerPrincipal::new(PrincipalKind::UnixUid, uid.to_string(), name)?,
+        principal: WorkerPrincipal::new(
+            PrincipalKind::UnixUid,
+            uid.to_string(),
+            name,
+            account_policy,
+        )?,
         gid: entry.pw_gid,
         home,
     })

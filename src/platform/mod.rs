@@ -453,6 +453,14 @@ pub(crate) fn resolve_worker_directory_layout(
     principal: &WorkerPrincipal,
     override_root: Option<&Path>,
 ) -> std::io::Result<WorkerDirectoryLayout> {
+    if scope == InstallationScope::User
+        && principal.account_policy() != WorkerAccountPolicy::CurrentUser
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "user-scope worker must use the current-user account policy",
+        ));
+    }
     platform_impl::validate_worker_root_principal(scope, principal)?;
     let (root, creation_policy) = if let Some(root) = override_root {
         validate_worker_root_override(root)?;
@@ -720,6 +728,12 @@ fn validate_user_scope_principal(
     selected: &WorkerPrincipal,
     current: &WorkerPrincipal,
 ) -> std::io::Result<()> {
+    if selected.account_policy() != WorkerAccountPolicy::CurrentUser {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "user-scope worker must use the current-user account policy",
+        ));
+    }
     if selected != current {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
@@ -736,6 +750,20 @@ pub(crate) enum PrincipalKind {
     WindowsSid,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum WorkerAccountPolicy {
+    CurrentUser,
+    Dedicated,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum WorkerIsolation {
+    SharedUser,
+    DedicatedAccount,
+}
+
 /// A validated, stable native account identity.
 ///
 /// Keep this type free of `Display`: callers must choose deliberately whether
@@ -745,6 +773,7 @@ pub(crate) struct WorkerPrincipal {
     principal_kind: PrincipalKind,
     principal_id: String,
     name: String,
+    account_policy: WorkerAccountPolicy,
 }
 
 impl WorkerPrincipal {
@@ -752,6 +781,7 @@ impl WorkerPrincipal {
         principal_kind: PrincipalKind,
         principal_id: impl Into<String>,
         name: impl Into<String>,
+        account_policy: WorkerAccountPolicy,
     ) -> std::io::Result<Self> {
         let principal_id = principal_id.into();
         let name = name.into();
@@ -764,6 +794,7 @@ impl WorkerPrincipal {
             principal_kind,
             principal_id,
             name,
+            account_policy,
         })
     }
 
@@ -778,6 +809,17 @@ impl WorkerPrincipal {
 
     pub(crate) fn name(&self) -> &str {
         &self.name
+    }
+
+    pub(crate) fn account_policy(&self) -> WorkerAccountPolicy {
+        self.account_policy
+    }
+
+    pub(crate) fn isolation(&self) -> WorkerIsolation {
+        match self.account_policy {
+            WorkerAccountPolicy::CurrentUser => WorkerIsolation::SharedUser,
+            WorkerAccountPolicy::Dedicated => WorkerIsolation::DedicatedAccount,
+        }
     }
 
     #[cfg(unix)]
@@ -802,11 +844,17 @@ impl<'de> Deserialize<'de> for WorkerPrincipal {
             principal_kind: PrincipalKind,
             principal_id: String,
             name: String,
+            account_policy: WorkerAccountPolicy,
         }
 
         let wire = Wire::deserialize(deserializer)?;
-        Self::new(wire.principal_kind, wire.principal_id, wire.name)
-            .map_err(serde::de::Error::custom)
+        Self::new(
+            wire.principal_kind,
+            wire.principal_id,
+            wire.name,
+            wire.account_policy,
+        )
+        .map_err(serde::de::Error::custom)
     }
 }
 
@@ -1489,10 +1537,22 @@ mod principal_tests {
 
     #[test]
     fn stable_principal_syntax_is_closed_and_rejects_privileged_ids() {
-        assert!(WorkerPrincipal::new(PrincipalKind::UnixUid, "501", "123-build$").is_ok());
+        assert!(WorkerPrincipal::new(
+            PrincipalKind::UnixUid,
+            "501",
+            "123-build$",
+            WorkerAccountPolicy::CurrentUser,
+        )
+        .is_ok());
         for id in ["", "0", "0501", "4294967296", "-1"] {
             assert!(
-                WorkerPrincipal::new(PrincipalKind::UnixUid, id, "worker").is_err(),
+                WorkerPrincipal::new(
+                    PrincipalKind::UnixUid,
+                    id,
+                    "worker",
+                    WorkerAccountPolicy::CurrentUser,
+                )
+                .is_err(),
                 "{id}"
             );
         }
@@ -1500,6 +1560,7 @@ mod principal_tests {
             PrincipalKind::WindowsSid,
             "S-1-5-21-1-2-3-1001",
             "build.agent$",
+            WorkerAccountPolicy::CurrentUser,
         )
         .is_ok());
         for id in [
@@ -1511,7 +1572,13 @@ mod principal_tests {
             "S-1-281474976710656-1",
         ] {
             assert!(
-                WorkerPrincipal::new(PrincipalKind::WindowsSid, id, "worker").is_err(),
+                WorkerPrincipal::new(
+                    PrincipalKind::WindowsSid,
+                    id,
+                    "worker",
+                    WorkerAccountPolicy::CurrentUser,
+                )
+                .is_err(),
                 "{id}"
             );
         }
@@ -1524,8 +1591,60 @@ mod principal_tests {
             "a\\b",
             "a:b",
         ] {
-            assert!(WorkerPrincipal::new(PrincipalKind::UnixUid, "501", name).is_err());
+            assert!(WorkerPrincipal::new(
+                PrincipalKind::UnixUid,
+                "501",
+                name,
+                WorkerAccountPolicy::CurrentUser,
+            )
+            .is_err());
         }
+    }
+
+    #[test]
+    fn worker_principal_policy_is_intrinsic_and_named_lookup_requires_it() {
+        let current = resolve_current_worker_principal().unwrap();
+        assert_eq!(current.account_policy(), WorkerAccountPolicy::CurrentUser);
+        assert_eq!(current.isolation(), WorkerIsolation::SharedUser);
+
+        let dedicated =
+            resolve_named_worker_principal(current.name(), WorkerAccountPolicy::Dedicated).unwrap();
+        assert_eq!(dedicated.account_policy(), WorkerAccountPolicy::Dedicated);
+        assert_eq!(dedicated.isolation(), WorkerIsolation::DedicatedAccount);
+        assert_ne!(current, dedicated);
+
+        let serialized = serde_json::to_string(&dedicated).unwrap();
+        assert!(serialized.contains("\"account_policy\":\"dedicated\""));
+        assert_eq!(
+            serde_json::from_str::<WorkerPrincipal>(&serialized).unwrap(),
+            dedicated
+        );
+    }
+
+    #[test]
+    fn user_scope_rejects_dedicated_principal_before_filesystem_mutation() {
+        let current = resolve_current_worker_principal().unwrap();
+        let dedicated = WorkerPrincipal::new(
+            current.principal_kind(),
+            current.principal_id(),
+            current.name(),
+            WorkerAccountPolicy::Dedicated,
+        )
+        .unwrap();
+        let parent = std::env::temp_dir().join(format!(
+            "styrn-dedicated-user-scope-{}",
+            uuid::Uuid::now_v7()
+        ));
+        std::fs::create_dir(&parent).unwrap();
+        let root = parent.join("styrn");
+
+        let error =
+            resolve_worker_directory_layout(InstallationScope::User, &dedicated, Some(&root))
+                .unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(!root.exists());
+        std::fs::remove_dir(parent).unwrap();
     }
 
     #[cfg(unix)]
@@ -1540,21 +1659,54 @@ mod principal_tests {
     #[cfg(unix)]
     #[test]
     fn unix_authorization_uses_stable_uid_not_account_name() {
-        let first = WorkerPrincipal::new(PrincipalKind::UnixUid, "501", "same-name").unwrap();
-        let replacement = WorkerPrincipal::new(PrincipalKind::UnixUid, "502", "same-name").unwrap();
+        let first = WorkerPrincipal::new(
+            PrincipalKind::UnixUid,
+            "501",
+            "same-name",
+            WorkerAccountPolicy::CurrentUser,
+        )
+        .unwrap();
+        let replacement = WorkerPrincipal::new(
+            PrincipalKind::UnixUid,
+            "502",
+            "same-name",
+            WorkerAccountPolicy::CurrentUser,
+        )
+        .unwrap();
         assert_eq!(first.unix_uid().unwrap(), 501);
         assert_eq!(replacement.unix_uid().unwrap(), 502);
     }
 
     #[test]
     fn worker_principal_revalidation_rejects_id_name_deletion_and_current_user_drift() {
-        let expected =
-            WorkerPrincipal::new(PrincipalKind::UnixUid, "501", "selected-worker").unwrap();
-        let reused = WorkerPrincipal::new(PrincipalKind::UnixUid, "501", "replacement").unwrap();
-        let renamed =
-            WorkerPrincipal::new(PrincipalKind::UnixUid, "501", "renamed-worker").unwrap();
-        let different =
-            WorkerPrincipal::new(PrincipalKind::UnixUid, "502", "different-worker").unwrap();
+        let expected = WorkerPrincipal::new(
+            PrincipalKind::UnixUid,
+            "501",
+            "selected-worker",
+            WorkerAccountPolicy::CurrentUser,
+        )
+        .unwrap();
+        let reused = WorkerPrincipal::new(
+            PrincipalKind::UnixUid,
+            "501",
+            "replacement",
+            WorkerAccountPolicy::CurrentUser,
+        )
+        .unwrap();
+        let renamed = WorkerPrincipal::new(
+            PrincipalKind::UnixUid,
+            "501",
+            "renamed-worker",
+            WorkerAccountPolicy::CurrentUser,
+        )
+        .unwrap();
+        let different = WorkerPrincipal::new(
+            PrincipalKind::UnixUid,
+            "502",
+            "different-worker",
+            WorkerAccountPolicy::CurrentUser,
+        )
+        .unwrap();
 
         assert!(validate_revalidated_worker_principal(
             InstallationScope::System,
@@ -2318,8 +2470,20 @@ mod worker_directory_tests {
     fn user_worker_root_rejects_a_principal_other_than_the_current_user() {
         #[cfg(unix)]
         let (selected, current) = (
-            WorkerPrincipal::new(PrincipalKind::UnixUid, "501", "selected-worker").unwrap(),
-            WorkerPrincipal::new(PrincipalKind::UnixUid, "502", "current-worker").unwrap(),
+            WorkerPrincipal::new(
+                PrincipalKind::UnixUid,
+                "501",
+                "selected-worker",
+                WorkerAccountPolicy::CurrentUser,
+            )
+            .unwrap(),
+            WorkerPrincipal::new(
+                PrincipalKind::UnixUid,
+                "502",
+                "current-worker",
+                WorkerAccountPolicy::CurrentUser,
+            )
+            .unwrap(),
         );
         #[cfg(target_os = "windows")]
         let (selected, current) = (
@@ -2327,12 +2491,14 @@ mod worker_directory_tests {
                 PrincipalKind::WindowsSid,
                 "S-1-5-21-1-2-3-1001",
                 "selected-worker",
+                WorkerAccountPolicy::CurrentUser,
             )
             .unwrap(),
             WorkerPrincipal::new(
                 PrincipalKind::WindowsSid,
                 "S-1-5-21-1-2-3-1002",
                 "current-worker",
+                WorkerAccountPolicy::CurrentUser,
             )
             .unwrap(),
         );
@@ -2348,6 +2514,7 @@ mod worker_directory_tests {
             expected.principal_kind(),
             expected.principal_id(),
             "renamed-worker",
+            expected.account_policy(),
         )
         .unwrap();
         #[cfg(unix)]
@@ -2359,6 +2526,7 @@ mod worker_directory_tests {
                 "1"
             },
             expected.name(),
+            expected.account_policy(),
         )
         .unwrap();
         #[cfg(target_os = "windows")]
@@ -2366,6 +2534,7 @@ mod worker_directory_tests {
             PrincipalKind::WindowsSid,
             "S-1-5-21-1-2-3-1001",
             expected.name(),
+            expected.account_policy(),
         )
         .unwrap();
         let cases = [
@@ -3611,8 +3780,11 @@ pub(crate) fn resolve_current_worker_principal() -> std::io::Result<WorkerPrinci
 }
 
 #[allow(dead_code)] // Explicit system-account selection is exercised by environmental gates.
-pub(crate) fn resolve_named_worker_principal(name: &str) -> std::io::Result<WorkerPrincipal> {
-    platform_impl::resolve_named_worker_principal(name)
+pub(crate) fn resolve_named_worker_principal(
+    name: &str,
+    account_policy: WorkerAccountPolicy,
+) -> std::io::Result<WorkerPrincipal> {
+    platform_impl::resolve_named_worker_principal(name, account_policy)
 }
 
 pub(crate) fn verify_worker_principal(principal: &WorkerPrincipal) -> std::io::Result<()> {

@@ -841,6 +841,7 @@ fn execution_witness_binding_compares_scope_principal_and_normalized_path() {
             "1"
         },
         "other-worker",
+        crate::platform::WorkerAccountPolicy::CurrentUser,
     )
     .unwrap();
     #[cfg(windows)]
@@ -848,6 +849,7 @@ fn execution_witness_binding_compares_scope_principal_and_normalized_path() {
         crate::platform::PrincipalKind::WindowsSid,
         "S-1-5-18",
         "other-worker",
+        crate::platform::WorkerAccountPolicy::CurrentUser,
     )
     .unwrap();
     let base = ReceiptExecutionWitness {
@@ -1257,6 +1259,7 @@ fn canonical_store_requires_an_explicit_valid_worker_principal() {
             crate::platform::PrincipalKind::UnixUid,
             "501",
             name,
+            crate::platform::WorkerAccountPolicy::CurrentUser,
         )
         .is_err());
     }
@@ -1284,6 +1287,7 @@ fn user_store_rejects_a_different_principal_before_filesystem_mutation() {
         current.principal_kind(),
         current.principal_id(),
         different_name,
+        crate::platform::WorkerAccountPolicy::CurrentUser,
     )
     .unwrap();
 
@@ -1651,7 +1655,11 @@ fn real_selected_worker_can_read_but_cannot_mutate_replace_or_take_over_receipt(
         "/Library/Application Support/Styrn Receipt Test {nonce}"
     ));
     let receipt = directory.join("receipt.json");
-    let principal = crate::platform::resolve_named_worker_principal(&worker).unwrap();
+    let principal = crate::platform::resolve_named_worker_principal(
+        &worker,
+        crate::platform::WorkerAccountPolicy::Dedicated,
+    )
+    .unwrap();
     let store = ReceiptStore::new_system(&receipt, principal.clone()).unwrap();
     store
         .append_entry(entry_with_id("019cafd0-5c00-7000-8000-000000000001"))
