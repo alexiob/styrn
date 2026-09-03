@@ -23,6 +23,38 @@ Negative tests must assert the **specific** failure: the exit code from Part 10.
 from the Part 10.6 registry, and that no partial state was left behind. "It returned non-zero" is not a
 passing negative test.
 
+### Delivery slices and abstraction budget
+
+The numbered tasks are a dependency and coverage map, not a requirement to ship one
+internal layer at a time. Implementation proceeds in the largest reviewable vertical
+slice that ends in an executable user journey. A slice is accepted only when its CLI
+entry point runs against isolated real state, its positive and negative outcomes are
+observable, and the full applicable verification matrix passes. Internal-only
+checkpoints may protect difficult security or durability work, but they do not count as
+a user-visible milestone.
+
+The immediate delivery order is therefore capability-first:
+
+1. Finish T0.14 as one complete rootless-default plus optional dedicated-adoption
+   capability.
+2. Pull T0.19–T0.21 forward together with the minimum rootless portions of T0.15–T0.17
+   needed for a truthful, runnable `styrn setup`: defaults/config/flags/wizard all feed
+   one path; the command creates the current user's worker tree, receipt, and manifest;
+   existing host capabilities are adopted; unavailable machine-wide work is reported as
+   pending without elevation.
+3. Complete the remaining T0.15–T0.18 and T0.22–T0.23 host-readiness work as a fresh-host
+   setup journey, including the optional single OS-owned authorization delta and the
+   enrollment card.
+4. Build Phase 1 as an enroll → status/doctor → exec journey before expanding the
+   command surface further. Later phases follow the same end-to-end rule.
+
+Do not introduce an abstraction solely because a later phase might need it. A new
+boundary must either have a consumer in the current slice or close a concrete privilege,
+identity, secret, durability, concurrency, or data-loss hazard. Prefer a local concrete
+implementation until a second real consumer demonstrates the shared shape. Each delivery
+slice receives one consolidated review after its causal focused tests and one full matrix,
+rather than a review stop for every small internal edit.
+
 ### Conventions binding on every task
 
 - Every non-interactive command supports `--json`; JSON on stdout, diagnostics on stderr, never mixed (10.1–10.3).
