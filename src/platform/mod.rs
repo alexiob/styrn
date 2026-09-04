@@ -9,10 +9,175 @@ mod macos;
 #[cfg(target_os = "windows")]
 mod windows;
 
+use std::io::Read;
 use std::path::Path;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
+
+/// Closed, sanitized readiness inputs returned to the generic setup probe
+/// catalog. Native output and identity data never cross this boundary.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[allow(dead_code)] // Source-inclusion contract tests omit the setup probe catalog.
+pub(crate) enum BaselineProbeKind {
+    SshServer,
+    Tailscale,
+    Git,
+    SleepPolicy,
+    Styrnd,
+    Deferred,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(dead_code)] // Source-inclusion contract tests omit the setup probe catalog.
+pub(crate) enum BaselineProbeSnapshot {
+    Absent,
+    Present {
+        version: Option<String>,
+        healthy: bool,
+    },
+    Broken,
+    Unknowable,
+}
+
+const BASELINE_OUTPUT_LIMIT: u64 = 64 * 1024;
+const BASELINE_COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
+#[derive(Debug)]
+pub(super) struct BaselineCommandOutput {
+    pub(super) success: bool,
+    pub(super) stdout: Vec<u8>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum BaselineCommandFailure {
+    NotFound,
+    TimedOut,
+    OutputTooLarge,
+    Failed,
+}
+
+pub(super) fn run_fixed_baseline_command(
+    program: &Path,
+    arguments: &[&str],
+) -> Result<BaselineCommandOutput, BaselineCommandFailure> {
+    run_baseline_readonly_command(program, arguments, BASELINE_COMMAND_TIMEOUT)
+}
+
+fn run_baseline_readonly_command(
+    program: &Path,
+    arguments: &[&str],
+    timeout: std::time::Duration,
+) -> Result<BaselineCommandOutput, BaselineCommandFailure> {
+    use std::process::{Command, Stdio};
+
+    let mut command = Command::new(program);
+    command
+        .args(arguments)
+        .env_clear()
+        .env("LANG", "C")
+        .env("LC_ALL", "C")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn().map_err(|error| {
+        if error.kind() == std::io::ErrorKind::NotFound {
+            BaselineCommandFailure::NotFound
+        } else {
+            BaselineCommandFailure::Failed
+        }
+    })?;
+    let stdout = child.stdout.take().ok_or(BaselineCommandFailure::Failed)?;
+    let stderr = child.stderr.take().ok_or(BaselineCommandFailure::Failed)?;
+    let stdout_reader = std::thread::spawn(move || read_bounded(stdout));
+    let stderr_reader = std::thread::spawn(move || read_bounded(stderr));
+    let started = std::time::Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if started.elapsed() < timeout => {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                child.wait().map_err(|_| BaselineCommandFailure::Failed)?;
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+                return Err(BaselineCommandFailure::TimedOut);
+            }
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = stdout_reader.join();
+                let _ = stderr_reader.join();
+                return Err(BaselineCommandFailure::Failed);
+            }
+        }
+    };
+    let stdout = stdout_reader
+        .join()
+        .map_err(|_| BaselineCommandFailure::Failed)??;
+    stderr_reader
+        .join()
+        .map_err(|_| BaselineCommandFailure::Failed)??;
+    Ok(BaselineCommandOutput {
+        success: status.success(),
+        stdout,
+    })
+}
+
+fn read_bounded(mut reader: impl std::io::Read) -> Result<Vec<u8>, BaselineCommandFailure> {
+    let mut bytes = Vec::new();
+    reader
+        .by_ref()
+        .take(BASELINE_OUTPUT_LIMIT + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| BaselineCommandFailure::Failed)?;
+    if bytes.len() as u64 > BASELINE_OUTPUT_LIMIT {
+        Err(BaselineCommandFailure::OutputTooLarge)
+    } else {
+        Ok(bytes)
+    }
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static BASELINE_PROBE_SNAPSHOTS: std::cell::RefCell<
+        std::collections::HashMap<BaselineProbeKind, BaselineProbeSnapshot>
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
+#[cfg(test)]
+#[allow(dead_code)] // Some source-inclusion tests compile platform tests without setup probes.
+pub(crate) fn set_baseline_probe_snapshots_for_test(
+    snapshots: impl IntoIterator<Item = (BaselineProbeKind, BaselineProbeSnapshot)>,
+) {
+    BASELINE_PROBE_SNAPSHOTS.with(|slot| slot.borrow_mut().extend(snapshots));
+}
+
+#[cfg(test)]
+#[allow(dead_code)] // Some source-inclusion tests compile platform tests without setup probes.
+pub(crate) fn clear_baseline_probe_snapshots_for_test() {
+    BASELINE_PROBE_SNAPSHOTS.with(|slot| slot.borrow_mut().clear());
+}
+
+#[allow(dead_code)] // Source-inclusion contract tests omit the setup probe catalog.
+pub(crate) fn baseline_probe_snapshot(
+    kind: BaselineProbeKind,
+    authorized_public_keys: &[String],
+    tailscale_mode: &str,
+) -> BaselineProbeSnapshot {
+    #[cfg(test)]
+    if let Some(snapshot) = BASELINE_PROBE_SNAPSHOTS.with(|slot| slot.borrow().get(&kind).cloned())
+    {
+        return snapshot;
+    }
+    match kind {
+        BaselineProbeKind::Styrnd => BaselineProbeSnapshot::Absent,
+        BaselineProbeKind::Deferred => BaselineProbeSnapshot::Unknowable,
+        _ => platform_impl::baseline_probe_snapshot(kind, authorized_public_keys, tailscale_mode),
+    }
+}
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]

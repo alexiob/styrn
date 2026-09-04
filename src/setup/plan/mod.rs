@@ -4,7 +4,7 @@
 //! register probes, execute actions, elevate, or journal receipts.
 
 use super::{
-    action::{Action, ActionDescription, ActionError, ActionName, Privilege},
+    action::{Action, ActionCheck, ActionDescription, ActionError, ActionName, Privilege},
     probe::{ProbeCatalog, ProbeId, ProbeStatus},
     ObservedState,
 };
@@ -109,6 +109,10 @@ enum DesiredBehavior {
         action: DesiredAction,
         required_observation: ExceptionalObservation,
     },
+    AdoptOrDefer {
+        done: DesiredAction,
+        needs_human: DesiredAction,
+    },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -119,6 +123,29 @@ enum ExceptionalObservation {
 }
 
 impl DesiredChange {
+    /// Adopts an already healthy capability without claiming receipt ownership,
+    /// or records static human work for every state that cannot be adopted.
+    pub(crate) fn adopt_or_defer(
+        subject: ProbeId,
+        component: &str,
+        done: DesiredAction,
+        needs_human: DesiredAction,
+    ) -> Result<Self, PlanError> {
+        if [&done, &needs_human]
+            .iter()
+            .any(|action| action.subject() != &subject || action.privilege != Privilege::None)
+            || done.operation != PlanOperation::Done
+            || needs_human.operation != PlanOperation::NeedsHuman
+        {
+            return Err(PlanError::InvalidCrossLink);
+        }
+        Ok(Self {
+            subject,
+            component: ComponentName::parse(component)?,
+            behavior: DesiredBehavior::AdoptOrDefer { done, needs_human },
+        })
+    }
+
     pub(crate) fn converge(
         subject: ProbeId,
         component: &str,
@@ -291,7 +318,7 @@ impl SetupPlan {
                     DesiredBehavior::Exceptional {
                         required_observation: ExceptionalObservation::HumanRequired,
                         ..
-                    }
+                    } | DesiredBehavior::AdoptOrDefer { .. }
                 )
             {
                 return Err(PlanError::UnknowableObservation);
@@ -346,6 +373,16 @@ impl SetupPlan {
                         }
                     },
                     DesiredBehavior::Exceptional { action, .. } => action.clone(),
+                    DesiredBehavior::AdoptOrDefer { done, needs_human } => {
+                        if matches!(
+                            observation.status(),
+                            ProbeStatus::Present { healthy: true, .. }
+                        ) {
+                            done.clone()
+                        } else {
+                            needs_human.clone()
+                        }
+                    }
                 };
                 PlanEntry {
                     subject: change.subject.clone(),
@@ -359,6 +396,14 @@ impl SetupPlan {
 
     pub(crate) fn entries(&self) -> impl ExactSizeIterator<Item = &PlanEntry> {
         self.entries.iter()
+    }
+
+    /// Consumes the immutable plan while preserving the display grouping and
+    /// the closed action value needed by the journaled apply path.
+    pub(crate) fn into_component_actions(self) -> impl ExactSizeIterator<Item = (String, Action)> {
+        self.entries
+            .into_iter()
+            .map(|entry| (entry.component.0, entry.action))
     }
 }
 
@@ -375,6 +420,14 @@ impl PlanEntry {
 
     pub(crate) fn operation(&self) -> PlanOperation {
         self.action.plan_operation()
+    }
+
+    pub(crate) fn component(&self) -> &str {
+        self.component.as_str()
+    }
+
+    pub(crate) fn action(&self) -> &Action {
+        &self.action
     }
 }
 
@@ -410,16 +463,17 @@ pub(crate) fn render_dry_run<W: Write>(plan: &SetupPlan, mut writer: W) -> Resul
 }
 
 fn format_plan(plan: &SetupPlan) -> Result<String, DryRunError> {
-    let mut groups: Vec<(&ComponentName, Vec<&PlanEntry>)> = Vec::new();
+    let mut groups: Vec<(&ComponentName, Vec<(&PlanEntry, PlanOperation)>)> = Vec::new();
     for entry in &plan.entries {
-        entry.action.check().map_err(DryRunError::Action)?;
+        let check = entry.action.check().map_err(DryRunError::Action)?;
+        let operation = display_operation(entry.operation(), &check);
         if let Some((_, entries)) = groups
             .iter_mut()
             .find(|(component, _)| *component == &entry.component)
         {
-            entries.push(entry);
+            entries.push((entry, operation));
         } else {
-            groups.push((&entry.component, vec![entry]));
+            groups.push((&entry.component, vec![(entry, operation)]));
         }
     }
 
@@ -427,9 +481,9 @@ fn format_plan(plan: &SetupPlan) -> Result<String, DryRunError> {
     for (component, entries) in groups {
         output.push_str(component.as_str());
         output.push_str(":\n");
-        for entry in entries {
+        for (entry, operation) in entries {
             output.push_str("  ");
-            output.push(operation_mark(entry.operation()));
+            output.push(operation_mark(operation));
             output.push(' ');
             output.push_str(entry.action.describe().as_str());
             match entry.action.privilege() {
@@ -441,6 +495,14 @@ fn format_plan(plan: &SetupPlan) -> Result<String, DryRunError> {
         }
     }
     Ok(output)
+}
+
+fn display_operation(desired: PlanOperation, check: &ActionCheck) -> PlanOperation {
+    match check {
+        ActionCheck::Done => PlanOperation::Done,
+        ActionCheck::Todo => desired,
+        ActionCheck::NeedsHuman(_) => PlanOperation::NeedsHuman,
+    }
 }
 
 fn operation_mark(operation: PlanOperation) -> char {

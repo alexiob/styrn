@@ -15,6 +15,260 @@ use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
+pub(super) fn baseline_probe_snapshot(
+    kind: super::BaselineProbeKind,
+    authorized_public_keys: &[String],
+    _tailscale_mode: &str,
+) -> super::BaselineProbeSnapshot {
+    match kind {
+        super::BaselineProbeKind::SshServer => ssh_server_snapshot(authorized_public_keys),
+        super::BaselineProbeKind::Tailscale => tailscale_snapshot(),
+        super::BaselineProbeKind::Git => git_snapshot(),
+        super::BaselineProbeKind::SleepPolicy => sleep_snapshot(),
+        super::BaselineProbeKind::Styrnd | super::BaselineProbeKind::Deferred => {
+            super::BaselineProbeSnapshot::Unknowable
+        }
+    }
+}
+
+fn ssh_server_snapshot(required: &[String]) -> super::BaselineProbeSnapshot {
+    let Some(sshd) = [
+        Path::new("/usr/sbin/sshd"),
+        Path::new("/usr/local/sbin/sshd"),
+    ]
+    .into_iter()
+    .find(|path| path.is_file()) else {
+        return super::BaselineProbeSnapshot::Absent;
+    };
+    let service_observations = ["sshd.service", "ssh.service"].map(|service| {
+        super::run_fixed_baseline_command(
+            Path::new("/usr/bin/systemctl"),
+            &["is-active", "--quiet", service],
+        )
+    });
+    let service_running = if service_observations
+        .iter()
+        .any(|result| result.as_ref().is_ok_and(|output| output.success))
+    {
+        true
+    } else if service_observations.iter().any(Result::is_ok) {
+        false
+    } else {
+        return super::BaselineProbeSnapshot::Unknowable;
+    };
+    let config_enabled = match super::run_fixed_baseline_command(sshd, &["-T"]) {
+        Ok(output) if output.success => sshd_public_key_auth_is_enabled(&output.stdout),
+        Ok(_) | Err(_) => return super::BaselineProbeSnapshot::Unknowable,
+    };
+    let home = match account_details_for_uid(
+        unsafe { libc::getuid() },
+        WorkerAccountPolicy::CurrentUser,
+    ) {
+        Ok(account) => PathBuf::from(account.home),
+        Err(_) => return super::BaselineProbeSnapshot::Unknowable,
+    };
+    super::BaselineProbeSnapshot::Present {
+        version: None,
+        healthy: service_running
+            && config_enabled == Some(true)
+            && authorized_keys_are_ready(&home, required),
+    }
+}
+
+fn tailscale_snapshot() -> super::BaselineProbeSnapshot {
+    let Some(program) = [
+        Path::new("/usr/bin/tailscale"),
+        Path::new("/usr/local/bin/tailscale"),
+    ]
+    .into_iter()
+    .find(|path| path.is_file()) else {
+        return super::BaselineProbeSnapshot::Absent;
+    };
+    match super::run_fixed_baseline_command(program, &["status", "--json"]) {
+        Ok(output) if output.success => parse_tailscale_status(&output.stdout)
+            .unwrap_or(super::BaselineProbeSnapshot::Unknowable),
+        Ok(_) => super::BaselineProbeSnapshot::Unknowable,
+        Err(_) => super::BaselineProbeSnapshot::Unknowable,
+    }
+}
+
+fn git_snapshot() -> super::BaselineProbeSnapshot {
+    let Some(program) = [Path::new("/usr/bin/git"), Path::new("/usr/local/bin/git")]
+        .into_iter()
+        .find(|path| path.is_file())
+    else {
+        return super::BaselineProbeSnapshot::Absent;
+    };
+    match super::run_fixed_baseline_command(program, &["--version"]) {
+        Ok(output) if output.success => parse_git_version(&output.stdout)
+            .map(|version| super::BaselineProbeSnapshot::Present {
+                version: Some(version),
+                healthy: true,
+            })
+            .unwrap_or(super::BaselineProbeSnapshot::Unknowable),
+        Ok(_) => super::BaselineProbeSnapshot::Broken,
+        Err(_) => super::BaselineProbeSnapshot::Unknowable,
+    }
+}
+
+fn sleep_snapshot() -> super::BaselineProbeSnapshot {
+    let arguments = [
+        "is-enabled",
+        "sleep.target",
+        "suspend.target",
+        "hibernate.target",
+        "hybrid-sleep.target",
+    ];
+    match super::run_fixed_baseline_command(Path::new("/usr/bin/systemctl"), &arguments) {
+        Ok(output) => parse_sleep_posture(&output.stdout)
+            .map(|healthy| super::BaselineProbeSnapshot::Present {
+                version: None,
+                healthy,
+            })
+            .unwrap_or(super::BaselineProbeSnapshot::Unknowable),
+        Err(_) => super::BaselineProbeSnapshot::Unknowable,
+    }
+}
+
+fn parse_git_version(bytes: &[u8]) -> Option<String> {
+    if bytes.len() > 256 {
+        return None;
+    }
+    let version = std::str::from_utf8(bytes)
+        .ok()?
+        .trim()
+        .strip_prefix("git version ")?;
+    (!version.is_empty()
+        && version.len() <= 96
+        && version.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'+' | b'(' | b')')
+        }))
+    .then(|| version.to_owned())
+}
+
+fn parse_tailscale_status(bytes: &[u8]) -> Option<super::BaselineProbeSnapshot> {
+    let value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    let healthy = value.get("BackendState")?.as_str()? == "Running"
+        && value.get("Self")?.get("Online")?.as_bool()?;
+    Some(super::BaselineProbeSnapshot::Present {
+        version: None,
+        healthy,
+    })
+}
+
+fn parse_sleep_posture(bytes: &[u8]) -> Option<bool> {
+    let output = std::str::from_utf8(bytes).ok()?;
+    let states = output
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .collect::<Vec<_>>();
+    if states.len() != 4
+        || states.iter().any(|state| {
+            !matches!(
+                *state,
+                "masked" | "enabled" | "disabled" | "static" | "indirect" | "generated"
+            )
+        })
+    {
+        return None;
+    }
+    Some(states.iter().all(|state| *state == "masked"))
+}
+
+fn authorized_keys_are_ready(home: &Path, required: &[String]) -> bool {
+    let ssh = home.join(".ssh");
+    let Ok(metadata) = fs::symlink_metadata(&ssh) else {
+        return false;
+    };
+    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+        return false;
+    }
+    let Ok(mut file) = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(ssh.join("authorized_keys"))
+    else {
+        return false;
+    };
+    let Ok(metadata) = file.metadata() else {
+        return false;
+    };
+    if !metadata.is_file() || metadata.len() > 1024 * 1024 {
+        return false;
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    if std::io::Read::read_to_end(&mut file, &mut bytes).is_err() {
+        return false;
+    }
+    let Ok(contents) = std::str::from_utf8(&bytes) else {
+        return false;
+    };
+    let keys = contents
+        .lines()
+        .map(str::trim)
+        .filter(|line| valid_authorized_key_line(line))
+        .collect::<Vec<_>>();
+    if required.is_empty() {
+        !keys.is_empty()
+    } else {
+        required.iter().all(|key| keys.contains(&key.as_str()))
+    }
+}
+
+fn valid_authorized_key_line(line: &str) -> bool {
+    let mut fields = line.split_ascii_whitespace();
+    matches!(
+        fields.next(),
+        Some(
+            "ssh-ed25519"
+                | "ssh-rsa"
+                | "ecdsa-sha2-nistp256"
+                | "ecdsa-sha2-nistp384"
+                | "ecdsa-sha2-nistp521"
+                | "sk-ssh-ed25519@openssh.com"
+        )
+    ) && fields.next().is_some_and(|key| !key.is_empty())
+}
+
+fn sshd_public_key_auth_is_enabled(bytes: &[u8]) -> Option<bool> {
+    let output = std::str::from_utf8(bytes).ok()?;
+    output.lines().find_map(|line| {
+        let mut fields = line.split_ascii_whitespace();
+        (fields.next()? == "publickeyauthentication").then(|| fields.next() == Some("yes"))
+    })
+}
+
+#[cfg(test)]
+mod baseline_probe_tests {
+    use super::super::{BaselineProbeKind, BaselineProbeSnapshot};
+
+    #[test]
+    #[ignore = "requires a disposable Linux user with running sshd and Tailscale, valid per-user authorized_keys, Git, and all sleep targets masked"]
+    fn native_rootless_baseline_positive_requires_disposable_configured_host() {
+        for kind in [
+            BaselineProbeKind::SshServer,
+            BaselineProbeKind::Tailscale,
+            BaselineProbeKind::Git,
+            BaselineProbeKind::SleepPolicy,
+        ] {
+            assert!(matches!(
+                super::baseline_probe_snapshot(kind, &[], ""),
+                BaselineProbeSnapshot::Present { healthy: true, .. }
+            ));
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a disposable Linux user with deliberately denied, malformed, and timeout-injected native probe state"]
+    fn native_rootless_baseline_negative_requires_disposable_faulted_host() {
+        assert!(matches!(
+            super::baseline_probe_snapshot(BaselineProbeKind::SleepPolicy, &[], ""),
+            BaselineProbeSnapshot::Unknowable
+        ));
+    }
+}
+
 #[cfg(test)]
 type PostWorkerMkdirHook = fn(i32, &std::ffi::CStr);
 

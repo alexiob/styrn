@@ -72,12 +72,23 @@ pub(in crate::setup) struct EffectiveRootlessSetup {
     fail_on_pending: bool,
 }
 impl EffectiveRootlessSetup {
+    pub(in crate::setup) fn selected_component_names(
+        &self,
+    ) -> impl ExactSizeIterator<Item = &'static str> + '_ {
+        self.components.iter().map(|component| component.name())
+    }
+
+    pub(in crate::setup) fn authorized_public_keys(&self) -> &[String] {
+        &self.authorized_keys
+    }
+
+    pub(in crate::setup) fn requested_tailscale_mode(&self) -> &str {
+        &self.tailscale_mode
+    }
+
     #[cfg(test)]
     fn component_names(&self) -> Vec<&'static str> {
-        self.components
-            .iter()
-            .map(|component| component.name())
-            .collect()
+        self.selected_component_names().collect()
     }
 }
 

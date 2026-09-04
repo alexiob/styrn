@@ -8,6 +8,33 @@ use crate::setup::ObservedState;
 use std::collections::HashSet;
 use thiserror::Error;
 
+#[cfg(not(any(
+    action_core_fixture,
+    action_compile_fixture,
+    plan_pending_authority_forge_fixture,
+    plan_pending_publication_forge_fixture,
+    plan_completed_execution_construct_fixture,
+    plan_completed_execution_mutate_fixture,
+    plan_completed_execution_clone_fixture,
+    plan_completed_execution_serialize_fixture,
+    plan_pending_projection_fixture,
+)))]
+mod baseline;
+
+#[cfg(not(any(
+    action_core_fixture,
+    action_compile_fixture,
+    plan_pending_authority_forge_fixture,
+    plan_pending_publication_forge_fixture,
+    plan_completed_execution_construct_fixture,
+    plan_completed_execution_mutate_fixture,
+    plan_completed_execution_clone_fixture,
+    plan_completed_execution_serialize_fixture,
+    plan_pending_projection_fixture,
+)))]
+#[allow(unused_imports)] // Task 3 consumes the Task 2 catalog and desired-state factory.
+pub(in crate::setup) use baseline::{production_rootless_catalog, rootless_baseline_desired_state};
+
 pub(crate) use super::probe_values::{
     FindingSeverity, ProbeDescriptorSpec, ProbeId, RemediationSpec, StyrnCommand,
 };
@@ -112,6 +139,10 @@ impl ProbeCatalog {
 
     pub(crate) fn observe(&self) -> ObservedState {
         super::observe_worker_probes(&self.probes)
+    }
+
+    pub(crate) fn descriptors(&self) -> impl ExactSizeIterator<Item = &ProbeDescriptorSpec> {
+        self.probes.iter().map(|probe| probe.descriptor())
     }
 }
 

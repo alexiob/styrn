@@ -88,6 +88,118 @@ fn converge_with_done(
     .expect("test desired convergence must be valid")
 }
 
+fn adopt_or_defer(subject: &str, component: &str) -> DesiredChange {
+    DesiredChange::adopt_or_defer(
+        id(subject),
+        component,
+        action(
+            subject,
+            "test.adopted",
+            "existing capability is ready",
+            Privilege::None,
+            PlanOperation::Done,
+        ),
+        action(
+            subject,
+            "test.pending",
+            "make the capability ready outside Styrn, then retry setup",
+            Privilege::None,
+            PlanOperation::NeedsHuman,
+        ),
+    )
+    .expect("test adopt-or-defer change must be valid")
+}
+
+#[test]
+fn adopt_or_defer_maps_only_present_healthy_to_done_and_every_other_state_to_needs_human() {
+    let cases = [
+        (
+            ProbeStatus::Present {
+                version: Some("1.0.0".to_owned()),
+                healthy: true,
+            },
+            PlanOperation::Done,
+        ),
+        (ProbeStatus::Absent, PlanOperation::NeedsHuman),
+        (
+            ProbeStatus::Present {
+                version: Some("1.0.0".to_owned()),
+                healthy: false,
+            },
+            PlanOperation::NeedsHuman,
+        ),
+        (
+            ProbeStatus::Broken {
+                reason: "sanitized broken state".to_owned(),
+            },
+            PlanOperation::NeedsHuman,
+        ),
+        (
+            ProbeStatus::Unknowable {
+                reason: "sanitized unavailable state".to_owned(),
+            },
+            PlanOperation::NeedsHuman,
+        ),
+    ];
+
+    for (status, expected) in cases {
+        let catalog = test_support::catalog(vec![test_support::TestProbe::fixed(
+            "tool.baseline",
+            status,
+            Arc::new(AtomicUsize::new(0)),
+        )]);
+        let desired = DesiredState::new(vec![adopt_or_defer("tool.baseline", "baseline")]);
+        let plan = SetupPlan::compute(&catalog.observe(), &desired).unwrap();
+        let entry = plan.entries().next().unwrap();
+
+        assert_eq!(entry.operation(), expected);
+        assert_eq!(entry.action().privilege(), Privilege::None);
+        assert_eq!(entry.component(), "baseline");
+    }
+}
+
+#[test]
+fn plan_display_operation_is_derived_from_the_action_check() {
+    assert_eq!(
+        display_operation(
+            PlanOperation::Create,
+            &crate::setup::action::ActionCheck::Done
+        ),
+        PlanOperation::Done
+    );
+    assert_eq!(
+        display_operation(
+            PlanOperation::Create,
+            &crate::setup::action::ActionCheck::Todo
+        ),
+        PlanOperation::Create
+    );
+}
+
+#[test]
+fn consuming_plan_entries_retain_component_and_closed_action() {
+    let catalog = test_support::catalog(vec![test_support::TestProbe::fixed(
+        "tool.baseline",
+        ProbeStatus::Present {
+            version: None,
+            healthy: true,
+        },
+        Arc::new(AtomicUsize::new(0)),
+    )]);
+    let plan = SetupPlan::compute(
+        &catalog.observe(),
+        &DesiredState::new(vec![adopt_or_defer("tool.baseline", "baseline")]),
+    )
+    .unwrap();
+
+    let entries = plan.into_component_actions().collect::<Vec<_>>();
+
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].0, "baseline");
+    assert_eq!(entries[0].1.name().as_str(), "test.adopted");
+    assert_eq!(entries[0].1.privilege(), Privilege::None);
+}
+
 #[test]
 fn ordered_diff_renders_grouped_create_reconfigure_and_done_lines() {
     let calls = Arc::new(AtomicUsize::new(0));
@@ -550,7 +662,7 @@ fn remote_login_observation_failures_truthfully_require_human_action_without_ele
 }
 
 #[test]
-fn badges_and_first_seen_component_groups_are_exact_and_special_lines_stay_typed() {
+fn badges_and_first_seen_component_groups_are_exact_and_display_follows_checks() {
     let catalog = test_support::catalog(vec![
         test_support::TestProbe::fixed(
             "tool.root",
@@ -661,7 +773,7 @@ fn badges_and_first_seen_component_groups_are_exact_and_special_lines_stay_typed
 
     assert_eq!(
         String::from_utf8(rendered).unwrap(),
-        "first:\n  ✓ root line [sudo]\n  ✓ plain line\nsecond:\n  ✓ admin line [admin]\nspecial:\n  ! authenticate in browser\n  . enable with configuration\n  - remove old component [admin]\n"
+        "first:\n  ✓ root line [sudo]\n  ✓ plain line\nsecond:\n  ✓ admin line [admin]\nspecial:\n  ! authenticate in browser\n  ✓ enable with configuration\n  - remove old component [admin]\n"
     );
 }
 

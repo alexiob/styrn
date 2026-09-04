@@ -15,6 +15,258 @@ use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
+pub(super) fn baseline_probe_snapshot(
+    kind: super::BaselineProbeKind,
+    authorized_public_keys: &[String],
+    _tailscale_mode: &str,
+) -> super::BaselineProbeSnapshot {
+    match kind {
+        super::BaselineProbeKind::SshServer => ssh_server_snapshot(authorized_public_keys),
+        super::BaselineProbeKind::Tailscale => tailscale_snapshot(),
+        super::BaselineProbeKind::Git => git_snapshot(),
+        super::BaselineProbeKind::SleepPolicy => sleep_snapshot(),
+        super::BaselineProbeKind::Styrnd | super::BaselineProbeKind::Deferred => {
+            super::BaselineProbeSnapshot::Unknowable
+        }
+    }
+}
+
+fn ssh_server_snapshot(required: &[String]) -> super::BaselineProbeSnapshot {
+    let Ok(system) = baseline_system_directory() else {
+        return super::BaselineProbeSnapshot::Unknowable;
+    };
+    let sshd = system.join("OpenSSH").join("sshd.exe");
+    if !sshd.is_file() {
+        return super::BaselineProbeSnapshot::Absent;
+    }
+    let service =
+        match super::run_fixed_baseline_command(&system.join("sc.exe"), &["query", "sshd"]) {
+            Ok(output) => parse_sshd_service_running(&output.stdout),
+            Err(_) => return super::BaselineProbeSnapshot::Unknowable,
+        };
+    let Some(service) = service else {
+        return super::BaselineProbeSnapshot::Unknowable;
+    };
+    let config = match super::run_fixed_baseline_command(&sshd, &["-T"]) {
+        Ok(output) if output.success => sshd_public_key_auth_is_enabled(&output.stdout),
+        Ok(_) | Err(_) => return super::BaselineProbeSnapshot::Unknowable,
+    };
+    let Ok(profile) = current_profile_directory() else {
+        return super::BaselineProbeSnapshot::Unknowable;
+    };
+    super::BaselineProbeSnapshot::Present {
+        version: None,
+        healthy: service && config == Some(true) && authorized_keys_are_ready(&profile, required),
+    }
+}
+
+fn tailscale_snapshot() -> super::BaselineProbeSnapshot {
+    let program = Path::new(r"C:\Program Files\Tailscale\tailscale.exe");
+    if !program.is_file() {
+        return super::BaselineProbeSnapshot::Absent;
+    }
+    match super::run_fixed_baseline_command(program, &["status", "--json"]) {
+        Ok(output) if output.success => parse_tailscale_status(&output.stdout)
+            .unwrap_or(super::BaselineProbeSnapshot::Unknowable),
+        Ok(_) => super::BaselineProbeSnapshot::Unknowable,
+        Err(_) => super::BaselineProbeSnapshot::Unknowable,
+    }
+}
+
+fn git_snapshot() -> super::BaselineProbeSnapshot {
+    let Some(program) = [
+        Path::new(r"C:\Program Files\Git\cmd\git.exe"),
+        Path::new(r"C:\Program Files (x86)\Git\cmd\git.exe"),
+    ]
+    .into_iter()
+    .find(|path| path.is_file()) else {
+        return super::BaselineProbeSnapshot::Absent;
+    };
+    match super::run_fixed_baseline_command(program, &["--version"]) {
+        Ok(output) if output.success => parse_git_version(&output.stdout)
+            .map(|version| super::BaselineProbeSnapshot::Present {
+                version: Some(version),
+                healthy: true,
+            })
+            .unwrap_or(super::BaselineProbeSnapshot::Unknowable),
+        Ok(_) => super::BaselineProbeSnapshot::Broken,
+        Err(_) => super::BaselineProbeSnapshot::Unknowable,
+    }
+}
+
+fn sleep_snapshot() -> super::BaselineProbeSnapshot {
+    let Ok(system) = baseline_system_directory() else {
+        return super::BaselineProbeSnapshot::Unknowable;
+    };
+    match super::run_fixed_baseline_command(
+        &system.join("powercfg.exe"),
+        &["/query", "SCHEME_CURRENT", "SUB_SLEEP", "STANDBYIDLE"],
+    ) {
+        Ok(output) if output.success => parse_sleep_posture(&output.stdout)
+            .map(|healthy| super::BaselineProbeSnapshot::Present {
+                version: None,
+                healthy,
+            })
+            .unwrap_or(super::BaselineProbeSnapshot::Unknowable),
+        Ok(_) | Err(_) => super::BaselineProbeSnapshot::Unknowable,
+    }
+}
+
+fn baseline_system_directory() -> io::Result<PathBuf> {
+    let mut buffer = vec![0_u16; 32_768];
+    let length = unsafe { GetSystemDirectoryW(buffer.as_mut_ptr(), buffer.len() as u32) };
+    if length == 0 || length as usize >= buffer.len() {
+        return Err(io::Error::last_os_error());
+    }
+    buffer.truncate(length as usize);
+    Ok(std::ffi::OsString::from_wide(&buffer).into())
+}
+
+fn parse_git_version(bytes: &[u8]) -> Option<String> {
+    if bytes.len() > 256 {
+        return None;
+    }
+    let version = std::str::from_utf8(bytes)
+        .ok()?
+        .trim()
+        .strip_prefix("git version ")?;
+    (!version.is_empty()
+        && version.len() <= 96
+        && version.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'+' | b'(' | b')')
+        }))
+    .then(|| version.to_owned())
+}
+
+fn parse_tailscale_status(bytes: &[u8]) -> Option<super::BaselineProbeSnapshot> {
+    let value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    let healthy = value.get("BackendState")?.as_str()? == "Running"
+        && value.get("Self")?.get("Online")?.as_bool()?;
+    Some(super::BaselineProbeSnapshot::Present {
+        version: None,
+        healthy,
+    })
+}
+
+fn parse_sshd_service_running(bytes: &[u8]) -> Option<bool> {
+    let output = std::str::from_utf8(bytes).ok()?;
+    if output.contains("RUNNING") {
+        Some(true)
+    } else if output.contains("STOPPED") {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+fn parse_sleep_posture(bytes: &[u8]) -> Option<bool> {
+    let output = std::str::from_utf8(bytes).ok()?;
+    let values = output
+        .split_ascii_whitespace()
+        .filter_map(|field| {
+            field
+                .strip_prefix("0x")
+                .and_then(|hex| u32::from_str_radix(hex, 16).ok())
+        })
+        .collect::<Vec<_>>();
+    (values.len() == 2).then(|| values.into_iter().all(|value| value == 0))
+}
+
+fn authorized_keys_are_ready(profile: &Path, required: &[String]) -> bool {
+    let ssh = profile.join(".ssh");
+    if path_is_reparse_point(&ssh) || !ssh.is_dir() {
+        return false;
+    }
+    let path = ssh.join("authorized_keys");
+    if path_is_reparse_point(&path) {
+        return false;
+    }
+    let Ok(mut file) = std::fs::OpenOptions::new().read(true).open(path) else {
+        return false;
+    };
+    let Ok(metadata) = file.metadata() else {
+        return false;
+    };
+    if !metadata.is_file() || metadata.len() > 1024 * 1024 {
+        return false;
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    if std::io::Read::read_to_end(&mut file, &mut bytes).is_err() {
+        return false;
+    }
+    let Ok(contents) = std::str::from_utf8(&bytes) else {
+        return false;
+    };
+    let keys = contents
+        .lines()
+        .map(str::trim)
+        .filter(|line| valid_authorized_key_line(line))
+        .collect::<Vec<_>>();
+    if required.is_empty() {
+        !keys.is_empty()
+    } else {
+        required.iter().all(|key| keys.contains(&key.as_str()))
+    }
+}
+
+fn path_is_reparse_point(path: &Path) -> bool {
+    let attributes = unsafe { GetFileAttributesW(wide_os(path).as_ptr()) };
+    attributes == INVALID_FILE_ATTRIBUTES || attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+}
+
+fn valid_authorized_key_line(line: &str) -> bool {
+    let mut fields = line.split_ascii_whitespace();
+    matches!(
+        fields.next(),
+        Some(
+            "ssh-ed25519"
+                | "ssh-rsa"
+                | "ecdsa-sha2-nistp256"
+                | "ecdsa-sha2-nistp384"
+                | "ecdsa-sha2-nistp521"
+                | "sk-ssh-ed25519@openssh.com"
+        )
+    ) && fields.next().is_some_and(|key| !key.is_empty())
+}
+
+fn sshd_public_key_auth_is_enabled(bytes: &[u8]) -> Option<bool> {
+    let output = std::str::from_utf8(bytes).ok()?;
+    output.lines().find_map(|line| {
+        let mut fields = line.split_ascii_whitespace();
+        (fields.next()? == "publickeyauthentication").then(|| fields.next() == Some("yes"))
+    })
+}
+
+#[cfg(test)]
+mod baseline_probe_tests {
+    use super::super::{BaselineProbeKind, BaselineProbeSnapshot};
+
+    #[test]
+    #[ignore = "requires a disposable native Windows profile with running OpenSSH and Tailscale, per-user authorized_keys, Git, and AC/DC standby timeout disabled"]
+    fn native_rootless_baseline_positive_requires_disposable_configured_host() {
+        for kind in [
+            BaselineProbeKind::SshServer,
+            BaselineProbeKind::Tailscale,
+            BaselineProbeKind::Git,
+            BaselineProbeKind::SleepPolicy,
+        ] {
+            assert!(matches!(
+                super::baseline_probe_snapshot(kind, &[], ""),
+                BaselineProbeSnapshot::Present { healthy: true, .. }
+            ));
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a disposable native Windows profile with denied ACL, malformed command output, and timeout-injected probe state"]
+    fn native_rootless_baseline_negative_requires_disposable_faulted_host() {
+        assert!(matches!(
+            super::baseline_probe_snapshot(BaselineProbeKind::SleepPolicy, &[], ""),
+            BaselineProbeSnapshot::Unknowable
+        ));
+    }
+}
+
 type WorkerPrivilegeCleanupHook = fn(io::Result<()>) -> io::Result<()>;
 
 #[cfg(test)]
@@ -3928,6 +4180,7 @@ fn validate_worker_sid_name_use(sid_name_use: i32) -> io::Result<()> {
 #[link(name = "kernel32")]
 unsafe extern "system" {
     fn LocalFree(memory: *mut c_void) -> *mut c_void;
+    fn GetSystemDirectoryW(buffer: *mut u16, size: u32) -> u32;
     fn GetFileAttributesW(file_name: *const u16) -> u32;
     fn CreateDirectoryW(
         path_name: *const u16,
