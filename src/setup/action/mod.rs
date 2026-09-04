@@ -1340,6 +1340,7 @@ mod gate {
 #[cfg(not(action_core_fixture))]
 mod authorized_keys;
 #[cfg(not(action_core_fixture))]
+#[allow(unused_imports)] // Source-inclusion boundary fixtures do not build setup orchestration.
 pub(in crate::setup) use authorized_keys::current_user_ssh_action_plan;
 #[cfg(test)]
 pub(in crate::setup) use authorized_keys::current_user_ssh_action_plan_for_test;
