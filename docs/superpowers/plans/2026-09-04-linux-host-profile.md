@@ -10,10 +10,29 @@
 
 **Spec:** `docs/superpowers/specs/2026-09-04-linux-host-profile-design.md`
 
+## Delivery slice
+
+Tasks 2–9 below are internal TDD checkpoints for one user-visible delivery,
+not separate milestones or review stops.  The slice is accepted only when an
+ordinary non-root user on each supported Linux family can run setup, retain
+useful rootless state after declining elevation, optionally authorize one
+closed OS-owned package delta for stock Git/OpenSSH, receive an enrollment
+card when SSH is ready, and use that card for controller-side `host enroll`,
+`host status`, and `exec`.
+
+Implement the checkpoints in dependency order, but batch review, broad
+verification, documentation, and handoff at that executable boundary.  Do not
+pull Cockpit, Tailscale repository provisioning, general user-manager/linger
+support, dedicated-account generalization, or unrelated service abstractions
+into the critical path.  Those remain required by their later tasks; they are
+not prerequisites for proving this first useful Linux journey.
+
 ## Global Constraints
 
 - Work directly on `main`; preserve every path reported by the initial and each subsequent `git status`. Never rely on a hard-coded dirty-file list, and do not stage another contributor's path until its owner has committed or explicitly handed it off.
-- Follow `docs/design.md` revision H until Task 1 atomically canonicalizes revision I. Where the approved supporting spec is ambiguous, preserve revision H's independent-capability and fail-safe rules.
+- Follow canonical `docs/design.md` revision I. Where the approved supporting
+  spec is ambiguous, preserve the design's independent-capability and
+  fail-safe rules.
 - Use strict TDD for every behavior: focused red test, smallest green implementation, refactor with the focused suite green, then exact-path commit.
 - Never use `PATH`, shell evaluation, WSL environment variables, caller-provided package names, or mutable image tags as authority.
 - Never claim container success for systemd start/enable, user-manager, linger, reboot, ssh login, Tailscale TUN, sudo handoff, or dedicated-account acceptance.

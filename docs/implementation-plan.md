@@ -33,22 +33,24 @@ observable, and the full applicable verification matrix passes. Internal-only
 checkpoints may protect difficult security or durability work, but they do not count as
 a user-visible milestone.
 
-The immediate delivery order is therefore capability-first:
+The immediate delivery order is therefore journey-first:
 
-1. Finish T0.14 Slice 5 as an internal accepted security and durability checkpoint for
-   rootless-default plus optional dedicated adoption. It is not a user-visible milestone:
-   T0.20 must supply the single production CLI consumer and runnable isolated-state setup
-   journey before this capability satisfies the delivery-slice acceptance rule above.
-2. Pull T0.19–T0.21 forward together with the minimum rootless portions of T0.15–T0.17
-   needed for a truthful, runnable `styrn setup`: defaults/config/flags/wizard all feed
-   one path; the command creates the current user's worker tree, receipt, and manifest;
-   existing host capabilities are adopted; unavailable machine-wide work is reported as
-   pending without elevation.
-3. Complete the remaining T0.15–T0.18 and T0.22–T0.23 host-readiness work as a fresh-host
-   setup journey, including the optional single OS-owned authorization delta and the
-   enrollment card.
-4. Build Phase 1 as an enroll → status/doctor → exec journey before expanding the
-   command surface further. Later phases follow the same end-to-end rule.
+1. Complete the current-user setup → enrollment-card → controller enrollment
+   journey. It must create the worker tree and authorized-key state without an
+   account or privilege requirement, preserve useful state when host readiness
+   is pending, and feed the already-runnable Phase 1 status/doctor/exec path.
+2. Treat the Linux host-profile/package checkpoints as one delivery slice:
+   native Debian, Red Hat, and Arch-family setup adopts existing Git/OpenSSH or
+   offers one closed OS-owned authorization for missing stock packages. A
+   decline keeps rootless work and explicit pending state; acceptance ends in
+   card-driven enroll → status → exec, not in a parser or provider abstraction.
+3. Close the equivalent macOS and Windows fresh-host gaps, then add the
+   stage-zero verified installers. Native gates remain honest where disposable
+   accounts, OS authorization, reboot, or service lifecycle cannot run in CI.
+4. Only after those journeys are green, continue with the remaining Phase 1
+   fleet surface and Phase 2 governed jobs. Daemons, streaming RPC,
+   multiplexing, retries, fanout, and generic installer/provider frameworks do
+   not enter an earlier slice without a present consumer or concrete hazard.
 
 Do not introduce an abstraction solely because a later phase might need it. A new
 boundary must either have a consumer in the current slice or close a concrete privilege,
