@@ -31,6 +31,85 @@ pub(super) fn baseline_probe_snapshot(
     }
 }
 
+fn systemd_alias_is_active(observations: &[Option<bool>; 2]) -> Option<bool> {
+    if observations.contains(&Some(true)) {
+        Some(true)
+    } else if observations.iter().all(Option::is_some) {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+fn all_systemd_states_are_active(observations: &[Option<bool>; 2]) -> Option<bool> {
+    let mut all_active = true;
+    for observation in observations {
+        all_active &= *observation.as_ref()?;
+    }
+    Some(all_active)
+}
+
+fn parse_systemd_active_output(output: &super::BaselineCommandOutput) -> Option<bool> {
+    parse_systemd_state_output(
+        output,
+        &["active", "reloading", "refreshing"],
+        &[
+            "inactive",
+            "failed",
+            "activating",
+            "deactivating",
+            "maintenance",
+        ],
+    )
+}
+
+fn parse_systemd_enabled_output(output: &super::BaselineCommandOutput) -> Option<bool> {
+    parse_systemd_state_output(
+        output,
+        &[
+            "enabled",
+            "enabled-runtime",
+            "alias",
+            "static",
+            "indirect",
+            "generated",
+            "transient",
+        ],
+        &[
+            "linked",
+            "linked-runtime",
+            "masked",
+            "masked-runtime",
+            "disabled",
+            "bad",
+            "not-found",
+        ],
+    )
+}
+
+fn parse_systemd_state_output(
+    output: &super::BaselineCommandOutput,
+    successful_states: &[&str],
+    unsuccessful_states: &[&str],
+) -> Option<bool> {
+    let state = std::str::from_utf8(&output.stdout).ok()?.trim();
+    let observed = if successful_states.contains(&state) {
+        true
+    } else if unsuccessful_states.contains(&state) {
+        false
+    } else {
+        return None;
+    };
+    (observed == output.success).then_some(observed)
+}
+
+fn parse_systemd_observation(
+    result: &Result<super::BaselineCommandOutput, super::BaselineCommandFailure>,
+    parser: fn(&super::BaselineCommandOutput) -> Option<bool>,
+) -> Option<bool> {
+    result.as_ref().ok().and_then(parser)
+}
+
 fn ssh_server_snapshot(required: &[String]) -> super::BaselineProbeSnapshot {
     let Some(sshd) = [
         Path::new("/usr/sbin/sshd"),
@@ -41,19 +120,13 @@ fn ssh_server_snapshot(required: &[String]) -> super::BaselineProbeSnapshot {
         return super::BaselineProbeSnapshot::Absent;
     };
     let service_observations = ["sshd.service", "ssh.service"].map(|service| {
-        super::run_fixed_baseline_command(
+        let result = super::run_fixed_baseline_command(
             Path::new("/usr/bin/systemctl"),
-            &["is-active", "--quiet", service],
-        )
+            &["is-active", service],
+        );
+        parse_systemd_observation(&result, parse_systemd_active_output)
     });
-    let service_running = if service_observations
-        .iter()
-        .any(|result| result.as_ref().is_ok_and(|output| output.success))
-    {
-        true
-    } else if service_observations.iter().any(Result::is_ok) {
-        false
-    } else {
+    let Some(service_running) = systemd_alias_is_active(&service_observations) else {
         return super::BaselineProbeSnapshot::Unknowable;
     };
     let account = match account_details_for_uid(
@@ -97,23 +170,30 @@ fn tailscale_snapshot(requested_mode: &str) -> super::BaselineProbeSnapshot {
     .find(|path| path.is_file()) else {
         return super::BaselineProbeSnapshot::Absent;
     };
-    let service_active = super::run_fixed_baseline_command(
-        Path::new("/usr/bin/systemctl"),
-        &["is-active", "--quiet", "tailscaled.service"],
-    )
-    .is_ok_and(|output| output.success);
-    let service_enabled = super::run_fixed_baseline_command(
-        Path::new("/usr/bin/systemctl"),
-        &["is-enabled", "--quiet", "tailscaled.service"],
-    )
-    .is_ok_and(|output| output.success);
+    let service_observations = [
+        parse_systemd_observation(
+            &super::run_fixed_baseline_command(
+                Path::new("/usr/bin/systemctl"),
+                &["is-active", "tailscaled.service"],
+            ),
+            parse_systemd_active_output,
+        ),
+        parse_systemd_observation(
+            &super::run_fixed_baseline_command(
+                Path::new("/usr/bin/systemctl"),
+                &["is-enabled", "tailscaled.service"],
+            ),
+            parse_systemd_enabled_output,
+        ),
+    ];
+    let Some(persistent) = all_systemd_states_are_active(&service_observations) else {
+        return super::BaselineProbeSnapshot::Unknowable;
+    };
     match super::run_fixed_baseline_command(program, &["status", "--json"]) {
-        Ok(output) if output.success => parse_tailscale_status(
-            &output.stdout,
-            service_active && service_enabled,
-            requested_mode,
-        )
-        .unwrap_or(super::BaselineProbeSnapshot::Unknowable),
+        Ok(output) if output.success => {
+            parse_tailscale_status(&output.stdout, persistent, requested_mode)
+                .unwrap_or(super::BaselineProbeSnapshot::Unknowable)
+        }
         Ok(_) => super::BaselineProbeSnapshot::Unknowable,
         Err(_) => super::BaselineProbeSnapshot::Unknowable,
     }
@@ -300,7 +380,133 @@ fn secure_ssh_path_metadata(metadata: &fs::Metadata, uid: u32, directory: bool) 
 
 #[cfg(test)]
 mod baseline_probe_tests {
-    use super::super::{BaselineProbeKind, BaselineProbeSnapshot};
+    use super::super::{
+        BaselineCommandFailure, BaselineCommandOutput, BaselineProbeKind, BaselineProbeSnapshot,
+    };
+
+    fn systemd_output(success: bool, stdout: &[u8]) -> BaselineCommandOutput {
+        BaselineCommandOutput {
+            success,
+            stdout: stdout.to_vec(),
+        }
+    }
+
+    #[test]
+    fn systemd_active_output_distinguishes_known_state_from_operational_failure() {
+        assert_eq!(
+            super::parse_systemd_active_output(&systemd_output(true, b"active\n")),
+            Some(true)
+        );
+        assert_eq!(
+            super::parse_systemd_active_output(&systemd_output(false, b"inactive\n")),
+            Some(false)
+        );
+        assert_eq!(
+            super::parse_systemd_active_output(&systemd_output(false, b"")),
+            None
+        );
+        assert_eq!(
+            super::parse_systemd_active_output(&systemd_output(false, b"unknown\n")),
+            None
+        );
+        assert_eq!(
+            super::parse_systemd_active_output(&systemd_output(false, b"active\n")),
+            None
+        );
+    }
+
+    #[test]
+    fn systemd_enabled_output_distinguishes_known_state_from_operational_failure() {
+        assert_eq!(
+            super::parse_systemd_enabled_output(&systemd_output(true, b"enabled\n")),
+            Some(true)
+        );
+        assert_eq!(
+            super::parse_systemd_enabled_output(&systemd_output(false, b"disabled\n")),
+            Some(false)
+        );
+        assert_eq!(
+            super::parse_systemd_enabled_output(&systemd_output(false, b"not-found\n")),
+            Some(false)
+        );
+        assert_eq!(
+            super::parse_systemd_enabled_output(&systemd_output(false, b"")),
+            None
+        );
+        assert_eq!(
+            super::parse_systemd_enabled_output(&systemd_output(true, b"disabled\n")),
+            None
+        );
+    }
+
+    #[test]
+    fn systemd_command_failures_are_unobservable() {
+        for failure in [
+            BaselineCommandFailure::NotFound,
+            BaselineCommandFailure::TimedOut,
+            BaselineCommandFailure::OutputTooLarge,
+            BaselineCommandFailure::Failed,
+        ] {
+            assert_eq!(
+                super::parse_systemd_observation(&Err(failure), super::parse_systemd_active_output,),
+                None
+            );
+        }
+    }
+
+    #[test]
+    fn ssh_alias_observation_accepts_either_active_alias_despite_an_unobservable_alternative() {
+        assert_eq!(
+            super::systemd_alias_is_active(&[None, Some(true)]),
+            Some(true)
+        );
+        assert_eq!(
+            super::systemd_alias_is_active(&[Some(true), None]),
+            Some(true)
+        );
+        assert_eq!(
+            super::systemd_alias_is_active(&[Some(true), Some(false)]),
+            Some(true)
+        );
+        assert_eq!(
+            super::systemd_alias_is_active(&[Some(false), Some(true)]),
+            Some(true)
+        );
+    }
+
+    #[test]
+    fn ssh_alias_observation_distinguishes_known_inactive_from_unobservable() {
+        assert_eq!(
+            super::systemd_alias_is_active(&[Some(false), Some(false)]),
+            Some(false)
+        );
+        assert_eq!(super::systemd_alias_is_active(&[Some(false), None]), None);
+        assert_eq!(super::systemd_alias_is_active(&[None, Some(false)]), None);
+    }
+
+    #[test]
+    fn tailscale_persistence_requires_both_systemd_observations_to_be_known() {
+        assert_eq!(
+            super::all_systemd_states_are_active(&[Some(true), Some(true)]),
+            Some(true)
+        );
+        assert_eq!(
+            super::all_systemd_states_are_active(&[Some(true), Some(false)]),
+            Some(false)
+        );
+        assert_eq!(
+            super::all_systemd_states_are_active(&[Some(false), Some(true)]),
+            Some(false)
+        );
+        assert_eq!(
+            super::all_systemd_states_are_active(&[Some(false), None]),
+            None
+        );
+        assert_eq!(
+            super::all_systemd_states_are_active(&[None, Some(false)]),
+            None
+        );
+    }
 
     #[test]
     #[ignore = "requires a disposable Linux user with running sshd and Tailscale, valid per-user authorized_keys, Git, and all sleep targets masked"]
