@@ -121,7 +121,7 @@ fn parse_git_version(bytes: &[u8]) -> Option<String> {
     (!version.is_empty()
         && version.len() <= 96
         && version.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'+' | b'(' | b')')
+            byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'+' | b'(' | b')' | b' ')
         }))
     .then(|| version.to_owned())
 }
@@ -293,6 +293,10 @@ mod baseline_probe_tests {
         assert_eq!(
             parse_git_version(b"git version 2.51.0\n"),
             Some("2.51.0".to_owned())
+        );
+        assert_eq!(
+            parse_git_version(b"git version 2.50.1 (Apple Git-155)\n"),
+            Some("2.50.1 (Apple Git-155)".to_owned())
         );
         assert_eq!(parse_git_version(b"git release secret\n"), None);
         assert_eq!(parse_git_version(&vec![b'1'; 65 * 1024]), None);
