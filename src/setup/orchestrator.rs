@@ -15,7 +15,7 @@ use std::{collections::BTreeMap, fmt, path::Path};
 const CURRENT_USER_CAVEAT: &str = "Current-user mode provides no OS-account isolation, no controller-credential isolation, and no same-user Styrn-state integrity boundary.";
 const CONCURRENT_PUBLICATION_RETRIES: usize = 1;
 
-pub(in crate::setup) struct RootlessSetupPlan {
+pub(crate) struct RootlessSetupPlan {
     effective: EffectiveRootlessSetup,
     plan_items: Vec<RootlessSetupPlanItem>,
     actions: ActionPlan,
@@ -37,17 +37,17 @@ impl fmt::Debug for RootlessSetupPlan {
 }
 
 impl RootlessSetupPlan {
-    pub(in crate::setup) fn effective(&self) -> &EffectiveRootlessSetup {
+    pub(crate) fn effective(&self) -> &EffectiveRootlessSetup {
         &self.effective
     }
 
-    pub(in crate::setup) fn plan_items(&self) -> &[RootlessSetupPlanItem] {
+    pub(crate) fn plan_items(&self) -> &[RootlessSetupPlanItem] {
         &self.plan_items
     }
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub(in crate::setup) struct RootlessSetupPlanItem {
+pub(crate) struct RootlessSetupPlanItem {
     action_id: String,
     component: String,
     operation: &'static str,
@@ -60,44 +60,44 @@ pub(in crate::setup) struct RootlessSetupPlanItem {
 }
 
 impl RootlessSetupPlanItem {
-    pub(in crate::setup) fn action_id(&self) -> &str {
+    pub(crate) fn action_id(&self) -> &str {
         &self.action_id
     }
 
-    pub(in crate::setup) fn component(&self) -> &str {
+    pub(crate) fn component(&self) -> &str {
         &self.component
     }
 
-    pub(in crate::setup) const fn operation(&self) -> &'static str {
+    pub(crate) const fn operation(&self) -> &'static str {
         self.operation
     }
 
-    pub(in crate::setup) const fn privilege(&self) -> &'static str {
+    pub(crate) const fn privilege(&self) -> &'static str {
         self.privilege
     }
 
-    pub(in crate::setup) fn description(&self) -> &str {
+    pub(crate) fn description(&self) -> &str {
         &self.description
     }
 
-    pub(in crate::setup) const fn scope(&self) -> &'static str {
+    pub(crate) const fn scope(&self) -> &'static str {
         self.scope
     }
 
-    pub(in crate::setup) const fn role(&self) -> &'static str {
+    pub(crate) const fn role(&self) -> &'static str {
         self.role
     }
 
-    pub(in crate::setup) const fn account(&self) -> &'static str {
+    pub(crate) const fn account(&self) -> &'static str {
         self.account
     }
 
-    pub(in crate::setup) const fn security_caveat(&self) -> &'static str {
+    pub(crate) const fn security_caveat(&self) -> &'static str {
         self.security_caveat
     }
 }
 
-pub(in crate::setup) struct RootlessSetupOutcome {
+pub(crate) struct RootlessSetupOutcome {
     plan_items: Vec<RootlessSetupPlanItem>,
     results: Vec<ActionExecutionResult>,
     pending: Vec<RootlessPendingResult>,
@@ -122,7 +122,7 @@ impl fmt::Debug for RootlessSetupOutcome {
 }
 
 impl RootlessSetupOutcome {
-    pub(in crate::setup) fn plan_items(&self) -> &[RootlessSetupPlanItem] {
+    pub(crate) fn plan_items(&self) -> &[RootlessSetupPlanItem] {
         &self.plan_items
     }
 
@@ -130,19 +130,25 @@ impl RootlessSetupOutcome {
         &self.results
     }
 
-    pub(in crate::setup) fn pending(&self) -> &[RootlessPendingResult] {
+    pub(crate) fn execution_results(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.results
+            .iter()
+            .map(|result| (result.action_id(), result.status().as_str()))
+    }
+
+    pub(crate) fn pending(&self) -> &[RootlessPendingResult] {
         &self.pending
     }
 
-    pub(in crate::setup) fn manifest_path(&self) -> &Path {
+    pub(crate) fn manifest_path(&self) -> &Path {
         &self.manifest_path
     }
 
-    pub(in crate::setup) fn receipt_path(&self) -> &Path {
+    pub(crate) fn receipt_path(&self) -> &Path {
         &self.receipt_path
     }
 
-    pub(in crate::setup) const fn security_caveat(&self) -> &'static str {
+    pub(crate) const fn security_caveat(&self) -> &'static str {
         self.security_caveat
     }
 
@@ -152,27 +158,27 @@ impl RootlessSetupOutcome {
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub(in crate::setup) struct RootlessPendingResult {
+pub(crate) struct RootlessPendingResult {
     action_id: String,
     severity: &'static str,
     message: String,
 }
 
 impl RootlessPendingResult {
-    pub(in crate::setup) fn action_id(&self) -> &str {
+    pub(crate) fn action_id(&self) -> &str {
         &self.action_id
     }
 
-    pub(in crate::setup) const fn severity(&self) -> &'static str {
+    pub(crate) const fn severity(&self) -> &'static str {
         self.severity
     }
 
-    pub(in crate::setup) fn message(&self) -> &str {
+    pub(crate) fn message(&self) -> &str {
         &self.message
     }
 }
 
-pub(in crate::setup) enum RootlessSetupError {
+pub(crate) enum RootlessSetupError {
     ProbeFailed,
     PlanInvalid,
     ApplyFailed,
@@ -209,7 +215,7 @@ impl fmt::Display for RootlessSetupError {
 impl std::error::Error for RootlessSetupError {}
 
 impl RootlessSetupError {
-    pub(in crate::setup) const fn error_code(&self) -> &'static str {
+    pub(crate) const fn error_code(&self) -> &'static str {
         match self {
             Self::ProbeFailed => "setup.probe_failed",
             Self::PlanInvalid => "setup.plan_invalid",
@@ -223,7 +229,7 @@ impl RootlessSetupError {
         13
     }
 
-    pub(in crate::setup) const fn outcome(&self) -> Option<&RootlessSetupOutcome> {
+    pub(crate) const fn outcome(&self) -> Option<&RootlessSetupOutcome> {
         match self {
             Self::NeedsHuman(outcome) => Some(outcome),
             _ => None,
@@ -231,7 +237,7 @@ impl RootlessSetupError {
     }
 }
 
-pub(in crate::setup) fn prepare_rootless_setup(
+pub(crate) fn prepare_rootless_setup(
     effective: EffectiveRootlessSetup,
 ) -> Result<RootlessSetupPlan, RootlessSetupError> {
     let context =
@@ -359,7 +365,7 @@ fn prepare_resolved_rootless_setup(
     })
 }
 
-pub(in crate::setup) fn apply_rootless_setup(
+pub(crate) fn apply_rootless_setup(
     prepared: RootlessSetupPlan,
 ) -> Result<RootlessSetupOutcome, RootlessSetupError> {
     let RootlessSetupPlan {

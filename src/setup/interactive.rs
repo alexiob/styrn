@@ -1,6 +1,6 @@
 use std::io::{BufRead, Write};
 
-pub(in crate::setup) fn collect_interactive_answers(
+pub(crate) fn collect_interactive_answers(
     input: &mut dyn BufRead,
     output: &mut dyn Write,
     terminal: bool,
@@ -21,16 +21,6 @@ pub(in crate::setup) fn collect_interactive_answers(
     let name = prompt(input, output, "Machine name (blank for native hostname): ")?;
     let effective =
         super::config::effective_from_interactive_answers(role, components.as_deref(), name)?;
-    let confirmation = prompt(input, output, "Apply this rootless user-scope plan? [y/N] ")?
-        .ok_or_else(|| super::SetupInputError::Plan("setup confirmation is required".into()))?;
-    if !matches!(
-        confirmation.trim().to_ascii_lowercase().as_str(),
-        "y" | "yes"
-    ) {
-        return Err(super::SetupInputError::Plan(
-            "setup confirmation is required".into(),
-        ));
-    }
     Ok(effective)
 }
 
@@ -61,7 +51,7 @@ mod tests {
     use std::io::Cursor;
 
     #[test]
-    fn interactive_setup_requires_tty_and_never_reads_eof_as_consent() {
+    fn interactive_setup_requires_tty_and_collects_only_desired_state() {
         let mut output = Vec::new();
         let non_terminal = collect_interactive_answers(&mut Cursor::new(b""), &mut output, false);
         assert!(matches!(
@@ -71,13 +61,18 @@ mod tests {
         assert!(output.is_empty());
 
         let mut output = Vec::new();
-        let eof = collect_interactive_answers(&mut Cursor::new(b"\n\n\n"), &mut output, true);
-        assert!(matches!(eof, Err(super::super::SetupInputError::Plan(_))));
-        assert!(String::from_utf8(output).unwrap().contains("[y/N]"));
+        let effective = collect_interactive_answers(
+            &mut Cursor::new(b"worker\nssh,git\nalpha\n"),
+            &mut output,
+            true,
+        )
+        .unwrap();
+        assert_eq!(effective.machine_name(), Some("alpha"));
+        assert!(!String::from_utf8(output).unwrap().contains("[y/N]"));
     }
 
     #[test]
-    fn interactive_setup_writes_one_replayable_atomic_config_only_after_yes() {
+    fn interactive_setup_effective_state_has_one_replayable_atomic_config() {
         let destination = std::env::temp_dir().join(format!(
             "styrn-interactive-{}-{}.toml",
             std::process::id(),
@@ -87,17 +82,8 @@ mod tests {
                 .as_nanos()
         ));
         let mut output = Vec::new();
-        let refused = collect_interactive_answers(
-            &mut Cursor::new(b"worker\nssh,git\nalpha\nn\n"),
-            &mut output,
-            true,
-        );
-        assert!(refused.is_err());
-        assert!(!destination.exists());
-
-        let mut output = Vec::new();
         let effective = collect_interactive_answers(
-            &mut Cursor::new(b"worker\nssh,git\nalpha\nyes\n"),
+            &mut Cursor::new(b"worker\nssh,git\nalpha\n"),
             &mut output,
             true,
         )
@@ -116,7 +102,7 @@ mod tests {
     fn interactive_and_equivalent_flags_produce_identical_effective_state() {
         let mut output = Vec::new();
         let interactive = collect_interactive_answers(
-            &mut Cursor::new(b"worker\nssh,git\nalpha\ny\n"),
+            &mut Cursor::new(b"worker\nssh,git\nalpha\n"),
             &mut output,
             true,
         )

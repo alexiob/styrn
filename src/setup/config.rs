@@ -58,7 +58,7 @@ impl Component {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(in crate::setup) struct EffectiveRootlessSetup {
+pub(crate) struct EffectiveRootlessSetup {
     role: String,
     scope: crate::platform::InstallationScope,
     account_mode: String,
@@ -80,7 +80,7 @@ impl EffectiveRootlessSetup {
         self.fail_on_pending
     }
 
-    pub(in crate::setup) fn selected_component_names(
+    pub(crate) fn selected_component_names(
         &self,
     ) -> impl ExactSizeIterator<Item = &'static str> + '_ {
         self.components.iter().map(|component| component.name())
@@ -101,7 +101,7 @@ impl EffectiveRootlessSetup {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub(in crate::setup) enum SetupInputError {
+pub(crate) enum SetupInputError {
     Usage(String),
     Config(String),
     Plan(String),
@@ -182,7 +182,7 @@ struct PendingPolicyConfig {
     fail_on_pending: Option<bool>,
 }
 
-pub(in crate::setup) fn load_effective_rootless_setup(
+pub(crate) fn load_effective_rootless_setup(
     request: &crate::cli::SetupRequest,
 ) -> Result<EffectiveRootlessSetup, SetupInputError> {
     let config = request
@@ -603,7 +603,7 @@ pub(in crate::setup) fn replay_toml(effective: &EffectiveRootlessSetup) -> Strin
     ));
     output
 }
-pub(in crate::setup) fn persist_interactive_replay(
+pub(crate) fn persist_interactive_replay(
     effective: &EffectiveRootlessSetup,
     destination: &Path,
 ) -> Result<(), SetupInputError> {

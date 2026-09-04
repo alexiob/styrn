@@ -5,7 +5,55 @@
 Styrn is a planned cross-platform command-line tool for operating a fleet of macOS, Linux, and native Windows development machines from any enrolled controller. It will set up and inspect hosts, run project-defined workflows under resource limits, keep remote jobs alive after the controller disconnects, and—on hosts where Herdr is installed and registered—manage persistent Codex and Claude Code sessions through it. Herdr is optional per host: everything except the agent-session surface runs without it.
 
 > [!IMPORTANT]
-> **Styrn is not yet usable software.** Implementation has begun — the repository contains a Rust crate that builds and tests on Linux, macOS, and Windows — but it is early in Phase 0 of nine, there is no release or installable binary, and no command yet performs real fleet work. Commands in this README describe the intended interface, not current behavior.
+> **Styrn is early software, not a supported release.** The rootless
+> current-user `styrn setup` path is runnable from a built checkout, but Phase 0
+> is incomplete and there is no released or installable binary. Fleet, job,
+> agent, enrollment, and most other commands below still describe the intended
+> interface rather than available end-to-end behavior.
+
+## Runnable rootless setup
+
+The implemented setup slice supports an ordinary current user as a user-scope
+worker, with no account creation and no root/Administrator requirement:
+
+```console
+# Review the complete plan without writing setup state.
+styrn setup --dry-run
+
+# Apply the rootless plan without the ordinary confirmation prompt.
+styrn setup --yes
+
+# Replay desired state from TOML, or collect it through terminal prompts.
+styrn setup --config examples/setup-config.rootless.toml --yes
+styrn setup --interactive
+
+# Receive one styrn.command.v1 document on stdout.
+styrn setup --dry-run --json
+styrn setup --yes --json
+```
+
+Bare setup probes the host, displays one complete plan, and asks once before
+applying. A non-TTY invocation without `--yes` displays that plan and exits 13
+with `setup.confirmation_required`; `--yes` confirms only the unprivileged
+plan and never authorizes or elevates. `--interactive` collects role,
+components, and machine name, then displays the same prepared plan before its
+single confirmation and writes a replayable `./setup-config.toml` only after
+acceptance.
+
+Apply creates or reconciles the current user's canonical worker directory
+tree, durable setup receipt, and user machine manifest. It adopts already
+healthy SSH-server, Tailscale, Git, and sleep posture without claiming
+ownership. Missing, broken, or unprovable machine-wide work—and the not-yet-
+shipped `styrnd` service—is recorded as pending with static remediation.
+Current-user mode is explicitly not OS-account, controller-credential, or
+same-user Styrn-state isolation.
+
+This slice does **not** install packages, edit SSH/firewall/service/power
+configuration, authenticate Tailscale, create or adopt a dedicated account,
+request sudo/UAC, emit setup scripts, enroll the machine, or make it remotely
+job-ready. System scope, controller/both roles, dedicated identity, privileged
+and user phases, uninstall, and enrollment output remain unavailable and fail
+closed.
 
 ## Why Styrn?
 
@@ -128,11 +176,15 @@ Styrn is not literally dependency-free: v1 relies on system OpenSSH for transpor
 
 ## Repository status
 
-Implementation is in **early Phase 0 of nine phases (0–8)**: the crate,
-command-line surface, output envelope, exit-code registry, machine manifest,
-and setup probe layer are taking shape. The repository defines a three-OS CI
-matrix for formatting, build, tests, and lints. Everything from Phase 1 onward
-is unstarted; there is no release or supported installation path yet.
+Implementation is in **early Phase 0 of nine phases (0–8)**. The crate,
+command-line and output contracts, manifest, setup engine, and the first
+runnable rootless setup slice exist. The broader sshd, Tailscale, baseline
+component, config/invocation, and interactive tasks remain partial and
+unchecked because their deferred system mutation, dedicated identity,
+service, enrollment, and fresh-host acceptance work has not landed. The
+repository defines a three-OS CI matrix for formatting, build, tests, and
+lints. Everything from Phase 1 onward is unstarted; there is no release or
+supported installation path yet.
 
 | Phase | Intended outcome |
 |---:|---|
@@ -152,7 +204,7 @@ The detailed, testable task list is in the [implementation plan](docs/implementa
 
 | Document | Use it for |
 |---|---|
-| [Canonical design, revision F](docs/design.md) | Current architecture, behavior, security model, protocols, and binding decisions |
+| [Canonical design, revision H](docs/design.md) | Current architecture, behavior, security model, protocols, and binding decisions |
 | [Implementation plan](docs/implementation-plan.md) | Ordered work items, positive tests, negative tests, and phase exit criteria |
 | [Revision-D review](docs/design-review-D.md) | Historical adversarial review and proportionality analysis; not the current specification |
 
@@ -177,8 +229,9 @@ cargo test --locked
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 ```
 
-These commands validate the current foundation; they do not install a usable
-Styrn release. There is no supported installation path yet.
+These commands validate the current foundation and runnable rootless setup
+slice; they do not install a supported Styrn release. There is no supported
+installation path yet.
 
 ## Naming
 

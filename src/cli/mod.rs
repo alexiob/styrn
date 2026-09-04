@@ -226,6 +226,8 @@ impl ParsedCli {
 pub(crate) struct ParseFailure {
     error: clap::Error,
     policy: AnsiPolicy,
+    setup_invocation: bool,
+    json_output: bool,
 }
 
 impl ParseFailure {
@@ -234,6 +236,10 @@ impl ParseFailure {
             self.error.kind(),
             clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion
         )
+    }
+
+    pub(crate) const fn is_setup_json_failure(&self) -> bool {
+        self.setup_invocation && self.json_output
     }
 }
 
@@ -271,20 +277,27 @@ impl Cli {
         facts: CliFacts,
     ) -> Result<ParsedCli, ParseFailure> {
         let args = normalize_harness_tail(args);
+        let setup_invocation = preparse_setup_invocation(&args);
+        let requested_json = preparse_machine_mode(&args)
+            || facts.styrn_json.as_deref() == Some(std::ffi::OsStr::new("1"));
         let error_policy = AnsiPolicy::from_terminals(
             facts.stdout_terminal,
             facts.stderr_terminal,
-            preparse_machine_mode(&args),
+            requested_json,
         );
         let matches = Self::command()
             .try_get_matches_from(args)
             .map_err(|error| ParseFailure {
                 error,
                 policy: error_policy,
+                setup_invocation,
+                json_output: requested_json,
             })?;
         let cli = Self::from_arg_matches(&matches).map_err(|error| ParseFailure {
             error,
             policy: error_policy,
+            setup_invocation,
+            json_output: requested_json,
         })?;
         let env_json = match facts.styrn_json.as_deref() {
             None => false,
@@ -298,6 +311,8 @@ impl Cli {
                         "STYRN_JSON must be exactly 0 or 1",
                     ),
                     policy: error_policy,
+                    setup_invocation,
+                    json_output: requested_json,
                 });
             }
         };
@@ -305,6 +320,25 @@ impl Cli {
             json: cli.json || env_json,
             ..cli
         };
+        if cli.json
+            && matches!(
+                &cli.command,
+                RootCommand::Setup(SetupArgs {
+                    interactive: true,
+                    ..
+                })
+            )
+        {
+            return Err(ParseFailure {
+                error: Self::command().error(
+                    clap::error::ErrorKind::ArgumentConflict,
+                    "--interactive cannot be used with JSON output",
+                ),
+                policy: error_policy,
+                setup_invocation,
+                json_output: true,
+            });
+        }
         let policy = AnsiPolicy::from_terminals(
             facts.stdout_terminal,
             facts.stderr_terminal,
@@ -365,6 +399,13 @@ fn preparse_machine_mode(args: &[OsString]) -> bool {
         .skip(1)
         .take_while(|argument| argument.as_os_str() != std::ffi::OsStr::new("--"))
         .any(|argument| argument == "--json" || argument == "--jsonl")
+}
+
+fn preparse_setup_invocation(args: &[OsString]) -> bool {
+    args.iter()
+        .skip(1)
+        .find(|argument| argument.as_os_str() != std::ffi::OsStr::new("--json"))
+        .is_some_and(|argument| argument.as_os_str() == std::ffi::OsStr::new("setup"))
 }
 
 pub(crate) fn render_parse_failure(
@@ -821,7 +862,7 @@ struct WatchArgs {
 
 #[cfg(test)]
 mod tests {
-    use super::{render_parse_failure, AnsiPolicy, Cli, MachineAction};
+    use super::{render_parse_failure, AnsiPolicy, Cli, CliFacts, MachineAction};
     use std::ffi::OsString;
 
     #[test]
@@ -976,6 +1017,17 @@ mod tests {
             false,
         )
         .is_err());
+    }
+
+    #[test]
+    fn styrn_json_environment_preserves_the_interactive_json_conflict() {
+        let mut facts = CliFacts::for_test(true, true, true);
+        facts.styrn_json = Some(OsString::from("1"));
+
+        let failure = Cli::try_parse_with_facts(args(["styrn", "setup", "--interactive"]), facts)
+            .unwrap_err();
+
+        assert!(failure.is_setup_json_failure());
     }
 
     #[test]

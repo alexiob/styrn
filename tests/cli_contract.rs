@@ -100,21 +100,54 @@ fn inactive_setup_orchestration_never_reports_false_success() {
 
 #[test]
 fn styrn_json_environment_matches_global_json_flag_without_ansi() {
+    let root = std::env::temp_dir().join(format!("styrn-json-cli-{}", uuid::Uuid::now_v7()));
+    std::fs::create_dir_all(&root).unwrap();
+    let config = root.join("config");
+    let state = root.join("state");
+    let data = root.join("data");
     let environment = Command::new(env!("CARGO_BIN_EXE_styrn"))
+        .env_clear()
+        .env("HOME", &root)
+        .env("USERPROFILE", &root)
+        .env("APPDATA", &config)
+        .env("LOCALAPPDATA", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .env("XDG_STATE_HOME", &state)
+        .env("XDG_DATA_HOME", &data)
+        .env("STYRN_CONFIG_DIR", &config)
         .env("STYRN_JSON", "1")
-        .args(["setup", "--yes"])
+        .args(["setup", "--dry-run"])
         .output()
         .unwrap();
-    let explicit = run(&["--json", "setup", "--yes"]);
+    let explicit = Command::new(env!("CARGO_BIN_EXE_styrn"))
+        .env_clear()
+        .env("HOME", &root)
+        .env("USERPROFILE", &root)
+        .env("APPDATA", &config)
+        .env("LOCALAPPDATA", &data)
+        .env("XDG_CONFIG_HOME", &config)
+        .env("XDG_STATE_HOME", &state)
+        .env("XDG_DATA_HOME", &data)
+        .env("STYRN_CONFIG_DIR", &config)
+        .args(["--json", "setup", "--dry-run"])
+        .output()
+        .unwrap();
 
     for output in [&environment, &explicit] {
-        assert_eq!(output.status.code(), Some(13));
+        assert!(output.status.success(), "{output:?}");
         assert!(output.stderr.is_empty());
         assert!(!output.stdout.contains(&0x1b));
         let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(value["schema"], "styrn.command.v1");
-        assert_eq!(value["ok"], false);
+        assert_eq!(value["ok"], true);
+        assert!(value["data"]["plan"]
+            .as_array()
+            .is_some_and(|plan| !plan.is_empty()));
     }
+    assert!(!config.exists());
+    assert!(!state.exists());
+    assert!(!data.exists());
+    std::fs::remove_dir(root).unwrap();
 }
 
 #[test]

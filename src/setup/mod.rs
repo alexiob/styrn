@@ -52,7 +52,7 @@ mod orchestrator;
     plan_completed_execution_serialize_fixture,
     plan_pending_projection_fixture,
 )))]
-pub(in crate::setup) use config::{
+pub(crate) use config::{
     load_effective_rootless_setup, persist_interactive_replay, EffectiveRootlessSetup,
     SetupInputError,
 };
@@ -68,7 +68,7 @@ pub(in crate::setup) use config::{
     plan_completed_execution_serialize_fixture,
     plan_pending_projection_fixture,
 )))]
-pub(in crate::setup) use interactive::collect_interactive_answers;
+pub(crate) use interactive::collect_interactive_answers;
 #[cfg(test)]
 pub(in crate::setup) use orchestrator::prepare_rootless_setup_for_test;
 #[allow(unused_imports)]
@@ -83,9 +83,9 @@ pub(in crate::setup) use orchestrator::prepare_rootless_setup_for_test;
     plan_completed_execution_serialize_fixture,
     plan_pending_projection_fixture,
 )))]
-pub(in crate::setup) use orchestrator::{
-    apply_rootless_setup, prepare_rootless_setup, RootlessSetupError, RootlessSetupOutcome,
-    RootlessSetupPlan,
+pub(crate) use orchestrator::{
+    apply_rootless_setup, prepare_rootless_setup, RootlessPendingResult, RootlessSetupError,
+    RootlessSetupOutcome, RootlessSetupPlan, RootlessSetupPlanItem,
 };
 
 #[allow(dead_code)]
