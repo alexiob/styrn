@@ -59,6 +59,9 @@ fn parse_os_release(input: &[u8]) -> Result<LinuxDistribution, LinuxObservationE
             return Err(LinuxObservationError::InvalidKey);
         }
         let value = parse_value(encoded_value)?;
+        if value.chars().any(char::is_control) {
+            return Err(LinuxObservationError::InvalidClassificationToken);
+        }
 
         let destination = match key {
             "ID" => &mut id,
@@ -304,6 +307,23 @@ mod tests {
     }
 
     #[test]
+    fn deleting_any_supported_exact_id_mapping_breaks_authority_without_ancestry() {
+        let cases: &[(&[u8], LinuxFamily)] = &[
+            (b"ID=debian\n", LinuxFamily::Debian),
+            (b"ID=ubuntu\n", LinuxFamily::Debian),
+            (b"ID=fedora\n", LinuxFamily::RedHat),
+            (b"ID=rhel\n", LinuxFamily::RedHat),
+            (b"ID=centos\n", LinuxFamily::RedHat),
+            (b"ID=arch\n", LinuxFamily::Arch),
+            (b"ID=omarchy\n", LinuxFamily::Arch),
+        ];
+
+        for (input, expected_family) in cases {
+            assert_eq!(parse_os_release(input).unwrap().family, *expected_family);
+        }
+    }
+
+    #[test]
     fn ignoring_single_family_id_like_breaks_derivative_distribution_fixtures() {
         let cases = [
             (
@@ -369,6 +389,14 @@ mod tests {
     fn choosing_the_exact_family_despite_cross_family_ancestry_hides_conflicts() {
         assert_eq!(
             parse_os_release(CONFLICTING),
+            Err(LinuxObservationError::ConflictingFamily)
+        );
+    }
+
+    #[test]
+    fn accepting_one_contradictory_ancestor_breaks_exact_id_authority() {
+        assert_eq!(
+            parse_os_release(b"ID=ubuntu\nID_LIKE=rhel\n"),
             Err(LinuxObservationError::ConflictingFamily)
         );
     }
@@ -504,6 +532,22 @@ ID=arch
         for (input, expected) in cases.iter().zip(expected) {
             assert_eq!(parse_os_release(input), Err(expected));
         }
+    }
+
+    #[test]
+    fn treating_a_control_byte_as_id_like_whitespace_bypasses_token_grammar() {
+        assert_eq!(
+            parse_os_release(b"ID=custom\nID_LIKE=\"debian\tubuntu\"\n"),
+            Err(LinuxObservationError::InvalidClassificationToken)
+        );
+    }
+
+    #[test]
+    fn discarding_an_unknown_control_value_bypasses_assignment_validation() {
+        assert_eq!(
+            parse_os_release(b"NAME=\"ignored\tcontrol\"\nID=arch\n"),
+            Err(LinuxObservationError::InvalidClassificationToken)
+        );
     }
 
     #[test]

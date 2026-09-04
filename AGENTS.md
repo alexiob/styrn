@@ -10,7 +10,7 @@ project-build-system dependency to the core design.
 Work from the most specific applicable source, in this order:
 
 1. The user's request and security constraints.
-2. [`docs/design.md`](docs/design.md), revision H: the canonical, binding
+2. [`docs/design.md`](docs/design.md), revision I: the canonical, binding
    architecture and protocol specification. Cite its Part numbers in design
    discussions. If it conflicts with the plan, the design wins.
 3. [`docs/implementation-plan.md`](docs/implementation-plan.md): ordered work,
@@ -79,6 +79,17 @@ project workflows; project-specific build knowledge belongs in `.styrn.toml`.
 
 ## Implementation and tests
 
+- Treat plan tasks as a dependency and coverage map, not as delivery-sized
+  units. Work in the largest reviewable vertical slice that ends in an
+  executable user journey; an internal parser, trait, provider, or receipt
+  layer is not progress by itself. The current priority is ordinary user
+  setup -> enrollment card -> controller enrollment -> status/doctor/exec.
+  Defer daemons, streaming, multiplexing, retries, fanout, and generic
+  installer/provider frameworks until a current journey consumes them.
+- Every new abstraction must either serve a consumer in the current slice or
+  close a concrete privilege, identity, secret, durability, concurrency, or
+  data-loss hazard. Otherwise keep the implementation local and concrete until
+  a second real consumer demonstrates the shared shape.
 - Use strict TDD: first add or adjust a focused test that fails for the intended
   reason, implement the smallest correct change, then refactor with the suite
   green. Each plan task needs both a positive behavior test and a negative test
