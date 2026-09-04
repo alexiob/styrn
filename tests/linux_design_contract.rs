@@ -44,6 +44,10 @@ fn canonical_design_owns_linux_host_profiles_once() {
             "distribution, package, system-service, and user-service",
             "degrade independently",
             "only kernel disposition",
+            "permission denial",
+            "absent expected package backend",
+            "`Unsupported`",
+            "dependent action becomes `NeedsHuman`",
         ],
     );
 }
