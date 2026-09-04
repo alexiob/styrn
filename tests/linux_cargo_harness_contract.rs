@@ -77,6 +77,7 @@ fn native_arm64_cargo_harness_enforces_and_exercises_its_contract() {
     let attestation_stdout = String::from_utf8_lossy(&attestation.stdout);
     assert!(attestation_stdout.contains("podman_machine=styrn-linux"));
     assert!(attestation_stdout.contains("podman_host_arch=arm64"));
+    assert!(attestation_stdout.contains("pinned_image=docker.io/library/rust:1.98-bookworm@sha256:56bfc6a715db852bdafd5e4bdf68ef7abceb791e77c47e5d87c7e861702a9ca6"));
     assert!(attestation_stdout.contains("image_platform=linux/arm64"));
     assert!(attestation_stdout.contains("container_uname=aarch64"));
     assert!(attestation_stdout.contains("rust_host=aarch64-unknown-linux-gnu"));
@@ -98,6 +99,17 @@ fn native_arm64_cargo_harness_enforces_and_exercises_its_contract() {
         existing_volumes.status.success(),
         "existing task-owned volumes must be reusable: {}",
         stderr(&existing_volumes)
+    );
+
+    let wrong_selected = FakePodman::new().run(
+        "wrong_selected_machine",
+        &["target-attestation"],
+        &env::temp_dir(),
+    );
+    assert!(
+        wrong_selected.status.success(),
+        "an ambient non-styrn connection must not affect explicit selection: {}",
+        stderr(&wrong_selected)
     );
 
     let wrong_host =
@@ -127,7 +139,7 @@ fn native_arm64_cargo_harness_enforces_and_exercises_its_contract() {
 
     let pass_through_fake = FakePodman::new();
     let pass_through = pass_through_fake.run(
-        "ok",
+        "pass_through",
         &["cargo", "--", "test", "--locked", "--exact", "module::case"],
         &env::temp_dir(),
     );
@@ -163,10 +175,63 @@ set -eu
 
 : "${PODMAN_LOG:?}"
 : "${PODMAN_SCENARIO:?}"
+EXPECTED_IMAGE='docker.io/library/rust:1.98-bookworm@sha256:56bfc6a715db852bdafd5e4bdf68ef7abceb791e77c47e5d87c7e861702a9ca6'
 printf 'CALL\n' >> "$PODMAN_LOG"
 for argument in "$@"; do
     printf '%s\n' "$argument" >> "$PODMAN_LOG"
 done
+
+[ "${1-}" = --connection ] || exit 89
+[ "${2-}" = styrn-linux ] || exit 89
+printf 'SELECTED_CONNECTION:%s\n' "$2" >> "$PODMAN_LOG"
+shift 2
+if [ "$PODMAN_SCENARIO" = wrong_selected_machine ]; then
+    printf '%s\n' 'AMBIENT_CONNECTION=other-arm64-machine' >> "$PODMAN_LOG"
+fi
+
+exact() {
+    [ "$1" = "$2" ] || exit "$3"
+}
+
+runner_prefix() {
+    exact "$1" --rm 99; shift
+    exact "$1" --platform 99; shift
+    exact "$1" linux/arm64 99; shift
+    exact "$1" --userns=keep-id:uid=1000,gid=1000 99; shift
+    exact "$1" --user 99; shift
+    exact "$1" 1000:1000 99; shift
+    exact "$1" --env 99; shift
+    exact "$1" CARGO_HOME=/cargo 99; shift
+    exact "$1" -v 99; shift
+    case "$1" in *:/workspace:ro) ;; *) exit 99 ;; esac; shift
+    exact "$1" -v 99; shift
+    exact "$1" styrn-cargo-registry-arm64:/cargo 99; shift
+    exact "$1" -v 99; shift
+    exact "$1" styrn-cargo-target-arm64:/workspace/target 99; shift
+    exact "$1" --workdir 99; shift
+    exact "$1" /workspace 99; shift
+    exact "$1" "$EXPECTED_IMAGE" 99; shift
+    printf 'RUNNER_IMAGE:%s\n' "$EXPECTED_IMAGE" >> "$PODMAN_LOG"
+    RUNNER_REMAINDER="$*"
+}
+
+initializer_prefix() {
+    exact "$1" --rm 99; shift
+    exact "$1" --platform 99; shift
+    exact "$1" linux/arm64 99; shift
+    exact "$1" --userns=keep-id:uid=1000,gid=1000 99; shift
+    exact "$1" --user 99; shift
+    exact "$1" 0:0 99; shift
+    exact "$1" -v 99; shift
+    exact "$1" styrn-cargo-registry-arm64:/cargo 99; shift
+    exact "$1" -v 99; shift
+    exact "$1" styrn-cargo-target-arm64:/workspace/target 99; shift
+    exact "$1" "$EXPECTED_IMAGE" 99; shift
+    exact "$1" sh 99; shift
+    exact "$1" -ec 99; shift
+    exact "$1" 'chown -R 1000:1000 /cargo /workspace/target' 99; shift
+    [ "$#" -eq 0 ] || exit 99
+}
 
 case "${1-}:${2-}" in
     machine:inspect)
@@ -178,8 +243,10 @@ case "${1-}:${2-}" in
         ;;
     pull:--platform)
         [ "${3-}" = linux/arm64 ] || exit 91
+        [ "${4-}" = "$EXPECTED_IMAGE" ] || exit 99
         ;;
     image:inspect)
+        [ "${3-}" = "$EXPECTED_IMAGE" ] || exit 99
         if [ "$PODMAN_SCENARIO" = wrong_image_arch ]; then printf '%s\n' linux/amd64; else printf '%s\n' linux/arm64; fi
         ;;
     volume:create)
@@ -192,24 +259,20 @@ case "${1-}:${2-}" in
         ;;
     run:*)
         arguments=" $* "
+        shift
         case "$arguments" in *' --privileged '*|*' --network host '*|*'/podman.sock'*) exit 93 ;; esac
         case "$arguments" in
             *' --user 0:0 '*)
-                case "$arguments" in *' --userns=keep-id:uid=1000,gid=1000 '*) ;; *) exit 94 ;; esac
-                case "$arguments" in
-                    *' styrn-cargo-registry-arm64:/cargo '* ) ;;
-                    *) exit 94 ;;
-                esac
-                case "$arguments" in *' styrn-cargo-target-arm64:/workspace/target '*) ;; *) exit 94 ;; esac
+                initializer_prefix "$@"
                 ;;
             *)
-                case "$arguments" in *' --platform linux/arm64 '*) ;; *) exit 95 ;; esac
-                case "$arguments" in *' --userns=keep-id:uid=1000,gid=1000 '*) ;; *) exit 95 ;; esac
-                case "$arguments" in *' --user 1000:1000 '*) ;; *) exit 95 ;; esac
-                case "$arguments" in *':/workspace:ro '*) ;; *) exit 95 ;; esac
+                runner_prefix "$@"
                 for argument in "$@"; do printf 'RUNNER_ARG:%s\n' "$argument" >> "$PODMAN_LOG"; done
                 case "$arguments" in
                     *' cargo '*)
+                        if [ "$PODMAN_SCENARIO" = pass_through ]; then
+                            exact "$RUNNER_REMAINDER" 'cargo test --locked --exact module::case' 99
+                        fi
                         if [ "$PODMAN_SCENARIO" = zero_filter ] && printf '%s\n' "$arguments" | grep -q -- ' --list '; then
                             printf '%s\n' '0 tests, 0 benchmarks'
                         elif [ "$PODMAN_SCENARIO" = child_exit_37 ]; then

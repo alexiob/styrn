@@ -26,8 +26,12 @@ require_exact() {
     [ "$actual" = "$expected" ] || fail "$description must be $expected (got $actual)"
 }
 
+podman_styrn() {
+    podman --connection "$MACHINE" "$@"
+}
+
 runner() {
-    podman run --rm \
+    podman_styrn run --rm \
         --platform linux/arm64 \
         --userns=keep-id:uid=1000,gid=1000 \
         --user 1000:1000 \
@@ -40,26 +44,26 @@ runner() {
 }
 
 ensure_task_volume() {
-    if podman volume inspect "$1" >/dev/null 2>&1; then
+    if podman_styrn volume inspect "$1" >/dev/null 2>&1; then
         return
     fi
-    podman volume create "$1" >/dev/null
+    podman_styrn volume create "$1" >/dev/null
 }
 
 preflight() {
-    machine=$(podman machine inspect "$MACHINE" --format '{{.Name}}')
+    machine=$(podman_styrn machine inspect "$MACHINE" --format '{{.Name}}')
     require_exact "$machine" "$MACHINE" 'selected Podman machine'
 
-    host_arch=$(podman info --format '{{.Host.Arch}}')
+    host_arch=$(podman_styrn info --format '{{.Host.Arch}}')
     require_exact "$host_arch" arm64 'Podman host architecture'
 
-    podman pull --platform linux/arm64 "$IMAGE" >/dev/null
-    image_platform=$(podman image inspect "$IMAGE" --format '{{.Os}}/{{.Architecture}}')
+    podman_styrn pull --platform linux/arm64 "$IMAGE" >/dev/null
+    image_platform=$(podman_styrn image inspect "$IMAGE" --format '{{.Os}}/{{.Architecture}}')
     require_exact "$image_platform" linux/arm64 'pinned image platform'
 
     ensure_task_volume "$REGISTRY_VOLUME"
     ensure_task_volume "$TARGET_VOLUME"
-    podman run --rm \
+    podman_styrn run --rm \
         --platform linux/arm64 \
         --userns=keep-id:uid=1000,gid=1000 \
         --user 0:0 \
