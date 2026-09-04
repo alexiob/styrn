@@ -369,13 +369,35 @@ fn global_json_is_accepted_before_and_after_finite_commands_without_ansi() {
     for args in [
         &["--json", "host", "list"][..],
         &["host", "list", "--json"][..],
-        &["workflow", "plan", "demo", "test", "--json"][..],
-        &["--json", "fleet", "status"][..],
     ] {
         let output = run(args);
         assert!(output.status.success(), "{}: {output:?}", display(args));
         assert!(!output.stdout.contains(&0x1b), "{}", display(args));
         assert!(!output.stderr.contains(&0x1b), "{}", display(args));
+    }
+
+    for args in [
+        &["workflow", "plan", "demo", "test", "--json"][..],
+        &["--json", "fleet", "status"][..],
+    ] {
+        let output = run(args);
+        assert_eq!(
+            output.status.code(),
+            Some(7),
+            "{}: {output:?}",
+            display(args)
+        );
+        assert!(output.stderr.is_empty(), "{}: {output:?}", display(args));
+        assert!(!output.stdout.contains(&0x1b), "{}", display(args));
+        let envelope: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(envelope["schema"], "styrn.command.v1", "{}", display(args));
+        assert_eq!(envelope["ok"], false, "{}", display(args));
+        assert_eq!(
+            envelope["errors"][0]["code"],
+            "capability.unsatisfied",
+            "{}",
+            display(args)
+        );
     }
 }
 
@@ -385,7 +407,21 @@ fn streaming_mode_is_limited_to_following_job_logs_and_monitor() {
         &["job", "logs", "job-1", "--follow", "--jsonl"][..],
         &["monitor", "--jsonl"][..],
     ] {
-        assert!(run(args).status.success(), "{}", display(args));
+        let output = run(args);
+        assert_eq!(
+            output.status.code(),
+            Some(7),
+            "{}: {output:?}",
+            display(args)
+        );
+        assert!(output.stdout.is_empty(), "{}: {output:?}", display(args));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains("not available in this build"),
+            "{}: {output:?}",
+            display(args)
+        );
+        assert!(!stderr.contains("Usage:"), "{}: {output:?}", display(args));
     }
 
     for args in [
