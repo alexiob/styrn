@@ -9,7 +9,7 @@ use super::{
     WindowsTokenPosture, WindowsUserTokenChoice, WorkerAccountPolicy, WorkerPrincipal,
 };
 use std::ffi::c_void;
-use std::io;
+use std::io::{self, Read};
 use std::os::windows::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 
@@ -18,11 +18,11 @@ use sha2::{Digest, Sha256};
 pub(super) fn baseline_probe_snapshot(
     kind: super::BaselineProbeKind,
     authorized_public_keys: &[String],
-    _tailscale_mode: &str,
+    tailscale_mode: &str,
 ) -> super::BaselineProbeSnapshot {
     match kind {
         super::BaselineProbeKind::SshServer => ssh_server_snapshot(authorized_public_keys),
-        super::BaselineProbeKind::Tailscale => tailscale_snapshot(),
+        super::BaselineProbeKind::Tailscale => tailscale_snapshot(tailscale_mode),
         super::BaselineProbeKind::Git => git_snapshot(),
         super::BaselineProbeKind::SleepPolicy => sleep_snapshot(),
         super::BaselineProbeKind::Styrnd | super::BaselineProbeKind::Deferred => {
@@ -47,27 +47,58 @@ fn ssh_server_snapshot(required: &[String]) -> super::BaselineProbeSnapshot {
     let Some(service) = service else {
         return super::BaselineProbeSnapshot::Unknowable;
     };
-    let config = match super::run_fixed_baseline_command(&sshd, &["-T"]) {
-        Ok(output) if output.success => sshd_public_key_auth_is_enabled(&output.stdout),
+    let Ok(principal) = resolve_current_worker_principal() else {
+        return super::BaselineProbeSnapshot::Unknowable;
+    };
+    let match_context = format!("user={},host=localhost,addr=127.0.0.1", principal.name());
+    let config = match super::run_fixed_baseline_command(&sshd, &["-T", "-C", &match_context]) {
+        Ok(output) if output.success => super::parse_effective_sshd_config(&output.stdout),
         Ok(_) | Err(_) => return super::BaselineProbeSnapshot::Unknowable,
+    };
+    let Some(config) = config else {
+        return super::BaselineProbeSnapshot::Unknowable;
     };
     let Ok(profile) = current_profile_directory() else {
         return super::BaselineProbeSnapshot::Unknowable;
     };
     super::BaselineProbeSnapshot::Present {
         version: None,
-        healthy: service && config == Some(true) && authorized_keys_are_ready(&profile, required),
+        healthy: service
+            && config.public_key_authentication()
+            && authorized_keys_are_ready(
+                &profile,
+                &principal,
+                config.authorized_keys_files(),
+                required,
+            ),
     }
 }
 
-fn tailscale_snapshot() -> super::BaselineProbeSnapshot {
+fn tailscale_snapshot(requested_mode: &str) -> super::BaselineProbeSnapshot {
     let program = Path::new(r"C:\Program Files\Tailscale\tailscale.exe");
     if !program.is_file() {
         return super::BaselineProbeSnapshot::Absent;
     }
+    let Ok(system) = baseline_system_directory() else {
+        return super::BaselineProbeSnapshot::Unknowable;
+    };
+    let running =
+        super::run_fixed_baseline_command(&system.join("sc.exe"), &["query", "Tailscale"])
+            .ok()
+            .filter(|output| output.success)
+            .and_then(|output| parse_sshd_service_running(&output.stdout))
+            .unwrap_or(false);
+    let auto_start =
+        super::run_fixed_baseline_command(&system.join("sc.exe"), &["qc", "Tailscale"])
+            .ok()
+            .filter(|output| output.success)
+            .and_then(|output| parse_service_auto_start(&output.stdout))
+            .unwrap_or(false);
     match super::run_fixed_baseline_command(program, &["status", "--json"]) {
-        Ok(output) if output.success => parse_tailscale_status(&output.stdout)
-            .unwrap_or(super::BaselineProbeSnapshot::Unknowable),
+        Ok(output) if output.success => {
+            parse_tailscale_status(&output.stdout, running && auto_start, requested_mode)
+                .unwrap_or(super::BaselineProbeSnapshot::Unknowable)
+        }
         Ok(_) => super::BaselineProbeSnapshot::Unknowable,
         Err(_) => super::BaselineProbeSnapshot::Unknowable,
     }
@@ -138,14 +169,33 @@ fn parse_git_version(bytes: &[u8]) -> Option<String> {
     .then(|| version.to_owned())
 }
 
-fn parse_tailscale_status(bytes: &[u8]) -> Option<super::BaselineProbeSnapshot> {
-    let value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
-    let healthy = value.get("BackendState")?.as_str()? == "Running"
-        && value.get("Self")?.get("Online")?.as_bool()?;
-    Some(super::BaselineProbeSnapshot::Present {
-        version: None,
-        healthy,
-    })
+fn parse_tailscale_status(
+    bytes: &[u8],
+    persistent: bool,
+    requested_mode: &str,
+) -> Option<super::BaselineProbeSnapshot> {
+    super::tailscale_status_snapshot(
+        bytes,
+        super::BaselineTailscaleMode::Service,
+        persistent,
+        true,
+        requested_mode,
+        super::BaselineTailscaleMode::Service,
+    )
+}
+
+fn parse_service_auto_start(bytes: &[u8]) -> Option<bool> {
+    let output = std::str::from_utf8(bytes).ok()?;
+    let mut values = output.lines().filter_map(|line| {
+        line.split_once(':')
+            .filter(|(label, _)| label.trim() == "START_TYPE")
+            .map(|(_, value)| value.trim())
+    });
+    let value = values.next()?;
+    if values.next().is_some() {
+        return None;
+    }
+    Some(value.starts_with('2') && value.contains("AUTO_START"))
 }
 
 fn parse_sshd_service_running(bytes: &[u8]) -> Option<bool> {
@@ -161,37 +211,86 @@ fn parse_sshd_service_running(bytes: &[u8]) -> Option<bool> {
 
 fn parse_sleep_posture(bytes: &[u8]) -> Option<bool> {
     let output = std::str::from_utf8(bytes).ok()?;
-    let values = output
-        .split_ascii_whitespace()
-        .filter_map(|field| {
-            field
-                .strip_prefix("0x")
-                .and_then(|hex| u32::from_str_radix(hex, 16).ok())
-        })
-        .collect::<Vec<_>>();
-    (values.len() == 2).then(|| values.into_iter().all(|value| value == 0))
+    let mut ac = None;
+    let mut dc = None;
+    for line in output.lines().map(str::trim) {
+        let slot = if let Some(value) = line.strip_prefix("Current AC Power Setting Index:") {
+            (&mut ac, value)
+        } else if let Some(value) = line.strip_prefix("Current DC Power Setting Index:") {
+            (&mut dc, value)
+        } else {
+            continue;
+        };
+        if slot.0.is_some() {
+            return None;
+        }
+        let value = slot.1.trim().strip_prefix("0x")?;
+        *slot.0 = Some(u32::from_str_radix(value, 16).ok()?);
+    }
+    Some(ac? == 0 && dc? == 0)
 }
 
-fn authorized_keys_are_ready(profile: &Path, required: &[String]) -> bool {
+fn authorized_keys_are_ready(
+    profile: &Path,
+    principal: &WorkerPrincipal,
+    configured: &[String],
+    required: &[String],
+) -> bool {
     let ssh = profile.join(".ssh");
-    if path_is_reparse_point(&ssh) || !ssh.is_dir() {
+    if path_is_reparse_point(&ssh)
+        || !ssh.is_dir()
+        || inspect_user_acl(&ssh, principal, AclKind::UserDirectory).is_err()
+    {
         return false;
     }
-    let path = ssh.join("authorized_keys");
-    if path_is_reparse_point(&path) {
-        return false;
+    configured.iter().any(|configured| {
+        let Some(path) = canonical_authorized_keys_path(profile, configured) else {
+            return false;
+        };
+        authorized_keys_file_is_ready(&path, principal, required)
+    })
+}
+
+fn canonical_authorized_keys_path(profile: &Path, configured: &str) -> Option<PathBuf> {
+    let normalized = configured.replace('\\', "/");
+    let relative = normalized
+        .strip_prefix("%h/")
+        .or_else(|| normalized.strip_prefix("./"))
+        .unwrap_or(&normalized);
+    if !matches!(relative, ".ssh/authorized_keys" | ".ssh/authorized_keys2") {
+        // In particular, never treat OpenSSH's Administrators-group
+        // ProgramData key file as current-user rootless posture.
+        return None;
     }
-    let Ok(mut file) = std::fs::OpenOptions::new().read(true).open(path) else {
+    Some(profile.join(relative.replace('/', "\\")))
+}
+
+fn authorized_keys_file_is_ready(
+    path: &Path,
+    principal: &WorkerPrincipal,
+    required: &[String],
+) -> bool {
+    let Ok((mut file, information)) = open_private_file_handle(path) else {
         return false;
     };
+    if information.file_attributes & (FILE_ATTRIBUTE_REPARSE_POINT | FILE_ATTRIBUTE_DIRECTORY) != 0
+        || inspect_handle_user_acl(&file, principal, AclKind::UserFile).is_err()
+    {
+        return false;
+    }
     let Ok(metadata) = file.metadata() else {
         return false;
     };
-    if !metadata.is_file() || metadata.len() > 1024 * 1024 {
+    if metadata.len() > 1024 * 1024 {
         return false;
     }
     let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    if std::io::Read::read_to_end(&mut file, &mut bytes).is_err() {
+    if std::io::Read::by_ref(&mut file)
+        .take(1024 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .is_err()
+        || bytes.len() > 1024 * 1024
+    {
         return false;
     }
     let Ok(contents) = std::str::from_utf8(&bytes) else {
@@ -200,12 +299,15 @@ fn authorized_keys_are_ready(profile: &Path, required: &[String]) -> bool {
     let keys = contents
         .lines()
         .map(str::trim)
-        .filter(|line| valid_authorized_key_line(line))
+        .filter_map(super::parse_authorized_key_line)
         .collect::<Vec<_>>();
     if required.is_empty() {
         !keys.is_empty()
     } else {
-        required.iter().all(|key| keys.contains(&key.as_str()))
+        required.iter().all(|required| {
+            super::parse_authorized_key_line(required)
+                .is_some_and(|required| keys.contains(&required))
+        })
     }
 }
 
@@ -214,32 +316,41 @@ fn path_is_reparse_point(path: &Path) -> bool {
     attributes == INVALID_FILE_ATTRIBUTES || attributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
 }
 
-fn valid_authorized_key_line(line: &str) -> bool {
-    let mut fields = line.split_ascii_whitespace();
-    matches!(
-        fields.next(),
-        Some(
-            "ssh-ed25519"
-                | "ssh-rsa"
-                | "ecdsa-sha2-nistp256"
-                | "ecdsa-sha2-nistp384"
-                | "ecdsa-sha2-nistp521"
-                | "sk-ssh-ed25519@openssh.com"
-        )
-    ) && fields.next().is_some_and(|key| !key.is_empty())
-}
-
-fn sshd_public_key_auth_is_enabled(bytes: &[u8]) -> Option<bool> {
-    let output = std::str::from_utf8(bytes).ok()?;
-    output.lines().find_map(|line| {
-        let mut fields = line.split_ascii_whitespace();
-        (fields.next()? == "publickeyauthentication").then(|| fields.next() == Some("yes"))
-    })
-}
-
 #[cfg(test)]
 mod baseline_probe_tests {
     use super::super::{BaselineProbeKind, BaselineProbeSnapshot};
+    use super::{canonical_authorized_keys_path, parse_sleep_posture};
+    use std::path::Path;
+
+    #[test]
+    fn current_user_ssh_path_rejects_the_windows_administrators_shared_key_trap() {
+        let profile = Path::new(r"C:\Users\ordinary");
+        assert_eq!(
+            canonical_authorized_keys_path(profile, r".ssh\authorized_keys"),
+            Some(profile.join(r".ssh\authorized_keys"))
+        );
+        assert_eq!(
+            canonical_authorized_keys_path(
+                profile,
+                r"__PROGRAMDATA__/ssh/administrators_authorized_keys"
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn powercfg_parser_requires_named_ac_and_dc_standby_indices() {
+        let realistic = b"Power Setting GUID: 29f6c1db-86da-48c5-9fdb-f2b67b1f44da  (Sleep after)\r\n  Current AC Power Setting Index: 0x00000000\r\n  Current DC Power Setting Index: 0x00000000\r\n";
+        assert_eq!(parse_sleep_posture(realistic), Some(true));
+        assert_eq!(
+            parse_sleep_posture(b"Current AC Power Setting Index: 0x00000000\r\n"),
+            None
+        );
+        assert_eq!(
+            parse_sleep_posture(b"unrelated 0x00000000 0x00000000\r\n"),
+            None
+        );
+    }
 
     #[test]
     #[ignore = "requires a disposable native Windows profile with running OpenSSH and Tailscale, per-user authorized_keys, Git, and AC/DC standby timeout disabled"]
@@ -253,6 +364,7 @@ mod baseline_probe_tests {
             assert!(matches!(
                 super::baseline_probe_snapshot(kind, &[], ""),
                 BaselineProbeSnapshot::Present { healthy: true, .. }
+                    | BaselineProbeSnapshot::TailscalePresent { healthy: true, .. }
             ));
         }
     }

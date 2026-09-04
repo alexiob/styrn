@@ -323,4 +323,19 @@ impl PendingError {
     pub(crate) const fn exit_code(&self) -> output::StyrnExit {
         output::StyrnExit::Setup
     }
+
+    pub(in crate::setup) const fn safe_cause(&self) -> &'static str {
+        match self {
+            Self::DuplicateId => "pending_projection",
+            Self::Output(_) | Self::Render(_) => "output_publication",
+            Self::Receipt(_) => "receipt_publication",
+            Self::StaleCompletionWitness => "concurrent_publication",
+            Self::Publication(super::receipt::PendingPublicationProtocolError::Receipt(_)) => {
+                "receipt_publication"
+            }
+            Self::Publication(super::receipt::PendingPublicationProtocolError::Manifest(_)) => {
+                "manifest_publication"
+            }
+        }
+    }
 }

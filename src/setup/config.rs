@@ -1,6 +1,6 @@
 use serde::Deserialize;
 use std::fmt;
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::Path;
 
@@ -283,14 +283,18 @@ fn read_config(path: &Path) -> Result<SetupConfigV1, SetupInputError> {
             "config input must be a regular file smaller than 1 MiB",
         ));
     }
-    let mut input = String::new();
-    file.read_to_string(&mut input)
-        .map_err(|_| config_error("config input is not valid UTF-8"))?;
-    if input.len() > MAX_CONFIG_BYTES as usize {
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    Read::by_ref(&mut file)
+        .take(MAX_CONFIG_BYTES + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| config_error("config input is unavailable"))?;
+    if bytes.len() > MAX_CONFIG_BYTES as usize {
         return Err(config_error(
             "config input must be a regular file smaller than 1 MiB",
         ));
     }
+    let input =
+        String::from_utf8(bytes).map_err(|_| config_error("config input is not valid UTF-8"))?;
     let config: SetupConfigV1 =
         toml::from_str(&input).map_err(|error| toml_error(&input, error))?;
     if config.schema_version != Some(1) {
@@ -307,6 +311,14 @@ fn validate_config_enums(config: &SetupConfigV1) -> Result<(), SetupInputError> 
         .is_some_and(|role| !matches!(role, "controller" | "worker" | "both"))
     {
         return Err(config_error("config key role is invalid"));
+    }
+    if config
+        .installation
+        .as_ref()
+        .and_then(|installation| installation.scope.as_deref())
+        .is_some_and(|scope| !matches!(scope, "user" | "system"))
+    {
+        return Err(config_error("config key installation.scope is invalid"));
     }
     if config
         .account
@@ -447,14 +459,12 @@ fn validate_effective(
     effective: &EffectiveRootlessSetup,
     request: &crate::cli::SetupRequest,
 ) -> Result<(), SetupInputError> {
+    validate_rootless_setup_request(request)?;
     if effective.role != "worker"
         || effective.scope != crate::platform::InstallationScope::User
         || effective.account_mode != "current-user"
         || effective.account_name.is_some()
         || !effective.root.is_empty()
-        || request.authorize_system()
-        || request.emit_script().is_some()
-        || request.uninstall()
     {
         return Err(SetupInputError::Plan("rootless setup supports only scope=user role=worker account=current-user with canonical paths and no mutation flags".into()));
     }
@@ -498,23 +508,19 @@ fn valid_public_key(value: &str) -> bool {
     if value.bytes().any(|byte| byte.is_ascii_control()) || value.contains("PRIVATE KEY") {
         return false;
     }
-    let mut parts = value.split_ascii_whitespace();
-    let (Some(kind), Some(encoded)) = (parts.next(), parts.next()) else {
-        return false;
-    };
-    parts
-        .next()
-        .is_none_or(|comment| !comment.contains("PRIVATE KEY"))
-        && matches!(
-            kind,
-            "ssh-ed25519"
-                | "ssh-rsa"
-                | "ecdsa-sha2-nistp256"
-                | "ecdsa-sha2-nistp384"
-                | "ecdsa-sha2-nistp521"
-        )
-        && base64::Engine::decode(&base64::engine::general_purpose::STANDARD, encoded)
-            .is_ok_and(|bytes| !bytes.is_empty())
+    crate::platform::parse_authorized_key_line(value).is_some()
+}
+
+pub(crate) fn validate_rootless_setup_request(
+    request: &crate::cli::SetupRequest,
+) -> Result<(), SetupInputError> {
+    if request.authorize_system() || request.emit_script().is_some() || request.uninstall() {
+        Err(SetupInputError::Plan(
+            "rootless setup does not execute deferred mutation requests".into(),
+        ))
+    } else {
+        Ok(())
+    }
 }
 fn usage_error(message: &str) -> SetupInputError {
     SetupInputError::Usage(message.into())
@@ -608,23 +614,6 @@ pub(crate) fn persist_interactive_replay(
     destination: &Path,
 ) -> Result<(), SetupInputError> {
     let bytes = replay_toml(effective).into_bytes();
-    if let Ok(existing) = fs::symlink_metadata(destination) {
-        if existing.file_type().is_symlink() || !existing.is_file() {
-            return Err(SetupInputError::Plan(
-                "interactive replay destination must be a regular file".into(),
-            ));
-        }
-        return if fs::read(destination).map_err(|_| {
-            SetupInputError::Plan("interactive replay destination is unreadable".into())
-        })? == bytes
-        {
-            Ok(())
-        } else {
-            Err(SetupInputError::Plan(
-                "interactive replay destination already exists with different content".into(),
-            ))
-        };
-    }
     let parent = destination.parent().ok_or_else(|| {
         SetupInputError::Plan("interactive replay destination has no parent".into())
     })?;
@@ -634,17 +623,28 @@ pub(crate) fn persist_interactive_replay(
         .ok_or_else(|| {
             SetupInputError::Plan("interactive replay destination has an unsafe name".into())
         })?;
+    let principal = crate::platform::resolve_current_worker_principal()
+        .map_err(|_| SetupInputError::Plan("interactive replay owner is unavailable".into()))?;
+    match read_existing_replay(destination, &principal) {
+        Ok(existing) => return compare_existing_replay(&existing, &bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => {
+            return Err(SetupInputError::Plan(
+                "interactive replay destination is unsafe or unreadable".into(),
+            ))
+        }
+    }
     for sequence in 0..128_u16 {
         let temporary = parent.join(format!(
             ".{file_name}.{}.{}.tmp",
             std::process::id(),
             sequence
         ));
-        let mut file = match OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temporary)
-        {
+        let mut file = match crate::platform::create_private_publication_file(
+            &temporary,
+            crate::platform::ManifestOwner::User,
+            &principal,
+        ) {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(_) => {
@@ -653,29 +653,59 @@ pub(crate) fn persist_interactive_replay(
                 ))
             }
         };
-        if file
-            .write_all(&bytes)
-            .and_then(|()| file.sync_all())
-            .is_err()
-        {
-            let _ = fs::remove_file(&temporary);
+        let identity = file.identity();
+        if file.write_all(&bytes).is_err() {
+            cleanup_replay_temporary(&temporary, identity, &principal)?;
             return Err(SetupInputError::Plan(
                 "cannot write interactive replay file".into(),
             ));
         }
-        drop(file);
+        let complete = match file.complete_exact(&bytes) {
+            Ok(complete) => complete,
+            Err(_) => {
+                cleanup_replay_temporary(&temporary, identity, &principal)?;
+                return Err(SetupInputError::Plan(
+                    "cannot complete interactive replay file".into(),
+                ));
+            }
+        };
+        drop(complete);
         match fs::hard_link(&temporary, destination) {
             Ok(()) => {
-                let _ = fs::remove_file(&temporary);
-                let _ = File::open(parent).and_then(|directory| directory.sync_all());
+                crate::platform::sync_parent_directory(parent).map_err(|_| {
+                    SetupInputError::Plan("cannot make interactive replay durable".into())
+                })?;
+                let published_identity = crate::platform::private_file_identity(destination)
+                    .map_err(|_| {
+                        SetupInputError::Plan("cannot verify interactive replay publication".into())
+                    })?;
+                if published_identity != identity
+                    || crate::platform::open_verified_private_file_for_read(
+                        destination,
+                        crate::platform::ManifestOwner::User,
+                        &principal,
+                        identity,
+                    )
+                    .is_err()
+                {
+                    return Err(SetupInputError::Plan(
+                        "cannot verify interactive replay publication".into(),
+                    ));
+                }
+                cleanup_replay_temporary(&temporary, identity, &principal)?;
                 return Ok(());
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                let _ = fs::remove_file(&temporary);
-                return persist_interactive_replay(effective, destination);
+                cleanup_replay_temporary(&temporary, identity, &principal)?;
+                return match read_existing_replay(destination, &principal) {
+                    Ok(existing) => compare_existing_replay(&existing, &bytes),
+                    Err(_) => Err(SetupInputError::Plan(
+                        "interactive replay destination is unsafe or unreadable".into(),
+                    )),
+                };
             }
             Err(_) => {
-                let _ = fs::remove_file(&temporary);
+                cleanup_replay_temporary(&temporary, identity, &principal)?;
                 return Err(SetupInputError::Plan(
                     "cannot publish interactive replay file".into(),
                 ));
@@ -687,10 +717,153 @@ pub(crate) fn persist_interactive_replay(
     ))
 }
 
+fn read_existing_replay(
+    destination: &Path,
+    principal: &crate::platform::WorkerPrincipal,
+) -> std::io::Result<Vec<u8>> {
+    let identity = crate::platform::private_file_identity(destination)?;
+    let mut file = crate::platform::open_verified_private_file_for_read(
+        destination,
+        crate::platform::ManifestOwner::User,
+        principal,
+        identity,
+    )?;
+    let mut bytes = Vec::new();
+    Read::by_ref(&mut file)
+        .take(MAX_CONFIG_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() > MAX_CONFIG_BYTES as usize {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "interactive replay exceeds the bounded size",
+        ));
+    }
+    Ok(bytes)
+}
+
+fn compare_existing_replay(existing: &[u8], expected: &[u8]) -> Result<(), SetupInputError> {
+    if existing == expected {
+        Ok(())
+    } else {
+        Err(SetupInputError::Plan(
+            "interactive replay destination already exists with different content".into(),
+        ))
+    }
+}
+
+fn cleanup_replay_temporary(
+    temporary: &Path,
+    expected_identity: crate::platform::PrivateFileIdentity,
+    principal: &crate::platform::WorkerPrincipal,
+) -> Result<(), SetupInputError> {
+    let parent = temporary
+        .parent()
+        .ok_or_else(|| SetupInputError::Plan("cannot verify interactive replay cleanup".into()))?;
+    let parent_metadata = fs::symlink_metadata(parent)
+        .map_err(|_| SetupInputError::Plan("cannot verify interactive replay cleanup".into()))?;
+    if !parent_metadata.is_dir() || parent_metadata.file_type().is_symlink() {
+        return Err(SetupInputError::Plan(
+            "cannot verify interactive replay cleanup".into(),
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        if parent_metadata.uid()
+            != principal.unix_uid().map_err(|_| {
+                SetupInputError::Plan("cannot verify interactive replay cleanup".into())
+            })?
+            || parent_metadata.permissions().mode() & 0o022 != 0
+        {
+            return Err(SetupInputError::Plan(
+                "cannot verify interactive replay cleanup".into(),
+            ));
+        }
+    }
+    let identity = match crate::platform::private_file_identity(temporary) {
+        Ok(identity) => identity,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(_) => {
+            return Err(SetupInputError::Plan(
+                "cannot verify interactive replay cleanup".into(),
+            ))
+        }
+    };
+    if identity != expected_identity {
+        return Err(SetupInputError::Plan(
+            "cannot verify interactive replay cleanup".into(),
+        ));
+    }
+    drop(
+        crate::platform::open_verified_private_file_for_read(
+            temporary,
+            crate::platform::ManifestOwner::User,
+            principal,
+            identity,
+        )
+        .map_err(|_| SetupInputError::Plan("cannot prepare interactive replay cleanup".into()))?,
+    );
+    fs::remove_file(temporary)
+        .and_then(|()| crate::platform::sync_parent_directory(parent))
+        .map_err(|_| SetupInputError::Plan("cannot complete interactive replay cleanup".into()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::ffi::OsString;
+
+    #[cfg(unix)]
+    #[test]
+    fn interactive_replay_uses_private_nofollow_atomic_publication_and_exact_rerun() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+
+        let directory = std::env::temp_dir().join(format!(
+            "styrn-replay-security-{}-{}",
+            std::process::id(),
+            uuid::Uuid::now_v7()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let destination = directory.join("setup-config.toml");
+        let effective =
+            effective_from_interactive_answers("worker".to_owned(), None, Some("alpha".to_owned()))
+                .unwrap();
+
+        persist_interactive_replay(&effective, &destination).unwrap();
+        assert_eq!(
+            fs::metadata(&destination).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let expected = replay_toml(&effective).into_bytes();
+        assert_eq!(fs::read(&destination).unwrap(), expected);
+        persist_interactive_replay(&effective, &destination).unwrap();
+        assert!(fs::read_dir(&directory).unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .ends_with(".tmp")
+        }));
+
+        fs::set_permissions(&destination, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(matches!(
+            persist_interactive_replay(&effective, &destination),
+            Err(SetupInputError::Plan(_))
+        ));
+        fs::remove_file(&destination).unwrap();
+        let target = directory.join("target");
+        fs::write(&target, &expected).unwrap();
+        symlink(&target, &destination).unwrap();
+        assert!(matches!(
+            persist_interactive_replay(&effective, &destination),
+            Err(SetupInputError::Plan(_))
+        ));
+
+        fs::remove_file(destination).unwrap();
+        fs::remove_file(target).unwrap();
+        fs::remove_dir(directory).unwrap();
+    }
+
     #[test]
     fn setup_config_v1_merges_defaults_config_environment_and_cli_in_order() {
         let path = temp_path("merge");
@@ -758,17 +931,45 @@ mod tests {
 
     #[test]
     fn setup_config_rejects_invalid_enum_spelling_as_config_input() {
-        let path = temp_path("enum");
-        fs::write(&path, "schema_version = 1\nrole = \"not-a-role\"\n").unwrap();
-        assert!(matches!(
-            load_effective_rootless_setup(&request(&[
-                "styrn",
-                "setup",
-                "--config",
-                path.to_str().unwrap()
-            ])),
-            Err(SetupInputError::Config(_))
-        ));
+        for (label, body, override_args) in [
+            ("role", "role = \"not-a-role\"\n", &["--role", "worker"][..]),
+            (
+                "scope",
+                "[installation]\nscope = \"not-a-scope\"\n",
+                &["--scope", "user"][..],
+            ),
+            (
+                "account",
+                "[account]\nmode = \"not-an-account\"\n",
+                &["--account", "current-user"][..],
+            ),
+            ("tailscale", "[tailscale]\nmode = \"not-a-mode\"\n", &[][..]),
+        ] {
+            let path = temp_path(label);
+            fs::write(&path, format!("schema_version = 1\n{body}")).unwrap();
+            let mut arguments = vec!["styrn", "setup", "--config", path.to_str().unwrap()];
+            arguments.extend_from_slice(override_args);
+            assert!(matches!(
+                load_effective_rootless_setup(&request(&arguments)),
+                Err(SetupInputError::Config(_))
+            ));
+            fs::remove_file(path).unwrap();
+        }
+    }
+
+    #[test]
+    fn setup_config_streaming_read_rejects_more_than_one_mib() {
+        let path = temp_path("oversize");
+        fs::write(&path, vec![b'x'; MAX_CONFIG_BYTES as usize + 1]).unwrap();
+        let error = load_effective_rootless_setup(&request(&[
+            "styrn",
+            "setup",
+            "--config",
+            path.to_str().unwrap(),
+        ]))
+        .unwrap_err();
+        assert!(matches!(error, SetupInputError::Config(_)));
+        assert!(error.to_string().contains("smaller than 1 MiB"));
         fs::remove_file(path).unwrap();
     }
     #[test]

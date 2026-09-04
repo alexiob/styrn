@@ -10,10 +10,7 @@ pub(crate) struct CliFacts {
     stdin_terminal: bool,
     stdout_terminal: bool,
     stderr_terminal: bool,
-    styrn_config_dir: Option<OsString>,
     styrn_json: Option<OsString>,
-    styrn_log: Option<OsString>,
-    styrn_ssh: Option<OsString>,
 }
 
 impl CliFacts {
@@ -22,10 +19,7 @@ impl CliFacts {
             stdin_terminal: std::io::stdin().is_terminal(),
             stdout_terminal: std::io::stdout().is_terminal(),
             stderr_terminal: std::io::stderr().is_terminal(),
-            styrn_config_dir: std::env::var_os("STYRN_CONFIG_DIR"),
             styrn_json: std::env::var_os("STYRN_JSON"),
-            styrn_log: std::env::var_os("STYRN_LOG"),
-            styrn_ssh: std::env::var_os("STYRN_SSH"),
         }
     }
 
@@ -38,10 +32,7 @@ impl CliFacts {
             stdin_terminal,
             stdout_terminal,
             stderr_terminal,
-            styrn_config_dir: None,
             styrn_json: None,
-            styrn_log: None,
-            styrn_ssh: None,
         }
     }
 }
@@ -147,15 +138,6 @@ impl SetupRequest {
     pub(crate) fn stdin_terminal(&self) -> bool {
         self.facts.stdin_terminal
     }
-    pub(crate) fn config_dir(&self) -> Option<&std::ffi::OsStr> {
-        self.facts.styrn_config_dir.as_deref()
-    }
-    pub(crate) fn log_filter(&self) -> Option<&std::ffi::OsStr> {
-        self.facts.styrn_log.as_deref()
-    }
-    pub(crate) fn ssh_client(&self) -> Option<&std::ffi::OsStr> {
-        self.facts.styrn_ssh.as_deref()
-    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -228,6 +210,13 @@ pub(crate) struct ParseFailure {
     policy: AnsiPolicy,
     setup_invocation: bool,
     json_output: bool,
+    setup_class: SetupParseFailureClass,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SetupParseFailureClass {
+    Generic,
+    InvalidScope,
 }
 
 impl ParseFailure {
@@ -240,6 +229,17 @@ impl ParseFailure {
 
     pub(crate) const fn is_setup_json_failure(&self) -> bool {
         self.setup_invocation && self.json_output
+    }
+
+    pub(crate) const fn safe_setup_message(&self) -> &'static str {
+        match self.setup_class {
+            SetupParseFailureClass::InvalidScope => {
+                "invalid value for --scope; allowed values: user, system"
+            }
+            SetupParseFailureClass::Generic => {
+                "setup arguments are invalid; use 'styrn setup --help'"
+            }
+        }
     }
 }
 
@@ -278,6 +278,7 @@ impl Cli {
     ) -> Result<ParsedCli, ParseFailure> {
         let args = normalize_harness_tail(args);
         let setup_invocation = preparse_setup_invocation(&args);
+        let setup_class = preparse_setup_failure_class(&args);
         let requested_json = preparse_machine_mode(&args)
             || facts.styrn_json.as_deref() == Some(std::ffi::OsStr::new("1"));
         let error_policy = AnsiPolicy::from_terminals(
@@ -292,12 +293,14 @@ impl Cli {
                 policy: error_policy,
                 setup_invocation,
                 json_output: requested_json,
+                setup_class,
             })?;
         let cli = Self::from_arg_matches(&matches).map_err(|error| ParseFailure {
             error,
             policy: error_policy,
             setup_invocation,
             json_output: requested_json,
+            setup_class,
         })?;
         let env_json = match facts.styrn_json.as_deref() {
             None => false,
@@ -313,6 +316,7 @@ impl Cli {
                     policy: error_policy,
                     setup_invocation,
                     json_output: requested_json,
+                    setup_class,
                 });
             }
         };
@@ -337,6 +341,7 @@ impl Cli {
                 policy: error_policy,
                 setup_invocation,
                 json_output: true,
+                setup_class,
             });
         }
         let policy = AnsiPolicy::from_terminals(
@@ -408,11 +413,40 @@ fn preparse_setup_invocation(args: &[OsString]) -> bool {
         .is_some_and(|argument| argument.as_os_str() == std::ffi::OsStr::new("setup"))
 }
 
+fn preparse_setup_failure_class(args: &[OsString]) -> SetupParseFailureClass {
+    let mut arguments = args.iter().skip(1).peekable();
+    while let Some(argument) = arguments.next() {
+        if argument == "--" {
+            break;
+        }
+        if argument == "--scope" {
+            return match arguments.peek().and_then(|value| value.to_str()) {
+                Some("user" | "system") => SetupParseFailureClass::Generic,
+                _ => SetupParseFailureClass::InvalidScope,
+            };
+        }
+        if let Some(value) = argument
+            .to_str()
+            .and_then(|value| value.strip_prefix("--scope="))
+        {
+            return if matches!(value, "user" | "system") {
+                SetupParseFailureClass::Generic
+            } else {
+                SetupParseFailureClass::InvalidScope
+            };
+        }
+    }
+    SetupParseFailureClass::Generic
+}
+
 pub(crate) fn render_parse_failure(
     failure: &ParseFailure,
     stdout: &mut dyn Write,
     stderr: &mut dyn Write,
 ) -> std::io::Result<()> {
+    if failure.setup_invocation && !failure.is_display() {
+        return writeln!(stderr, "error: {}", failure.safe_setup_message());
+    }
     let use_stderr = failure.error.use_stderr();
     let rendered = failure.error.render();
 
@@ -808,7 +842,7 @@ struct SetupArgs {
     install: Option<String>,
     #[arg(long)]
     config: Option<PathBuf>,
-    #[arg(long, conflicts_with_all = ["config", "role", "scope", "name", "account", "install", "yes", "dry_run", "emit_script", "uninstall", "json"])]
+    #[arg(long, conflicts_with_all = ["config", "role", "scope", "name", "account", "install", "yes", "no_elevate", "authorize_system", "dry_run", "emit_script", "uninstall", "json"])]
     interactive: bool,
     #[arg(long)]
     yes: bool,
@@ -1098,6 +1132,51 @@ mod tests {
         let stdout = String::from_utf8(stdout).unwrap();
         assert!(!stdout.contains("privileged-phase"));
         assert!(!stdout.contains("user-phase"));
+    }
+
+    #[test]
+    fn setup_parse_failures_hide_secret_shaped_values_in_human_mode() {
+        for arguments in [
+            ["styrn", "setup", "--scope", "token-never-render-this"],
+            [
+                "styrn",
+                "setup",
+                "--unknown-password",
+                "secret-never-render-this",
+            ],
+        ] {
+            let failure = Cli::try_parse_with_terminals(args(arguments), false, false).unwrap_err();
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            render_parse_failure(&failure, &mut stdout, &mut stderr).unwrap();
+            let rendered = String::from_utf8(stderr).unwrap();
+
+            assert!(stdout.is_empty());
+            assert!(rendered.contains(if arguments[2] == "--scope" {
+                "invalid value for --scope; allowed values: user, system"
+            } else {
+                "setup arguments are invalid"
+            }));
+            assert!(!rendered.contains("never-render-this"));
+        }
+    }
+
+    #[test]
+    fn setup_help_and_version_remain_clap_rendered() {
+        for arguments in [["styrn", "setup", "--help"], ["styrn", "--version", ""]] {
+            let arguments = arguments
+                .into_iter()
+                .filter(|argument| !argument.is_empty())
+                .map(OsString::from)
+                .collect();
+            let failure = Cli::try_parse_with_terminals(arguments, false, false).unwrap_err();
+            assert!(failure.is_display());
+            let mut stdout = Vec::new();
+            let mut stderr = Vec::new();
+            render_parse_failure(&failure, &mut stdout, &mut stderr).unwrap();
+            assert!(!stdout.is_empty());
+            assert!(stderr.is_empty());
+        }
     }
 
     fn args<const N: usize>(values: [&str; N]) -> Vec<OsString> {

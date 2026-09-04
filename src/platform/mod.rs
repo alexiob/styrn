@@ -36,8 +36,67 @@ pub(crate) enum BaselineProbeSnapshot {
         version: Option<String>,
         healthy: bool,
     },
+    TailscalePresent {
+        version: Option<String>,
+        healthy: bool,
+        posture: BaselineTailscalePosture,
+    },
     Broken,
     Unknowable,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum BaselineTailscaleMode {
+    Gui,
+    Tailscaled,
+    Service,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct BaselineTailscalePosture {
+    pub(crate) mode: BaselineTailscaleMode,
+    pub(crate) persistent: bool,
+    pub(crate) unattended: bool,
+}
+
+pub(super) fn tailscale_status_snapshot(
+    bytes: &[u8],
+    mode: BaselineTailscaleMode,
+    persistent: bool,
+    unattended: bool,
+    requested_mode: &str,
+    default_mode: BaselineTailscaleMode,
+) -> Option<BaselineProbeSnapshot> {
+    let value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+    let backend_healthy = value.get("BackendState")?.as_str()? == "Running"
+        && value.get("Self")?.get("Online")?.as_bool()?;
+    let requested = match requested_mode {
+        "" => default_mode,
+        "gui" => BaselineTailscaleMode::Gui,
+        "tailscaled" => BaselineTailscaleMode::Tailscaled,
+        "service" => BaselineTailscaleMode::Service,
+        _ => return None,
+    };
+    let version = value
+        .get("Version")
+        .and_then(serde_json::Value::as_str)
+        .filter(|version| {
+            !version.is_empty()
+                && version.len() <= 96
+                && version
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'+'))
+        })
+        .map(str::to_owned);
+    Some(BaselineProbeSnapshot::TailscalePresent {
+        version,
+        healthy: backend_healthy && persistent && requested == mode,
+        posture: BaselineTailscalePosture {
+            mode,
+            persistent,
+            unattended,
+        },
+    })
 }
 
 const BASELINE_OUTPUT_LIMIT: u64 = 64 * 1024;
@@ -61,12 +120,36 @@ pub(super) fn run_fixed_baseline_command(
     program: &Path,
     arguments: &[&str],
 ) -> Result<BaselineCommandOutput, BaselineCommandFailure> {
-    run_baseline_readonly_command(program, arguments, BASELINE_COMMAND_TIMEOUT)
+    run_baseline_readonly_command_with_env(program, arguments, &[], BASELINE_COMMAND_TIMEOUT)
 }
 
+#[cfg(target_os = "macos")]
+pub(super) fn run_fixed_baseline_command_with_env(
+    program: &Path,
+    arguments: &[&str],
+    environment: &[(&str, &str)],
+) -> Result<BaselineCommandOutput, BaselineCommandFailure> {
+    run_baseline_readonly_command_with_env(
+        program,
+        arguments,
+        environment,
+        BASELINE_COMMAND_TIMEOUT,
+    )
+}
+
+#[cfg(all(test, target_os = "macos"))]
 fn run_baseline_readonly_command(
     program: &Path,
     arguments: &[&str],
+    timeout: std::time::Duration,
+) -> Result<BaselineCommandOutput, BaselineCommandFailure> {
+    run_baseline_readonly_command_with_env(program, arguments, &[], timeout)
+}
+
+fn run_baseline_readonly_command_with_env(
+    program: &Path,
+    arguments: &[&str],
+    environment: &[(&str, &str)],
     timeout: std::time::Duration,
 ) -> Result<BaselineCommandOutput, BaselineCommandFailure> {
     use std::process::{Command, Stdio};
@@ -80,6 +163,9 @@ fn run_baseline_readonly_command(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    for (name, value) in environment {
+        command.env(name, value);
+    }
     let mut child = command.spawn().map_err(|error| {
         if error.kind() == std::io::ErrorKind::NotFound {
             BaselineCommandFailure::NotFound
@@ -137,6 +223,232 @@ fn read_bounded(mut reader: impl std::io::Read) -> Result<Vec<u8>, BaselineComma
         Err(BaselineCommandFailure::OutputTooLarge)
     } else {
         Ok(bytes)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(super) struct EffectiveSshdConfig {
+    public_key_authentication: bool,
+    authorized_keys_files: Vec<String>,
+}
+
+impl EffectiveSshdConfig {
+    pub(super) const fn public_key_authentication(&self) -> bool {
+        self.public_key_authentication
+    }
+
+    pub(super) fn authorized_keys_files(&self) -> &[String] {
+        &self.authorized_keys_files
+    }
+}
+
+pub(super) fn parse_effective_sshd_config(bytes: &[u8]) -> Option<EffectiveSshdConfig> {
+    if bytes.len() > BASELINE_OUTPUT_LIMIT as usize {
+        return None;
+    }
+    let output = std::str::from_utf8(bytes).ok()?;
+    let mut public_key_authentication = None;
+    let mut authorized_keys_files = None;
+    for line in output.lines() {
+        let mut fields = line.split_ascii_whitespace();
+        match fields.next()? {
+            "publickeyauthentication" => {
+                let value = match (fields.next(), fields.next()) {
+                    (Some("yes"), None) => true,
+                    (Some("no"), None) => false,
+                    _ => return None,
+                };
+                if public_key_authentication.replace(value).is_some() {
+                    return None;
+                }
+            }
+            "authorizedkeysfile" => {
+                let paths = fields
+                    .map(str::to_owned)
+                    .filter(|path| {
+                        !path.is_empty()
+                            && path.len() <= 1024
+                            && path != "none"
+                            && path.bytes().all(|byte| byte.is_ascii_graphic())
+                    })
+                    .collect::<Vec<_>>();
+                if paths.is_empty() || authorized_keys_files.replace(paths).is_some() {
+                    return None;
+                }
+            }
+            _ => {}
+        }
+    }
+    Some(EffectiveSshdConfig {
+        public_key_authentication: public_key_authentication?,
+        authorized_keys_files: authorized_keys_files?,
+    })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) struct AuthorizedKey<'a> {
+    key_type: &'a str,
+    encoded: &'a str,
+}
+
+pub(crate) fn parse_authorized_key_line(line: &str) -> Option<AuthorizedKey<'_>> {
+    use base64::Engine as _;
+
+    let mut fields = line.split_ascii_whitespace();
+    let key_type = fields.next()?;
+    let encoded = fields.next()?;
+    if !matches!(
+        key_type,
+        "ssh-ed25519"
+            | "ssh-rsa"
+            | "ecdsa-sha2-nistp256"
+            | "ecdsa-sha2-nistp384"
+            | "ecdsa-sha2-nistp521"
+            | "sk-ssh-ed25519@openssh.com"
+    ) || encoded.len() > 16 * 1024
+    {
+        return None;
+    }
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .ok()?;
+    let mut wire = decoded.as_slice();
+    if take_ssh_wire_string(&mut wire)? != key_type.as_bytes() {
+        return None;
+    }
+    match key_type {
+        "ssh-ed25519" => {
+            if take_ssh_wire_string(&mut wire)?.len() != 32 {
+                return None;
+            }
+        }
+        "ssh-rsa" => {
+            if take_ssh_wire_string(&mut wire)?.is_empty()
+                || take_ssh_wire_string(&mut wire)?.is_empty()
+            {
+                return None;
+            }
+        }
+        "ecdsa-sha2-nistp256" | "ecdsa-sha2-nistp384" | "ecdsa-sha2-nistp521" => {
+            let expected_curve = key_type.strip_prefix("ecdsa-sha2-")?.as_bytes();
+            if take_ssh_wire_string(&mut wire)? != expected_curve
+                || take_ssh_wire_string(&mut wire)?.is_empty()
+            {
+                return None;
+            }
+        }
+        "sk-ssh-ed25519@openssh.com" => {
+            if take_ssh_wire_string(&mut wire)?.len() != 32
+                || take_ssh_wire_string(&mut wire)?.is_empty()
+            {
+                return None;
+            }
+        }
+        _ => return None,
+    }
+    wire.is_empty()
+        .then_some(AuthorizedKey { key_type, encoded })
+}
+
+fn take_ssh_wire_string<'a>(wire: &mut &'a [u8]) -> Option<&'a [u8]> {
+    let length_bytes: [u8; 4] = wire.get(..4)?.try_into().ok()?;
+    let length = usize::try_from(u32::from_be_bytes(length_bytes)).ok()?;
+    let value = wire.get(4..4usize.checked_add(length)?)?;
+    *wire = wire.get(4 + length..)?;
+    Some(value)
+}
+
+#[cfg(test)]
+mod baseline_ssh_contract_tests {
+    use super::{
+        parse_authorized_key_line, parse_effective_sshd_config, tailscale_status_snapshot,
+        BaselineProbeSnapshot, BaselineTailscaleMode, BaselineTailscalePosture,
+    };
+
+    const VALID_ED25519: &str =
+        "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAABAgMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhscHR4f fixture";
+
+    #[test]
+    fn authorized_key_parser_decodes_and_validates_the_openssh_blob() {
+        assert!(parse_authorized_key_line(VALID_ED25519).is_some());
+        assert!(parse_authorized_key_line("ssh-ed25519 not-base64 fixture").is_none());
+        assert!(parse_authorized_key_line(
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIE9Hc3R5cm5UZXN0S2V5T25seQ fixture"
+        )
+        .is_none());
+        assert!(parse_authorized_key_line(
+            "ssh-rsa AAAAC3NzaC1lZDI1NTE5AAAAIAABAgMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhscHR4f fixture"
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn effective_sshd_parser_requires_public_key_auth_and_authorized_key_paths() {
+        let parsed = parse_effective_sshd_config(
+            b"port 22\npublickeyauthentication yes\nauthorizedkeysfile .ssh/authorized_keys .ssh/authorized_keys2\n",
+        )
+        .unwrap();
+        assert_eq!(
+            parsed.authorized_keys_files(),
+            [".ssh/authorized_keys", ".ssh/authorized_keys2"]
+        );
+        assert!(parsed.public_key_authentication());
+
+        assert!(parse_effective_sshd_config(b"publickeyauthentication yes\n").is_none());
+        assert!(parse_effective_sshd_config(
+            b"publickeyauthentication yes\npublickeyauthentication no\nauthorizedkeysfile .ssh/authorized_keys\n"
+        )
+        .is_none());
+        assert!(parse_effective_sshd_config(
+            b"publickeyauthentication yes\nauthorizedkeysfile none\n"
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn tailscale_status_requires_observed_service_persistence_and_requested_mode() {
+        let status = br#"{"BackendState":"Running","Self":{"Online":true},"Version":"1.90.0"}"#;
+        assert_eq!(
+            tailscale_status_snapshot(
+                status,
+                BaselineTailscaleMode::Service,
+                true,
+                true,
+                "service",
+                BaselineTailscaleMode::Service,
+            ),
+            Some(BaselineProbeSnapshot::TailscalePresent {
+                version: Some("1.90.0".to_owned()),
+                healthy: true,
+                posture: BaselineTailscalePosture {
+                    mode: BaselineTailscaleMode::Service,
+                    persistent: true,
+                    unattended: true,
+                },
+            })
+        );
+        assert!(matches!(
+            tailscale_status_snapshot(
+                status,
+                BaselineTailscaleMode::Service,
+                true,
+                true,
+                "tailscaled",
+                BaselineTailscaleMode::Service,
+            ),
+            Some(BaselineProbeSnapshot::TailscalePresent { healthy: false, .. })
+        ));
+        assert!(matches!(
+            tailscale_status_snapshot(
+                status,
+                BaselineTailscaleMode::Service,
+                false,
+                true,
+                "service",
+                BaselineTailscaleMode::Service,
+            ),
+            Some(BaselineProbeSnapshot::TailscalePresent { healthy: false, .. })
+        ));
     }
 }
 
@@ -6141,6 +6453,10 @@ impl std::io::Write for PrivatePublicationFile {
 
 #[allow(dead_code)] // Consumed by the T0.13 receipt durability follow-up.
 impl PrivatePublicationFile {
+    pub(crate) const fn identity(&self) -> PrivateFileIdentity {
+        self.identity
+    }
+
     pub(crate) fn complete_exact(
         mut self,
         expected_bytes: &[u8],

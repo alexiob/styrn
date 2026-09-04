@@ -158,6 +158,42 @@ fn setup_interactive_without_tty_exits_usage_with_hint_and_writes_nothing() {
     environment.assert_no_setup_state();
 }
 
+#[test]
+fn setup_human_parse_errors_never_echo_secret_shaped_values() {
+    let environment = IsolatedEnvironment::new("human-parse-secret");
+    for arguments in [
+        &["setup", "--scope", "token-never-render-this"][..],
+        &["setup", "--unknown-password", "secret-never-render-this"][..],
+    ] {
+        let output = environment.run(arguments);
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        assert!(output.stdout.is_empty(), "{output:?}");
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(stderr.contains(if arguments[1] == "--scope" {
+            "invalid value for --scope; allowed values: user, system"
+        } else {
+            "setup arguments are invalid"
+        }));
+        assert!(!stderr.contains("never-render-this"));
+        environment.assert_no_setup_state();
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn interactive_deferred_mutation_flags_fail_before_prompts_and_write_nothing() {
+    let environment = IsolatedEnvironment::new("interactive-deferred-mutation");
+    let output = environment.run_in_pty(
+        &["setup", "--interactive", "--authorize-system"],
+        b"worker\n\nalpha\nyes\n",
+    );
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    let transcript = String::from_utf8_lossy(&output.stdout);
+    assert!(!transcript.contains("Worker role"));
+    assert!(!transcript.contains("Apply this rootless"));
+    environment.assert_no_setup_state();
+}
+
 #[cfg(unix)]
 #[test]
 fn bare_setup_in_tty_decline_prints_the_complete_plan_before_one_confirmation() {

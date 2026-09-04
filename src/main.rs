@@ -33,7 +33,7 @@ fn main() {
                 fail_setup(
                     true,
                     output::ErrorCode::UsageInvalidArgument,
-                    "setup arguments are invalid; use 'styrn setup --help'",
+                    failure.safe_setup_message(),
                     None,
                 );
             } else {
@@ -141,6 +141,9 @@ fn run(parsed: cli::ParsedCli) {
 
 fn run_rootless_setup(request: cli::SetupRequest) {
     let json = request.json();
+    if let Err(error) = setup::validate_rootless_setup_request(&request) {
+        fail_setup_input(json, error);
+    }
     let effective = if request.interactive() {
         let stdin = std::io::stdin();
         let stdout = std::io::stdout();
@@ -409,7 +412,7 @@ fn fail_setup_input(json: bool, error: setup::SetupInputError) -> ! {
 fn fail_setup_orchestrator(json: bool, error: &setup::RootlessSetupError) -> ! {
     let code = output::ErrorCode::from_str(error.error_code())
         .expect("rootless setup errors must use the registered output codes");
-    fail_setup(json, code, &error.to_string(), None)
+    fail_setup(json, code, &error.to_string(), error.details())
 }
 
 fn fail_setup(
@@ -419,17 +422,24 @@ fn fail_setup(
     details: Option<serde_json::Value>,
 ) -> ! {
     if json {
-        let error = output::ErrorDiagnostic::new(code, message, details)
-            .expect("the built-in setup diagnostic must be valid");
-        let envelope =
-            output::Envelope::failure("setup", chrono::Utc::now(), vec![error], Vec::new())
-                .expect("the built-in setup failure output must be valid");
+        let envelope = setup_failure_envelope(code, message, details);
         output::write_json(std::io::stdout().lock(), &envelope)
             .expect("writing setup output must succeed");
     } else {
         eprintln!("{message}");
     }
     output::exit_process(code.exit_code());
+}
+
+fn setup_failure_envelope(
+    code: output::ErrorCode,
+    message: &str,
+    details: Option<serde_json::Value>,
+) -> output::Envelope {
+    let error = output::ErrorDiagnostic::new(code, message, details)
+        .expect("the built-in setup diagnostic must be valid");
+    output::Envelope::failure("setup", chrono::Utc::now(), vec![error], Vec::new())
+        .expect("the built-in setup failure output must be valid")
 }
 
 fn fail_unavailable_setup(parsed: &cli::ParsedCli, command: &str, message: &str) -> ! {
@@ -447,4 +457,36 @@ fn fail_unavailable_setup(parsed: &cli::ParsedCli, command: &str, message: &str)
     }
     eprintln!("{message}");
     output::exit_process(output::StyrnExit::Setup);
+}
+
+#[cfg(test)]
+mod setup_failure_output_tests {
+    #[test]
+    fn operation_failure_reaches_json_details_and_safe_human_remediation() {
+        let error = crate::setup::RootlessSetupError::operation_failed_for_output_test();
+        let code = crate::output::ErrorCode::from_str(error.error_code()).unwrap();
+        let envelope = super::setup_failure_envelope(code, &error.to_string(), error.details());
+        let mut bytes = Vec::new();
+        crate::output::write_json(&mut bytes, &envelope).unwrap();
+        let document: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+
+        assert_eq!(document["errors"][0]["details"]["phase"], "execution");
+        assert_eq!(
+            document["errors"][0]["details"]["action_id"],
+            "identity.directory.root"
+        );
+        assert_eq!(
+            document["errors"][0]["details"]["cause_category"],
+            "action_apply"
+        );
+        assert!(document["errors"][0]["details"]["remediation"]
+            .as_str()
+            .unwrap()
+            .contains("retry setup"));
+        let human = error.to_string();
+        assert!(human.contains("identity.directory.root"));
+        assert!(human.contains("retry setup"));
+        assert!(!String::from_utf8(bytes).unwrap().contains("native-secret"));
+        assert!(!human.contains("native-secret"));
+    }
 }

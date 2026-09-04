@@ -55,12 +55,31 @@ pub(crate) enum ProbeStatus {
         version: Option<String>,
         healthy: bool,
     },
+    TailscalePresent {
+        version: Option<String>,
+        healthy: bool,
+        posture: ObservedTailscalePosture,
+    },
     Broken {
         reason: String,
     },
     Unknowable {
         reason: String,
     },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ObservedTailscaleMode {
+    Gui,
+    Tailscaled,
+    Service,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ObservedTailscalePosture {
+    pub(crate) mode: ObservedTailscaleMode,
+    pub(crate) persistent: bool,
+    pub(crate) unattended: bool,
 }
 
 #[derive(Clone, PartialEq, Eq)]

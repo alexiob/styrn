@@ -206,6 +206,20 @@ impl ApplyPlanError {
     pub(crate) fn exit_code(&self) -> u8 {
         13
     }
+
+    pub(in crate::setup) fn action_id(&self) -> Option<&ActionName> {
+        match self {
+            Self::Action(error) => error.action_id(),
+            Self::Receipt(_) => None,
+        }
+    }
+
+    pub(in crate::setup) fn safe_cause(&self) -> &'static str {
+        match self {
+            Self::Action(error) => error.safe_cause(),
+            Self::Receipt(_) => "receipt_journal",
+        }
+    }
 }
 
 pub(in crate::setup) fn apply_plan_with_journal(

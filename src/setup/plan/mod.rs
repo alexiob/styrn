@@ -342,6 +342,7 @@ impl SetupPlan {
                         matches!(
                             observation.status(),
                             ProbeStatus::Present { healthy: true, .. }
+                                | ProbeStatus::TailscalePresent { healthy: true, .. }
                         )
                     }
                 };
@@ -365,8 +366,10 @@ impl SetupPlan {
                         done,
                     } => match observation.status() {
                         ProbeStatus::Absent => create.clone(),
-                        ProbeStatus::Present { healthy: true, .. } => done.clone(),
+                        ProbeStatus::Present { healthy: true, .. }
+                        | ProbeStatus::TailscalePresent { healthy: true, .. } => done.clone(),
                         ProbeStatus::Present { healthy: false, .. }
+                        | ProbeStatus::TailscalePresent { healthy: false, .. }
                         | ProbeStatus::Broken { .. } => repair.clone(),
                         ProbeStatus::Unknowable { .. } => {
                             unreachable!("unknowable observations were validated above")
@@ -377,6 +380,7 @@ impl SetupPlan {
                         if matches!(
                             observation.status(),
                             ProbeStatus::Present { healthy: true, .. }
+                                | ProbeStatus::TailscalePresent { healthy: true, .. }
                         ) {
                             done.clone()
                         } else {

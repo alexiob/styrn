@@ -143,6 +143,12 @@ impl<'a> From<&'a ProbeStatus> for SerializedProbeStatus<'a> {
                 version: version.as_deref(),
                 healthy: *healthy,
             },
+            ProbeStatus::TailscalePresent {
+                version, healthy, ..
+            } => Self::Present {
+                version: version.as_deref(),
+                healthy: *healthy,
+            },
             ProbeStatus::Broken { reason } => Self::Broken { reason },
             ProbeStatus::Unknowable { reason } => Self::Unknowable { reason },
         }
@@ -197,6 +203,12 @@ impl DoctorFinding {
             ProbeStatus::Absent => (DoctorFindingState::Fail, "subject is absent"),
             ProbeStatus::Present { healthy: true, .. } => (DoctorFindingState::Pass, "healthy"),
             ProbeStatus::Present { healthy: false, .. } => {
+                (DoctorFindingState::Fail, "present but unhealthy")
+            }
+            ProbeStatus::TailscalePresent { healthy: true, .. } => {
+                (DoctorFindingState::Pass, "healthy")
+            }
+            ProbeStatus::TailscalePresent { healthy: false, .. } => {
                 (DoctorFindingState::Fail, "present but unhealthy")
             }
             ProbeStatus::Broken { reason } => (DoctorFindingState::Fail, reason.as_str()),
@@ -272,6 +284,15 @@ fn sanitize_status(status: ProbeStatus) -> ProbeStatus {
         ProbeStatus::Present { version, healthy } => ProbeStatus::Present {
             version: version.filter(|version| is_safe_version(version)),
             healthy,
+        },
+        ProbeStatus::TailscalePresent {
+            version,
+            healthy,
+            posture,
+        } => ProbeStatus::TailscalePresent {
+            version: version.filter(|version| is_safe_version(version)),
+            healthy,
+            posture,
         },
         ProbeStatus::Broken { reason } => ProbeStatus::Broken {
             reason: canonical_reason(&reason),

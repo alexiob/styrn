@@ -4,7 +4,7 @@ use super::{
 };
 use std::ffi::{CString, OsString};
 use std::fs;
-use std::io;
+use std::io::{self, Read};
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::ffi::OsStringExt;
@@ -18,11 +18,11 @@ use sha2::{Digest, Sha256};
 pub(super) fn baseline_probe_snapshot(
     kind: super::BaselineProbeKind,
     authorized_public_keys: &[String],
-    _tailscale_mode: &str,
+    tailscale_mode: &str,
 ) -> super::BaselineProbeSnapshot {
     match kind {
         super::BaselineProbeKind::SshServer => ssh_server_snapshot(authorized_public_keys),
-        super::BaselineProbeKind::Tailscale => tailscale_snapshot(),
+        super::BaselineProbeKind::Tailscale => tailscale_snapshot(tailscale_mode),
         super::BaselineProbeKind::Git => git_snapshot(),
         super::BaselineProbeKind::SleepPolicy => sleep_snapshot(),
         super::BaselineProbeKind::Styrnd | super::BaselineProbeKind::Deferred => {
@@ -56,26 +56,39 @@ fn ssh_server_snapshot(required: &[String]) -> super::BaselineProbeSnapshot {
     } else {
         return super::BaselineProbeSnapshot::Unknowable;
     };
-    let config_enabled = match super::run_fixed_baseline_command(sshd, &["-T"]) {
-        Ok(output) if output.success => sshd_public_key_auth_is_enabled(&output.stdout),
-        Ok(_) | Err(_) => return super::BaselineProbeSnapshot::Unknowable,
-    };
-    let home = match account_details_for_uid(
+    let account = match account_details_for_uid(
         unsafe { libc::getuid() },
         WorkerAccountPolicy::CurrentUser,
     ) {
-        Ok(account) => PathBuf::from(account.home),
+        Ok(account) => account,
         Err(_) => return super::BaselineProbeSnapshot::Unknowable,
     };
+    let match_context = format!(
+        "user={},host=localhost,addr=127.0.0.1",
+        account.principal.name()
+    );
+    let config = match super::run_fixed_baseline_command(sshd, &["-T", "-C", &match_context]) {
+        Ok(output) if output.success => super::parse_effective_sshd_config(&output.stdout),
+        Ok(_) | Err(_) => return super::BaselineProbeSnapshot::Unknowable,
+    };
+    let Some(config) = config else {
+        return super::BaselineProbeSnapshot::Unknowable;
+    };
+    let home = PathBuf::from(account.home);
     super::BaselineProbeSnapshot::Present {
         version: None,
         healthy: service_running
-            && config_enabled == Some(true)
-            && authorized_keys_are_ready(&home, required),
+            && config.public_key_authentication()
+            && authorized_keys_are_ready(
+                &home,
+                unsafe { libc::getuid() },
+                config.authorized_keys_files(),
+                required,
+            ),
     }
 }
 
-fn tailscale_snapshot() -> super::BaselineProbeSnapshot {
+fn tailscale_snapshot(requested_mode: &str) -> super::BaselineProbeSnapshot {
     let Some(program) = [
         Path::new("/usr/bin/tailscale"),
         Path::new("/usr/local/bin/tailscale"),
@@ -84,9 +97,23 @@ fn tailscale_snapshot() -> super::BaselineProbeSnapshot {
     .find(|path| path.is_file()) else {
         return super::BaselineProbeSnapshot::Absent;
     };
+    let service_active = super::run_fixed_baseline_command(
+        Path::new("/usr/bin/systemctl"),
+        &["is-active", "--quiet", "tailscaled.service"],
+    )
+    .is_ok_and(|output| output.success);
+    let service_enabled = super::run_fixed_baseline_command(
+        Path::new("/usr/bin/systemctl"),
+        &["is-enabled", "--quiet", "tailscaled.service"],
+    )
+    .is_ok_and(|output| output.success);
     match super::run_fixed_baseline_command(program, &["status", "--json"]) {
-        Ok(output) if output.success => parse_tailscale_status(&output.stdout)
-            .unwrap_or(super::BaselineProbeSnapshot::Unknowable),
+        Ok(output) if output.success => parse_tailscale_status(
+            &output.stdout,
+            service_active && service_enabled,
+            requested_mode,
+        )
+        .unwrap_or(super::BaselineProbeSnapshot::Unknowable),
         Ok(_) => super::BaselineProbeSnapshot::Unknowable,
         Err(_) => super::BaselineProbeSnapshot::Unknowable,
     }
@@ -146,14 +173,19 @@ fn parse_git_version(bytes: &[u8]) -> Option<String> {
     .then(|| version.to_owned())
 }
 
-fn parse_tailscale_status(bytes: &[u8]) -> Option<super::BaselineProbeSnapshot> {
-    let value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
-    let healthy = value.get("BackendState")?.as_str()? == "Running"
-        && value.get("Self")?.get("Online")?.as_bool()?;
-    Some(super::BaselineProbeSnapshot::Present {
-        version: None,
-        healthy,
-    })
+fn parse_tailscale_status(
+    bytes: &[u8],
+    persistent: bool,
+    requested_mode: &str,
+) -> Option<super::BaselineProbeSnapshot> {
+    super::tailscale_status_snapshot(
+        bytes,
+        super::BaselineTailscaleMode::Tailscaled,
+        persistent,
+        true,
+        requested_mode,
+        super::BaselineTailscaleMode::Tailscaled,
+    )
 }
 
 fn parse_sleep_posture(bytes: &[u8]) -> Option<bool> {
@@ -176,29 +208,65 @@ fn parse_sleep_posture(bytes: &[u8]) -> Option<bool> {
     Some(states.iter().all(|state| *state == "masked"))
 }
 
-fn authorized_keys_are_ready(home: &Path, required: &[String]) -> bool {
+fn authorized_keys_are_ready(
+    home: &Path,
+    uid: u32,
+    configured: &[String],
+    required: &[String],
+) -> bool {
+    let Ok(home_metadata) = fs::symlink_metadata(home) else {
+        return false;
+    };
+    if !secure_ssh_path_metadata(&home_metadata, uid, true) {
+        return false;
+    }
     let ssh = home.join(".ssh");
     let Ok(metadata) = fs::symlink_metadata(&ssh) else {
         return false;
     };
-    if !metadata.is_dir() || metadata.file_type().is_symlink() {
+    if !secure_ssh_path_metadata(&metadata, uid, true) {
         return false;
     }
+    configured.iter().any(|configured| {
+        let Some(path) = canonical_authorized_keys_path(home, configured) else {
+            return false;
+        };
+        authorized_keys_file_is_ready(&path, uid, required)
+    })
+}
+
+fn canonical_authorized_keys_path(home: &Path, configured: &str) -> Option<PathBuf> {
+    let relative = configured
+        .strip_prefix("%h/")
+        .or_else(|| configured.strip_prefix("./"))
+        .unwrap_or(configured);
+    if !matches!(relative, ".ssh/authorized_keys" | ".ssh/authorized_keys2") {
+        return None;
+    }
+    Some(home.join(relative))
+}
+
+fn authorized_keys_file_is_ready(path: &Path, uid: u32, required: &[String]) -> bool {
     let Ok(mut file) = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(ssh.join("authorized_keys"))
+        .open(path)
     else {
         return false;
     };
     let Ok(metadata) = file.metadata() else {
         return false;
     };
-    if !metadata.is_file() || metadata.len() > 1024 * 1024 {
+    if !secure_ssh_path_metadata(&metadata, uid, false) || metadata.len() > 1024 * 1024 {
         return false;
     }
     let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    if std::io::Read::read_to_end(&mut file, &mut bytes).is_err() {
+    if std::io::Read::by_ref(&mut file)
+        .take(1024 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .is_err()
+        || bytes.len() > 1024 * 1024
+    {
         return false;
     }
     let Ok(contents) = std::str::from_utf8(&bytes) else {
@@ -207,36 +275,27 @@ fn authorized_keys_are_ready(home: &Path, required: &[String]) -> bool {
     let keys = contents
         .lines()
         .map(str::trim)
-        .filter(|line| valid_authorized_key_line(line))
+        .filter_map(super::parse_authorized_key_line)
         .collect::<Vec<_>>();
     if required.is_empty() {
         !keys.is_empty()
     } else {
-        required.iter().all(|key| keys.contains(&key.as_str()))
+        required.iter().all(|required| {
+            super::parse_authorized_key_line(required)
+                .is_some_and(|required| keys.contains(&required))
+        })
     }
 }
 
-fn valid_authorized_key_line(line: &str) -> bool {
-    let mut fields = line.split_ascii_whitespace();
-    matches!(
-        fields.next(),
-        Some(
-            "ssh-ed25519"
-                | "ssh-rsa"
-                | "ecdsa-sha2-nistp256"
-                | "ecdsa-sha2-nistp384"
-                | "ecdsa-sha2-nistp521"
-                | "sk-ssh-ed25519@openssh.com"
-        )
-    ) && fields.next().is_some_and(|key| !key.is_empty())
-}
-
-fn sshd_public_key_auth_is_enabled(bytes: &[u8]) -> Option<bool> {
-    let output = std::str::from_utf8(bytes).ok()?;
-    output.lines().find_map(|line| {
-        let mut fields = line.split_ascii_whitespace();
-        (fields.next()? == "publickeyauthentication").then(|| fields.next() == Some("yes"))
-    })
+fn secure_ssh_path_metadata(metadata: &fs::Metadata, uid: u32, directory: bool) -> bool {
+    !metadata.file_type().is_symlink()
+        && if directory {
+            metadata.is_dir()
+        } else {
+            metadata.is_file()
+        }
+        && matches!(metadata.uid(), owner if owner == uid || owner == 0)
+        && metadata.mode() & 0o022 == 0
 }
 
 #[cfg(test)]
@@ -255,6 +314,7 @@ mod baseline_probe_tests {
             assert!(matches!(
                 super::baseline_probe_snapshot(kind, &[], ""),
                 BaselineProbeSnapshot::Present { healthy: true, .. }
+                    | BaselineProbeSnapshot::TailscalePresent { healthy: true, .. }
             ));
         }
     }

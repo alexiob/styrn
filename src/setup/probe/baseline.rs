@@ -1,6 +1,7 @@
 use super::{
-    worker_probe_only, FindingSeverity, ProbeCatalog, ProbeCatalogError, ProbeDescriptorSpec,
-    ProbeFailure, ProbeId, ProbeStatus, WorkerProbe,
+    worker_probe_only, FindingSeverity, ObservedTailscaleMode, ObservedTailscalePosture,
+    ProbeCatalog, ProbeCatalogError, ProbeDescriptorSpec, ProbeFailure, ProbeId, ProbeStatus,
+    WorkerProbe,
 };
 use crate::setup::{
     action::{PlanOperation, Privilege},
@@ -33,6 +34,29 @@ impl WorkerProbe for BaselineProbe {
                 crate::platform::BaselineProbeSnapshot::Present { version, healthy } => {
                     ProbeStatus::Present { version, healthy }
                 }
+                crate::platform::BaselineProbeSnapshot::TailscalePresent {
+                    version,
+                    healthy,
+                    posture,
+                } => ProbeStatus::TailscalePresent {
+                    version,
+                    healthy,
+                    posture: ObservedTailscalePosture {
+                        mode: match posture.mode {
+                            crate::platform::BaselineTailscaleMode::Gui => {
+                                ObservedTailscaleMode::Gui
+                            }
+                            crate::platform::BaselineTailscaleMode::Tailscaled => {
+                                ObservedTailscaleMode::Tailscaled
+                            }
+                            crate::platform::BaselineTailscaleMode::Service => {
+                                ObservedTailscaleMode::Service
+                            }
+                        },
+                        persistent: posture.persistent,
+                        unattended: posture.unattended,
+                    },
+                },
                 crate::platform::BaselineProbeSnapshot::Broken => ProbeStatus::Broken {
                     reason: "baseline capability state is broken".to_owned(),
                 },

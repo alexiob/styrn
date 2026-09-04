@@ -653,6 +653,32 @@ impl ActionError {
     pub(in crate::setup) fn apply_failed(action: ActionName) -> Self {
         Self::ApplyFailed { action }
     }
+
+    pub(in crate::setup) fn action_id(&self) -> Option<&ActionName> {
+        match self {
+            Self::CheckFailed { action }
+            | Self::ApplyFailed { action }
+            | Self::UnsupportedUntilPhase7 { action, .. } => Some(action),
+            Self::InvalidActionName
+            | Self::InvalidDescription
+            | Self::InvalidInstructions
+            | Self::InvalidScriptFragment
+            | Self::InvalidDedicatedAccountSelection => None,
+        }
+    }
+
+    pub(in crate::setup) const fn safe_cause(&self) -> &'static str {
+        match self {
+            Self::CheckFailed { .. } => "action_check",
+            Self::ApplyFailed { .. } => "action_apply",
+            Self::UnsupportedUntilPhase7 { .. } => "action_unsupported",
+            Self::InvalidActionName
+            | Self::InvalidDescription
+            | Self::InvalidInstructions
+            | Self::InvalidScriptFragment
+            | Self::InvalidDedicatedAccountSelection => "action_validation",
+        }
+    }
 }
 
 /// The closed setup action plan type. Future component actions extend this
@@ -1259,7 +1285,9 @@ pub(in crate::setup) use execution::apply_plan_with_journal;
 pub(in crate::setup) use execution::CompletedExecutionToken;
 #[cfg(not(action_core_fixture))]
 #[allow(unused_imports)]
-pub(in crate::setup) use execution::{ActionExecutionResult, ActionExecutionStatus, ApplyReport};
+pub(in crate::setup) use execution::{
+    ActionExecutionResult, ActionExecutionStatus, ApplyPlanError, ApplyReport,
+};
 
 fn checked_text(value: &str, error: ActionError) -> Result<String, ActionError> {
     if super::validate_probe_static_text(value) {

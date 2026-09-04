@@ -4,7 +4,7 @@ use super::{
 };
 use std::ffi::{c_void, CString, OsString};
 use std::fs;
-use std::io;
+use std::io::{self, Read};
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::ffi::OsStringExt;
@@ -18,11 +18,11 @@ use sha2::{Digest, Sha256};
 pub(super) fn baseline_probe_snapshot(
     kind: super::BaselineProbeKind,
     authorized_public_keys: &[String],
-    _tailscale_mode: &str,
+    tailscale_mode: &str,
 ) -> super::BaselineProbeSnapshot {
     match kind {
         super::BaselineProbeKind::SshServer => ssh_server_snapshot(authorized_public_keys),
-        super::BaselineProbeKind::Tailscale => tailscale_snapshot(),
+        super::BaselineProbeKind::Tailscale => tailscale_snapshot(tailscale_mode),
         super::BaselineProbeKind::Git => git_snapshot(),
         super::BaselineProbeKind::SleepPolicy => sleep_snapshot(),
         super::BaselineProbeKind::Styrnd | super::BaselineProbeKind::Deferred => {
@@ -43,40 +43,94 @@ fn ssh_server_snapshot(authorized_public_keys: &[String]) -> super::BaselineProb
         Ok(output) => output.success,
         Err(_) => return super::BaselineProbeSnapshot::Unknowable,
     };
-    let config = match super::run_fixed_baseline_command(sshd, &["-T"]) {
-        Ok(output) if output.success => sshd_public_key_auth_is_enabled(&output.stdout),
-        Ok(_) | Err(_) => return super::BaselineProbeSnapshot::Unknowable,
-    };
-    let home = match account_details_for_uid(
+    let account = match account_details_for_uid(
         unsafe { libc::getuid() },
         WorkerAccountPolicy::CurrentUser,
     ) {
-        Ok(account) => PathBuf::from(account.home),
+        Ok(account) => account,
         Err(_) => return super::BaselineProbeSnapshot::Unknowable,
     };
+    let match_context = format!(
+        "user={},host=localhost,addr=127.0.0.1",
+        account.principal.name()
+    );
+    let config = match super::run_fixed_baseline_command(sshd, &["-T", "-C", &match_context]) {
+        Ok(output) if output.success => super::parse_effective_sshd_config(&output.stdout),
+        Ok(_) | Err(_) => return super::BaselineProbeSnapshot::Unknowable,
+    };
+    let Some(config) = config else {
+        return super::BaselineProbeSnapshot::Unknowable;
+    };
+    let home = PathBuf::from(account.home);
     super::BaselineProbeSnapshot::Present {
         version: None,
         healthy: service
-            && config == Some(true)
-            && authorized_keys_are_ready(&home, authorized_public_keys),
+            && config.public_key_authentication()
+            && authorized_keys_are_ready(
+                &home,
+                unsafe { libc::getuid() },
+                config.authorized_keys_files(),
+                authorized_public_keys,
+            ),
     }
 }
 
-fn tailscale_snapshot() -> super::BaselineProbeSnapshot {
-    let Some(program) = [
+fn tailscale_snapshot(requested_mode: &str) -> super::BaselineProbeSnapshot {
+    let daemon_program = [
         Path::new("/opt/homebrew/bin/tailscale"),
         Path::new("/usr/local/bin/tailscale"),
     ]
     .into_iter()
-    .find(|path| path.is_file()) else {
-        return super::BaselineProbeSnapshot::Absent;
+    .find(|path| path.is_file());
+    let gui_program = Path::new("/Applications/Tailscale.app/Contents/MacOS/Tailscale")
+        .is_file()
+        .then_some(Path::new(
+            "/Applications/Tailscale.app/Contents/MacOS/Tailscale",
+        ));
+    let (program, mode, unattended, environment): (
+        &Path,
+        super::BaselineTailscaleMode,
+        bool,
+        &[(&str, &str)],
+    ) = match (daemon_program, gui_program) {
+        (Some(program), None) => (program, super::BaselineTailscaleMode::Tailscaled, true, &[]),
+        (None, Some(program)) => (
+            program,
+            super::BaselineTailscaleMode::Gui,
+            false,
+            &[("TAILSCALE_BE_CLI", "1")],
+        ),
+        (None, None) => return super::BaselineProbeSnapshot::Absent,
+        (Some(_), Some(_)) => return super::BaselineProbeSnapshot::Unknowable,
     };
-    match super::run_fixed_baseline_command(program, &["status", "--json"]) {
-        Ok(output) if output.success => parse_tailscale_status(&output.stdout)
-            .unwrap_or(super::BaselineProbeSnapshot::Unknowable),
+    let persistent = tailscale_service_is_persistent(mode);
+    match super::run_fixed_baseline_command_with_env(program, &["status", "--json"], environment) {
+        Ok(output) if output.success => {
+            parse_tailscale_status(&output.stdout, mode, persistent, unattended, requested_mode)
+                .unwrap_or(super::BaselineProbeSnapshot::Unknowable)
+        }
         Ok(_) => super::BaselineProbeSnapshot::Unknowable,
         Err(_) => super::BaselineProbeSnapshot::Unknowable,
     }
+}
+
+fn tailscale_service_is_persistent(mode: super::BaselineTailscaleMode) -> bool {
+    let uid = unsafe { libc::getuid() };
+    let labels = match mode {
+        super::BaselineTailscaleMode::Gui => vec![
+            format!("gui/{uid}/io.tailscale.ipn.macsys"),
+            format!("gui/{uid}/io.tailscale.ipn.macos"),
+        ],
+        super::BaselineTailscaleMode::Tailscaled => vec![
+            "system/com.tailscale.tailscaled".to_owned(),
+            "system/homebrew.mxcl.tailscale".to_owned(),
+        ],
+        super::BaselineTailscaleMode::Service => return false,
+    };
+    labels.iter().any(|label| {
+        super::run_fixed_baseline_command(Path::new("/bin/launchctl"), &["print", label])
+            .is_ok_and(|output| output.success)
+    })
 }
 
 fn git_snapshot() -> super::BaselineProbeSnapshot {
@@ -97,7 +151,7 @@ fn git_snapshot() -> super::BaselineProbeSnapshot {
 }
 
 fn sleep_snapshot() -> super::BaselineProbeSnapshot {
-    match super::run_fixed_baseline_command(Path::new("/usr/bin/pmset"), &["-g"]) {
+    match super::run_fixed_baseline_command(Path::new("/usr/bin/pmset"), &["-g", "custom"]) {
         Ok(output) if output.success => parse_sleep_posture(&output.stdout)
             .map(|healthy| super::BaselineProbeSnapshot::Present {
                 version: None,
@@ -126,42 +180,94 @@ fn parse_git_version(bytes: &[u8]) -> Option<String> {
     .then(|| version.to_owned())
 }
 
-fn parse_tailscale_status(bytes: &[u8]) -> Option<super::BaselineProbeSnapshot> {
-    let value: serde_json::Value = serde_json::from_slice(bytes).ok()?;
-    let healthy = value.get("BackendState")?.as_str()? == "Running"
-        && value.get("Self")?.get("Online")?.as_bool()?;
-    Some(super::BaselineProbeSnapshot::Present {
-        version: None,
-        healthy,
-    })
+fn parse_tailscale_status(
+    bytes: &[u8],
+    mode: super::BaselineTailscaleMode,
+    persistent: bool,
+    unattended: bool,
+    requested_mode: &str,
+) -> Option<super::BaselineProbeSnapshot> {
+    super::tailscale_status_snapshot(
+        bytes,
+        mode,
+        persistent,
+        unattended,
+        requested_mode,
+        super::BaselineTailscaleMode::Gui,
+    )
 }
 
 fn parse_sleep_posture(bytes: &[u8]) -> Option<bool> {
     let output = std::str::from_utf8(bytes).ok()?;
-    let mut values = output.lines().filter_map(|line| {
-        let mut fields = line.split_ascii_whitespace();
-        (fields.next()? == "sleep").then(|| fields.next()).flatten()
-    });
-    let value = values.next()?;
-    if values.next().is_some() {
-        return None;
+    let mut section_count = 0_usize;
+    let mut sleep_values = Vec::new();
+    let mut section_has_sleep = false;
+    for line in output.lines() {
+        let trimmed = line.trim();
+        if trimmed.ends_with(" Power:") {
+            if section_count != 0 && !section_has_sleep {
+                return None;
+            }
+            section_count += 1;
+            section_has_sleep = false;
+            continue;
+        }
+        let mut fields = trimmed.split_ascii_whitespace();
+        if fields.next() == Some("sleep") {
+            if section_count == 0 || section_has_sleep {
+                return None;
+            }
+            let value = fields.next()?;
+            if fields.next().is_some() || !value.bytes().all(|byte| byte.is_ascii_digit()) {
+                return None;
+            }
+            sleep_values.push(value == "0");
+            section_has_sleep = true;
+        }
     }
-    match value {
-        "0" => Some(true),
-        value if value.bytes().all(|byte| byte.is_ascii_digit()) => Some(false),
-        _ => None,
-    }
+    (section_count != 0 && section_has_sleep && sleep_values.len() == section_count)
+        .then(|| sleep_values.into_iter().all(|value| value))
 }
 
-fn authorized_keys_are_ready(home: &Path, required: &[String]) -> bool {
+fn authorized_keys_are_ready(
+    home: &Path,
+    uid: u32,
+    configured: &[String],
+    required: &[String],
+) -> bool {
+    let Ok(home_metadata) = fs::symlink_metadata(home) else {
+        return false;
+    };
+    if !secure_ssh_path_metadata(&home_metadata, uid, true) {
+        return false;
+    }
     let ssh = home.join(".ssh");
     let Ok(ssh_metadata) = fs::symlink_metadata(&ssh) else {
         return false;
     };
-    if !ssh_metadata.is_dir() || ssh_metadata.file_type().is_symlink() {
+    if !secure_ssh_path_metadata(&ssh_metadata, uid, true) {
         return false;
     }
-    let path = ssh.join("authorized_keys");
+    configured.iter().any(|configured| {
+        let Some(path) = canonical_authorized_keys_path(home, configured) else {
+            return false;
+        };
+        authorized_keys_file_is_ready(&path, uid, required)
+    })
+}
+
+fn canonical_authorized_keys_path(home: &Path, configured: &str) -> Option<PathBuf> {
+    let relative = configured
+        .strip_prefix("%h/")
+        .or_else(|| configured.strip_prefix("./"))
+        .unwrap_or(configured);
+    if !matches!(relative, ".ssh/authorized_keys" | ".ssh/authorized_keys2") {
+        return None;
+    }
+    Some(home.join(relative))
+}
+
+fn authorized_keys_file_is_ready(path: &Path, uid: u32, required: &[String]) -> bool {
     let Ok(mut file) = std::fs::OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
@@ -172,11 +278,16 @@ fn authorized_keys_are_ready(home: &Path, required: &[String]) -> bool {
     let Ok(metadata) = file.metadata() else {
         return false;
     };
-    if !metadata.is_file() || metadata.len() > 1024 * 1024 {
+    if !secure_ssh_path_metadata(&metadata, uid, false) || metadata.len() > 1024 * 1024 {
         return false;
     }
     let mut bytes = Vec::with_capacity(metadata.len() as usize);
-    if std::io::Read::read_to_end(&mut file, &mut bytes).is_err() {
+    if std::io::Read::by_ref(&mut file)
+        .take(1024 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .is_err()
+        || bytes.len() > 1024 * 1024
+    {
         return false;
     }
     let Ok(contents) = std::str::from_utf8(&bytes) else {
@@ -185,38 +296,27 @@ fn authorized_keys_are_ready(home: &Path, required: &[String]) -> bool {
     let keys = contents
         .lines()
         .map(str::trim)
-        .filter(|line| valid_authorized_key_line(line))
+        .filter_map(super::parse_authorized_key_line)
         .collect::<Vec<_>>();
     if required.is_empty() {
         !keys.is_empty()
     } else {
-        required
-            .iter()
-            .all(|required| keys.contains(&required.as_str()))
+        required.iter().all(|required| {
+            super::parse_authorized_key_line(required)
+                .is_some_and(|required| keys.contains(&required))
+        })
     }
 }
 
-fn valid_authorized_key_line(line: &str) -> bool {
-    let mut fields = line.split_ascii_whitespace();
-    matches!(
-        fields.next(),
-        Some(
-            "ssh-ed25519"
-                | "ssh-rsa"
-                | "ecdsa-sha2-nistp256"
-                | "ecdsa-sha2-nistp384"
-                | "ecdsa-sha2-nistp521"
-                | "sk-ssh-ed25519@openssh.com"
-        )
-    ) && fields.next().is_some_and(|key| !key.is_empty())
-}
-
-fn sshd_public_key_auth_is_enabled(bytes: &[u8]) -> Option<bool> {
-    let output = std::str::from_utf8(bytes).ok()?;
-    output.lines().find_map(|line| {
-        let mut fields = line.split_ascii_whitespace();
-        (fields.next()? == "publickeyauthentication").then(|| fields.next() == Some("yes"))
-    })
+fn secure_ssh_path_metadata(metadata: &fs::Metadata, uid: u32, directory: bool) -> bool {
+    !metadata.file_type().is_symlink()
+        && if directory {
+            metadata.is_dir()
+        } else {
+            metadata.is_file()
+        }
+        && matches!(metadata.uid(), owner if owner == uid || owner == 0)
+        && metadata.mode() & 0o022 == 0
 }
 
 #[cfg(test)]
@@ -230,6 +330,7 @@ mod baseline_probe_tests {
         parse_tailscale_status,
     };
     use std::fs;
+    use std::os::unix::fs::PermissionsExt;
     use std::path::Path;
     use std::time::{Duration, Instant};
 
@@ -260,7 +361,12 @@ mod baseline_probe_tests {
         fs::write(&shared, format!("{key}\n")).unwrap();
         let before = fs::read(&shared).unwrap();
 
-        assert!(!authorized_keys_are_ready(&home, &[]));
+        assert!(!authorized_keys_are_ready(
+            &home,
+            unsafe { libc::getuid() },
+            &[".ssh/authorized_keys".to_owned()],
+            &[],
+        ));
         assert_eq!(fs::read(&shared).unwrap(), before);
         assert!(!home.join(".ssh").exists());
 
@@ -268,21 +374,123 @@ mod baseline_probe_tests {
     }
 
     #[test]
+    fn rootless_ssh_probe_requires_secure_modes_and_valid_openssh_key_blobs() {
+        let home = std::env::temp_dir().join(format!(
+            "styrn-baseline-ssh-security-{}-{}",
+            std::process::id(),
+            uuid::Uuid::now_v7()
+        ));
+        let ssh = home.join(".ssh");
+        fs::create_dir_all(&ssh).unwrap();
+        fs::set_permissions(&home, fs::Permissions::from_mode(0o700)).unwrap();
+        fs::set_permissions(&ssh, fs::Permissions::from_mode(0o700)).unwrap();
+        let authorized_keys = ssh.join("authorized_keys");
+        let valid = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAABAgMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhscHR4f fixture";
+        fs::write(&authorized_keys, format!("{valid}\n")).unwrap();
+        fs::set_permissions(&authorized_keys, fs::Permissions::from_mode(0o600)).unwrap();
+        let configured = [".ssh/authorized_keys".to_owned()];
+
+        assert!(authorized_keys_are_ready(
+            &home,
+            unsafe { libc::getuid() },
+            &configured,
+            &[valid.to_owned()],
+        ));
+
+        fs::set_permissions(&authorized_keys, fs::Permissions::from_mode(0o666)).unwrap();
+        assert!(!authorized_keys_are_ready(
+            &home,
+            unsafe { libc::getuid() },
+            &configured,
+            &[],
+        ));
+
+        fs::set_permissions(&authorized_keys, fs::Permissions::from_mode(0o600)).unwrap();
+        fs::write(
+            &authorized_keys,
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIE9Hc3R5cm5UZXN0S2V5T25seQ malformed\n",
+        )
+        .unwrap();
+        assert!(!authorized_keys_are_ready(
+            &home,
+            unsafe { libc::getuid() },
+            &configured,
+            &[],
+        ));
+
+        fs::remove_dir_all(home).unwrap();
+    }
+
+    #[test]
     fn tailscale_probe_discards_raw_identity_address_login_and_error_output() {
         let raw = br#"{"BackendState":"Running","Self":{"Online":true,"HostName":"private-node","TailscaleIPs":["100.64.0.1"]},"AuthURL":"https://login.example/secret"}"#;
-        let status = parse_tailscale_status(raw);
+        let status = parse_tailscale_status(
+            raw,
+            super::super::BaselineTailscaleMode::Gui,
+            true,
+            false,
+            "",
+        );
 
         assert_eq!(
             status,
-            Some(BaselineProbeSnapshot::Present {
+            Some(BaselineProbeSnapshot::TailscalePresent {
                 version: None,
                 healthy: true,
+                posture: super::super::BaselineTailscalePosture {
+                    mode: super::super::BaselineTailscaleMode::Gui,
+                    persistent: true,
+                    unattended: false,
+                },
             })
         );
         let rendered = format!("{status:?}");
         for secret in ["private-node", "100.64.0.1", "login.example"] {
             assert!(!rendered.contains(secret));
         }
+    }
+
+    #[test]
+    fn tailscale_probe_requires_requested_mode_and_persistence_proof() {
+        let raw = br#"{"BackendState":"Running","Self":{"Online":true}}"#;
+        let mismatch = parse_tailscale_status(
+            raw,
+            super::super::BaselineTailscaleMode::Gui,
+            true,
+            false,
+            "tailscaled",
+        );
+        let unpersisted = parse_tailscale_status(
+            raw,
+            super::super::BaselineTailscaleMode::Gui,
+            false,
+            false,
+            "",
+        );
+
+        assert!(matches!(
+            mismatch,
+            Some(BaselineProbeSnapshot::TailscalePresent {
+                healthy: false,
+                posture: super::super::BaselineTailscalePosture {
+                    mode: super::super::BaselineTailscaleMode::Gui,
+                    persistent: true,
+                    unattended: false,
+                },
+                ..
+            })
+        ));
+        assert!(matches!(
+            unpersisted,
+            Some(BaselineProbeSnapshot::TailscalePresent {
+                healthy: false,
+                posture: super::super::BaselineTailscalePosture {
+                    persistent: false,
+                    ..
+                },
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -304,10 +512,23 @@ mod baseline_probe_tests {
 
     #[test]
     fn sleep_probe_never_guesses_healthy_when_native_state_cannot_be_proven() {
-        assert_eq!(parse_sleep_posture(b" sleep 0\n"), Some(true));
-        assert_eq!(parse_sleep_posture(b" sleep 15\n"), Some(false));
+        assert_eq!(
+            parse_sleep_posture(b"Battery Power:\n sleep 0\nAC Power:\n sleep 0\n"),
+            Some(true)
+        );
+        assert_eq!(
+            parse_sleep_posture(b"Battery Power:\n sleep 15\nAC Power:\n sleep 0\n"),
+            Some(false)
+        );
         assert_eq!(parse_sleep_posture(b"localized unknown state\n"), None);
-        assert_eq!(parse_sleep_posture(b" sleep 0\n sleep 10\n"), None);
+        assert_eq!(
+            parse_sleep_posture(b"Battery Power:\n sleep 0\n sleep 10\n"),
+            None
+        );
+        assert_eq!(
+            parse_sleep_posture(b"Battery Power:\n sleep 0\nAC Power:\n"),
+            None
+        );
     }
 
     #[test]
@@ -322,6 +543,7 @@ mod baseline_probe_tests {
             assert!(matches!(
                 super::baseline_probe_snapshot(kind, &[], ""),
                 BaselineProbeSnapshot::Present { healthy: true, .. }
+                    | BaselineProbeSnapshot::TailscalePresent { healthy: true, .. }
             ));
         }
     }

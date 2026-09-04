@@ -5,7 +5,7 @@ use super::{
     },
     pending::{self, PendingPolicy},
     plan::SetupPlan,
-    probe::{production_rootless_catalog, rootless_baseline_desired_state, ProbeStatus},
+    probe::{self, production_rootless_catalog, rootless_baseline_desired_state, ProbeStatus},
     receipt::{configured_receipt_store, ReceiptMetadataSource, ReceiptStore},
     EffectiveRootlessSetup, ObservedState,
 };
@@ -183,7 +183,19 @@ pub(crate) enum RootlessSetupError {
     PlanInvalid,
     ApplyFailed,
     ReceiptConflict,
+    OperationFailed {
+        error_code: &'static str,
+        context: RootlessFailureContext,
+    },
     NeedsHuman(Box<RootlessSetupOutcome>),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct RootlessFailureContext {
+    phase: &'static str,
+    action_id: String,
+    cause_category: &'static str,
+    remediation: &'static str,
 }
 
 impl fmt::Debug for RootlessSetupError {
@@ -193,6 +205,7 @@ impl fmt::Debug for RootlessSetupError {
             Self::PlanInvalid => "RootlessSetupError::PlanInvalid",
             Self::ApplyFailed => "RootlessSetupError::ApplyFailed",
             Self::ReceiptConflict => "RootlessSetupError::ReceiptConflict",
+            Self::OperationFailed { .. } => "RootlessSetupError::OperationFailed",
             Self::NeedsHuman(_) => "RootlessSetupError::NeedsHuman",
         })
     }
@@ -205,6 +218,13 @@ impl fmt::Display for RootlessSetupError {
             Self::PlanInvalid => "rootless setup plan is invalid",
             Self::ApplyFailed => "rootless setup apply failed",
             Self::ReceiptConflict => "rootless setup receipt conflicts with the requested plan",
+            Self::OperationFailed { context, .. } => {
+                return write!(
+                    formatter,
+                    "rootless setup {} operation `{}` failed ({}); {}",
+                    context.phase, context.action_id, context.cause_category, context.remediation
+                );
+            }
             Self::NeedsHuman(_) => {
                 "rootless setup has unresolved actions requiring human attention"
             }
@@ -221,6 +241,7 @@ impl RootlessSetupError {
             Self::PlanInvalid => "setup.plan_invalid",
             Self::ApplyFailed => "setup.apply_failed",
             Self::ReceiptConflict => "setup.receipt_conflict",
+            Self::OperationFailed { error_code, .. } => error_code,
             Self::NeedsHuman(_) => "setup.needs_human",
         }
     }
@@ -233,6 +254,31 @@ impl RootlessSetupError {
         match self {
             Self::NeedsHuman(outcome) => Some(outcome),
             _ => None,
+        }
+    }
+
+    pub(crate) fn details(&self) -> Option<serde_json::Value> {
+        let Self::OperationFailed { context, .. } = self else {
+            return None;
+        };
+        Some(serde_json::json!({
+            "phase": context.phase,
+            "action_id": context.action_id,
+            "cause_category": context.cause_category,
+            "remediation": context.remediation,
+        }))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn operation_failed_for_output_test() -> Self {
+        Self::OperationFailed {
+            error_code: "setup.apply_failed",
+            context: RootlessFailureContext {
+                phase: "execution",
+                action_id: "identity.directory.root".to_owned(),
+                cause_category: "action_apply",
+                remediation: "correct the reported setup operation posture and retry setup",
+            },
         }
     }
 }
@@ -379,7 +425,7 @@ pub(crate) fn apply_rootless_setup(
     let fail_on_pending = effective.fail_on_pending();
     let mut metadata = ReceiptMetadataSource::system();
     let mut report = action::apply_plan_with_journal(&mut actions, &receipt_store, &mut metadata)
-        .map_err(|error| map_error_code(error.error_code()))?;
+        .map_err(map_apply_error)?;
     let mut results = report.results().to_vec();
     let mut retry_count = 0;
     let machine_id = loop {
@@ -398,7 +444,7 @@ pub(crate) fn apply_rootless_setup(
                 retry_count += 1;
                 report =
                     action::apply_plan_with_journal(&mut actions, &receipt_store, &mut metadata)
-                        .map_err(|error| map_error_code(error.error_code()))?;
+                        .map_err(map_apply_error)?;
                 merge_action_results(&mut results, report.results());
             }
             Err(error) => return Err(map_publication_error(error)),
@@ -461,14 +507,31 @@ const fn execution_status_rank(status: action::ActionExecutionStatus) -> u8 {
 }
 
 fn map_publication_error(error: pending::PendingError) -> RootlessSetupError {
-    map_error_code(error.error_code())
+    RootlessSetupError::OperationFailed {
+        error_code: error.error_code(),
+        context: RootlessFailureContext {
+            phase: "publication",
+            action_id: "manifest.publish".to_owned(),
+            cause_category: error.safe_cause(),
+            remediation: "verify the user state directory and retry setup",
+        },
+    }
 }
 
-fn map_error_code(error_code: &str) -> RootlessSetupError {
-    if error_code == "setup.receipt_conflict" {
-        RootlessSetupError::ReceiptConflict
-    } else {
-        RootlessSetupError::ApplyFailed
+fn map_apply_error(error: action::ApplyPlanError) -> RootlessSetupError {
+    let action_id = error
+        .action_id()
+        .map(|action| action.as_str())
+        .unwrap_or("receipt.journal")
+        .to_owned();
+    RootlessSetupError::OperationFailed {
+        error_code: error.error_code(),
+        context: RootlessFailureContext {
+            phase: "execution",
+            action_id,
+            cause_category: error.safe_cause(),
+            remediation: "correct the reported setup operation posture and retry setup",
+        },
     }
 }
 
@@ -643,12 +706,17 @@ fn rootless_manifest_base(
         server: Some(probe_is_present(observed, "service.sshd")),
         public_key_auth: Some(probe_is_healthy(observed, "service.sshd")),
     });
-    draft.tailscale = component_selected(effective, "tailscale").then(|| manifest::Tailscale {
-        installed: Some(probe_is_present(observed, "network.tailscale")),
-        mode: Some(native_tailscale_mode(effective.requested_tailscale_mode())),
-        unattended: Some(
-            !cfg!(target_os = "macos") || effective.requested_tailscale_mode() == "tailscaled",
-        ),
+    draft.tailscale = component_selected(effective, "tailscale").then(|| {
+        let posture = observed_tailscale_posture(observed);
+        manifest::Tailscale {
+            installed: Some(probe_is_present(observed, "network.tailscale")),
+            mode: posture.map(|posture| match posture.mode {
+                probe::ObservedTailscaleMode::Gui => manifest::TailscaleMode::Gui,
+                probe::ObservedTailscaleMode::Tailscaled => manifest::TailscaleMode::Tailscaled,
+                probe::ObservedTailscaleMode::Service => manifest::TailscaleMode::Service,
+            }),
+            unattended: posture.map(|posture| posture.unattended),
+        }
     });
     if component_selected(effective, "herdr") {
         let enabled = draft
@@ -676,7 +744,10 @@ fn component_selected(effective: &EffectiveRootlessSetup, expected: &str) -> boo
 fn probe_is_present(observed: &ObservedState, id: &str) -> bool {
     observed.setup_observations().any(|observation| {
         observation.descriptor().id().as_str() == id
-            && matches!(observation.status(), ProbeStatus::Present { .. })
+            && matches!(
+                observation.status(),
+                ProbeStatus::Present { .. } | ProbeStatus::TailscalePresent { .. }
+            )
     })
 }
 
@@ -686,7 +757,20 @@ fn probe_is_healthy(observed: &ObservedState, id: &str) -> bool {
             && matches!(
                 observation.status(),
                 ProbeStatus::Present { healthy: true, .. }
+                    | ProbeStatus::TailscalePresent { healthy: true, .. }
             )
+    })
+}
+
+fn observed_tailscale_posture(observed: &ObservedState) -> Option<probe::ObservedTailscalePosture> {
+    observed.setup_observations().find_map(|observation| {
+        if observation.descriptor().id().as_str() != "network.tailscale" {
+            return None;
+        }
+        match observation.status() {
+            ProbeStatus::TailscalePresent { posture, .. } => Some(*posture),
+            _ => None,
+        }
     })
 }
 
@@ -722,27 +806,6 @@ fn native_architecture() -> Result<manifest::Architecture, RootlessSetupError> {
         "x86_64" => Ok(manifest::Architecture::X86_64),
         "aarch64" => Ok(manifest::Architecture::Aarch64),
         _ => Err(RootlessSetupError::ProbeFailed),
-    }
-}
-
-fn native_tailscale_mode(requested: &str) -> manifest::TailscaleMode {
-    #[cfg(target_os = "macos")]
-    {
-        if requested == "tailscaled" {
-            manifest::TailscaleMode::Tailscaled
-        } else {
-            manifest::TailscaleMode::Gui
-        }
-    }
-    #[cfg(target_os = "linux")]
-    {
-        let _ = requested;
-        manifest::TailscaleMode::Tailscaled
-    }
-    #[cfg(target_os = "windows")]
-    {
-        let _ = requested;
-        manifest::TailscaleMode::Service
     }
 }
 
@@ -923,9 +986,14 @@ mod tests {
                 ),
                 (
                     Kind::Tailscale,
-                    Snapshot::Present {
+                    Snapshot::TailscalePresent {
                         version: Some("1.90.0".to_owned()),
                         healthy: true,
+                        posture: platform::BaselineTailscalePosture {
+                            mode: platform::BaselineTailscaleMode::Tailscaled,
+                            persistent: true,
+                            unattended: true,
+                        },
                     },
                 ),
                 (
@@ -965,6 +1033,30 @@ mod tests {
         fn drop(&mut self) {
             platform::clear_baseline_probe_snapshots_for_test();
         }
+    }
+
+    #[test]
+    fn execution_and_publication_failures_preserve_only_safe_bounded_context() {
+        let action_id = crate::setup::action::ActionName::parse("identity.directory.root").unwrap();
+        let execution = super::map_apply_error(crate::setup::action::ApplyPlanError::Action(
+            crate::setup::action::ActionError::apply_failed(action_id),
+        ));
+        let execution_details = execution.details().unwrap();
+        assert_eq!(execution.error_code(), "setup.apply_failed");
+        assert_eq!(execution_details["phase"], "execution");
+        assert_eq!(execution_details["action_id"], "identity.directory.root");
+        assert_eq!(execution_details["cause_category"], "action_apply");
+        assert!(execution.to_string().contains("identity.directory.root"));
+        assert!(execution.to_string().contains("retry setup"));
+
+        let publication =
+            super::map_publication_error(crate::setup::pending::PendingError::DuplicateId);
+        let publication_details = publication.details().unwrap();
+        assert_eq!(publication.error_code(), "setup.plan_invalid");
+        assert_eq!(publication_details["phase"], "publication");
+        assert_eq!(publication_details["action_id"], "manifest.publish");
+        assert_eq!(publication_details["cause_category"], "pending_projection");
+        assert!(publication.to_string().contains("retry setup"));
     }
 
     #[test]
@@ -1062,6 +1154,15 @@ mod tests {
         let bytes = receipt.to_json().unwrap();
         let text = String::from_utf8(bytes).unwrap();
         assert!(!text.contains("baseline."));
+        let tailscale = fixture
+            .manifest_store()
+            .read()
+            .unwrap()
+            .manifest
+            .tailscale
+            .unwrap();
+        assert_eq!(tailscale.mode, Some(manifest::TailscaleMode::Tailscaled));
+        assert_eq!(tailscale.unattended, Some(true));
     }
 
     #[test]

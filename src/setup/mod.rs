@@ -53,8 +53,8 @@ mod orchestrator;
     plan_pending_projection_fixture,
 )))]
 pub(crate) use config::{
-    load_effective_rootless_setup, persist_interactive_replay, EffectiveRootlessSetup,
-    SetupInputError,
+    load_effective_rootless_setup, persist_interactive_replay, validate_rootless_setup_request,
+    EffectiveRootlessSetup, SetupInputError,
 };
 #[allow(unused_imports)]
 #[cfg(not(any(
