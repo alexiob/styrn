@@ -143,19 +143,46 @@ fn native_arm64_cargo_harness_enforces_and_exercises_its_contract() {
         &["cargo", "--", "test", "--locked", "--exact", "module::case"],
         &env::temp_dir(),
     );
-    assert!(pass_through.status.success(), "{}", stderr(&pass_through));
+    assert!(
+        pass_through.status.success(),
+        "{}; fake log: {}",
+        stderr(&pass_through),
+        pass_through_fake.log()
+    );
     let pass_through_log = pass_through_fake.log();
-    for expected in [
-        "RUNNER_ARG:test",
-        "RUNNER_ARG:--locked",
-        "RUNNER_ARG:--exact",
-        "RUNNER_ARG:module::case",
-    ] {
-        assert!(
-            pass_through_log.contains(expected),
-            "missing {expected} in {pass_through_log}"
-        );
-    }
+    let exact_tail = [
+        "RUNNER_TAIL_ARGC=5",
+        "RUNNER_TAIL_0=cargo",
+        "RUNNER_TAIL_1=test",
+        "RUNNER_TAIL_2=--locked",
+        "RUNNER_TAIL_3=--exact",
+        "RUNNER_TAIL_4=module::case",
+    ]
+    .join("\n");
+    assert!(
+        pass_through_log.contains(&exact_tail),
+        "missing exact indexed tail in {pass_through_log}"
+    );
+
+    let collapsed_boundary = FakePodman::new().run(
+        "pass_through",
+        &["cargo", "--", "test --locked", "--exact", "module::case"],
+        &env::temp_dir(),
+    );
+    assert!(
+        !collapsed_boundary.status.success(),
+        "one argv element containing a space must not satisfy the exact pass-through contract"
+    );
+
+    let adjacent_boundary = FakePodman::new().run(
+        "pass_through",
+        &["cargo", "--", "test", "--locked --exact", "module::case"],
+        &env::temp_dir(),
+    );
+    assert!(
+        !adjacent_boundary.status.success(),
+        "adjacent tokens combined into one argv element must not satisfy the exact pass-through contract"
+    );
 
     let child_failure = FakePodman::new().run(
         "child_exit_37",
@@ -212,7 +239,21 @@ runner_prefix() {
     exact "$1" /workspace 99; shift
     exact "$1" "$EXPECTED_IMAGE" 99; shift
     printf 'RUNNER_IMAGE:%s\n' "$EXPECTED_IMAGE" >> "$PODMAN_LOG"
-    RUNNER_REMAINDER="$*"
+    printf 'RUNNER_TAIL_ARGC=%s\n' "$#" >> "$PODMAN_LOG"
+    runner_tail_index=0
+    for runner_tail_argument in "$@"; do
+        printf 'RUNNER_TAIL_%s=%s\n' "$runner_tail_index" "$runner_tail_argument" >> "$PODMAN_LOG"
+        runner_tail_index=$((runner_tail_index + 1))
+    done
+    if [ "$PODMAN_SCENARIO" = pass_through ] && [ "${1-}" = cargo ]; then
+        [ "$#" -eq 5 ] || exit 99
+        exact "$1" cargo 99; shift
+        exact "$1" test 99; shift
+        exact "$1" --locked 99; shift
+        exact "$1" --exact 99; shift
+        exact "$1" module::case 99; shift
+        [ "$#" -eq 0 ] || exit 99
+    fi
 }
 
 initializer_prefix() {
@@ -270,9 +311,6 @@ case "${1-}:${2-}" in
                 for argument in "$@"; do printf 'RUNNER_ARG:%s\n' "$argument" >> "$PODMAN_LOG"; done
                 case "$arguments" in
                     *' cargo '*)
-                        if [ "$PODMAN_SCENARIO" = pass_through ]; then
-                            exact "$RUNNER_REMAINDER" 'cargo test --locked --exact module::case' 99
-                        fi
                         if [ "$PODMAN_SCENARIO" = zero_filter ] && printf '%s\n' "$arguments" | grep -q -- ' --list '; then
                             printf '%s\n' '0 tests, 0 benchmarks'
                         elif [ "$PODMAN_SCENARIO" = child_exit_37 ]; then
