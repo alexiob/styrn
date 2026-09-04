@@ -6646,6 +6646,52 @@ impl PrivatePublicationFile {
         }
         Ok(CompletePrivatePublication(self))
     }
+
+    /// Publishes a private file already produced by a trusted external tool.
+    ///
+    /// Task 2 uses this after `ssh-keygen` writes an ED25519 key. Deliberately
+    /// avoid `complete_exact`: that method reads the file to compare contents,
+    /// while the controller-key contract prohibits Rust from reading private
+    /// key bytes at all.
+    pub(crate) fn publish_no_replace_without_reading(
+        self,
+        destination: &Path,
+    ) -> std::io::Result<DurablePrivatePublication> {
+        let temporary_parent = self
+            .path
+            .parent()
+            .ok_or_else(|| std::io::Error::other("private publication has no parent"))?;
+        if destination.parent() != Some(temporary_parent) || destination.file_name().is_none() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "private publication destination must be a same-directory leaf",
+            ));
+        }
+        self.file.sync_all()?;
+        platform_impl::verify_private_file_handle_security(
+            &self.file,
+            self.owner,
+            &self.principal,
+        )?;
+        if platform_impl::private_file_identity_from_handle(&self.file)? != self.identity {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "private publication handle identity changed",
+            ));
+        }
+        platform_impl::publish_private_file_no_replace(
+            &self.file,
+            &self.path,
+            destination,
+            self.owner,
+            &self.principal,
+            self.identity,
+        )?;
+        Ok(DurablePrivatePublication {
+            path: destination.to_path_buf(),
+            identity: self.identity,
+        })
+    }
 }
 
 #[allow(dead_code)] // Consumed by the T0.13 receipt durability follow-up.
@@ -6809,6 +6855,101 @@ pub(crate) fn create_private_publication_file(
         owner,
         principal: principal.clone(),
     })
+}
+
+/// Validates the current-user directory that holds a controller SSH identity.
+///
+/// This is intentionally narrower than the manifest storage API: Task 2 is
+/// its sole consumer and needs the same no-link/owner/ACL ancestor checks
+/// before invoking OpenSSH with an identity path.
+#[allow(dead_code)] // Source-including manifest tests omit the controller identity module.
+pub(crate) fn verify_controller_identity_directory(
+    directory: &Path,
+) -> std::io::Result<WorkerPrincipal> {
+    let principal = resolve_current_worker_principal()?;
+    platform_impl::verify_manifest_parent_chain(directory, ManifestOwner::User, &principal)?;
+    platform_impl::verify_manifest_directory_security(directory, ManifestOwner::User, &principal)?;
+    Ok(principal)
+}
+
+/// Validates an existing controller identity file without reading its bytes.
+#[allow(dead_code)] // Source-including manifest tests omit the controller identity module.
+pub(crate) fn verify_controller_identity_file(
+    path: &Path,
+    principal: &WorkerPrincipal,
+) -> std::io::Result<()> {
+    let parent = path.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "controller identity path has no parent directory",
+        )
+    })?;
+    platform_impl::verify_manifest_parent_chain(parent, ManifestOwner::User, principal)?;
+    platform_impl::verify_manifest_directory_security(parent, ManifestOwner::User, principal)?;
+    platform_impl::verify_private_file_security(path, ManifestOwner::User, principal)
+}
+
+/// Applies the existing current-user private-file policy to a newly generated
+/// controller identity file before it is published.
+#[allow(dead_code)] // Source-including manifest tests omit the controller identity module.
+pub(crate) fn harden_new_controller_identity_file(
+    path: &Path,
+    principal: &WorkerPrincipal,
+) -> std::io::Result<()> {
+    platform_impl::harden_manifest_file(path, ManifestOwner::User, principal)?;
+    verify_controller_identity_file(path, principal)
+}
+
+/// Adopts a verified private key for no-replace publication without exposing
+/// or reading the private key material in Rust.
+#[allow(dead_code)] // Source-including manifest tests omit the controller identity module.
+pub(crate) fn adopt_controller_identity_private_publication(
+    path: &Path,
+    principal: &WorkerPrincipal,
+) -> std::io::Result<PrivatePublicationFile> {
+    verify_controller_identity_file(path, principal)?;
+    let identity = platform_impl::private_file_identity(path)?;
+    let file = platform_impl::open_verified_private_file_for_read(
+        path,
+        ManifestOwner::User,
+        principal,
+        identity,
+    )?;
+    Ok(PrivatePublicationFile {
+        path: path.to_path_buf(),
+        file,
+        identity,
+        owner: ManifestOwner::User,
+        principal: principal.clone(),
+    })
+}
+
+/// A held native advisory lock for the narrow controller-identity transaction.
+/// It is released when dropped, before any later inventory or network work.
+#[allow(dead_code)] // The held field intentionally owns the native advisory lock.
+pub(crate) struct ControllerIdentityLock(std::fs::File);
+
+#[allow(dead_code)] // Source-including manifest tests omit the controller identity module.
+pub(crate) fn lock_controller_identity(
+    path: &Path,
+    principal: &WorkerPrincipal,
+) -> std::io::Result<ControllerIdentityLock> {
+    let file = match create_private_file(path, ManifestOwner::User, principal) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            verify_controller_identity_file(path, principal)?;
+            let identity = platform_impl::private_file_identity(path)?;
+            platform_impl::open_verified_private_file_for_read(
+                path,
+                ManifestOwner::User,
+                principal,
+                identity,
+            )?
+        }
+        Err(error) => return Err(error),
+    };
+    platform_impl::lock_controller_identity_file(&file)?;
+    Ok(ControllerIdentityLock(file))
 }
 
 #[allow(dead_code)] // Source-including manifest tests omit receipt recovery.

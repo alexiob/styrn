@@ -939,6 +939,16 @@ struct FileIdInfo {
 }
 
 #[repr(C)]
+#[allow(dead_code)] // Task 2's native lock is exercised by the Windows runtime gate.
+struct Overlapped {
+    internal: usize,
+    internal_high: usize,
+    offset: u32,
+    offset_high: u32,
+    event: *mut c_void,
+}
+
+#[repr(C)]
 #[allow(dead_code)] // Source-including manifest tests omit authorization execution.
 struct FileDispositionInformation {
     delete_file: u8,
@@ -4427,6 +4437,14 @@ unsafe extern "system" {
         ignore_case: i32,
     ) -> i32;
     fn CharUpperBuffW(buffer: *mut u16, length: u32) -> u32;
+    fn LockFileEx(
+        file: *mut c_void,
+        flags: u32,
+        reserved: u32,
+        bytes_low: u32,
+        bytes_high: u32,
+        overlapped: *mut Overlapped,
+    ) -> i32;
 }
 
 #[link(name = "ntdll")]
@@ -4644,6 +4662,28 @@ pub(super) fn create_private_file(
         principal,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
     )
+}
+
+#[allow(dead_code)] // Reached by the controller identity consumer on native Windows.
+pub(super) fn lock_controller_identity_file(file: &std::fs::File) -> io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+
+    const LOCKFILE_EXCLUSIVE_LOCK: u32 = 0x2;
+    let mut overlapped = unsafe { std::mem::zeroed::<Overlapped>() };
+    if unsafe {
+        LockFileEx(
+            file.as_raw_handle(),
+            LOCKFILE_EXCLUSIVE_LOCK,
+            0,
+            u32::MAX,
+            u32::MAX,
+            &mut overlapped,
+        )
+    } == 0
+    {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 pub(super) fn private_file_identity(path: &Path) -> io::Result<PrivateFileIdentity> {

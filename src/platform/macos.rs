@@ -4058,6 +4058,14 @@ pub(super) fn create_private_file(
     Ok(file)
 }
 
+#[allow(dead_code)] // Reached by the controller identity consumer on native macOS.
+pub(super) fn lock_controller_identity_file(file: &fs::File) -> io::Result<()> {
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 pub(super) fn private_file_identity(path: &Path) -> io::Result<PrivateFileIdentity> {
     let metadata = fs::symlink_metadata(path)?;
     if !metadata.is_file() {

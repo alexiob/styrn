@@ -40,10 +40,16 @@ impl LocalChildTransport {
 impl RpcTransport for LocalChildTransport {
     fn connect(&self, _target: &RpcTarget) -> Result<RpcProcess, TransportError> {
         let mut command = self.server_command();
-        let mut child = command.spawn().map_err(|_| TransportError)?;
-        let input = child.stdin.take().ok_or(TransportError)?;
-        let output = child.stdout.take().ok_or(TransportError)?;
-        let stderr = child.stderr.take().ok_or(TransportError)?;
+        let mut child = command.spawn().map_err(|_| TransportError::unreachable())?;
+        let input = child.stdin.take().ok_or_else(TransportError::unreachable)?;
+        let output = child
+            .stdout
+            .take()
+            .ok_or_else(TransportError::unreachable)?;
+        let stderr = child
+            .stderr
+            .take()
+            .ok_or_else(TransportError::unreachable)?;
         Ok(RpcProcess::new(child, input, output, stderr))
     }
 }
