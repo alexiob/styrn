@@ -1,0 +1,4 @@
+NAME="Red Hat Enterprise Linux"
+ID=rhel
+ID_LIKE="fedora"
+VERSION_ID="9.6"

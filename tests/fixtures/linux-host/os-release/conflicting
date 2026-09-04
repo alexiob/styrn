@@ -1,0 +1,3 @@
+ID=ubuntu
+ID_LIKE="debian rhel"
+VERSION_ID=24.04
