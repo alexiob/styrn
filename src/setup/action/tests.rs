@@ -6979,7 +6979,7 @@ fn todo_check_runs_mutation_once_then_a_second_public_apply_is_a_noop() {
 
     assert_eq!(
         action.apply().unwrap(),
-        ApplyOutcome::Applied(ActionEffect::test_fixture(1))
+        ApplyOutcome::Applied(Box::new(ActionEffect::test_fixture(1)))
     );
     assert_eq!(action.apply().unwrap(), ApplyOutcome::Noop);
 

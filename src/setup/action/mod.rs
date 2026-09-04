@@ -78,7 +78,7 @@ pub(crate) enum ActionCheck {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum ApplyOutcome {
     Noop,
-    Applied(ActionEffect),
+    Applied(Box<ActionEffect>),
     NeedsHuman(NeedsHuman),
 }
 
@@ -1196,7 +1196,7 @@ mod gate {
             }
             match self.check()? {
                 ActionCheck::Done => Ok(ApplyOutcome::Noop),
-                ActionCheck::Todo => execute(self).map(ApplyOutcome::Applied),
+                ActionCheck::Todo => execute(self).map(Box::new).map(ApplyOutcome::Applied),
                 ActionCheck::NeedsHuman(needs_human) => Ok(ApplyOutcome::NeedsHuman(needs_human)),
             }
         }
