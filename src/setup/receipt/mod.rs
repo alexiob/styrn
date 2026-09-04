@@ -412,6 +412,7 @@ pub(in crate::setup) struct ReceiptExecutionWitness {
     receipt_path: String,
     receipt_entry_count: usize,
     pending_publication_count: usize,
+    receipt_entries_sha256: Sha256Digest,
     effective_receipt_sha256: Sha256Digest,
 }
 
@@ -688,6 +689,13 @@ fn receipt_prefix(
 
 fn receipt_document_digest(document: &ReceiptDocument) -> Result<Sha256Digest, ReceiptStoreError> {
     Ok(manifest_digest(&document.to_json()?))
+}
+
+fn receipt_entries_digest(document: &ReceiptDocument) -> Result<Sha256Digest, ReceiptStoreError> {
+    document.validate()?;
+    let bytes =
+        serde_json::to_vec_pretty(&document.entries).map_err(|_| ReceiptError::Serialize)?;
+    Ok(manifest_digest(&bytes))
 }
 
 fn pending_publication_prefix_digest_matches(
@@ -2542,6 +2550,7 @@ impl ReceiptApplySession<'_> {
             receipt_path: normalized_path_text(&self.store.path)?,
             receipt_entry_count: effective.entries.len(),
             pending_publication_count: effective.pending_publications.len(),
+            receipt_entries_sha256: receipt_entries_digest(&effective)?,
             effective_receipt_sha256: receipt_document_digest(&effective)?,
         })
     }
@@ -2962,6 +2971,63 @@ impl ReceiptApplySession<'_> {
 
 #[cfg(not(any(action_core_fixture, action_compile_fixture)))]
 impl ReceiptPendingPublicationSession<'_> {
+    /// Distinguishes the one safe retry case from a generic receipt conflict:
+    /// only pending-publication checkpoints advanced, while the exact sealed
+    /// receipt entry prefix and its full prior effective document are intact.
+    pub(in crate::setup) fn completed_execution_is_stale_after_publication_append(
+        &self,
+        witness: &ReceiptExecutionWitness,
+        occurrences: &[PendingReceiptOccurrence],
+        pending: &[crate::setup::action::PendingAction],
+    ) -> Result<bool, ReceiptStoreError> {
+        if witness.installation_scope != self.store.scope
+            || witness.worker_principal != self.store.worker
+            || witness.receipt_path != normalized_path_text(&self.store.path)?
+        {
+            return Ok(false);
+        }
+
+        let receipt = self.store.read_locked()?;
+        let publication_intent = self.store.read_verified_pending_publication_intent()?;
+        if let Some(intent) = &publication_intent {
+            intent
+                .document
+                .validate_receipt_binding(self.store, &receipt)?;
+        }
+        let intent_document = publication_intent.as_ref().map(|intent| &intent.document);
+        let effective = effective_receipt_document(&receipt, intent_document)?;
+        if effective.entries.len() != witness.receipt_entry_count
+            || effective.pending_publications.len() <= witness.pending_publication_count
+            || receipt_entries_digest(&effective)? != witness.receipt_entries_sha256
+            || pending.len() != occurrences.len()
+        {
+            return Ok(false);
+        }
+        let prior = receipt_prefix(
+            &effective,
+            witness.receipt_entry_count,
+            witness.pending_publication_count,
+        )?;
+        if receipt_document_digest(&prior)? != witness.effective_receipt_sha256 {
+            return Ok(false);
+        }
+
+        let mut action_ids = HashSet::with_capacity(occurrences.len());
+        let mut entry_ids = HashSet::with_capacity(occurrences.len());
+        for (action, occurrence) in pending.iter().zip(occurrences) {
+            if !occurrence.matches_action(action.id())
+                || !action_ids.insert(action.id().as_str())
+                || !entry_ids.insert(occurrence.entry_id.as_str())
+                || current_pending_occurrence(&receipt, &occurrence.action_id.0, intent_document)
+                    .as_ref()
+                    != Some(occurrence)
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     pub(in crate::setup) fn promotion_receipt_snapshot(
         &self,
     ) -> Result<PromotionReceiptSnapshot, ReceiptStoreError> {

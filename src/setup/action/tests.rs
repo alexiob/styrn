@@ -2,7 +2,8 @@ use super::{
     apply_plan_with_journal, current_user_worker_directory_plan,
     current_user_worker_directory_plan_for_test, dedicated_account_prerequisite,
     execution::{
-        apply_plan_with_runner, ApplyPlanError, DurableReceiptBinding, PreparedActionRunner,
+        apply_plan_with_runner, ActionExecutionStatus, ApplyPlanError, DurableReceiptBinding,
+        PreparedActionRunner,
     },
     Action, ActionDescription, ActionEffect, ActionError, ActionName, ActionParameters,
     ApplyOutcome, HumanInstructions, MutationCompletion, NeedsHuman, PendingSeverity,
@@ -25,6 +26,58 @@ use std::{
 
 fn state_driven(state: Arc<Mutex<Vec<u8>>>) -> (Action, TestMetrics) {
     Action::test_state_driven(Privilege::None, state)
+}
+
+#[test]
+fn rootless_setup_results_are_ordered_unique_and_do_not_expose_effects_or_authority() {
+    let fixture = JournalFixture::new("rootless-ordered-results");
+    let store = ReceiptStore::new_for_test(fixture.receipt_path());
+    let state = Arc::new(Mutex::new(vec![1]));
+    let mut plan = vec![
+        Action::test_journaled_state("rootless.unchanged", 1, Privilege::None, Arc::clone(&state))
+            .0,
+        Action::test_journaled_state("rootless.applied", 2, Privilege::None, Arc::clone(&state)).0,
+        Action::test_named_needs_human(
+            "rootless.pending",
+            Privilege::None,
+            Arc::clone(&state),
+            NeedsHuman::new(
+                HumanInstructions::new("Complete the static prerequisite, then rerun setup.")
+                    .unwrap(),
+                None,
+            ),
+        )
+        .0,
+    ];
+    let mut metadata = ReceiptMetadataSource::for_test([
+        (
+            "019cafd0-5c00-7000-8000-000000000201",
+            "2026-09-04T10:00:00Z",
+        ),
+        (
+            "019cafd0-5c00-7000-8000-000000000202",
+            "2026-09-04T10:00:01Z",
+        ),
+    ]);
+
+    let report = apply_plan_with_journal(&mut plan, &store, &mut metadata).unwrap();
+    let results = report.results();
+
+    assert_eq!(results.len(), 3);
+    assert_eq!(results[0].action_id(), "rootless.unchanged");
+    assert_eq!(results[0].status().as_str(), "unchanged");
+    assert_eq!(results[1].action_id(), "rootless.applied");
+    assert_eq!(results[1].status().as_str(), "applied");
+    assert_eq!(results[2].action_id(), "rootless.pending");
+    assert_eq!(results[2].status().as_str(), "pending");
+    let ids = results
+        .iter()
+        .map(|result| result.action_id())
+        .collect::<std::collections::HashSet<_>>();
+    assert_eq!(ids.len(), results.len());
+    let debug = format!("{results:?}");
+    assert!(!debug.contains("effect"));
+    assert!(!debug.contains("authority"));
 }
 
 fn worker_directory_action(
@@ -4938,6 +4991,85 @@ fn completed_execution_rejects_a_missing_durable_occurrence() {
 }
 
 #[test]
+fn stale_completion_classifier_rejects_same_count_receipt_content_substitution() {
+    let fixture = JournalFixture::new("stale-same-count-substitution");
+    let store = ReceiptStore::new_for_test(fixture.receipt_path());
+    let state = Arc::new(Mutex::new(Vec::new()));
+    let mut plan = vec![
+        Action::test_named_needs_human(
+            "test.original-pending",
+            Privilege::None,
+            Arc::clone(&state),
+            NeedsHuman::new(
+                HumanInstructions::new("Complete the original local action, then rerun setup.")
+                    .unwrap(),
+                None,
+            ),
+        )
+        .0,
+    ];
+    let report = apply_plan_with_journal(
+        &mut plan,
+        &store,
+        &mut ReceiptMetadataSource::for_test([(
+            "019cafd0-5c00-7000-8000-000000000132",
+            "2026-09-02T10:21:11Z",
+        )]),
+    )
+    .unwrap();
+
+    let replacement_fixture = JournalFixture::new("stale-same-count-replacement");
+    let replacement_store = ReceiptStore::new_for_test(replacement_fixture.receipt_path());
+    let mut replacement_plan = vec![
+        Action::test_named_needs_human(
+            "test.hostile-substitute",
+            Privilege::None,
+            state,
+            NeedsHuman::new(
+                HumanInstructions::new("Complete the substitute local action, then rerun setup.")
+                    .unwrap(),
+                None,
+            ),
+        )
+        .0,
+    ];
+    apply_plan_with_journal(
+        &mut replacement_plan,
+        &replacement_store,
+        &mut ReceiptMetadataSource::for_test([(
+            "019cafd0-5c00-7000-8000-000000000133",
+            "2026-09-02T10:21:12Z",
+        )]),
+    )
+    .unwrap();
+    let substituted = fs::read(replacement_fixture.receipt_path()).unwrap();
+    fs::write(fixture.receipt_path(), &substituted).unwrap();
+    let manifest_path = fixture.root.join("machine.toml");
+    let mut draft = pending_manifest_draft();
+
+    let error = crate::setup::pending::publish_manifest(
+        &crate::manifest::MachineManifestStore::new_for_test(&manifest_path),
+        &store,
+        &mut draft,
+        report.completion(),
+        &mut ReceiptMetadataSource::for_test([]),
+    )
+    .unwrap_err();
+
+    assert!(
+        matches!(
+            &error,
+            crate::setup::pending::PendingError::Receipt(ReceiptStoreError::IntentConflict)
+        ),
+        "{error:?}"
+    );
+    assert!(!error.is_stale_completion_witness());
+    assert_eq!(error.error_code(), "setup.receipt_conflict");
+    assert_eq!(fs::read(fixture.receipt_path()).unwrap(), substituted);
+    assert!(!manifest_path.exists());
+}
+
+#[test]
 fn pending_receipt_failure_stops_before_manifest_or_mutation() {
     let fixture = JournalFixture::new("pending-receipt-failure");
     let receipt_store = ReceiptStore::new_for_test_failing_before_replace(fixture.receipt_path());
@@ -6213,9 +6345,7 @@ fn concurrent_publication_of_one_token_allows_one_checkpoint_and_rejects_stale_r
             .filter(|result| {
                 matches!(
                     result,
-                    Err(crate::setup::pending::PendingError::Receipt(
-                        ReceiptStoreError::IntentConflict
-                    ))
+                    Err(crate::setup::pending::PendingError::StaleCompletionWitness)
                 )
             })
             .count(),
@@ -6410,6 +6540,19 @@ fn mixed_plan_reports_applied_recovered_noop_and_pending_outcomes_independently(
     assert_eq!(report.pending_count(), 1);
     assert_eq!(report.pending()[0].id().as_str(), "test.pending");
     assert_eq!(report.pending()[0].needs_human(), &pending);
+    assert_eq!(
+        report
+            .results()
+            .iter()
+            .map(|result| (result.action_id(), result.status()))
+            .collect::<Vec<_>>(),
+        [
+            ("test.applied", ActionExecutionStatus::Applied),
+            ("test.noop", ActionExecutionStatus::Unchanged),
+            ("test.pending", ActionExecutionStatus::Pending),
+            ("test.recovered", ActionExecutionStatus::Recovered),
+        ]
+    );
     assert!(!report.is_nothing_to_do());
     assert_eq!(report.message(), "setup actions applied");
     assert_eq!(applied_metrics.mutation_calls(), 1);

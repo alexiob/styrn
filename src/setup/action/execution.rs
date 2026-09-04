@@ -5,8 +5,47 @@ use super::{
     MutationCompletion, PendingAction, PreparedExecutionError, VerifiedActionEffect,
 };
 use crate::setup::receipt::{PendingReceiptOccurrence, ReceiptExecutionWitness, ReceiptStoreError};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use thiserror::Error;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(in crate::setup) enum ActionExecutionStatus {
+    Applied,
+    Recovered,
+    Unchanged,
+    Pending,
+}
+
+impl ActionExecutionStatus {
+    pub(in crate::setup) const fn as_str(self) -> &'static str {
+        match self {
+            Self::Applied => "applied",
+            Self::Recovered => "recovered",
+            Self::Unchanged => "unchanged",
+            Self::Pending => "pending",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(in crate::setup) struct ActionExecutionResult {
+    action_id: ActionName,
+    status: ActionExecutionStatus,
+}
+
+impl ActionExecutionResult {
+    fn new(action_id: ActionName, status: ActionExecutionStatus) -> Self {
+        Self { action_id, status }
+    }
+
+    pub(in crate::setup) fn action_id(&self) -> &str {
+        self.action_id.as_str()
+    }
+
+    pub(in crate::setup) const fn status(&self) -> ActionExecutionStatus {
+        self.status
+    }
+}
 
 pub(in crate::setup) struct CompletedExecutionToken {
     pending: Vec<PendingAction>,
@@ -83,6 +122,7 @@ impl ApplySummary {
 pub(crate) struct ApplyReport {
     summary: ApplySummary,
     completion: CompletedExecutionToken,
+    results: Vec<ActionExecutionResult>,
 }
 
 impl std::fmt::Debug for ApplyReport {
@@ -91,6 +131,7 @@ impl std::fmt::Debug for ApplyReport {
             .debug_struct("ApplyReport")
             .field("summary", &self.summary)
             .field("pending_count", &self.completion.pending().len())
+            .field("results", &self.results)
             .finish()
     }
 }
@@ -118,6 +159,10 @@ impl ApplyReport {
 
     pub(in crate::setup) fn completion(&self) -> &CompletedExecutionToken {
         &self.completion
+    }
+
+    pub(in crate::setup) fn results(&self) -> &[ActionExecutionResult] {
+        &self.results
     }
 
     pub(crate) fn is_nothing_to_do(&self) -> bool {
@@ -303,11 +348,19 @@ pub(super) fn apply_plan_with_runner<R: PreparedActionRunner>(
         recovered_count: 0,
         noop_count: 0,
     };
+    let plan_order = plan
+        .iter()
+        .map(|action| action.name().clone())
+        .collect::<Vec<_>>();
+    let mut result_by_action = HashMap::with_capacity(plan.len());
+    let mut recovered_order = Vec::new();
     let mut pending = Vec::new();
     let mut occurrences = Vec::new();
     for intent in session.pending_intents(&authority)? {
         match session.intent_phase(&intent, &authority) {
             crate::setup::receipt::ReceiptIntentPhase::Succeeded => {
+                let action_id = ActionName::parse(session.intent_action_id(&intent, &authority))
+                    .map_err(|_| ReceiptStoreError::IntentConflict)?;
                 session.append_succeeded_intent(&intent, &authority)?;
                 session.retire_succeeded_worker_directory_evidence(
                     &intent,
@@ -316,6 +369,11 @@ pub(super) fn apply_plan_with_runner<R: PreparedActionRunner>(
                 )?;
                 session.retire_finalized_intent(&intent, &authority)?;
                 summary.recovered_count += 1;
+                recovered_order.push(action_id.clone());
+                result_by_action.insert(
+                    action_id.as_str().to_owned(),
+                    ActionExecutionResult::new(action_id, ActionExecutionStatus::Recovered),
+                );
             }
             crate::setup::receipt::ReceiptIntentPhase::Prepared => {
                 let action_id = session.intent_action_id(&intent, &authority);
@@ -346,6 +404,11 @@ pub(super) fn apply_plan_with_runner<R: PreparedActionRunner>(
                         )?;
                         finish_bound_mutation(&session, &intent, &authority, completion, binding)?;
                         summary.applied_count += 1;
+                        let action_id = action.name().clone();
+                        result_by_action.insert(
+                            action_id.as_str().to_owned(),
+                            ActionExecutionResult::new(action_id, ActionExecutionStatus::Applied),
+                        );
                     }
                     ActionCheck::Done | ActionCheck::NeedsHuman(_) => {
                         return Err(crate::setup::receipt::ReceiptStoreError::IntentConflict.into());
@@ -356,7 +419,15 @@ pub(super) fn apply_plan_with_runner<R: PreparedActionRunner>(
     }
     for action in plan {
         match action.check()? {
-            ActionCheck::Done => summary.noop_count += 1,
+            ActionCheck::Done => {
+                summary.noop_count += 1;
+                let action_id = action.name().clone();
+                result_by_action
+                    .entry(action_id.as_str().to_owned())
+                    .or_insert_with(|| {
+                        ActionExecutionResult::new(action_id, ActionExecutionStatus::Unchanged)
+                    });
+            }
             ActionCheck::Todo => {
                 let prepared = action.prepare()?;
                 let mut intent =
@@ -375,19 +446,39 @@ pub(super) fn apply_plan_with_runner<R: PreparedActionRunner>(
                     })?;
                 finish_bound_mutation(&session, &intent, &authority, completion, binding)?;
                 summary.applied_count += 1;
+                let action_id = action.name().clone();
+                result_by_action.insert(
+                    action_id.as_str().to_owned(),
+                    ActionExecutionResult::new(action_id, ActionExecutionStatus::Applied),
+                );
             }
             ActionCheck::NeedsHuman(needs_human) => {
                 let pending_action = PendingAction::from_action(action, needs_human);
                 let occurrence = session.record_pending(&pending_action, metadata, &authority)?;
                 pending.push(pending_action);
                 occurrences.push(occurrence);
+                let action_id = action.name().clone();
+                result_by_action.insert(
+                    action_id.as_str().to_owned(),
+                    ActionExecutionResult::new(action_id, ActionExecutionStatus::Pending),
+                );
             }
         }
     }
     let receipt = session.complete_execution(&occurrences, &authority)?;
+    let mut results = Vec::with_capacity(result_by_action.len());
+    for action_id in plan_order.into_iter().chain(recovered_order) {
+        if let Some(result) = result_by_action.remove(action_id.as_str()) {
+            results.push(result);
+        }
+    }
+    if !result_by_action.is_empty() {
+        return Err(ReceiptStoreError::IntentConflict.into());
+    }
     Ok(ApplyReport {
         summary,
         completion: CompletedExecutionToken::new(pending, occurrences, receipt)?,
+        results,
     })
 }
 

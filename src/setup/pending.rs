@@ -142,11 +142,22 @@ pub(in crate::setup) fn publish_manifest(
     validate_unique_pending(pending)?;
     let authority = PendingPublicationAuthority(());
     let session = receipt_store.begin_pending_publication(&authority)?;
-    session.validate_completed_execution(
+    if let Err(error) = session.validate_completed_execution(
         completed.receipt_witness(),
         completed.occurrences(),
         pending,
-    )?;
+    ) {
+        if matches!(error, super::receipt::ReceiptStoreError::IntentConflict)
+            && session.completed_execution_is_stale_after_publication_append(
+                completed.receipt_witness(),
+                completed.occurrences(),
+                pending,
+            )?
+        {
+            return Err(PendingError::StaleCompletionWitness);
+        }
+        return Err(error.into());
+    }
     {
         let manifest_session = manifest_store
             .begin_pending_publication()
@@ -282,6 +293,8 @@ pub(crate) enum PendingError {
     Output(#[from] output::OutputError),
     #[error(transparent)]
     Receipt(#[from] super::receipt::ReceiptStoreError),
+    #[error("completed setup execution was superseded by a concurrent manifest publication")]
+    StaleCompletionWitness,
     #[error(transparent)]
     Publication(#[from] super::receipt::PendingPublicationProtocolError),
     #[error("could not render pending actions")]
@@ -289,10 +302,15 @@ pub(crate) enum PendingError {
 }
 
 impl PendingError {
+    pub(in crate::setup) const fn is_stale_completion_witness(&self) -> bool {
+        matches!(self, Self::StaleCompletionWitness)
+    }
+
     pub(crate) fn error_code(&self) -> &'static str {
         match self {
             Self::DuplicateId => output::ErrorCode::SetupPlanInvalid.as_str(),
             Self::Receipt(error) => error.error_code(),
+            Self::StaleCompletionWitness => output::ErrorCode::SetupReceiptConflict.as_str(),
             Self::Publication(super::receipt::PendingPublicationProtocolError::Receipt(error)) => {
                 error.error_code()
             }

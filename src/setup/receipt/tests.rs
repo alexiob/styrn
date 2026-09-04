@@ -1816,6 +1816,9 @@ fn execution_witness_binding_compares_scope_principal_and_normalized_path() {
         receipt_path: normalized_path_text(fixture.receipt_path()).unwrap(),
         receipt_entry_count: 1,
         pending_publication_count: 2,
+        receipt_entries_sha256: Sha256Digest(
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_owned(),
+        ),
         effective_receipt_sha256: Sha256Digest(
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned(),
         ),

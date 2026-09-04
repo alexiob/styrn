@@ -1225,6 +1225,8 @@ enum ManifestSecurity {
     #[cfg(test)]
     FailPendingBeforeReplace,
     #[cfg(test)]
+    FailUserPendingBeforeReplace,
+    #[cfg(test)]
     FailPendingParentSync,
     #[cfg(test)]
     DirectoryPublicationRace,
@@ -1542,6 +1544,17 @@ impl MachineManifestStore {
         let mut store = Self::new_user(path, principal)?;
         store.worker_layout_binding =
             WorkerManifestLayoutBinding::ExactCurrentUser(Box::new(projection));
+        Ok(store)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new_user_with_worker_layout_failing_publication_for_test(
+        path: impl Into<PathBuf>,
+        principal: platform::WorkerPrincipal,
+        layout: &platform::WorkerDirectoryLayout,
+    ) -> Result<Self, ManifestError> {
+        let mut store = Self::new_user_with_worker_layout_for_test(path, principal, layout)?;
+        store.security = ManifestSecurity::FailUserPendingBeforeReplace;
         Ok(store)
     }
 
@@ -1883,6 +1896,29 @@ impl MachineManifestStore {
             manifest,
             machine_id_minted: false,
         })
+    }
+
+    /// Reads a valid, bound setup base without preparing the destination or
+    /// creating the manifest lock. Exact absence is the only `None` case.
+    pub(crate) fn read_optional_for_setup(&self) -> Result<Option<MachineManifest>, ManifestError> {
+        self.validate_destination_policy()?;
+        self.verify_bound_principal()?;
+        let mut file = match platform::open_verified_manifest_file_for_read(
+            &self.path,
+            self.platform_owner(),
+            &self.principal,
+            &self.trusted_root,
+        ) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(ManifestError::Security(error)),
+        };
+        let mut input = String::new();
+        file.read_to_string(&mut input)
+            .map_err(ManifestError::Read)?;
+        let manifest = MachineManifest::parse_toml(&input)?;
+        self.validate_manifest_binding(&manifest)?;
+        Ok(Some(manifest))
     }
 
     pub(crate) fn reconcile(&self) -> Result<ReadOutcome, ManifestError> {
@@ -2265,7 +2301,11 @@ impl MachineManifestStore {
             file.sync_all().map_err(ManifestError::Write)?;
             self.harden_temporary(&temporary)?;
             #[cfg(test)]
-            if matches!(self.security, ManifestSecurity::FailPendingBeforeReplace) {
+            if matches!(
+                self.security,
+                ManifestSecurity::FailPendingBeforeReplace
+                    | ManifestSecurity::FailUserPendingBeforeReplace
+            ) {
                 return Err(ManifestError::Write(std::io::Error::new(
                     std::io::ErrorKind::Interrupted,
                     "injected manifest interruption before replacement",
@@ -2323,6 +2363,8 @@ impl MachineManifestStore {
             ManifestSecurity::System => platform::ManifestOwner::System,
             ManifestSecurity::User => platform::ManifestOwner::User,
             #[cfg(test)]
+            ManifestSecurity::FailUserPendingBeforeReplace => platform::ManifestOwner::User,
+            #[cfg(test)]
             ManifestSecurity::CurrentProcess
             | ManifestSecurity::FailBeforeReplace
             | ManifestSecurity::FailPendingBeforeReplace
@@ -2353,10 +2395,7 @@ impl MachineManifestStore {
     }
 
     fn verify_bound_principal(&self) -> Result<(), ManifestError> {
-        if matches!(
-            self.security,
-            ManifestSecurity::System | ManifestSecurity::User
-        ) {
+        if self.verifies_bound_principal() {
             platform::verify_worker_principal(&self.principal)
                 .map_err(ManifestError::CallerIdentity)?;
             if self.scope == platform::InstallationScope::User {
@@ -2382,10 +2421,7 @@ impl MachineManifestStore {
         manifest: &MachineManifest,
         worker_layout_binding: &WorkerManifestLayoutBinding,
     ) -> Result<(), ManifestError> {
-        if !matches!(
-            self.security,
-            ManifestSecurity::System | ManifestSecurity::User
-        ) {
+        if !self.verifies_bound_principal() {
             return Ok(());
         }
         let scope = manifest
@@ -2453,6 +2489,16 @@ impl MachineManifestStore {
             }
         }
         Ok(())
+    }
+
+    fn verifies_bound_principal(&self) -> bool {
+        match self.security {
+            ManifestSecurity::System | ManifestSecurity::User => true,
+            #[cfg(test)]
+            ManifestSecurity::FailUserPendingBeforeReplace => true,
+            #[cfg(test)]
+            _ => false,
+        }
     }
 
     fn revalidate_manifest_before_replace(
@@ -3017,8 +3063,37 @@ pub(crate) enum ManifestError {
 #[cfg(test)]
 mod projection_tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     const EXPECTED_CAVEAT: &str = "Current-user mode provides no OS-account isolation, no controller-credential isolation, and no same-user Styrn-state integrity boundary.";
+
+    #[test]
+    fn rootless_setup_manifest_preflight_absence_creates_no_destination_or_lock() {
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
+        let fixture = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join(format!(
+                "styrn-rootless-manifest-preflight-{}-{}",
+                std::process::id(),
+                NEXT.fetch_add(1, Ordering::Relaxed)
+            ));
+        let principal = platform::resolve_current_worker_principal().unwrap();
+        let layout = platform::worker_directory_layout_for_test(
+            platform::InstallationScope::User,
+            principal.clone(),
+            fixture.join("worker"),
+            Some(fixture.clone()),
+        );
+        let path = fixture.join("config").join("styrn").join("machine.toml");
+        let store =
+            MachineManifestStore::new_user_with_worker_layout_for_test(&path, principal, &layout)
+                .unwrap();
+
+        assert!(store.read_optional_for_setup().unwrap().is_none());
+        assert!(!path.parent().unwrap().exists());
+        assert!(!path.parent().unwrap().join(".machine.toml.lock").exists());
+    }
 
     fn worker_draft() -> MachineManifestDraft {
         let mut draft = MachineManifest::parse_toml(include_str!(

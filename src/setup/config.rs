@@ -72,6 +72,14 @@ pub(in crate::setup) struct EffectiveRootlessSetup {
     fail_on_pending: bool,
 }
 impl EffectiveRootlessSetup {
+    pub(in crate::setup) fn machine_name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+
+    pub(in crate::setup) const fn fail_on_pending(&self) -> bool {
+        self.fail_on_pending
+    }
+
     pub(in crate::setup) fn selected_component_names(
         &self,
     ) -> impl ExactSizeIterator<Item = &'static str> + '_ {

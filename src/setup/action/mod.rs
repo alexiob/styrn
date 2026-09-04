@@ -975,7 +975,7 @@ mod gate {
             }
         }
 
-        pub(in crate::setup::action) fn parameters(&self) -> ActionParameters {
+        pub(in crate::setup) fn parameters(&self) -> ActionParameters {
             match self {
                 Self::Foundation(action) => ActionParameters::Foundation(action.name.clone()),
                 #[cfg(not(action_core_fixture))]
@@ -1224,6 +1224,14 @@ mod worker_directory;
 pub(in crate::setup) use worker_directory::current_user_worker_directory_plan;
 #[cfg(test)]
 pub(in crate::setup::action) use worker_directory::current_user_worker_directory_plan_for_test;
+#[cfg(test)]
+pub(in crate::setup) fn current_user_worker_directory_plan_for_orchestrator_test(
+    context: &crate::platform::SetupExecutionContext,
+    root: PathBuf,
+    creation_anchor: Option<PathBuf>,
+) -> Result<(ActionPlan, crate::platform::WorkerDirectoryLayout), ActionError> {
+    worker_directory::current_user_worker_directory_plan_for_test(context, root, creation_anchor)
+}
 #[cfg(not(action_core_fixture))]
 #[allow(unused_imports)] // T0.20 consumes the selected dedicated System plan.
 pub(in crate::setup) use worker_directory::dedicated_system_worker_directory_plan;
@@ -1249,6 +1257,9 @@ pub(in crate::setup) use execution::apply_plan_with_journal;
 #[cfg(not(action_core_fixture))]
 #[allow(unused_imports)] // Opaque completion capability consumed by setup projections.
 pub(in crate::setup) use execution::CompletedExecutionToken;
+#[cfg(not(action_core_fixture))]
+#[allow(unused_imports)]
+pub(in crate::setup) use execution::{ActionExecutionResult, ActionExecutionStatus, ApplyReport};
 
 fn checked_text(value: &str, error: ActionError) -> Result<String, ActionError> {
     if super::validate_probe_static_text(value) {

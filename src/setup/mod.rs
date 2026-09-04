@@ -26,6 +26,19 @@ mod config;
     plan_pending_projection_fixture,
 )))]
 mod interactive;
+#[allow(dead_code)] // Task 4 wires this concrete orchestrator to the CLI boundary.
+#[cfg(not(any(
+    action_core_fixture,
+    action_compile_fixture,
+    plan_pending_authority_forge_fixture,
+    plan_pending_publication_forge_fixture,
+    plan_completed_execution_construct_fixture,
+    plan_completed_execution_mutate_fixture,
+    plan_completed_execution_clone_fixture,
+    plan_completed_execution_serialize_fixture,
+    plan_pending_projection_fixture,
+)))]
+mod orchestrator;
 
 #[allow(unused_imports)]
 #[cfg(not(any(
@@ -56,6 +69,24 @@ pub(in crate::setup) use config::{
     plan_pending_projection_fixture,
 )))]
 pub(in crate::setup) use interactive::collect_interactive_answers;
+#[cfg(test)]
+pub(in crate::setup) use orchestrator::prepare_rootless_setup_for_test;
+#[allow(unused_imports)]
+#[cfg(not(any(
+    action_core_fixture,
+    action_compile_fixture,
+    plan_pending_authority_forge_fixture,
+    plan_pending_publication_forge_fixture,
+    plan_completed_execution_construct_fixture,
+    plan_completed_execution_mutate_fixture,
+    plan_completed_execution_clone_fixture,
+    plan_completed_execution_serialize_fixture,
+    plan_pending_projection_fixture,
+)))]
+pub(in crate::setup) use orchestrator::{
+    apply_rootless_setup, prepare_rootless_setup, RootlessSetupError, RootlessSetupOutcome,
+    RootlessSetupPlan,
+};
 
 #[allow(dead_code)]
 pub(crate) mod action;
