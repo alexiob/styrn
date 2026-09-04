@@ -3747,6 +3747,8 @@ struct ReceiptEntry {
     directories_created: Vec<CreatedDirectory>,
     files_created: Vec<CreatedFile>,
     files_modified: Vec<ModifiedFile>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    files_appended: Vec<AppendedFile>,
     services: Vec<ServiceResource>,
     accounts: Vec<AccountResource>,
     registry_keys: Vec<RegistryKeyResource>,
@@ -3771,6 +3773,7 @@ impl ReceiptEntry {
             directories_created: Vec::new(),
             files_created: Vec::new(),
             files_modified: Vec::new(),
+            files_appended: Vec::new(),
             services: Vec::new(),
             accounts: Vec::new(),
             registry_keys: Vec::new(),
@@ -3794,6 +3797,7 @@ impl ReceiptEntry {
             directories_created: Vec::new(),
             files_created: Vec::new(),
             files_modified: Vec::new(),
+            files_appended: Vec::new(),
             services: Vec::new(),
             accounts: Vec::new(),
             registry_keys: Vec::new(),
@@ -3842,6 +3846,15 @@ impl ReceiptEntry {
                     path: RecordedPath(file.path().to_owned()),
                     before_sha256: Sha256Digest(file.before_sha256().to_owned()),
                     backup_path: RecordedPath(file.backup_path().to_owned()),
+                })
+                .collect(),
+            files_appended: effect
+                .files_appended()
+                .iter()
+                .map(|file| AppendedFile {
+                    path: RecordedPath(file.path().to_owned()),
+                    stanza_id: Sha256Digest(file.stanza_id().to_owned()),
+                    appended_sha256: Sha256Digest(file.appended_sha256().to_owned()),
                 })
                 .collect(),
             services: effect
@@ -3914,6 +3927,12 @@ impl ReceiptEntry {
                 return Err(ReceiptError::ConflictingResources);
             }
         }
+        for file in &self.files_appended {
+            file.validate()?;
+            if !file_paths.insert(file.path.0.as_str()) {
+                return Err(ReceiptError::ConflictingResources);
+            }
+        }
         let mut services = HashSet::new();
         for service in &self.services {
             service.name.validate()?;
@@ -3951,6 +3970,7 @@ impl ReceiptEntry {
                 || !self.directories_created.is_empty()
                 || !self.files_created.is_empty()
                 || !self.files_modified.is_empty()
+                || !self.files_appended.is_empty()
                 || !self.services.is_empty()
                 || !self.accounts.is_empty()
                 || !self.registry_keys.is_empty()
@@ -3984,6 +4004,7 @@ impl ReceiptEntry {
                 || !self.directories_created.is_empty()
                 || !self.files_created.is_empty()
                 || !self.files_modified.is_empty()
+                || !self.files_appended.is_empty()
                 || !self.services.is_empty()
                 || !self.accounts.is_empty()
                 || !self.registry_keys.is_empty()
@@ -4000,6 +4021,7 @@ impl ReceiptEntry {
                 || !self.directories_created.is_empty()
                 || !self.files_created.is_empty()
                 || !self.files_modified.is_empty()
+                || !self.files_appended.is_empty()
                 || !self.services.is_empty()
                 || !self.accounts.is_empty()
                 || !self.registry_keys.is_empty()
@@ -4016,6 +4038,7 @@ impl ReceiptEntry {
                 || !self.directories_created.is_empty()
                 || !self.files_created.is_empty()
                 || !self.files_modified.is_empty()
+                || !self.files_appended.is_empty()
                 || !self.services.is_empty()
                 || !self.accounts.is_empty()
                 || !self.registry_keys.is_empty()
@@ -4058,6 +4081,7 @@ impl ReceiptEntry {
             || self.directories_created[0].path != parameters.path
             || !self.files_created.is_empty()
             || !self.files_modified.is_empty()
+            || !self.files_appended.is_empty()
             || !self.services.is_empty()
             || !self.accounts.is_empty()
             || !self.registry_keys.is_empty()
@@ -4091,15 +4115,29 @@ impl ReceiptEntry {
                 if self.directories_created.len() == 1
                     && self.directories_created[0].path == parameters.path
                     && self.files_created.is_empty()
-                    && self.files_modified.is_empty() =>
+                    && self.files_modified.is_empty()
+                    && self.files_appended.is_empty() =>
             {
                 Ok(())
             }
             "ssh.authorized-keys" if self.directories_created.is_empty() => {
                 let created = self.files_created.len() == 1
                     && self.files_created[0].path == parameters.path
-                    && self.files_modified.is_empty();
-                if created {
+                    && self.files_modified.is_empty()
+                    && self.files_appended.is_empty()
+                    && parameters
+                        .owned_stanza_sha256
+                        .as_ref()
+                        .is_none_or(|digest| self.files_created[0].sha256 == *digest);
+                let appended = self.files_created.is_empty()
+                    && self.files_modified.is_empty()
+                    && self.files_appended.len() == 1
+                    && self.files_appended[0].path == parameters.path
+                    && parameters.owned_stanza_id.as_ref()
+                        == Some(&self.files_appended[0].stanza_id)
+                    && parameters.owned_stanza_sha256.as_ref()
+                        == Some(&self.files_appended[0].appended_sha256);
+                if created || appended {
                     Ok(())
                 } else {
                     Err(ReceiptError::InvalidCurrentUserSshAction)
@@ -4159,6 +4197,12 @@ impl ReceiptAction {
                     ),
                     directory: RecordedPath::from_path(parameters.directory())?,
                     path: RecordedPath::from_path(parameters.path())?,
+                    owned_stanza_id: parameters
+                        .owned_stanza_id()
+                        .map(|value| Sha256Digest(value.to_owned())),
+                    owned_stanza_sha256: parameters
+                        .owned_stanza_sha256()
+                        .map(|value| Sha256Digest(value.to_owned())),
                 }))
             }
             crate::setup::action::ActionParameters::DedicatedAccountPrerequisite(parameters) => Ok(
@@ -4630,6 +4674,10 @@ struct CurrentUserSshActionParameters {
     principal: ReceiptWorkerPrincipal,
     directory: RecordedPath,
     path: RecordedPath,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    owned_stanza_id: Option<Sha256Digest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    owned_stanza_sha256: Option<Sha256Digest>,
 }
 
 impl CurrentUserSshActionParameters {
@@ -4638,13 +4686,24 @@ impl CurrentUserSshActionParameters {
         self.principal.validate()?;
         self.directory.validate()?;
         self.path.validate()?;
+        if let Some(value) = &self.owned_stanza_id {
+            value.validate()?;
+        }
+        if let Some(value) = &self.owned_stanza_sha256 {
+            value.validate()?;
+        }
+        if self.owned_stanza_id.is_some() != self.owned_stanza_sha256.is_some() {
+            return Err(ReceiptError::InvalidCurrentUserSshAction);
+        }
         if self.principal.account_policy != WorkerAccountPolicy::CurrentUser
             || Path::new(&self.directory.0).file_name() != Some(std::ffi::OsStr::new(".ssh"))
         {
             return Err(ReceiptError::InvalidCurrentUserSshAction);
         }
         let expected_path = match self.action_id.0.as_str() {
-            "ssh.directory" => Path::new(&self.directory.0).to_path_buf(),
+            "ssh.directory" if self.owned_stanza_id.is_none() => {
+                Path::new(&self.directory.0).to_path_buf()
+            }
             "ssh.authorized-keys" => Path::new(&self.directory.0).join("authorized_keys"),
             _ => return Err(ReceiptError::InvalidCurrentUserSshAction),
         };
@@ -5008,6 +5067,22 @@ struct ModifiedFile {
     path: RecordedPath,
     before_sha256: Sha256Digest,
     backup_path: RecordedPath,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AppendedFile {
+    path: RecordedPath,
+    stanza_id: Sha256Digest,
+    appended_sha256: Sha256Digest,
+}
+
+impl AppendedFile {
+    fn validate(&self) -> Result<(), ReceiptError> {
+        self.path.validate()?;
+        self.stanza_id.validate()?;
+        self.appended_sha256.validate()
+    }
 }
 
 impl ModifiedFile {

@@ -448,6 +448,38 @@ fn current_user_ssh_receipt_round_trips_exact_principal_path_and_action_effect()
 }
 
 #[test]
+fn current_user_ssh_append_receipt_binds_only_the_owned_stanza_hash() {
+    let mut value = current_user_ssh_receipt_value("ssh.authorized-keys");
+    value["entries"][0]["action"]["parameters"]["owned_stanza_id"] =
+        serde_json::json!("98ff7af609c65c1d80216da6639b7237639791245203f28402d2237d6a91a1ae");
+    value["entries"][0]["action"]["parameters"]["owned_stanza_sha256"] =
+        serde_json::json!("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb");
+    value["entries"][0]["files_created"] = serde_json::json!([]);
+    value["entries"][0]["files_appended"] = serde_json::json!([{
+        "path": value["entries"][0]["action"]["parameters"]["path"].clone(),
+        "stanza_id": "98ff7af609c65c1d80216da6639b7237639791245203f28402d2237d6a91a1ae",
+        "appended_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    }]);
+
+    let encoded = serde_json::to_vec(&value).unwrap();
+    let document = ReceiptDocument::from_json(&encoded).unwrap();
+    let serialized = document.to_json().unwrap();
+    assert!(!String::from_utf8(serialized.clone())
+        .unwrap()
+        .contains("ssh-ed25519"));
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&serialized).unwrap(),
+        value
+    );
+    let schema: serde_json::Value = serde_json::from_str(include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/schemas/setup-receipt-v1.schema.json"
+    )))
+    .unwrap();
+    assert!(jsonschema::validator_for(&schema).unwrap().is_valid(&value));
+}
+
+#[test]
 fn current_user_ssh_receipt_rejects_generic_or_detached_parameters_and_effects() {
     let base = current_user_ssh_receipt_value("ssh.authorized-keys");
     let mut cases = Vec::new();

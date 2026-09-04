@@ -209,6 +209,11 @@
           "uniqueItems": true,
           "items": { "$ref": "#/$defs/modifiedFile" }
         },
+        "files_appended": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": { "$ref": "#/$defs/appendedFile" }
+        },
         "services": {
           "type": "array",
           "uniqueItems": true,
@@ -249,6 +254,7 @@
               "directories_created": { "maxItems": 0 },
               "files_created": { "maxItems": 0 },
               "files_modified": { "maxItems": 0 },
+              "files_appended": { "maxItems": 0 },
               "services": { "maxItems": 0 },
               "accounts": { "maxItems": 0 },
               "registry_keys": { "maxItems": 0 },
@@ -393,15 +399,30 @@
                         "properties": {
                           "directories_created": { "minItems": 1, "maxItems": 1 },
                           "files_created": { "maxItems": 0 },
-                          "files_modified": { "maxItems": 0 }
+                          "files_modified": { "maxItems": 0 },
+                          "files_appended": { "maxItems": 0 }
                         }
                       },
                       "else": {
                         "properties": {
                           "directories_created": { "maxItems": 0 },
-                          "files_created": { "minItems": 1, "maxItems": 1 },
                           "files_modified": { "maxItems": 0 }
-                        }
+                        },
+                        "oneOf": [
+                          {
+                            "properties": {
+                              "files_created": { "minItems": 1, "maxItems": 1 },
+                              "files_appended": { "maxItems": 0 }
+                            }
+                          },
+                          {
+                            "properties": {
+                              "files_created": { "maxItems": 0 },
+                              "files_appended": { "minItems": 1, "maxItems": 1 }
+                            },
+                            "required": ["files_appended"]
+                          }
+                        ]
                       }
                     }
                   ]
@@ -515,7 +536,9 @@
               ]
             },
             "directory": { "$ref": "#/$defs/absolutePath" },
-            "path": { "$ref": "#/$defs/absolutePath" }
+            "path": { "$ref": "#/$defs/absolutePath" },
+            "owned_stanza_id": { "$ref": "#/$defs/sha256" },
+            "owned_stanza_sha256": { "$ref": "#/$defs/sha256" }
           }
         }
       }
@@ -890,6 +913,16 @@
         "path": { "$ref": "#/$defs/absolutePath" },
         "before_sha256": { "$ref": "#/$defs/sha256" },
         "backup_path": { "$ref": "#/$defs/absolutePath" }
+      }
+    },
+    "appendedFile": {
+      "type": "object",
+      "required": ["path", "stanza_id", "appended_sha256"],
+      "additionalProperties": false,
+      "properties": {
+        "path": { "$ref": "#/$defs/absolutePath" },
+        "stanza_id": { "$ref": "#/$defs/sha256" },
+        "appended_sha256": { "$ref": "#/$defs/sha256" }
       }
     },
     "namedResource": {

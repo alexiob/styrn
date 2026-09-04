@@ -1394,7 +1394,7 @@ fn inspect_dedicated_profile(path: &Path, owner_sid: &[u8]) -> io::Result<Dedica
     let metadata = match std::fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return Ok(DedicatedProfileState::Missing)
+            return Ok(DedicatedProfileState::Missing);
         }
         Err(error) => return Err(error),
     };
@@ -4835,6 +4835,38 @@ pub(super) fn open_verified_private_file_for_read(
         }
     }
     Ok(file)
+}
+
+pub(super) fn append_verified_private_file_once(
+    path: &Path,
+    owner: ManifestOwner,
+    principal: &WorkerPrincipal,
+    expected_identity: PrivateFileIdentity,
+    bytes: &[u8],
+) -> io::Result<()> {
+    use std::io::Write as _;
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let mut file = std::fs::OpenOptions::new()
+        .append(true)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    if private_file_identity_from_handle(&file)? != expected_identity {
+        return Err(permission_denied("private append target identity changed"));
+    }
+    verify_private_file_handle_security(&file, owner, principal)?;
+    if file.write(bytes)? != bytes.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::WriteZero,
+            "private append was incomplete",
+        ));
+    }
+    file.sync_all()?;
+    if private_file_identity_from_handle(&file)? != expected_identity {
+        return Err(permission_denied("private append target identity changed"));
+    }
+    Ok(())
 }
 
 #[allow(dead_code)] // Source-including manifest tests omit authorization execution.

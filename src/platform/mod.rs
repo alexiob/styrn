@@ -7155,6 +7155,31 @@ pub(crate) fn open_verified_private_file_for_read(
     platform_impl::open_verified_private_file_for_read(path, owner, principal, expected_identity)
 }
 
+/// Appends one complete, non-empty byte sequence through a no-follow handle
+/// whose identity and user-owned security were verified before the write.
+#[allow(dead_code)] // Source-inclusion tests omit current-user SSH setup actions.
+pub(crate) fn append_verified_private_file_once(
+    path: &Path,
+    owner: ManifestOwner,
+    principal: &WorkerPrincipal,
+    expected_identity: PrivateFileIdentity,
+    bytes: &[u8],
+) -> std::io::Result<()> {
+    if bytes.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "private file append is empty",
+        ));
+    }
+    platform_impl::append_verified_private_file_once(
+        path,
+        owner,
+        principal,
+        expected_identity,
+        bytes,
+    )
+}
+
 #[allow(dead_code)] // Source-including manifest tests omit authorization execution.
 pub(crate) struct PrivateFileRemoval(platform_impl::PrivateFileRemoval);
 

@@ -91,6 +91,7 @@ pub(crate) struct ActionEffect {
     directories_created: Vec<CreatedDirectoryEffect>,
     files_created: Vec<CreatedFileEffect>,
     files_modified: Vec<ModifiedFileEffect>,
+    files_appended: Vec<AppendedFileEffect>,
     services: Vec<String>,
     accounts: Vec<String>,
     registry_keys: Vec<String>,
@@ -146,6 +147,13 @@ pub(crate) struct ModifiedFileEffect {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct AppendedFileEffect {
+    path: String,
+    stanza_id: String,
+    appended_sha256: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct DownloadProvenanceEffect {
     url: String,
     version: String,
@@ -163,6 +171,10 @@ impl ActionEffect {
 
     pub(in crate::setup) fn files_modified(&self) -> &[ModifiedFileEffect] {
         &self.files_modified
+    }
+
+    pub(in crate::setup) fn files_appended(&self) -> &[AppendedFileEffect] {
+        &self.files_appended
     }
 
     pub(in crate::setup) fn services(&self) -> &[String] {
@@ -210,6 +222,7 @@ impl ActionEffect {
                 before_sha256: "a".repeat(64),
                 backup_path,
             }],
+            files_appended: Vec::new(),
             services: vec![format!("styrn-test-{marker}")],
             accounts: vec![format!("styrn-test-{marker}")],
             registry_keys: vec![format!(r"HKLM\Software\Styrn\Test{marker}")],
@@ -250,6 +263,20 @@ impl ModifiedFileEffect {
 
     pub(in crate::setup) fn backup_path(&self) -> &str {
         &self.backup_path
+    }
+}
+
+impl AppendedFileEffect {
+    pub(in crate::setup) fn path(&self) -> &str {
+        &self.path
+    }
+
+    pub(in crate::setup) fn stanza_id(&self) -> &str {
+        &self.stanza_id
+    }
+
+    pub(in crate::setup) fn appended_sha256(&self) -> &str {
+        &self.appended_sha256
     }
 }
 
@@ -454,6 +481,8 @@ pub(crate) struct CurrentUserSshActionParameters {
     principal: crate::platform::WorkerPrincipal,
     directory: PathBuf,
     path: PathBuf,
+    owned_stanza_id: Option<String>,
+    owned_stanza_sha256: Option<String>,
 }
 
 #[cfg(not(action_core_fixture))]
@@ -463,12 +492,16 @@ impl CurrentUserSshActionParameters {
         principal: crate::platform::WorkerPrincipal,
         directory: PathBuf,
         path: PathBuf,
+        owned_stanza_id: Option<String>,
+        owned_stanza_sha256: Option<String>,
     ) -> Self {
         Self {
             action_id,
             principal,
             directory,
             path,
+            owned_stanza_id,
+            owned_stanza_sha256,
         }
     }
 
@@ -486,6 +519,14 @@ impl CurrentUserSshActionParameters {
 
     pub(in crate::setup) fn path(&self) -> &std::path::Path {
         &self.path
+    }
+
+    pub(in crate::setup) fn owned_stanza_id(&self) -> Option<&str> {
+        self.owned_stanza_id.as_deref()
+    }
+
+    pub(in crate::setup) fn owned_stanza_sha256(&self) -> Option<&str> {
+        self.owned_stanza_sha256.as_deref()
     }
 }
 
@@ -1028,6 +1069,7 @@ mod gate {
                 directories_created: vec![CreatedDirectoryEffect { path: effect_path }],
                 files_created: Vec::new(),
                 files_modified: Vec::new(),
+                files_appended: Vec::new(),
                 services: Vec::new(),
                 accounts: Vec::new(),
                 registry_keys: Vec::new(),
@@ -1280,6 +1322,7 @@ mod gate {
                 before_sha256: before_sha256.to_owned(),
                 backup_path: dynamic_backup_path(path).to_string_lossy().into_owned(),
             }],
+            files_appended: Vec::new(),
             services: Vec::new(),
             accounts: Vec::new(),
             registry_keys: Vec::new(),

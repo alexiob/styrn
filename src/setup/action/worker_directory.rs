@@ -261,6 +261,7 @@ pub(super) fn directory_effect(path: impl Into<String>) -> ActionEffect {
         directories_created: vec![CreatedDirectoryEffect { path: path.into() }],
         files_created: Vec::new(),
         files_modified: Vec::new(),
+        files_appended: Vec::new(),
         services: Vec::new(),
         accounts: Vec::new(),
         registry_keys: Vec::new(),

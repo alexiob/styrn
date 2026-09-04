@@ -3642,7 +3642,7 @@ fn inspect_dedicated_home(path: &Path, expected_uid: u32) -> DedicatedHomeState 
     let metadata = match fs::symlink_metadata(path) {
         Ok(metadata) => metadata,
         Err(error) if error.kind() == io::ErrorKind::NotFound => {
-            return DedicatedHomeState::Missing
+            return DedicatedHomeState::Missing;
         }
         Err(_) => return DedicatedHomeState::Unknowable,
     };
@@ -4210,6 +4210,36 @@ pub(super) fn open_verified_private_file_for_read(
     }
     verify_no_extended_acl_fd(file.as_raw_fd())?;
     Ok(file)
+}
+
+pub(super) fn append_verified_private_file_once(
+    path: &Path,
+    owner: ManifestOwner,
+    principal: &WorkerPrincipal,
+    expected_identity: PrivateFileIdentity,
+    bytes: &[u8],
+) -> io::Result<()> {
+    use std::io::Write as _;
+
+    let mut file = fs::OpenOptions::new()
+        .append(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(path)?;
+    if private_file_identity_from_handle(&file)? != expected_identity {
+        return Err(permission_denied("private append target identity changed"));
+    }
+    verify_private_file_handle_security(&file, owner, principal)?;
+    if file.write(bytes)? != bytes.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::WriteZero,
+            "private append was incomplete",
+        ));
+    }
+    file.sync_all()?;
+    if private_file_identity_from_handle(&file)? != expected_identity {
+        return Err(permission_denied("private append target identity changed"));
+    }
+    Ok(())
 }
 
 pub(crate) struct PrivateFileRemoval {
