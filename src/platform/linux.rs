@@ -15,13 +15,25 @@ use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
+#[allow(dead_code)] // Source-inclusion tests omit current-user SSH setup actions.
+pub(super) fn current_user_ssh_directory() -> io::Result<PathBuf> {
+    let account =
+        account_details_for_uid(unsafe { libc::getuid() }, WorkerAccountPolicy::CurrentUser)?;
+    Ok(PathBuf::from(account.home).join(".ssh"))
+}
+
+#[allow(dead_code)] // Source-inclusion contract tests omit enrollment-card discovery.
+pub(super) fn native_ssh_keyscan_path() -> PathBuf {
+    PathBuf::from("/usr/bin/ssh-keyscan")
+}
+
 pub(super) fn baseline_probe_snapshot(
     kind: super::BaselineProbeKind,
     authorized_public_keys: &[String],
     tailscale_mode: &str,
 ) -> super::BaselineProbeSnapshot {
     match kind {
-        super::BaselineProbeKind::SshServer => ssh_server_snapshot(authorized_public_keys),
+        super::BaselineProbeKind::SshServer => ssh_server_snapshot(authorized_public_keys, true),
         super::BaselineProbeKind::Tailscale => tailscale_snapshot(tailscale_mode),
         super::BaselineProbeKind::Git => git_snapshot(),
         super::BaselineProbeKind::SleepPolicy => sleep_snapshot(),
@@ -110,7 +122,14 @@ fn parse_systemd_observation(
     result.as_ref().ok().and_then(parser)
 }
 
-fn ssh_server_snapshot(required: &[String]) -> super::BaselineProbeSnapshot {
+pub(super) fn ssh_server_transport_snapshot() -> super::BaselineProbeSnapshot {
+    ssh_server_snapshot(&[], false)
+}
+
+fn ssh_server_snapshot(
+    required: &[String],
+    require_authorized_keys: bool,
+) -> super::BaselineProbeSnapshot {
     let Some(sshd) = [
         Path::new("/usr/sbin/sshd"),
         Path::new("/usr/local/sbin/sshd"),
@@ -147,11 +166,17 @@ fn ssh_server_snapshot(required: &[String]) -> super::BaselineProbeSnapshot {
     let Some(config) = config else {
         return super::BaselineProbeSnapshot::Unknowable;
     };
+    let transport_healthy = service_running && config.public_key_authentication();
+    if !require_authorized_keys {
+        return super::BaselineProbeSnapshot::Present {
+            version: None,
+            healthy: transport_healthy,
+        };
+    }
     let home = PathBuf::from(account.home);
     super::BaselineProbeSnapshot::Present {
         version: None,
-        healthy: service_running
-            && config.public_key_authentication()
+        healthy: transport_healthy
             && authorized_keys_are_ready(
                 &home,
                 unsafe { libc::getuid() },

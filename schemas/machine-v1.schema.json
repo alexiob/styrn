@@ -299,7 +299,11 @@
       "properties": {
         "installed": { "type": "boolean" },
         "server": { "type": "boolean" },
-        "public_key_auth": { "type": "boolean" }
+        "public_key_auth": { "type": "boolean" },
+        "host_key_fingerprint": {
+          "type": "string",
+          "pattern": "^SHA256:[A-Za-z0-9+/]{43}$"
+        }
       }
     },
     "herdr": {

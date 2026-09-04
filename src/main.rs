@@ -429,7 +429,20 @@ fn host_enroll(
     let result = (|| {
         let store = inventory::InventoryStore::configured().map_err(inventory_error)?;
         let snapshot = store.read().map_err(inventory_error)?;
-        let previous = snapshot.host(host).cloned();
+        let named = snapshot.host(host);
+        let mut endpoint_matches = snapshot.hosts().iter().filter(|record| {
+            record.transport().host() == host && record.transport().user() == user
+        });
+        let endpoint = endpoint_matches.next();
+        if endpoint_matches.next().is_some()
+            || matches!((named, endpoint), (Some(named), Some(endpoint)) if named != endpoint)
+        {
+            return Err(Phase1CommandError::new(
+                output::ErrorCode::UsageConfigInvalid,
+                "the enrollment endpoint is ambiguous in local inventory",
+            ));
+        }
+        let previous = named.or(endpoint).cloned();
         let scanner = transport::SshTransport::configured(store.known_hosts_path().to_path_buf());
         let pin = scanner
             .scan_host_key(host, 22, fingerprint)
@@ -472,10 +485,15 @@ fn host_enroll(
             .as_ref()
             .map(inventory::InventoryHost::machine_id)
             .unwrap_or(client.server_hello().machine_id);
-        let expected = rpc::ExpectedPeer::new(machine_id, host, user).map_err(rpc_error)?;
+        let expected_name = previous.as_ref().map_or_else(
+            || client.server_hello().name.as_str(),
+            inventory::InventoryHost::name,
+        );
+        let expected =
+            rpc::ExpectedPeer::new(machine_id, expected_name, user).map_err(rpc_error)?;
         let version = client.server_hello().styrn_version.clone();
         let manifest = client.machine_manifest(&expected).map_err(rpc_error)?;
-        let record = inventory::InventoryHost::new(host, manifest.machine_id, stored)
+        let record = inventory::InventoryHost::new(&manifest.name, manifest.machine_id, stored)
             .map_err(inventory_error)?;
         validate_manifest_endpoint(&manifest, &record)?;
         let status = client.machine_status().map_err(rpc_error)?;
@@ -1043,6 +1061,19 @@ fn setup_outcome_json(outcome: &setup::RootlessSetupOutcome) -> serde_json::Valu
         "pending": setup_pending_json(outcome.pending()),
         "manifest": setup_path_text(outcome.manifest_path()),
         "receipt": setup_path_text(outcome.receipt_path()),
+        "enrollment_card": outcome.enrollment_card().map(setup_enrollment_card_json),
+    })
+}
+
+fn setup_enrollment_card_json(card: &setup::EnrollmentCard) -> serde_json::Value {
+    serde_json::json!({
+        "name": card.name(),
+        "host": card.host(),
+        "user": card.user(),
+        "fingerprint": card.fingerprint(),
+        "command": card.command(),
+        "integrity_guidance": card.integrity_guidance(),
+        "controller_recovery": card.controller_recovery(),
     })
 }
 
@@ -1107,6 +1138,14 @@ fn render_setup_summary(outcome: &setup::RootlessSetupOutcome) {
         for pending in outcome.pending() {
             println!("  {}: {}", pending.action_id(), pending.message());
         }
+    }
+    if let Some(card) = outcome.enrollment_card() {
+        println!("Ready to enroll. From any controller, run:");
+        println!();
+        println!("  {}", card.command());
+        println!();
+        println!("integrity: {}", card.integrity_guidance());
+        println!("controller recovery: {}", card.controller_recovery());
     }
     println!("security: {}", outcome.security_caveat());
 }
@@ -1202,6 +1241,48 @@ fn fail_unavailable_setup(parsed: &cli::ParsedCli, command: &str, message: &str)
 
 #[cfg(test)]
 mod setup_failure_output_tests {
+    const HOST_KEY_FINGERPRINT: &str = "SHA256:ZkAslGjFiUHdGf/WUL8rQvkib4PTvQatUV0OUQSncCA";
+
+    #[test]
+    fn setup_json_projects_the_complete_secret_free_enrollment_card() {
+        let host_key = crate::transport::PinnedHostKey::from_parts(
+            "ssh-ed25519",
+            "AAAAC3NzaC1lZDI1NTE5AAAAIAABAgMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhscHR4f",
+            HOST_KEY_FINGERPRINT,
+        )
+        .unwrap();
+        let card = crate::setup::EnrollmentCard::new(
+            "worker-01",
+            "worker-01.example",
+            "alex",
+            22,
+            &host_key,
+        )
+        .unwrap();
+
+        let value = super::setup_enrollment_card_json(&card);
+
+        assert_eq!(value["name"], "worker-01");
+        assert_eq!(value["host"], "worker-01.example");
+        assert_eq!(value["user"], "alex");
+        assert_eq!(value["fingerprint"], HOST_KEY_FINGERPRINT);
+        assert_eq!(
+            value["command"],
+            format!(
+                "styrn host enroll worker-01.example --user alex --fingerprint {HOST_KEY_FINGERPRINT}"
+            )
+        );
+        assert!(value["integrity_guidance"]
+            .as_str()
+            .unwrap()
+            .contains("worker's own console"));
+        assert!(value["controller_recovery"]
+            .as_str()
+            .unwrap()
+            .contains("styrn controller init"));
+        assert!(!value.to_string().contains("ssh-ed25519"));
+    }
+
     #[test]
     fn operation_failure_reaches_json_details_and_safe_human_remediation() {
         let error = crate::setup::RootlessSetupError::operation_failed_for_output_test();

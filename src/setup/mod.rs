@@ -69,8 +69,6 @@ pub(crate) use config::{
     plan_pending_projection_fixture,
 )))]
 pub(crate) use interactive::collect_interactive_answers;
-#[cfg(test)]
-pub(in crate::setup) use orchestrator::prepare_rootless_setup_for_test;
 #[allow(unused_imports)]
 #[cfg(not(any(
     action_core_fixture,
@@ -84,8 +82,13 @@ pub(in crate::setup) use orchestrator::prepare_rootless_setup_for_test;
     plan_pending_projection_fixture,
 )))]
 pub(crate) use orchestrator::{
-    apply_rootless_setup, prepare_rootless_setup, RootlessPendingResult, RootlessSetupError,
-    RootlessSetupOutcome, RootlessSetupPlan, RootlessSetupPlanItem,
+    apply_rootless_setup, prepare_rootless_setup, EnrollmentCard, RootlessPendingResult,
+    RootlessSetupError, RootlessSetupOutcome, RootlessSetupPlan, RootlessSetupPlanItem,
+};
+#[cfg(test)]
+pub(in crate::setup) use orchestrator::{
+    prepare_rootless_setup_for_test, prepare_rootless_setup_for_test_with_ssh_directory,
+    prepare_rootless_setup_for_test_with_ssh_directory_and_host_key,
 };
 
 #[allow(dead_code)]

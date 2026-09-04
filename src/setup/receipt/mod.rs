@@ -4026,6 +4026,9 @@ impl ReceiptEntry {
             }
             return Ok(());
         }
+        if let ReceiptAction::CurrentUserSsh(parameters) = &self.action {
+            return self.validate_current_user_ssh_effect(parameters);
+        }
         let ReceiptAction::WorkerDirectory(parameters) = &self.action else {
             return Ok(());
         };
@@ -4065,6 +4068,46 @@ impl ReceiptEntry {
         }
         Ok(())
     }
+
+    fn validate_current_user_ssh_effect(
+        &self,
+        parameters: &CurrentUserSshActionParameters,
+    ) -> Result<(), ReceiptError> {
+        if self.status == ReceiptStatus::Pending {
+            return Ok(());
+        }
+        let no_unrelated_effects = self.status == ReceiptStatus::Applied
+            && self.privilege_used == ReceiptPrivilege::None
+            && self.services.is_empty()
+            && self.accounts.is_empty()
+            && self.registry_keys.is_empty()
+            && self.firewall_rules.is_empty()
+            && self.download_provenance.0.is_none();
+        if !no_unrelated_effects {
+            return Err(ReceiptError::InvalidCurrentUserSshAction);
+        }
+        match parameters.action_id.0.as_str() {
+            "ssh.directory"
+                if self.directories_created.len() == 1
+                    && self.directories_created[0].path == parameters.path
+                    && self.files_created.is_empty()
+                    && self.files_modified.is_empty() =>
+            {
+                Ok(())
+            }
+            "ssh.authorized-keys" if self.directories_created.is_empty() => {
+                let created = self.files_created.len() == 1
+                    && self.files_created[0].path == parameters.path
+                    && self.files_modified.is_empty();
+                if created {
+                    Ok(())
+                } else {
+                    Err(ReceiptError::InvalidCurrentUserSshAction)
+                }
+            }
+            _ => Err(ReceiptError::InvalidCurrentUserSshAction),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -4076,6 +4119,7 @@ impl ReceiptEntry {
 )]
 enum ReceiptAction {
     Foundation(FoundationActionParameters),
+    CurrentUserSsh(CurrentUserSshActionParameters),
     DedicatedAccountPrerequisite(DedicatedAccountPrerequisiteParameters),
     DeferredSystemAction(DeferredSystemActionParameters),
     ScopePromotion(Box<ScopePromotionParameters>),
@@ -4091,6 +4135,7 @@ impl ReceiptAction {
         matches!(
             self,
             Self::DedicatedAccountPrerequisite(_)
+                | Self::CurrentUserSsh(_)
                 | Self::DeferredSystemAction(_)
                 | Self::ScopePromotion(_)
                 | Self::WorkerDirectory(_)
@@ -4104,6 +4149,16 @@ impl ReceiptAction {
             crate::setup::action::ActionParameters::Foundation(action_id) => {
                 Ok(Self::Foundation(FoundationActionParameters {
                     action_id: ActionIdentifier(action_id.as_str().to_owned()),
+                }))
+            }
+            crate::setup::action::ActionParameters::CurrentUserSsh(parameters) => {
+                Ok(Self::CurrentUserSsh(CurrentUserSshActionParameters {
+                    action_id: ActionIdentifier(parameters.action_id().as_str().to_owned()),
+                    principal: ReceiptWorkerPrincipal::from_worker_principal(
+                        parameters.principal(),
+                    ),
+                    directory: RecordedPath::from_path(parameters.directory())?,
+                    path: RecordedPath::from_path(parameters.path())?,
                 }))
             }
             crate::setup::action::ActionParameters::DedicatedAccountPrerequisite(parameters) => Ok(
@@ -4141,6 +4196,7 @@ impl ReceiptAction {
     fn action_id(&self) -> &str {
         match self {
             Self::Foundation(parameters) => &parameters.action_id.0,
+            Self::CurrentUserSsh(parameters) => &parameters.action_id.0,
             Self::DedicatedAccountPrerequisite(parameters) => &parameters.action_id.0,
             Self::DeferredSystemAction(parameters) => &parameters.action_id.0,
             Self::ScopePromotion(parameters) => &parameters.action_id.0,
@@ -4150,7 +4206,18 @@ impl ReceiptAction {
 
     fn validate(&self) -> Result<(), ReceiptError> {
         match self {
-            Self::Foundation(parameters) => parameters.action_id.validate(),
+            Self::Foundation(parameters) => {
+                parameters.action_id.validate()?;
+                if matches!(
+                    parameters.action_id.0.as_str(),
+                    "ssh.directory" | "ssh.authorized-keys"
+                ) {
+                    Err(ReceiptError::InvalidCurrentUserSshAction)
+                } else {
+                    Ok(())
+                }
+            }
+            Self::CurrentUserSsh(parameters) => parameters.validate(),
             Self::DedicatedAccountPrerequisite(parameters) => parameters.validate(),
             Self::DeferredSystemAction(parameters) => parameters.validate(),
             Self::ScopePromotion(parameters) => parameters.validate(),
@@ -4161,6 +4228,8 @@ impl ReceiptAction {
     fn validate_scope(&self, scope: InstallationScope) -> Result<(), ReceiptError> {
         match self {
             Self::Foundation(_) => Ok(()),
+            Self::CurrentUserSsh(_) if scope == InstallationScope::User => Ok(()),
+            Self::CurrentUserSsh(_) => Err(ReceiptError::InvalidCurrentUserSshAction),
             Self::DedicatedAccountPrerequisite(_) if scope == InstallationScope::User => Ok(()),
             Self::DedicatedAccountPrerequisite(_) => {
                 Err(ReceiptError::InvalidDedicatedAccountPrerequisite)
@@ -4182,6 +4251,13 @@ impl ReceiptAction {
     fn validate_worker_principal(&self, worker: &WorkerPrincipal) -> Result<(), ReceiptError> {
         match self {
             Self::Foundation(_) => Ok(()),
+            Self::CurrentUserSsh(parameters) => {
+                if parameters.principal.to_worker_principal()? == *worker {
+                    Ok(())
+                } else {
+                    Err(ReceiptError::InvalidWorkerPrincipal)
+                }
+            }
             Self::DedicatedAccountPrerequisite(_)
                 if worker.account_policy() == WorkerAccountPolicy::CurrentUser =>
             {
@@ -4545,6 +4621,38 @@ impl DeferredSystemActionParameters {
 #[serde(deny_unknown_fields)]
 struct FoundationActionParameters {
     action_id: ActionIdentifier,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CurrentUserSshActionParameters {
+    action_id: ActionIdentifier,
+    principal: ReceiptWorkerPrincipal,
+    directory: RecordedPath,
+    path: RecordedPath,
+}
+
+impl CurrentUserSshActionParameters {
+    fn validate(&self) -> Result<(), ReceiptError> {
+        self.action_id.validate()?;
+        self.principal.validate()?;
+        self.directory.validate()?;
+        self.path.validate()?;
+        if self.principal.account_policy != WorkerAccountPolicy::CurrentUser
+            || Path::new(&self.directory.0).file_name() != Some(std::ffi::OsStr::new(".ssh"))
+        {
+            return Err(ReceiptError::InvalidCurrentUserSshAction);
+        }
+        let expected_path = match self.action_id.0.as_str() {
+            "ssh.directory" => Path::new(&self.directory.0).to_path_buf(),
+            "ssh.authorized-keys" => Path::new(&self.directory.0).join("authorized_keys"),
+            _ => return Err(ReceiptError::InvalidCurrentUserSshAction),
+        };
+        if Path::new(&self.path.0) != expected_path {
+            return Err(ReceiptError::InvalidCurrentUserSshAction);
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -5213,6 +5321,8 @@ pub(crate) enum ReceiptError {
     InvalidActionIdentifier,
     #[error("setup receipt worker directory action is invalid")]
     InvalidWorkerDirectoryAction,
+    #[error("setup receipt current-user SSH action is invalid")]
+    InvalidCurrentUserSshAction,
     #[error("setup receipt dedicated-account prerequisite is invalid")]
     InvalidDedicatedAccountPrerequisite,
     #[error("setup receipt deferred system action is invalid")]

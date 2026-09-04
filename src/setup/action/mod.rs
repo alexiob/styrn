@@ -422,6 +422,8 @@ impl PendingAction {
 pub(crate) enum ActionParameters {
     Foundation(ActionName),
     #[cfg(not(action_core_fixture))]
+    CurrentUserSsh(CurrentUserSshActionParameters),
+    #[cfg(not(action_core_fixture))]
     DedicatedAccountPrerequisite(DedicatedAccountPrerequisiteParameters),
     #[cfg(not(action_core_fixture))]
     DeferredSystemAction(DeferredSystemActionParameters),
@@ -434,12 +436,56 @@ impl ActionParameters {
         match self {
             Self::Foundation(action_id) => action_id,
             #[cfg(not(action_core_fixture))]
+            Self::CurrentUserSsh(parameters) => parameters.action_id(),
+            #[cfg(not(action_core_fixture))]
             Self::DedicatedAccountPrerequisite(parameters) => parameters.action_id(),
             #[cfg(not(action_core_fixture))]
             Self::DeferredSystemAction(parameters) => parameters.action_id(),
             #[cfg(not(action_core_fixture))]
             Self::WorkerDirectory(parameters) => parameters.action_id(),
         }
+    }
+}
+
+#[cfg(not(action_core_fixture))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CurrentUserSshActionParameters {
+    action_id: ActionName,
+    principal: crate::platform::WorkerPrincipal,
+    directory: PathBuf,
+    path: PathBuf,
+}
+
+#[cfg(not(action_core_fixture))]
+impl CurrentUserSshActionParameters {
+    pub(in crate::setup) fn new(
+        action_id: ActionName,
+        principal: crate::platform::WorkerPrincipal,
+        directory: PathBuf,
+        path: PathBuf,
+    ) -> Self {
+        Self {
+            action_id,
+            principal,
+            directory,
+            path,
+        }
+    }
+
+    pub(in crate::setup) fn action_id(&self) -> &ActionName {
+        &self.action_id
+    }
+
+    pub(in crate::setup) fn principal(&self) -> &crate::platform::WorkerPrincipal {
+        &self.principal
+    }
+
+    pub(in crate::setup) fn directory(&self) -> &std::path::Path {
+        &self.directory
+    }
+
+    pub(in crate::setup) fn path(&self) -> &std::path::Path {
+        &self.path
     }
 }
 
@@ -685,6 +731,8 @@ impl ActionError {
 /// enum; there is no open implementation trait or raw mutation entry point.
 pub(crate) enum Action {
     Foundation(FoundationAction),
+    #[cfg(not(action_core_fixture))]
+    CurrentUserSsh(Box<authorized_keys::CurrentUserSshAction>),
     #[cfg(not(action_core_fixture))]
     DedicatedAccountPrerequisite(dedicated_account::DedicatedAccountPrerequisite),
     #[cfg(not(action_core_fixture))]
@@ -993,6 +1041,8 @@ mod gate {
             match self {
                 Self::Foundation(action) => &action.name,
                 #[cfg(not(action_core_fixture))]
+                Self::CurrentUserSsh(action) => action.name(),
+                #[cfg(not(action_core_fixture))]
                 Self::DedicatedAccountPrerequisite(action) => action.name(),
                 #[cfg(not(action_core_fixture))]
                 Self::WorkerDirectory(action) => action.name(),
@@ -1005,6 +1055,8 @@ mod gate {
             match self {
                 Self::Foundation(action) => ActionParameters::Foundation(action.name.clone()),
                 #[cfg(not(action_core_fixture))]
+                Self::CurrentUserSsh(action) => action.parameters(),
+                #[cfg(not(action_core_fixture))]
                 Self::DedicatedAccountPrerequisite(action) => action.parameters(),
                 #[cfg(not(action_core_fixture))]
                 Self::WorkerDirectory(action) => action.parameters(),
@@ -1016,6 +1068,8 @@ mod gate {
         pub(crate) fn check(&self) -> Result<ActionCheck, ActionError> {
             match self {
                 Self::Foundation(action) => Ok(action.check.clone()),
+                #[cfg(not(action_core_fixture))]
+                Self::CurrentUserSsh(action) => Ok(action.check()),
                 #[cfg(not(action_core_fixture))]
                 Self::DedicatedAccountPrerequisite(action) => Ok(action.check()),
                 #[cfg(not(action_core_fixture))]
@@ -1055,6 +1109,8 @@ mod gate {
             match self {
                 Self::Foundation(action) => action.privilege,
                 #[cfg(not(action_core_fixture))]
+                Self::CurrentUserSsh(_) => Privilege::None,
+                #[cfg(not(action_core_fixture))]
                 Self::DedicatedAccountPrerequisite(_) => Privilege::None,
                 #[cfg(not(action_core_fixture))]
                 Self::WorkerDirectory(action) => action.privilege(),
@@ -1067,6 +1123,8 @@ mod gate {
             match self {
                 Self::Foundation(action) => action.operation,
                 #[cfg(not(action_core_fixture))]
+                Self::CurrentUserSsh(action) => action.operation(),
+                #[cfg(not(action_core_fixture))]
                 Self::DedicatedAccountPrerequisite(action) => action.plan_operation(),
                 #[cfg(not(action_core_fixture))]
                 Self::WorkerDirectory(_) => PlanOperation::Create,
@@ -1078,6 +1136,8 @@ mod gate {
         pub(crate) fn describe(&self) -> &ActionDescription {
             match self {
                 Self::Foundation(action) => &action.description,
+                #[cfg(not(action_core_fixture))]
+                Self::CurrentUserSsh(action) => action.description(),
                 #[cfg(not(action_core_fixture))]
                 Self::DedicatedAccountPrerequisite(action) => action.description(),
                 #[cfg(not(action_core_fixture))]
@@ -1102,6 +1162,8 @@ mod gate {
         pub(in crate::setup::action) fn prepare(&self) -> Result<PreparedAction, ActionError> {
             let effect = match self {
                 Self::Foundation(action) => Err(ActionError::apply_failed(action.name.clone())),
+                #[cfg(not(action_core_fixture))]
+                Self::CurrentUserSsh(action) => action.expected_effect(),
                 #[cfg(not(action_core_fixture))]
                 Self::DedicatedAccountPrerequisite(action) => {
                     Err(ActionError::apply_failed(action.name().clone()))
@@ -1171,6 +1233,8 @@ mod gate {
         match action {
             Action::Foundation(action) => Err(ActionError::apply_failed(action.name.clone())),
             #[cfg(not(action_core_fixture))]
+            Action::CurrentUserSsh(action) => action.execute(),
+            #[cfg(not(action_core_fixture))]
             Action::DedicatedAccountPrerequisite(action) => {
                 Err(ActionError::apply_failed(action.name().clone()))
             }
@@ -1230,6 +1294,12 @@ mod gate {
     }
 }
 
+#[cfg(not(action_core_fixture))]
+mod authorized_keys;
+#[cfg(not(action_core_fixture))]
+pub(in crate::setup) use authorized_keys::current_user_ssh_action_plan;
+#[cfg(test)]
+pub(in crate::setup) use authorized_keys::current_user_ssh_action_plan_for_test;
 #[cfg(not(action_core_fixture))]
 mod dedicated_account;
 #[cfg(not(action_core_fixture))]

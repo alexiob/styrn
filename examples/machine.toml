@@ -82,6 +82,7 @@ unattended = true
 installed = true
 server = true
 public_key_auth = true
+host_key_fingerprint = "SHA256:ZkAslGjFiUHdGf/WUL8rQvkib4PTvQatUV0OUQSncCA"
 
 [herdr]
 installed = true

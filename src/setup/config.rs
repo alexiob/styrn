@@ -243,11 +243,15 @@ pub(crate) fn load_effective_rootless_setup(
             .as_ref()
             .and_then(|value| value.root.clone())
             .unwrap_or_default(),
-        authorized_keys: config
-            .ssh
-            .as_ref()
-            .and_then(|value| value.authorized_keys.clone())
-            .unwrap_or_default(),
+        authorized_keys: if request.authorized_keys().is_empty() {
+            config
+                .ssh
+                .as_ref()
+                .and_then(|value| value.authorized_keys.clone())
+                .unwrap_or_default()
+        } else {
+            request.authorized_keys().to_vec()
+        },
         tailscale_mode: config
             .tailscale
             .as_ref()
@@ -511,6 +515,7 @@ fn valid_public_key(value: &str) -> bool {
         return false;
     }
     crate::platform::parse_authorized_key_line(value).is_some()
+        && crate::setup::validate_probe_static_text(value)
 }
 
 pub(crate) fn validate_rootless_setup_request(
@@ -1111,6 +1116,46 @@ mod tests {
             assert!(error.contains("valid components: ssh-server"));
         }
     }
+
+    #[test]
+    fn authorized_keys_flags_override_the_replay_config_without_secret_material() {
+        let configured = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAABAgMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhscHR4f configured";
+        let supplied = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAABAgMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhscHR4f supplied";
+        let path = temp_path("authorized-key-layering");
+        fs::write(
+            &path,
+            format!("schema_version = 1\n[ssh]\nauthorized_keys = [{configured:?}]\n"),
+        )
+        .unwrap();
+
+        let effective = load_effective_rootless_setup(&request(&[
+            "styrn",
+            "setup",
+            "--config",
+            path.to_str().unwrap(),
+            "--authorized-keys",
+            supplied,
+        ]))
+        .unwrap();
+
+        assert_eq!(effective.authorized_public_keys(), [supplied]);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn authorized_key_secret_shaped_comment_fails_as_config_input_without_echo() {
+        let secret_comment = "password=hunter2-hunter2";
+        let key = format!(
+            "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAABAgMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhscHR4f {secret_comment}"
+        );
+        let error =
+            load_effective_rootless_setup(&request(&["styrn", "setup", "--authorized-keys", &key]))
+                .unwrap_err();
+
+        assert!(matches!(error, SetupInputError::Config(_)));
+        assert!(!error.to_string().contains(secret_comment));
+    }
+
     fn request(values: &[&str]) -> crate::cli::SetupRequest {
         crate::cli::Cli::try_parse_with_facts(
             values.iter().map(OsString::from).collect(),

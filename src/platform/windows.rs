@@ -21,7 +21,7 @@ pub(super) fn baseline_probe_snapshot(
     tailscale_mode: &str,
 ) -> super::BaselineProbeSnapshot {
     match kind {
-        super::BaselineProbeKind::SshServer => ssh_server_snapshot(authorized_public_keys),
+        super::BaselineProbeKind::SshServer => ssh_server_snapshot(authorized_public_keys, true),
         super::BaselineProbeKind::Tailscale => tailscale_snapshot(tailscale_mode),
         super::BaselineProbeKind::Git => git_snapshot(),
         super::BaselineProbeKind::SleepPolicy => sleep_snapshot(),
@@ -31,7 +31,22 @@ pub(super) fn baseline_probe_snapshot(
     }
 }
 
-fn ssh_server_snapshot(required: &[String]) -> super::BaselineProbeSnapshot {
+pub(super) fn ssh_server_transport_snapshot() -> super::BaselineProbeSnapshot {
+    ssh_server_snapshot(&[], false)
+}
+
+#[allow(dead_code)] // Source-inclusion contract tests omit enrollment-card discovery.
+pub(super) fn verified_native_ssh_keyscan_path() -> io::Result<PathBuf> {
+    let path = baseline_system_directory()?
+        .join("OpenSSH")
+        .join("ssh-keyscan.exe");
+    Ok(hold_verified_system_executable(&path)?.path)
+}
+
+fn ssh_server_snapshot(
+    required: &[String],
+    require_authorized_keys: bool,
+) -> super::BaselineProbeSnapshot {
     let Ok(system) = baseline_system_directory() else {
         return super::BaselineProbeSnapshot::Unknowable;
     };
@@ -58,13 +73,19 @@ fn ssh_server_snapshot(required: &[String]) -> super::BaselineProbeSnapshot {
     let Some(config) = config else {
         return super::BaselineProbeSnapshot::Unknowable;
     };
+    let transport_healthy = service && config.public_key_authentication();
+    if !require_authorized_keys {
+        return super::BaselineProbeSnapshot::Present {
+            version: None,
+            healthy: transport_healthy,
+        };
+    }
     let Ok(profile) = current_profile_directory() else {
         return super::BaselineProbeSnapshot::Unknowable;
     };
     super::BaselineProbeSnapshot::Present {
         version: None,
-        healthy: service
-            && config.public_key_authentication()
+        healthy: transport_healthy
             && authorized_keys_are_ready(
                 &profile,
                 &principal,
@@ -1622,6 +1643,11 @@ fn current_local_app_data() -> io::Result<PathBuf> {
 #[allow(dead_code)] // Reached through the deferred T0.14 action integration.
 fn current_profile_directory() -> io::Result<PathBuf> {
     current_known_folder(&FOLDER_ID_PROFILE, "profile")
+}
+
+#[allow(dead_code)] // Source-inclusion tests omit current-user SSH setup actions.
+pub(super) fn current_user_ssh_directory() -> io::Result<PathBuf> {
+    Ok(current_profile_directory()?.join(".ssh"))
 }
 
 #[allow(dead_code)] // Independent native expectation for the platform contract test.
@@ -4009,6 +4035,19 @@ struct VerifiedAuthorizationExecutable {
 fn hold_verified_authorization_executable(
     executable: &Path,
 ) -> io::Result<VerifiedAuthorizationExecutable> {
+    let expected = std::fs::canonicalize(std::env::current_exe()?)?;
+    let verified = hold_verified_system_executable(executable)?;
+    if verified.path != expected {
+        return Err(permission_denied(
+            "setup authorization executable is not the current binary",
+        ));
+    }
+    Ok(verified)
+}
+
+fn hold_verified_system_executable(
+    executable: &Path,
+) -> io::Result<VerifiedAuthorizationExecutable> {
     use std::path::{Component, Prefix};
 
     let executable = std::fs::canonicalize(executable)?;
@@ -4021,11 +4060,6 @@ fn hold_verified_authorization_executable(
             "setup authorization executable must use a local drive path",
         ));
     }
-    if executable != std::fs::canonicalize(std::env::current_exe()?)? {
-        return Err(permission_denied(
-            "setup authorization executable is not the current binary",
-        ));
-    }
     let worker = resolve_current_worker_principal()?;
     let (file, information) = open_authorization_executable_handle(&executable)?;
     inspect_authorization_executable_acl(&file, &worker)?;
@@ -4035,9 +4069,9 @@ fn hold_verified_authorization_executable(
         inspect_authorization_ancestor_acl(ancestor, &worker)?;
         current = ancestor.parent();
     }
-    if executable != std::fs::canonicalize(std::env::current_exe()?)? {
+    if executable != std::fs::canonicalize(&executable)? {
         return Err(permission_denied(
-            "setup authorization executable changed during verification",
+            "system executable changed during verification",
         ));
     }
     Ok(VerifiedAuthorizationExecutable {

@@ -34,7 +34,8 @@ mod baseline;
 )))]
 #[allow(unused_imports)] // Task 3 consumes the Task 2 catalog and desired-state factory.
 pub(in crate::setup) use baseline::{
-    production_rootless_catalog, production_worker_doctor_catalog, rootless_baseline_desired_state,
+    production_rootless_catalog, production_rootless_ssh_readiness,
+    production_worker_doctor_catalog, rootless_baseline_desired_state,
 };
 
 pub(crate) use super::probe_values::{

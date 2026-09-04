@@ -81,6 +81,34 @@ fn non_terminal_enrollment_without_a_fingerprint_fails_with_a_flag_hint() {
 }
 
 #[test]
+fn first_enrollment_keeps_the_endpoint_distinct_from_the_manifest_name() {
+    let environment = IsolatedEnvironment::new("endpoint-and-name");
+    environment.install_transport_fixture();
+    let user =
+        environment.seed_controller_and_named_worker_manifests("friendly-worker", "worker.example");
+
+    let arguments = [
+        "--json".to_owned(),
+        "host".to_owned(),
+        "enroll".to_owned(),
+        "worker.example".to_owned(),
+        "--user".to_owned(),
+        user,
+        "--fingerprint".to_owned(),
+        VALID_FINGERPRINT.to_owned(),
+    ];
+    let enrolled = assert_json_success(&environment.run_owned(&arguments), "host enroll");
+
+    assert_eq!(enrolled["data"]["host"], "friendly-worker");
+    let inventory = fs::read_to_string(environment.config.join("inventory.toml")).unwrap();
+    assert!(inventory.contains("name = \"friendly-worker\""));
+    assert!(inventory.contains("host = \"worker.example\""));
+    let repeated = assert_json_success(&environment.run_owned(&arguments), "host enroll");
+    assert_eq!(repeated["data"]["host"], "friendly-worker");
+    assert_eq!(repeated["data"]["created"], false);
+}
+
+#[test]
 fn invalid_ssh_arguments_are_usage_errors_before_controller_state_or_tools() {
     let environment = IsolatedEnvironment::new("invalid-ssh-arguments");
     environment.install_transport_fixture();
@@ -635,7 +663,7 @@ fn public_exec_maps_remote_failure_and_redacts_secret_output_in_both_modes() {
 }
 
 #[test]
-fn fake_ssh_public_journey_preserves_argv_and_rejects_a_changed_host_key() {
+fn fake_ssh_public_transport_journey_accepts_a_valid_card_and_rejects_a_changed_host_key() {
     let environment = IsolatedEnvironment::new("fake-ssh-journey");
     environment.install_transport_fixture();
     let user = environment.seed_controller_and_worker_manifests();
@@ -663,16 +691,15 @@ fn fake_ssh_public_journey_preserves_argv_and_rejects_a_changed_host_key() {
         "controller public identity was not created"
     );
 
-    let enroll_arguments = [
-        "--json".to_owned(),
-        "host".to_owned(),
-        "enroll".to_owned(),
-        "worker.example".to_owned(),
-        "--user".to_owned(),
-        user,
-        "--fingerprint".to_owned(),
-        VALID_FINGERPRINT.to_owned(),
-    ];
+    let enrollment_card =
+        format!("styrn host enroll worker.example --user {user} --fingerprint {VALID_FINGERPRINT}");
+    let mut enroll_arguments = vec!["--json".to_owned()];
+    enroll_arguments.extend(
+        enrollment_card
+            .split_ascii_whitespace()
+            .skip(1)
+            .map(str::to_owned),
+    );
     let enroll = environment.run_owned(&enroll_arguments);
     let enrolled = assert_json_success(&enroll, "host enroll");
     assert_eq!(enrolled["data"]["machine_id"], WORKER_ID, "{enroll:?}");
@@ -1015,6 +1042,14 @@ impl IsolatedEnvironment {
     }
 
     fn seed_controller_and_worker_manifests(&self) -> String {
+        self.seed_controller_and_named_worker_manifests("worker.example", "worker.example")
+    }
+
+    fn seed_controller_and_named_worker_manifests(
+        &self,
+        worker_name: &str,
+        worker_host: &str,
+    ) -> String {
         let principal = platform::resolve_current_worker_principal()
             .expect("phase 1 CLI tests require a real non-privileged caller");
         let worker_root = isolated_worker_root(self, &principal);
@@ -1028,9 +1063,9 @@ impl IsolatedEnvironment {
         );
         let worker = manifest_for(
             WORKER_ID,
-            "worker.example",
+            worker_name,
             &["worker"],
-            Some(("worker.example", principal.name())),
+            Some((worker_host, principal.name())),
             &worker_root,
             &principal,
         );

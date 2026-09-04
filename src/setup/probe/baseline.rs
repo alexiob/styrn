@@ -14,6 +14,7 @@ struct BaselineProbe {
     kind: crate::platform::BaselineProbeKind,
     authorized_public_keys: Vec<String>,
     tailscale_mode: String,
+    rootless_setup: bool,
 }
 
 impl worker_probe_only::Sealed for BaselineProbe {}
@@ -25,11 +26,19 @@ impl WorkerProbe for BaselineProbe {
 
     fn observe(&self) -> Result<ProbeStatus, ProbeFailure> {
         Ok(
-            match crate::platform::baseline_probe_snapshot(
-                self.kind,
-                &self.authorized_public_keys,
-                &self.tailscale_mode,
-            ) {
+            match if self.rootless_setup {
+                crate::platform::rootless_setup_baseline_probe_snapshot(
+                    self.kind,
+                    &self.authorized_public_keys,
+                    &self.tailscale_mode,
+                )
+            } else {
+                crate::platform::baseline_probe_snapshot(
+                    self.kind,
+                    &self.authorized_public_keys,
+                    &self.tailscale_mode,
+                )
+            } {
                 crate::platform::BaselineProbeSnapshot::Absent => ProbeStatus::Absent,
                 crate::platform::BaselineProbeSnapshot::Present { version, healthy } => {
                     ProbeStatus::Present { version, healthy }
@@ -79,10 +88,26 @@ pub(in crate::setup) fn production_rootless_catalog(
                 kind: probe_kind(component),
                 authorized_public_keys: effective.authorized_public_keys().to_vec(),
                 tailscale_mode: effective.requested_tailscale_mode().to_owned(),
+                rootless_setup: true,
             }) as Box<dyn WorkerProbe>
         })
         .collect();
     ProbeCatalog::new(probes)
+}
+
+/// Re-checks the one SSH capability that setup may have changed, including
+/// the exact controller keys supplied for this run.
+pub(in crate::setup) fn production_rootless_ssh_readiness(
+    effective: &EffectiveRootlessSetup,
+) -> Result<ProbeStatus, ProbeFailure> {
+    BaselineProbe {
+        descriptor: descriptor("ssh-server"),
+        kind: crate::platform::BaselineProbeKind::SshServer,
+        authorized_public_keys: effective.authorized_public_keys().to_vec(),
+        tailscale_mode: effective.requested_tailscale_mode().to_owned(),
+        rootless_setup: false,
+    }
+    .observe()
 }
 
 pub(in crate::setup) fn production_worker_doctor_catalog(
@@ -164,6 +189,7 @@ pub(in crate::setup) fn production_worker_doctor_catalog(
                 kind: probe_kind(component),
                 authorized_public_keys: vec![authorized_public_key.to_owned()],
                 tailscale_mode: tailscale_mode.to_owned(),
+                rootless_setup: false,
             }) as Box<dyn WorkerProbe>
         })
         .collect();
@@ -263,6 +289,87 @@ mod tests {
     use super::*;
     use crate::platform::{self, BaselineProbeKind, BaselineProbeSnapshot};
     use crate::setup::{action::ActionCheck, plan::SetupPlan};
+    use std::ffi::OsString;
+
+    const CONTROLLER_KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAABAgMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhscHR4f controller";
+
+    #[test]
+    fn rootless_setup_probes_ssh_transport_separately_when_it_will_install_the_keys() {
+        platform::set_baseline_probe_snapshots_for_test([(
+            BaselineProbeKind::SshServer,
+            BaselineProbeSnapshot::Present {
+                version: None,
+                healthy: false,
+            },
+        )]);
+        platform::set_rootless_ssh_transport_probe_snapshot_for_test(
+            BaselineProbeSnapshot::Present {
+                version: None,
+                healthy: true,
+            },
+        );
+        let parsed = crate::cli::Cli::try_parse_with_facts(
+            [
+                OsString::from("styrn"),
+                OsString::from("setup"),
+                OsString::from("--authorized-keys"),
+                OsString::from(CONTROLLER_KEY),
+            ]
+            .into(),
+            crate::cli::CliFacts::for_test(false, false, false),
+        )
+        .unwrap();
+        let effective =
+            crate::setup::load_effective_rootless_setup(&parsed.setup_request().unwrap()).unwrap();
+
+        let observed = production_rootless_catalog(&effective).unwrap().observe();
+        assert!(matches!(
+            observed
+                .get(&probe_id_for_test("service.sshd"))
+                .unwrap()
+                .status(),
+            ProbeStatus::Present { healthy: true, .. }
+        ));
+        platform::clear_baseline_probe_snapshots_for_test();
+        platform::clear_rootless_ssh_transport_probe_snapshot_for_test();
+    }
+
+    #[test]
+    fn final_rootless_ssh_readiness_requires_the_supplied_keys() {
+        platform::set_baseline_probe_snapshots_for_test([(
+            BaselineProbeKind::SshServer,
+            BaselineProbeSnapshot::Present {
+                version: None,
+                healthy: false,
+            },
+        )]);
+        platform::set_rootless_ssh_transport_probe_snapshot_for_test(
+            BaselineProbeSnapshot::Present {
+                version: None,
+                healthy: true,
+            },
+        );
+        let parsed = crate::cli::Cli::try_parse_with_facts(
+            [
+                OsString::from("styrn"),
+                OsString::from("setup"),
+                OsString::from("--authorized-keys"),
+                OsString::from(CONTROLLER_KEY),
+            ]
+            .into(),
+            crate::cli::CliFacts::for_test(false, false, false),
+        )
+        .unwrap();
+        let effective =
+            crate::setup::load_effective_rootless_setup(&parsed.setup_request().unwrap()).unwrap();
+
+        assert!(matches!(
+            production_rootless_ssh_readiness(&effective).ok().unwrap(),
+            ProbeStatus::Present { healthy: false, .. }
+        ));
+        platform::clear_baseline_probe_snapshots_for_test();
+        platform::clear_rootless_ssh_transport_probe_snapshot_for_test();
+    }
 
     #[test]
     fn rootless_baseline_catalog_is_closed_unique_and_canonical_ordered() {

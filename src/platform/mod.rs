@@ -601,6 +601,8 @@ std::thread_local! {
     static BASELINE_PROBE_SNAPSHOTS: std::cell::RefCell<
         std::collections::HashMap<BaselineProbeKind, BaselineProbeSnapshot>
     > = std::cell::RefCell::new(std::collections::HashMap::new());
+    static ROOTLESS_SSH_TRANSPORT_PROBE_SNAPSHOT: std::cell::RefCell<Option<BaselineProbeSnapshot>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(test)]
@@ -615,6 +617,18 @@ pub(crate) fn set_baseline_probe_snapshots_for_test(
 #[allow(dead_code)] // Some source-inclusion tests compile platform tests without setup probes.
 pub(crate) fn clear_baseline_probe_snapshots_for_test() {
     BASELINE_PROBE_SNAPSHOTS.with(|slot| slot.borrow_mut().clear());
+}
+
+#[cfg(test)]
+#[allow(dead_code)] // Source-inclusion tests omit the rootless setup probe catalog.
+pub(crate) fn set_rootless_ssh_transport_probe_snapshot_for_test(snapshot: BaselineProbeSnapshot) {
+    ROOTLESS_SSH_TRANSPORT_PROBE_SNAPSHOT.with(|slot| *slot.borrow_mut() = Some(snapshot));
+}
+
+#[cfg(test)]
+#[allow(dead_code)] // Source-inclusion tests omit the rootless setup probe catalog.
+pub(crate) fn clear_rootless_ssh_transport_probe_snapshot_for_test() {
+    ROOTLESS_SSH_TRANSPORT_PROBE_SNAPSHOT.with(|slot| *slot.borrow_mut() = None);
 }
 
 #[allow(dead_code)] // Source-inclusion contract tests omit the setup probe catalog.
@@ -632,6 +646,38 @@ pub(crate) fn baseline_probe_snapshot(
         BaselineProbeKind::Styrnd => BaselineProbeSnapshot::Absent,
         BaselineProbeKind::Deferred => BaselineProbeSnapshot::Unknowable,
         _ => platform_impl::baseline_probe_snapshot(kind, authorized_public_keys, tailscale_mode),
+    }
+}
+
+#[allow(dead_code)] // Source-inclusion contract tests omit the rootless setup catalog.
+pub(crate) fn rootless_setup_baseline_probe_snapshot(
+    kind: BaselineProbeKind,
+    authorized_public_keys: &[String],
+    tailscale_mode: &str,
+) -> BaselineProbeSnapshot {
+    if kind == BaselineProbeKind::SshServer && !authorized_public_keys.is_empty() {
+        #[cfg(test)]
+        if let Some(snapshot) =
+            ROOTLESS_SSH_TRANSPORT_PROBE_SNAPSHOT.with(|slot| slot.borrow().clone())
+        {
+            return snapshot;
+        }
+        return platform_impl::ssh_server_transport_snapshot();
+    }
+    baseline_probe_snapshot(kind, authorized_public_keys, tailscale_mode)
+}
+
+/// Resolves the fixed, OS-owned OpenSSH scanner used to mint an enrollment
+/// trust anchor. Unlike controller test seams, setup never searches `PATH`.
+#[allow(dead_code)] // Source-inclusion contract tests omit enrollment-card discovery.
+pub(crate) fn verified_native_ssh_keyscan_path() -> std::io::Result<PathBuf> {
+    #[cfg(unix)]
+    {
+        verify_setup_authorization_executable(&platform_impl::native_ssh_keyscan_path())
+    }
+    #[cfg(windows)]
+    {
+        platform_impl::verified_native_ssh_keyscan_path()
     }
 }
 
@@ -6694,7 +6740,7 @@ impl PrivatePublicationFile {
     }
 }
 
-#[allow(dead_code)] // Consumed by the T0.13 receipt durability follow-up.
+#[allow(dead_code)] // Some source-inclusion tests omit private publication consumers.
 impl CompletePrivatePublication {
     pub(crate) fn publish_no_replace(
         self,
@@ -6857,27 +6903,52 @@ pub(crate) fn create_private_publication_file(
     })
 }
 
-/// Validates the current-user directory that holds a controller SSH identity.
-///
-/// This is intentionally narrower than the manifest storage API: Task 2 is
-/// its sole consumer and needs the same no-link/owner/ACL ancestor checks
-/// before invoking OpenSSH with an identity path.
-#[allow(dead_code)] // Source-including manifest tests omit the controller identity module.
-pub(crate) fn verify_controller_identity_directory(
-    directory: &Path,
-) -> std::io::Result<WorkerPrincipal> {
-    let principal = resolve_current_worker_principal()?;
-    platform_impl::verify_manifest_parent_chain(directory, ManifestOwner::User, &principal)?;
-    platform_impl::verify_manifest_directory_security(directory, ManifestOwner::User, &principal)?;
-    Ok(principal)
+/// Resolves the invoking user's native OpenSSH directory without consulting a
+/// spoofable HOME/USERPROFILE environment value.
+#[allow(dead_code)] // Source-inclusion tests omit current-user SSH setup actions.
+pub(crate) fn current_user_ssh_directory(principal: &WorkerPrincipal) -> std::io::Result<PathBuf> {
+    if &resolve_current_worker_principal()? != principal {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "current-user SSH principal changed",
+        ));
+    }
+    let directory = platform_impl::current_user_ssh_directory()?;
+    if !directory.is_absolute()
+        || directory.file_name() != Some(std::ffi::OsStr::new(".ssh"))
+        || directory.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::CurDir | std::path::Component::ParentDir
+            )
+        })
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "native current-user SSH directory is invalid",
+        ));
+    }
+    Ok(directory)
 }
 
-/// Materializes the one current-user SSH identity directory without following
-/// or taking over an existing path, then returns the freshly verified caller.
-#[allow(dead_code)] // Source-including manifest tests omit the controller identity consumer.
-pub(crate) fn prepare_controller_identity_directory(
+pub(crate) fn verify_current_user_private_directory(
     directory: &Path,
-) -> std::io::Result<WorkerPrincipal> {
+    principal: &WorkerPrincipal,
+) -> std::io::Result<()> {
+    if &resolve_current_worker_principal()? != principal {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "current-user private directory principal changed",
+        ));
+    }
+    platform_impl::verify_manifest_parent_chain(directory, ManifestOwner::User, principal)?;
+    platform_impl::verify_manifest_directory_security(directory, ManifestOwner::User, principal)
+}
+
+pub(crate) fn prepare_current_user_private_directory(
+    directory: &Path,
+    principal: &WorkerPrincipal,
+) -> std::io::Result<()> {
     if !directory.is_absolute()
         || directory.file_name().is_none()
         || directory.components().any(|component| {
@@ -6890,27 +6961,32 @@ pub(crate) fn prepare_controller_identity_directory(
     {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            "controller identity directory is invalid",
+            "current-user private directory is invalid",
         ));
     }
-    let principal = resolve_current_worker_principal()?;
+    if &resolve_current_worker_principal()? != principal {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "current-user private directory principal changed",
+        ));
+    }
     let parent = directory.parent().ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
-            "controller identity directory has no parent",
+            "current-user private directory has no parent",
         )
     })?;
-    platform_impl::verify_manifest_parent_chain(parent, ManifestOwner::User, &principal)?;
+    platform_impl::verify_manifest_parent_chain(parent, ManifestOwner::User, principal)?;
     match std::fs::symlink_metadata(directory) {
         Ok(_) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
             match create_private_manifest_staging_directory(
                 directory,
                 ManifestOwner::User,
-                &principal,
+                principal,
             ) {
                 Ok(_) => {
-                    harden_manifest_directory(directory, ManifestOwner::User, &principal)?;
+                    harden_manifest_directory(directory, ManifestOwner::User, principal)?;
                     sync_parent_directory(parent)?;
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
@@ -6919,8 +6995,68 @@ pub(crate) fn prepare_controller_identity_directory(
         }
         Err(error) => return Err(error),
     }
-    platform_impl::verify_manifest_parent_chain(directory, ManifestOwner::User, &principal)?;
-    platform_impl::verify_manifest_directory_security(directory, ManifestOwner::User, &principal)?;
+    verify_current_user_private_directory(directory, principal)
+}
+
+/// Exclusively creates a current-user private directory for an action that
+/// will journal ownership of that exact creation. A concurrent creator is an
+/// error, never an adopted `CreatedDirectoryEffect`.
+#[allow(dead_code)] // Source-inclusion tests omit current-user SSH setup actions.
+pub(crate) fn create_current_user_private_directory_exclusive(
+    directory: &Path,
+    principal: &WorkerPrincipal,
+) -> std::io::Result<()> {
+    if !directory.is_absolute()
+        || directory.file_name().is_none()
+        || directory.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::CurDir | std::path::Component::ParentDir
+            )
+        })
+        || directory.components().collect::<PathBuf>().as_os_str() != directory.as_os_str()
+        || &resolve_current_worker_principal()? != principal
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "current-user private directory creation is invalid",
+        ));
+    }
+    let parent = directory.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "current-user private directory has no parent",
+        )
+    })?;
+    platform_impl::verify_manifest_parent_chain(parent, ManifestOwner::User, principal)?;
+    create_private_manifest_staging_directory(directory, ManifestOwner::User, principal)?;
+    harden_manifest_directory(directory, ManifestOwner::User, principal)?;
+    sync_parent_directory(parent)?;
+    verify_current_user_private_directory(directory, principal)
+}
+
+/// Validates the current-user directory that holds a controller SSH identity.
+///
+/// This is intentionally narrower than the manifest storage API: Task 2 is
+/// its sole consumer and needs the same no-link/owner/ACL ancestor checks
+/// before invoking OpenSSH with an identity path.
+#[allow(dead_code)] // Source-including manifest tests omit the controller identity module.
+pub(crate) fn verify_controller_identity_directory(
+    directory: &Path,
+) -> std::io::Result<WorkerPrincipal> {
+    let principal = resolve_current_worker_principal()?;
+    verify_current_user_private_directory(directory, &principal)?;
+    Ok(principal)
+}
+
+/// Materializes the one current-user SSH identity directory without following
+/// or taking over an existing path, then returns the freshly verified caller.
+#[allow(dead_code)] // Source-including manifest tests omit the controller identity consumer.
+pub(crate) fn prepare_controller_identity_directory(
+    directory: &Path,
+) -> std::io::Result<WorkerPrincipal> {
+    let principal = resolve_current_worker_principal()?;
+    prepare_current_user_private_directory(directory, &principal)?;
     Ok(principal)
 }
 

@@ -1,5 +1,8 @@
 use crate::platform;
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+use base64::{
+    engine::general_purpose::{STANDARD_NO_PAD, URL_SAFE_NO_PAD},
+    Engine as _,
+};
 use chrono::{DateTime, FixedOffset};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -228,7 +231,7 @@ manifest_types! {
     ResourcePolicy { reserved_memory_bytes: Option<u64>, reserved_disk_bytes: Option<u64>, reserved_disk_percent: Option<u8>, reserved_cpus: Option<u64>, max_parallel_compile_jobs: Option<u64>, max_parallel_test_jobs: Option<u64>, max_heavy_jobs: Option<u64>, max_job_disk_bytes: Option<u64> }
     Scheduling { priority: Option<i64>, prefer_remote_workers: Option<bool> }
     Tailscale { installed: Option<bool>, mode: Option<TailscaleMode>, unattended: Option<bool> }
-    Ssh { installed: Option<bool>, server: Option<bool>, public_key_auth: Option<bool> }
+    Ssh { installed: Option<bool>, server: Option<bool>, public_key_auth: Option<bool>, host_key_fingerprint: Option<String> }
     Herdr { installed: Option<bool>, enabled: Option<bool>, session: Option<String>, autostart: Option<String> }
     Agent { installed: Option<bool>, command: Option<String>, sandbox: Option<String>, shell: Option<String> }
     Toolchain { installed: Option<bool>, host: Option<String>, version: Option<String> }
@@ -903,6 +906,25 @@ impl MachineManifest {
             }
             if let Some(user) = &transport.user {
                 non_empty("transport.user", user)?;
+            }
+        }
+        if let Some(fingerprint) = self
+            .ssh
+            .as_ref()
+            .and_then(|ssh| ssh.host_key_fingerprint.as_deref())
+        {
+            let encoded = fingerprint.strip_prefix("SHA256:").ok_or_else(|| {
+                ManifestError::Validation(
+                    "ssh.host_key_fingerprint must be a canonical SHA256 fingerprint".to_owned(),
+                )
+            })?;
+            let digest = STANDARD_NO_PAD.decode(encoded).map_err(|_| {
+                ManifestError::Validation(
+                    "ssh.host_key_fingerprint must be a canonical SHA256 fingerprint".to_owned(),
+                )
+            })?;
+            if digest.len() != 32 || STANDARD_NO_PAD.encode(digest) != encoded {
+                return invalid("ssh.host_key_fingerprint must be a canonical SHA256 fingerprint");
             }
         }
         if let Some(resources) = &self.resources {

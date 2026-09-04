@@ -972,6 +972,9 @@ fn requested_action(action: &Action) -> RequestedAction {
         Action::DedicatedAccountPrerequisite(_) => unreachable!(
             "non-privileged dedicated-account prerequisites cannot enter authorization requests"
         ),
+        Action::CurrentUserSsh(_) => {
+            unreachable!("current-user SSH actions cannot enter authorization requests")
+        }
         Action::WorkerDirectory(worker_action) => {
             let super::ActionParameters::WorkerDirectory(parameters) = worker_action.parameters()
             else {

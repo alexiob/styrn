@@ -73,6 +73,71 @@ fn worker_directory_receipt_value() -> serde_json::Value {
     })
 }
 
+fn current_user_ssh_receipt_value(action_id: &str) -> serde_json::Value {
+    #[cfg(not(target_os = "windows"))]
+    let (principal_kind, principal_id, directory) = ("unix-uid", "501", "/home/alex/.ssh");
+    #[cfg(target_os = "windows")]
+    let (principal_kind, principal_id, directory) =
+        ("windows-sid", "S-1-5-21-1-2-3-1001", r"C:\Users\alex\.ssh");
+    let path = if action_id == "ssh.directory" {
+        directory.to_owned()
+    } else {
+        Path::new(directory)
+            .join("authorized_keys")
+            .to_string_lossy()
+            .into_owned()
+    };
+    let (directories_created, files_created, files_modified) = if action_id == "ssh.directory" {
+        (
+            serde_json::json!([{ "path": path }]),
+            serde_json::json!([]),
+            serde_json::json!([]),
+        )
+    } else {
+        (
+            serde_json::json!([]),
+            serde_json::json!([{
+                "path": path,
+                "sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            }]),
+            serde_json::json!([]),
+        )
+    };
+
+    serde_json::json!({
+        "schema_version": 1,
+        "installation_scope": "user",
+        "entries": [{
+            "entry_id": "019cafd0-5c00-7000-8000-000000000001",
+            "action": {
+                "type": "current_user_ssh",
+                "parameters": {
+                    "action_id": action_id,
+                    "principal": {
+                        "account_policy": "current-user",
+                        "principal_kind": principal_kind,
+                        "principal_id": principal_id,
+                        "name": "alex"
+                    },
+                    "directory": directory,
+                    "path": path
+                }
+            },
+            "timestamp": "2026-09-02T10:00:00Z",
+            "privilege_used": "none",
+            "directories_created": directories_created,
+            "files_created": files_created,
+            "files_modified": files_modified,
+            "services": [],
+            "accounts": [],
+            "registry_keys": [],
+            "firewall_rules": [],
+            "download_provenance": null,
+            "status": "applied"
+        }]
+    })
+}
+
 fn dedicated_account_prerequisite_receipt_value() -> serde_json::Value {
     serde_json::json!({
         "schema_version": 1,
@@ -363,6 +428,83 @@ fn worker_directory_receipt_round_trips_closed_parameters_and_directory_effect()
         serialized["entries"][0]["directories_created"],
         serde_json::json!([{ "path": value["entries"][0]["action"]["parameters"]["path"] }])
     );
+}
+
+#[test]
+fn current_user_ssh_receipt_round_trips_exact_principal_path_and_action_effect() {
+    let value = current_user_ssh_receipt_value("ssh.authorized-keys");
+    let document = ReceiptDocument::from_json(&serde_json::to_vec(&value).unwrap()).unwrap();
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&document.to_json().unwrap()).unwrap(),
+        value
+    );
+
+    let schema: serde_json::Value = serde_json::from_str(include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/schemas/setup-receipt-v1.schema.json"
+    )))
+    .unwrap();
+    assert!(jsonschema::validator_for(&schema).unwrap().is_valid(&value));
+}
+
+#[test]
+fn current_user_ssh_receipt_rejects_generic_or_detached_parameters_and_effects() {
+    let base = current_user_ssh_receipt_value("ssh.authorized-keys");
+    let mut cases = Vec::new();
+
+    let mut generic = base.clone();
+    generic["entries"][0]["action"] = serde_json::json!({
+        "type": "foundation",
+        "parameters": { "action_id": "ssh.authorized-keys" }
+    });
+    cases.push(("generic action", generic));
+
+    let mut wrong_action = base.clone();
+    wrong_action["entries"][0]["action"]["parameters"]["action_id"] =
+        serde_json::json!("ssh.directory");
+    cases.push(("wrong action", wrong_action));
+
+    let mut wrong_policy = base.clone();
+    wrong_policy["entries"][0]["action"]["parameters"]["principal"]["account_policy"] =
+        serde_json::json!("dedicated");
+    cases.push(("wrong principal policy", wrong_policy));
+
+    let mut detached_path = base.clone();
+    #[cfg(not(target_os = "windows"))]
+    let outside = "/home/alex/authorized_keys";
+    #[cfg(target_os = "windows")]
+    let outside = r"C:\Users\alex\authorized_keys";
+    detached_path["entries"][0]["action"]["parameters"]["path"] = serde_json::json!(outside);
+    detached_path["entries"][0]["files_created"][0]["path"] = serde_json::json!(outside);
+    cases.push(("detached path", detached_path));
+
+    let mut detached_effect = base.clone();
+    detached_effect["entries"][0]["files_created"][0]["path"] =
+        detached_effect["entries"][0]["action"]["parameters"]["directory"].clone();
+    cases.push(("detached effect", detached_effect));
+
+    for (label, value) in cases {
+        assert!(
+            ReceiptDocument::from_json(&serde_json::to_vec(&value).unwrap()).is_err(),
+            "current-user SSH receipt accepted {label}"
+        );
+    }
+
+    let directory = current_user_ssh_receipt_value("ssh.directory");
+    ReceiptDocument::from_json(&serde_json::to_vec(&directory).unwrap()).unwrap();
+
+    let mut pending = current_user_ssh_receipt_value("ssh.authorized-keys");
+    pending["entries"][0]["status"] = serde_json::json!("pending");
+    pending["entries"][0]["files_created"] = serde_json::json!([]);
+    ReceiptDocument::from_json(&serde_json::to_vec(&pending).unwrap()).unwrap();
+    let schema: serde_json::Value = serde_json::from_str(include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/schemas/setup-receipt-v1.schema.json"
+    )))
+    .unwrap();
+    assert!(jsonschema::validator_for(&schema)
+        .unwrap()
+        .is_valid(&pending));
 }
 
 #[test]

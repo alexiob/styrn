@@ -80,6 +80,7 @@ pub(crate) struct SetupRequest {
     name: Option<String>,
     account: Option<String>,
     install: Option<String>,
+    authorized_keys: Vec<String>,
     config: Option<PathBuf>,
     interactive: bool,
     yes: bool,
@@ -107,6 +108,9 @@ impl SetupRequest {
     }
     pub(crate) fn install(&self) -> Option<&str> {
         self.install.as_deref()
+    }
+    pub(crate) fn authorized_keys(&self) -> &[String] {
+        &self.authorized_keys
     }
     pub(crate) fn config(&self) -> Option<&std::path::Path> {
         self.config.as_deref()
@@ -216,6 +220,7 @@ impl ParsedCli {
             name: setup.name.clone(),
             account: setup.account.clone(),
             install: setup.install.clone(),
+            authorized_keys: setup.authorized_keys.clone(),
             config: setup.config.clone(),
             interactive: setup.interactive,
             yes: setup.yes,
@@ -1163,9 +1168,11 @@ struct SetupArgs {
     account: Option<String>,
     #[arg(long)]
     install: Option<String>,
+    #[arg(long, num_args = 1.., value_name = "K")]
+    authorized_keys: Vec<String>,
     #[arg(long)]
     config: Option<PathBuf>,
-    #[arg(long, conflicts_with_all = ["config", "role", "scope", "name", "account", "install", "yes", "no_elevate", "authorize_system", "dry_run", "emit_script", "uninstall", "json"])]
+    #[arg(long, conflicts_with_all = ["config", "role", "scope", "name", "account", "install", "authorized_keys", "yes", "no_elevate", "authorize_system", "dry_run", "emit_script", "uninstall", "json"])]
     interactive: bool,
     #[arg(long)]
     yes: bool,
@@ -1370,6 +1377,38 @@ mod tests {
         .is_err());
         assert!(Cli::try_parse_with_terminals(
             args(["styrn", "setup", "--scope", "machine"]),
+            false,
+            false,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn setup_accepts_the_canonical_plural_controller_key_surface() {
+        let first = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAABAgMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhscHR4f first";
+        let second = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAABAgMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhscHR4f second";
+
+        let parsed = Cli::try_parse_with_terminals(
+            args([
+                "styrn",
+                "setup",
+                "--authorized-keys",
+                first,
+                second,
+                "--yes",
+            ]),
+            false,
+            false,
+        )
+        .unwrap();
+        let super::RootCommand::Setup(setup) = parsed.cli.command else {
+            panic!("setup command expected")
+        };
+
+        assert_eq!(setup.authorized_keys, [first, second]);
+        assert!(setup.yes);
+        assert!(Cli::try_parse_with_terminals(
+            args(["styrn", "setup", "--authorized-key", first]),
             false,
             false,
         )

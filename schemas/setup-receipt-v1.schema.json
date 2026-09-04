@@ -69,6 +69,28 @@
             "contains": {
               "properties": {
                 "action": {
+                  "properties": { "type": { "const": "current_user_ssh" } },
+                  "required": ["type"]
+                }
+              },
+              "required": ["action"]
+            }
+          }
+        },
+        "required": ["entries"]
+      },
+      "then": {
+        "properties": { "installation_scope": { "const": "user" } },
+        "required": ["installation_scope"]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "entries": {
+            "contains": {
+              "properties": {
+                "action": {
                   "properties": { "type": { "const": "deferred_system_action" } },
                   "required": ["type"]
                 }
@@ -328,6 +350,70 @@
           "if": {
             "properties": {
               "action": {
+                "properties": { "type": { "const": "current_user_ssh" } },
+                "required": ["type"]
+              }
+            },
+            "required": ["action"]
+          },
+          "then": {
+            "properties": {
+              "privilege_used": { "const": "none" },
+              "services": { "maxItems": 0 },
+              "accounts": { "maxItems": 0 },
+              "registry_keys": { "maxItems": 0 },
+              "firewall_rules": { "maxItems": 0 },
+              "download_provenance": { "type": "null" }
+            },
+            "allOf": [
+              {
+                "if": {
+                  "properties": { "status": { "const": "pending" } },
+                  "required": ["status"]
+                },
+                "else": {
+                  "properties": { "status": { "const": "applied" } },
+                  "allOf": [
+                    {
+                      "if": {
+                        "properties": {
+                          "action": {
+                            "properties": {
+                              "parameters": {
+                                "properties": { "action_id": { "const": "ssh.directory" } },
+                                "required": ["action_id"]
+                              }
+                            },
+                            "required": ["parameters"]
+                          }
+                        },
+                        "required": ["action"]
+                      },
+                      "then": {
+                        "properties": {
+                          "directories_created": { "minItems": 1, "maxItems": 1 },
+                          "files_created": { "maxItems": 0 },
+                          "files_modified": { "maxItems": 0 }
+                        }
+                      },
+                      "else": {
+                        "properties": {
+                          "directories_created": { "maxItems": 0 },
+                          "files_created": { "minItems": 1, "maxItems": 1 },
+                          "files_modified": { "maxItems": 0 }
+                        }
+                      }
+                    }
+                  ]
+                }
+              }
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "action": {
                 "properties": { "type": { "const": "deferred_system_action" } },
                 "required": ["type"]
               }
@@ -379,6 +465,7 @@
     "action": {
       "oneOf": [
         { "$ref": "#/$defs/foundationAction" },
+        { "$ref": "#/$defs/currentUserSshAction" },
         { "$ref": "#/$defs/dedicatedAccountPrerequisiteAction" },
         { "$ref": "#/$defs/deferredSystemAction" },
         { "$ref": "#/$defs/scopePromotionAction" },
@@ -396,7 +483,39 @@
           "required": ["action_id"],
           "additionalProperties": false,
           "properties": {
-            "action_id": { "$ref": "#/$defs/actionIdentifier" }
+            "action_id": {
+              "allOf": [
+                { "$ref": "#/$defs/actionIdentifier" },
+                { "not": { "enum": ["ssh.directory", "ssh.authorized-keys"] } }
+              ]
+            }
+          }
+        }
+      }
+    },
+    "currentUserSshAction": {
+      "type": "object",
+      "required": ["type", "parameters"],
+      "additionalProperties": false,
+      "properties": {
+        "type": { "const": "current_user_ssh" },
+        "parameters": {
+          "type": "object",
+          "required": ["action_id", "principal", "directory", "path"],
+          "additionalProperties": false,
+          "properties": {
+            "action_id": { "enum": ["ssh.directory", "ssh.authorized-keys"] },
+            "principal": {
+              "allOf": [
+                { "$ref": "#/$defs/workerPrincipal" },
+                {
+                  "properties": { "account_policy": { "const": "current-user" } },
+                  "required": ["account_policy"]
+                }
+              ]
+            },
+            "directory": { "$ref": "#/$defs/absolutePath" },
+            "path": { "$ref": "#/$defs/absolutePath" }
           }
         }
       }

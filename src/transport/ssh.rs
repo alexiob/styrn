@@ -179,6 +179,26 @@ impl SshTransport {
         PinnedHostKey::select_scan(&output.stdout, fingerprint)
     }
 
+    pub(crate) fn scan_host_key_for_setup(
+        &self,
+        host: &str,
+        port: u16,
+        fingerprint: Option<&str>,
+    ) -> Result<PinnedHostKey, TransportError> {
+        let arguments = ssh_keyscan_arguments(host, port)?;
+        let output = run_bounded_tool_with_environment(
+            &self.keyscan,
+            &arguments,
+            TOOL_TIMEOUT,
+            MAX_KEYSCAN_BYTES,
+            ToolEnvironment::Clean,
+        )?;
+        if !output.status.success() {
+            return Err(TransportError::unreachable());
+        }
+        PinnedHostKey::select_scan(&output.stdout, fingerprint)
+    }
+
     pub(crate) fn verify_host_key(&self, target: &RpcTarget) -> Result<(), TransportError> {
         let arguments = ssh_keyscan_arguments(target.host(), target.port())?;
         let output = run_bounded_tool(&self.keyscan, &arguments, TOOL_TIMEOUT, MAX_KEYSCAN_BYTES)?;
@@ -363,9 +383,47 @@ fn run_bounded_tool(
     timeout: Duration,
     stdout_limit: usize,
 ) -> Result<ToolOutput, TransportError> {
-    let mut child = Command::new(executable)
-        .args(arguments)
-        .env_remove("STYRN_JSON")
+    run_bounded_tool_with_environment(
+        executable,
+        arguments,
+        timeout,
+        stdout_limit,
+        ToolEnvironment::Inherited,
+    )
+}
+
+#[derive(Clone, Copy)]
+enum ToolEnvironment {
+    Inherited,
+    Clean,
+}
+
+fn run_bounded_tool_with_environment(
+    executable: &Path,
+    arguments: &[String],
+    timeout: Duration,
+    stdout_limit: usize,
+    environment: ToolEnvironment,
+) -> Result<ToolOutput, TransportError> {
+    let mut command = Command::new(executable);
+    command.args(arguments);
+    match environment {
+        ToolEnvironment::Inherited => {
+            command.env_remove("STYRN_JSON");
+        }
+        ToolEnvironment::Clean => {
+            command.env_clear();
+            #[cfg(windows)]
+            if let Some(system_root) = executable
+                .parent()
+                .and_then(Path::parent)
+                .and_then(Path::parent)
+            {
+                command.env("SystemRoot", system_root);
+            }
+        }
+    }
+    let mut child = command
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -413,6 +471,45 @@ fn run_bounded_tool(
         return Err(TransportError::authentication());
     }
     Ok(ToolOutput { status, stdout })
+}
+
+#[cfg(all(test, unix))]
+mod setup_scanner_tests {
+    use super::{PinnedHostKey, SshTransport};
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn setup_host_key_scan_does_not_inherit_the_callers_environment() {
+        assert!(std::env::var_os("HOME").is_some());
+        let root = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join(format!("styrn-clean-keyscan-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&root).unwrap();
+        let scanner = root.join("ssh-keyscan");
+        std::fs::write(
+            &scanner,
+            b"#!/bin/sh\nif [ \"${HOME+x}\" = x ]; then exit 9; fi\nprintf '%s\\n' 'worker.example ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAABAgMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhscHR4f'\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&scanner, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let transport = SshTransport::new(root.join("unused"), scanner, root.join("known_hosts"));
+
+        assert!(transport.scan_host_key("worker.example", 22, None).is_err());
+        let key = transport
+            .scan_host_key_for_setup("worker.example", 22, None)
+            .unwrap();
+        assert_eq!(
+            key,
+            PinnedHostKey::from_parts(
+                "ssh-ed25519",
+                "AAAAC3NzaC1lZDI1NTE5AAAAIAABAgMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhscHR4f",
+                "SHA256:ZkAslGjFiUHdGf/WUL8rQvkib4PTvQatUV0OUQSncCA",
+            )
+            .unwrap()
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
 
 fn read_bounded(mut reader: impl Read, limit: usize) -> Result<(Vec<u8>, bool), TransportError> {

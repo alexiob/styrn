@@ -1,11 +1,14 @@
 use super::{
     action::{
-        self, Action, ActionCheck, ActionExecutionResult, ActionPlan, PendingSeverity,
-        PlanOperation, Privilege,
+        self, Action, ActionCheck, ActionDescription, ActionExecutionResult, ActionName,
+        ActionPlan, PendingSeverity, PlanOperation, Privilege,
     },
     pending::{self, PendingPolicy},
     plan::SetupPlan,
-    probe::{self, production_rootless_catalog, rootless_baseline_desired_state, ProbeStatus},
+    probe::{
+        self, production_rootless_catalog, production_rootless_ssh_readiness,
+        rootless_baseline_desired_state, ProbeStatus,
+    },
     receipt::{configured_receipt_store, ReceiptMetadataSource, ReceiptStore},
     EffectiveRootlessSetup, ObservedState,
 };
@@ -13,7 +16,75 @@ use crate::{manifest, platform};
 use std::{collections::BTreeMap, fmt, path::Path};
 
 const CURRENT_USER_CAVEAT: &str = "Current-user mode provides no OS-account isolation, no controller-credential isolation, and no same-user Styrn-state integrity boundary.";
+const ENROLLMENT_INTEGRITY_GUIDANCE: &str = "Read this fingerprint from the worker's own console or another session you initiated; do not relay it through a channel you would not trust for host-key pinning.";
+const CONTROLLER_RECOVERY_GUIDANCE: &str = "If the controller has no identity, run `styrn controller init`; authorize its printed public key on this worker with `styrn setup --authorized-keys <public-key>`, then rerun setup.";
 const CONCURRENT_PUBLICATION_RETRIES: usize = 1;
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct EnrollmentCard {
+    name: String,
+    host: String,
+    user: String,
+    fingerprint: String,
+    command: String,
+}
+
+impl EnrollmentCard {
+    pub(crate) fn new(
+        name: &str,
+        host: &str,
+        user: &str,
+        port: u16,
+        host_key: &crate::transport::PinnedHostKey,
+    ) -> Result<Self, RootlessSetupError> {
+        if name.is_empty()
+            || name.len() > 255
+            || !super::validate_probe_static_text(name)
+            || port != 22
+            || crate::transport::validate_ssh_destination(host, user, port).is_err()
+        {
+            return Err(RootlessSetupError::PlanInvalid);
+        }
+        let fingerprint = host_key.fingerprint().to_owned();
+        crate::transport::validate_host_key_fingerprint(&fingerprint)
+            .map_err(|_| RootlessSetupError::PlanInvalid)?;
+        Ok(Self {
+            name: name.to_owned(),
+            host: host.to_owned(),
+            user: user.to_owned(),
+            command: format!("styrn host enroll {host} --user {user} --fingerprint {fingerprint}"),
+            fingerprint,
+        })
+    }
+
+    pub(crate) fn name(&self) -> &str {
+        &self.name
+    }
+
+    pub(crate) fn host(&self) -> &str {
+        &self.host
+    }
+
+    pub(crate) fn user(&self) -> &str {
+        &self.user
+    }
+
+    pub(crate) fn fingerprint(&self) -> &str {
+        &self.fingerprint
+    }
+
+    pub(crate) fn command(&self) -> &str {
+        &self.command
+    }
+
+    pub(crate) const fn integrity_guidance(&self) -> &'static str {
+        ENROLLMENT_INTEGRITY_GUIDANCE
+    }
+
+    pub(crate) const fn controller_recovery(&self) -> &'static str {
+        CONTROLLER_RECOVERY_GUIDANCE
+    }
+}
 
 pub(crate) struct RootlessSetupPlan {
     effective: EffectiveRootlessSetup,
@@ -22,6 +93,7 @@ pub(crate) struct RootlessSetupPlan {
     draft: manifest::MachineManifestDraft,
     receipt_store: ReceiptStore,
     manifest_store: manifest::MachineManifestStore,
+    candidate_host_key: CandidateHostKey,
 }
 
 impl fmt::Debug for RootlessSetupPlan {
@@ -105,6 +177,7 @@ pub(crate) struct RootlessSetupOutcome {
     receipt_path: std::path::PathBuf,
     security_caveat: &'static str,
     machine_id: uuid::Uuid,
+    enrollment_card: Option<EnrollmentCard>,
 }
 
 impl fmt::Debug for RootlessSetupOutcome {
@@ -117,6 +190,7 @@ impl fmt::Debug for RootlessSetupOutcome {
             .field("manifest", &self.manifest_path)
             .field("receipt", &self.receipt_path)
             .field("machine_id", &self.machine_id)
+            .field("enrollment_card", &self.enrollment_card)
             .finish()
     }
 }
@@ -154,6 +228,10 @@ impl RootlessSetupOutcome {
 
     pub(in crate::setup) const fn machine_id(&self) -> uuid::Uuid {
         self.machine_id
+    }
+
+    pub(crate) const fn enrollment_card(&self) -> Option<&EnrollmentCard> {
+        self.enrollment_card.as_ref()
     }
 }
 
@@ -300,7 +378,11 @@ pub(crate) fn prepare_rootless_setup(
         directory_actions,
         receipt_store,
         manifest_store,
-        CandidateLayout::Canonical,
+        RootlessSetupCandidates {
+            layout: CandidateLayout::Canonical,
+            ssh_directory: CandidateSshDirectory::Canonical,
+            host_key: CandidateHostKey::Discover,
+        },
     )
 }
 
@@ -341,8 +423,109 @@ pub(in crate::setup) fn prepare_rootless_setup_for_test(
         directory_actions,
         receipt_store,
         manifest_store,
-        CandidateLayout::Exact(Box::new(layout)),
+        RootlessSetupCandidates {
+            layout: CandidateLayout::Exact(Box::new(layout)),
+            ssh_directory: CandidateSshDirectory::Unavailable,
+            host_key: CandidateHostKey::Unavailable,
+        },
     )
+}
+
+#[cfg(test)]
+pub(in crate::setup) fn prepare_rootless_setup_for_test_with_ssh_directory(
+    effective: EffectiveRootlessSetup,
+    context: platform::SetupExecutionContext,
+    layout: platform::WorkerDirectoryLayout,
+    receipt_store: ReceiptStore,
+    manifest_store: manifest::MachineManifestStore,
+    ssh_directory: std::path::PathBuf,
+) -> Result<RootlessSetupPlan, RootlessSetupError> {
+    if context.original_principal() != layout.worker_principal() {
+        return Err(RootlessSetupError::ProbeFailed);
+    }
+    let (directory_actions, derived_layout) =
+        action::current_user_worker_directory_plan_for_orchestrator_test(
+            &context,
+            layout.root().to_path_buf(),
+            layout
+                .materialization_nodes()
+                .into_iter()
+                .find_map(|node| match node {
+                    platform::WorkerDirectoryNode::Support { .. } => layout
+                        .path_for_node(node)
+                        .and_then(|path| path.parent().map(Path::to_path_buf)),
+                    _ => None,
+                }),
+        )
+        .map_err(|_| RootlessSetupError::ProbeFailed)?;
+    if derived_layout != layout {
+        return Err(RootlessSetupError::ProbeFailed);
+    }
+    let principal = context.original_principal().clone();
+    prepare_resolved_rootless_setup(
+        effective,
+        principal,
+        directory_actions,
+        receipt_store,
+        manifest_store,
+        RootlessSetupCandidates {
+            layout: CandidateLayout::Exact(Box::new(layout)),
+            ssh_directory: CandidateSshDirectory::Exact(ssh_directory),
+            host_key: CandidateHostKey::Unavailable,
+        },
+    )
+}
+
+#[cfg(test)]
+pub(in crate::setup) fn prepare_rootless_setup_for_test_with_ssh_directory_and_host_key(
+    effective: EffectiveRootlessSetup,
+    context: platform::SetupExecutionContext,
+    layout: platform::WorkerDirectoryLayout,
+    receipt_store: ReceiptStore,
+    manifest_store: manifest::MachineManifestStore,
+    ssh_directory: std::path::PathBuf,
+    host_key: crate::transport::PinnedHostKey,
+) -> Result<RootlessSetupPlan, RootlessSetupError> {
+    if context.original_principal() != layout.worker_principal() {
+        return Err(RootlessSetupError::ProbeFailed);
+    }
+    let (directory_actions, derived_layout) =
+        action::current_user_worker_directory_plan_for_orchestrator_test(
+            &context,
+            layout.root().to_path_buf(),
+            layout
+                .materialization_nodes()
+                .into_iter()
+                .find_map(|node| match node {
+                    platform::WorkerDirectoryNode::Support { .. } => layout
+                        .path_for_node(node)
+                        .and_then(|path| path.parent().map(Path::to_path_buf)),
+                    _ => None,
+                }),
+        )
+        .map_err(|_| RootlessSetupError::ProbeFailed)?;
+    if derived_layout != layout {
+        return Err(RootlessSetupError::ProbeFailed);
+    }
+    let principal = context.original_principal().clone();
+    prepare_resolved_rootless_setup(
+        effective,
+        principal,
+        directory_actions,
+        receipt_store,
+        manifest_store,
+        RootlessSetupCandidates {
+            layout: CandidateLayout::Exact(Box::new(layout)),
+            ssh_directory: CandidateSshDirectory::Exact(ssh_directory),
+            host_key: CandidateHostKey::Exact(host_key),
+        },
+    )
+}
+
+struct RootlessSetupCandidates {
+    layout: CandidateLayout,
+    ssh_directory: CandidateSshDirectory,
+    host_key: CandidateHostKey,
 }
 
 enum CandidateLayout {
@@ -351,14 +534,69 @@ enum CandidateLayout {
     Exact(Box<platform::WorkerDirectoryLayout>),
 }
 
+enum CandidateSshDirectory {
+    Canonical,
+    #[cfg(test)]
+    Exact(std::path::PathBuf),
+    #[cfg(test)]
+    Unavailable,
+}
+
+#[derive(Clone)]
+enum CandidateHostKey {
+    Discover,
+    #[cfg(test)]
+    Exact(crate::transport::PinnedHostKey),
+    #[cfg(test)]
+    Unavailable,
+}
+
+impl CandidateHostKey {
+    fn discover(
+        &self,
+        host: &str,
+        port: u16,
+        expected_fingerprint: Option<&str>,
+    ) -> Option<crate::transport::PinnedHostKey> {
+        match self {
+            Self::Discover => {
+                let scanner = platform::verified_native_ssh_keyscan_path().ok()?;
+                crate::transport::SshTransport::new(
+                    std::path::PathBuf::from("unused"),
+                    scanner,
+                    std::path::PathBuf::from("unused"),
+                )
+                .scan_host_key_for_setup(host, port, expected_fingerprint)
+                .ok()
+            }
+            #[cfg(test)]
+            Self::Exact(host_key)
+                if expected_fingerprint
+                    .is_none_or(|expected| expected == host_key.fingerprint()) =>
+            {
+                Some(host_key.clone())
+            }
+            #[cfg(test)]
+            Self::Exact(_) => None,
+            #[cfg(test)]
+            Self::Unavailable => None,
+        }
+    }
+}
+
 fn prepare_resolved_rootless_setup(
     effective: EffectiveRootlessSetup,
     principal: platform::WorkerPrincipal,
     mut actions: ActionPlan,
     receipt_store: ReceiptStore,
     manifest_store: manifest::MachineManifestStore,
-    candidate_layout: CandidateLayout,
+    candidates: RootlessSetupCandidates,
 ) -> Result<RootlessSetupPlan, RootlessSetupError> {
+    let RootlessSetupCandidates {
+        layout: candidate_layout,
+        ssh_directory: candidate_ssh_directory,
+        host_key: candidate_host_key,
+    } = candidates;
     if receipt_store.installation_scope() != platform::InstallationScope::User
         || receipt_store.worker_principal() != &principal
         || manifest_store.installation_scope() != platform::InstallationScope::User
@@ -370,6 +608,11 @@ fn prepare_resolved_rootless_setup(
     let existing = manifest_store
         .read_optional_for_setup()
         .map_err(|_| RootlessSetupError::PlanInvalid)?;
+    let recorded_host_key_fingerprint = existing
+        .as_ref()
+        .and_then(|manifest| manifest.ssh.as_ref())
+        .and_then(|ssh| ssh.host_key_fingerprint.as_deref())
+        .map(str::to_owned);
     let catalog =
         production_rootless_catalog(&effective).map_err(|_| RootlessSetupError::ProbeFailed)?;
     let observed = catalog.observe();
@@ -378,6 +621,30 @@ fn prepare_resolved_rootless_setup(
     let capability_plan =
         SetupPlan::compute(&observed, &desired).map_err(|_| RootlessSetupError::PlanInvalid)?;
     let mut components = vec!["directories".to_owned(); actions.len()];
+    if !effective.authorized_public_keys().is_empty() {
+        let ssh_actions = match candidate_ssh_directory {
+            CandidateSshDirectory::Canonical => action::current_user_ssh_action_plan(
+                principal.clone(),
+                effective.authorized_public_keys(),
+            ),
+            #[cfg(test)]
+            CandidateSshDirectory::Exact(directory) => {
+                action::current_user_ssh_action_plan_for_test(
+                    principal.clone(),
+                    directory,
+                    effective.authorized_public_keys(),
+                )
+            }
+            #[cfg(test)]
+            CandidateSshDirectory::Unavailable => return Err(RootlessSetupError::PlanInvalid),
+        }
+        .map_err(|_| RootlessSetupError::PlanInvalid)?;
+        components.extend(std::iter::repeat_n(
+            "ssh-server".to_owned(),
+            ssh_actions.len(),
+        ));
+        actions.extend(ssh_actions);
+    }
     for (component, action) in capability_plan.into_component_actions() {
         components.push(component);
         actions.push(action);
@@ -396,6 +663,23 @@ fn prepare_resolved_rootless_setup(
         }
     }
     .map_err(|_| RootlessSetupError::PlanInvalid)?;
+    let draft = candidate.into_draft();
+    if !effective.authorized_public_keys().is_empty() || recorded_host_key_fingerprint.is_some() {
+        let transport = draft
+            .transport
+            .as_ref()
+            .ok_or(RootlessSetupError::PlanInvalid)?;
+        let port = transport.port.unwrap_or(22);
+        let discovery_pending = candidate_host_key
+            .discover(
+                &transport.host,
+                port,
+                recorded_host_key_fingerprint.as_deref(),
+            )
+            .is_none();
+        components.push("ssh-server".to_owned());
+        actions.push(enrollment_card_action(discovery_pending)?);
+    }
     receipt_store
         .read_snapshot()
         .map_err(map_receipt_preflight_error)?;
@@ -405,10 +689,133 @@ fn prepare_resolved_rootless_setup(
         effective,
         plan_items,
         actions,
-        draft: candidate.into_draft(),
+        draft,
         receipt_store,
         manifest_store,
+        candidate_host_key,
     })
+}
+
+fn enrollment_card_after_apply(
+    effective: &EffectiveRootlessSetup,
+    draft: &mut manifest::MachineManifestDraft,
+    candidate_host_key: &CandidateHostKey,
+) -> Option<EnrollmentCard> {
+    let readiness = production_rootless_ssh_readiness(effective).ok();
+    refresh_ssh_manifest(draft, readiness.as_ref());
+    if !matches!(readiness, Some(ProbeStatus::Present { healthy: true, .. })) {
+        return None;
+    }
+    let should_emit = !effective.authorized_public_keys().is_empty()
+        || draft
+            .ssh
+            .as_ref()
+            .and_then(|ssh| ssh.host_key_fingerprint.as_ref())
+            .is_some();
+    if !should_emit {
+        return None;
+    }
+    let transport = draft.transport.as_ref()?;
+    let host = transport.host.clone();
+    let user = transport.user.clone()?;
+    let port = transport.port.unwrap_or(22);
+    let expected_fingerprint = draft
+        .ssh
+        .as_ref()
+        .and_then(|ssh| ssh.host_key_fingerprint.as_deref());
+    let host_key = candidate_host_key.discover(&host, port, expected_fingerprint)?;
+    let card = EnrollmentCard::new(&draft.name, &host, &user, port, &host_key).ok()?;
+    let ssh = draft.ssh.as_mut()?;
+    ssh.host_key_fingerprint = Some(host_key.fingerprint().to_owned());
+    Some(card)
+}
+
+fn refresh_ssh_manifest(
+    draft: &mut manifest::MachineManifestDraft,
+    readiness: Option<&ProbeStatus>,
+) {
+    let Some(ssh) = draft.ssh.as_mut() else {
+        return;
+    };
+    match readiness {
+        Some(ProbeStatus::Present { healthy, .. }) => {
+            ssh.installed = Some(true);
+            ssh.server = Some(true);
+            ssh.public_key_auth = Some(*healthy);
+        }
+        Some(ProbeStatus::Absent) => {
+            ssh.installed = Some(false);
+            ssh.server = Some(false);
+            ssh.public_key_auth = Some(false);
+        }
+        Some(ProbeStatus::Broken { .. }) => {
+            ssh.installed = Some(true);
+            ssh.server = Some(true);
+            ssh.public_key_auth = Some(false);
+        }
+        Some(ProbeStatus::TailscalePresent { .. })
+        | Some(ProbeStatus::Unknowable { .. })
+        | None => {
+            ssh.installed = None;
+            ssh.server = None;
+            ssh.public_key_auth = None;
+        }
+    }
+}
+
+fn enrollment_card_action(pending: bool) -> Result<Action, RootlessSetupError> {
+    let action_id =
+        ActionName::parse("ssh.enrollment-card").map_err(|_| RootlessSetupError::PlanInvalid)?;
+    let description = if pending {
+        "Verify that the SSH server is listening locally, then rerun setup to record its host-key fingerprint and enrollment card."
+    } else {
+        "Verify and record the live SSH host key for the enrollment card."
+    };
+    let description =
+        ActionDescription::new(description).map_err(|_| RootlessSetupError::PlanInvalid)?;
+    Ok(Action::planned(
+        action_id,
+        description,
+        Privilege::None,
+        if pending {
+            PlanOperation::NeedsHuman
+        } else {
+            PlanOperation::Done
+        },
+    ))
+}
+
+fn reconcile_enrollment_card_action(
+    actions: &mut [Action],
+    plan_items: &mut [RootlessSetupPlanItem],
+    pending: bool,
+) -> Result<bool, RootlessSetupError> {
+    let Some(action) = actions
+        .iter_mut()
+        .find(|action| action.name().as_str() == "ssh.enrollment-card")
+    else {
+        return Ok(false);
+    };
+    let currently_pending = matches!(
+        action
+            .check()
+            .map_err(|_| RootlessSetupError::ProbeFailed)?,
+        ActionCheck::NeedsHuman(_)
+    );
+    if currently_pending == pending {
+        return Ok(false);
+    }
+    *action = enrollment_card_action(pending)?;
+    let item = plan_items
+        .iter_mut()
+        .find(|item| item.action_id() == "ssh.enrollment-card")
+        .ok_or(RootlessSetupError::PlanInvalid)?;
+    let check = action
+        .check()
+        .map_err(|_| RootlessSetupError::ProbeFailed)?;
+    item.operation = displayed_operation(action.plan_operation(), &check);
+    item.description = action.describe().as_str().to_owned();
+    Ok(true)
 }
 
 pub(crate) fn apply_rootless_setup(
@@ -416,17 +823,27 @@ pub(crate) fn apply_rootless_setup(
 ) -> Result<RootlessSetupOutcome, RootlessSetupError> {
     let RootlessSetupPlan {
         effective,
-        plan_items,
+        mut plan_items,
         mut actions,
         mut draft,
         receipt_store,
         manifest_store,
+        candidate_host_key,
     } = prepared;
     let fail_on_pending = effective.fail_on_pending();
     let mut metadata = ReceiptMetadataSource::system();
     let mut report = action::apply_plan_with_journal(&mut actions, &receipt_store, &mut metadata)
         .map_err(map_apply_error)?;
     let mut results = report.results().to_vec();
+    let enrollment_card = enrollment_card_after_apply(&effective, &mut draft, &candidate_host_key);
+    if reconcile_enrollment_card_action(&mut actions, &mut plan_items, enrollment_card.is_none())? {
+        report = action::apply_plan_with_journal(&mut actions, &receipt_store, &mut metadata)
+            .map_err(map_apply_error)?;
+        merge_action_results(&mut results, report.results());
+    }
+    // The card marker is virtual plan/pending state. It performs no standalone
+    // mutation, so do not present its journal transition as an execution result.
+    results.retain(|result| result.action_id() != "ssh.enrollment-card");
     let mut retry_count = 0;
     let machine_id = loop {
         match pending::publish_manifest(
@@ -467,6 +884,7 @@ pub(crate) fn apply_rootless_setup(
         receipt_path: receipt_store.path().to_path_buf(),
         security_caveat: CURRENT_USER_CAVEAT,
         machine_id,
+        enrollment_card,
     };
     let policy = PendingPolicy::new(fail_on_pending)
         .evaluate(chrono::Utc::now(), report.completion())
@@ -654,6 +1072,10 @@ fn rootless_manifest_base(
         .resources
         .take()
         .and_then(|resources| resources.policy);
+    let recorded_host_key_fingerprint = draft
+        .ssh
+        .as_ref()
+        .and_then(|ssh| ssh.host_key_fingerprint.clone());
     let logical_cpus = std::thread::available_parallelism()
         .ok()
         .and_then(|count| u64::try_from(count.get()).ok());
@@ -705,6 +1127,7 @@ fn rootless_manifest_base(
         installed: Some(probe_is_present(observed, "service.sshd")),
         server: Some(probe_is_present(observed, "service.sshd")),
         public_key_auth: Some(probe_is_healthy(observed, "service.sshd")),
+        host_key_fingerprint: recorded_host_key_fingerprint,
     });
     draft.tailscale = component_selected(effective, "tailscale").then(|| {
         let posture = observed_tailscale_posture(observed);
@@ -819,7 +1242,8 @@ mod tests {
         action::{ActionExecutionStatus, ActionParameters, Privilege},
         apply_rootless_setup,
         config::effective_from_interactive_answers,
-        prepare_rootless_setup_for_test, RootlessSetupError,
+        prepare_rootless_setup_for_test, prepare_rootless_setup_for_test_with_ssh_directory,
+        prepare_rootless_setup_for_test_with_ssh_directory_and_host_key, RootlessSetupError,
     };
     use crate::{manifest, platform};
     use std::{
@@ -933,6 +1357,25 @@ mod tests {
             crate::setup::load_effective_rootless_setup(&parsed.setup_request().unwrap()).unwrap()
         }
 
+        fn effective_with_authorized_key(&self) -> crate::setup::EffectiveRootlessSetup {
+            let parsed = crate::cli::Cli::try_parse_with_facts(
+                [
+                    OsString::from("styrn"),
+                    OsString::from("setup"),
+                    OsString::from("--authorized-keys"),
+                    OsString::from(VALID_CONTROLLER_KEY),
+                ]
+                .into(),
+                crate::cli::CliFacts::for_test(false, false, false),
+            )
+            .unwrap();
+            crate::setup::load_effective_rootless_setup(&parsed.setup_request().unwrap()).unwrap()
+        }
+
+        fn ssh_directory(&self) -> PathBuf {
+            self.root.join("profile").join(".ssh")
+        }
+
         fn pending_intent_path(&self) -> PathBuf {
             self.receipt_path()
                 .parent()
@@ -1025,6 +1468,10 @@ mod tests {
                     },
                 ),
             ]);
+            platform::set_rootless_ssh_transport_probe_snapshot_for_test(Snapshot::Present {
+                version: None,
+                healthy: true,
+            });
             Self
         }
 
@@ -1050,7 +1497,389 @@ mod tests {
     impl Drop for SnapshotGuard {
         fn drop(&mut self) {
             platform::clear_baseline_probe_snapshots_for_test();
+            platform::clear_rootless_ssh_transport_probe_snapshot_for_test();
         }
+    }
+
+    const VALID_CONTROLLER_KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAABAgMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhscHR4f styrn-controller";
+    const HOST_KEY_FINGERPRINT: &str = "SHA256:ZkAslGjFiUHdGf/WUL8rQvkib4PTvQatUV0OUQSncCA";
+
+    #[test]
+    fn enrollment_card_names_the_exact_host_user_and_verified_fingerprint() {
+        let host_key = verified_host_key();
+
+        let card =
+            super::EnrollmentCard::new("worker-01", "worker-01.example", "alex", 22, &host_key)
+                .unwrap();
+
+        assert_eq!(card.name(), "worker-01");
+        assert_eq!(card.host(), "worker-01.example");
+        assert_eq!(card.user(), "alex");
+        assert_eq!(card.fingerprint(), HOST_KEY_FINGERPRINT);
+        assert_eq!(
+            card.command(),
+            format!(
+                "styrn host enroll worker-01.example --user alex --fingerprint {HOST_KEY_FINGERPRINT}"
+            )
+        );
+        assert!(card.integrity_guidance().contains("worker's own console"));
+        assert!(card.controller_recovery().contains("styrn controller init"));
+        assert!(!card.command().contains("ssh-ed25519"));
+    }
+
+    #[test]
+    fn enrollment_card_command_is_the_public_noninteractive_enroll_surface() {
+        let host_key = verified_host_key();
+        let card = super::EnrollmentCard::new(
+            "friendly-worker-name",
+            "worker-01.example",
+            "alex",
+            22,
+            &host_key,
+        )
+        .unwrap();
+        let arguments = card
+            .command()
+            .split_ascii_whitespace()
+            .map(OsString::from)
+            .collect::<Vec<_>>();
+
+        let parsed = crate::cli::Cli::try_parse_with_facts(
+            arguments,
+            crate::cli::CliFacts::for_test(false, false, false),
+        )
+        .unwrap();
+
+        assert_eq!(
+            parsed.host_action(),
+            Some(crate::cli::HostAction::Enroll {
+                host: "worker-01.example".to_owned(),
+                user: "alex".to_owned(),
+                fingerprint: Some(HOST_KEY_FINGERPRINT.to_owned()),
+            })
+        );
+        assert_eq!(card.name(), "friendly-worker-name");
+        assert_ne!(card.name(), card.host());
+    }
+
+    #[test]
+    fn successful_setup_records_and_returns_the_verified_enrollment_card() {
+        let fixture = Fixture::new("enrollment-card");
+        let _snapshots = SnapshotGuard::healthy();
+        fs::create_dir_all(fixture.ssh_directory().parent().unwrap()).unwrap();
+        let prepared = prepare_rootless_setup_for_test_with_ssh_directory_and_host_key(
+            fixture.effective_with_authorized_key(),
+            fixture.context(),
+            fixture.layout.clone(),
+            fixture.receipt_store(),
+            fixture.manifest_store(),
+            fixture.ssh_directory(),
+            verified_host_key(),
+        )
+        .unwrap();
+
+        let outcome = apply_rootless_setup(prepared).unwrap();
+        let card = outcome
+            .enrollment_card()
+            .expect("a verified ready SSH transport must produce an enrollment card");
+        assert_eq!(card.user(), fixture.principal.name());
+        assert_eq!(card.fingerprint(), HOST_KEY_FINGERPRINT);
+        assert!(card.command().contains(" --user "));
+        assert!(card.command().contains(" --fingerprint SHA256:"));
+        assert_eq!(
+            outcome
+                .plan_items()
+                .iter()
+                .find(|item| item.action_id() == "ssh.enrollment-card")
+                .unwrap()
+                .operation(),
+            "done"
+        );
+        assert!(outcome
+            .results()
+            .iter()
+            .all(|result| result.action_id() != "ssh.enrollment-card"));
+
+        let manifest = fixture.manifest_store().read().unwrap().manifest;
+        assert_eq!(
+            manifest
+                .ssh
+                .as_ref()
+                .and_then(|ssh| ssh.host_key_fingerprint.as_deref()),
+            Some(HOST_KEY_FINGERPRINT)
+        );
+    }
+
+    #[test]
+    fn host_key_discovery_failure_keeps_useful_state_and_records_pending_without_a_card() {
+        let fixture = Fixture::new("enrollment-card-discovery-failure");
+        let _snapshots = SnapshotGuard::healthy();
+        fs::create_dir_all(fixture.ssh_directory().parent().unwrap()).unwrap();
+        let outcome = prepare_rootless_setup_for_test_with_ssh_directory(
+            fixture.effective_with_authorized_key(),
+            fixture.context(),
+            fixture.layout.clone(),
+            fixture.receipt_store(),
+            fixture.manifest_store(),
+            fixture.ssh_directory(),
+        )
+        .and_then(apply_rootless_setup)
+        .unwrap();
+
+        assert!(outcome.enrollment_card().is_none());
+        assert!(outcome
+            .pending()
+            .iter()
+            .any(|pending| pending.action_id() == "ssh.enrollment-card"));
+        assert_eq!(
+            outcome
+                .plan_items()
+                .iter()
+                .find(|item| item.action_id() == "ssh.enrollment-card")
+                .unwrap()
+                .operation(),
+            "needs_human"
+        );
+        assert!(fixture.manifest_path().is_file());
+        assert_eq!(
+            fs::read_to_string(fixture.ssh_directory().join("authorized_keys")).unwrap(),
+            format!("{VALID_CONTROLLER_KEY}\n")
+        );
+        let manifest = fixture.manifest_store().read().unwrap().manifest;
+        assert!(manifest
+            .pending_actions
+            .as_ref()
+            .is_some_and(|pending| pending.iter().any(|item| item.id == "ssh.enrollment-card")));
+        assert!(manifest
+            .ssh
+            .as_ref()
+            .and_then(|ssh| ssh.host_key_fingerprint.as_ref())
+            .is_none());
+    }
+
+    #[test]
+    fn transport_only_readiness_never_emits_a_card_without_key_login_readiness() {
+        let fixture = Fixture::new("enrollment-card-full-readiness");
+        let _snapshots = SnapshotGuard::healthy();
+        platform::set_baseline_probe_snapshots_for_test([(
+            platform::BaselineProbeKind::SshServer,
+            platform::BaselineProbeSnapshot::Present {
+                version: None,
+                healthy: false,
+            },
+        )]);
+        fs::create_dir_all(fixture.ssh_directory().parent().unwrap()).unwrap();
+
+        let outcome = prepare_rootless_setup_for_test_with_ssh_directory_and_host_key(
+            fixture.effective_with_authorized_key(),
+            fixture.context(),
+            fixture.layout.clone(),
+            fixture.receipt_store(),
+            fixture.manifest_store(),
+            fixture.ssh_directory(),
+            verified_host_key(),
+        )
+        .and_then(apply_rootless_setup)
+        .unwrap();
+
+        assert!(outcome.enrollment_card().is_none());
+        assert!(outcome
+            .pending()
+            .iter()
+            .any(|pending| pending.action_id() == "ssh.enrollment-card"));
+        let manifest = fixture.manifest_store().read().unwrap().manifest;
+        let ssh = manifest.ssh.unwrap();
+        assert_eq!(ssh.public_key_auth, Some(false));
+        assert!(ssh.host_key_fingerprint.is_none());
+    }
+
+    #[test]
+    fn transient_discovery_failure_preserves_the_recorded_fingerprint_on_zero_arg_rerun() {
+        let fixture = Fixture::new("enrollment-card-fingerprint-rerun");
+        let _snapshots = SnapshotGuard::healthy();
+        fs::create_dir_all(fixture.ssh_directory().parent().unwrap()).unwrap();
+        let first = prepare_rootless_setup_for_test_with_ssh_directory_and_host_key(
+            fixture.effective_with_authorized_key(),
+            fixture.context(),
+            fixture.layout.clone(),
+            fixture.receipt_store(),
+            fixture.manifest_store(),
+            fixture.ssh_directory(),
+            verified_host_key(),
+        )
+        .and_then(apply_rootless_setup)
+        .unwrap();
+        assert!(first.enrollment_card().is_some());
+
+        let healthy_rerun = prepare_rootless_setup_for_test_with_ssh_directory_and_host_key(
+            fixture.effective(None),
+            fixture.context(),
+            fixture.layout.clone(),
+            fixture.receipt_store(),
+            fixture.manifest_store(),
+            fixture.ssh_directory(),
+            verified_host_key(),
+        )
+        .and_then(apply_rootless_setup)
+        .unwrap();
+        assert_eq!(
+            healthy_rerun
+                .enrollment_card()
+                .map(super::EnrollmentCard::fingerprint),
+            Some(HOST_KEY_FINGERPRINT)
+        );
+
+        let rerun = fixture
+            .prepare(fixture.effective(None))
+            .and_then(apply_rootless_setup)
+            .unwrap();
+
+        assert!(rerun.enrollment_card().is_none());
+        assert!(rerun
+            .pending()
+            .iter()
+            .any(|pending| pending.action_id() == "ssh.enrollment-card"));
+        assert_eq!(
+            fixture
+                .manifest_store()
+                .read()
+                .unwrap()
+                .manifest
+                .ssh
+                .and_then(|ssh| ssh.host_key_fingerprint),
+            Some(HOST_KEY_FINGERPRINT.to_owned())
+        );
+    }
+
+    fn verified_host_key() -> crate::transport::PinnedHostKey {
+        crate::transport::PinnedHostKey::from_parts(
+            "ssh-ed25519",
+            "AAAAC3NzaC1lZDI1NTE5AAAAIAABAgMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhscHR4f",
+            HOST_KEY_FINGERPRINT,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn configured_controller_key_is_a_journaled_current_user_action_and_reruns_unchanged() {
+        let fixture = Fixture::new("authorized-key");
+        let _snapshots = SnapshotGuard::healthy();
+        fs::create_dir_all(fixture.ssh_directory().parent().unwrap()).unwrap();
+        let effective = fixture.effective_with_authorized_key();
+        let prepared = prepare_rootless_setup_for_test_with_ssh_directory(
+            effective,
+            fixture.context(),
+            fixture.layout.clone(),
+            fixture.receipt_store(),
+            fixture.manifest_store(),
+            fixture.ssh_directory(),
+        )
+        .unwrap();
+
+        let key_item = prepared
+            .plan_items()
+            .iter()
+            .find(|item| item.action_id() == "ssh.authorized-keys")
+            .expect("configured controller keys must produce one concrete action");
+        assert_eq!(key_item.component(), "ssh-server");
+        assert_eq!(key_item.operation(), "create");
+        assert_eq!(key_item.privilege(), "none");
+
+        let first = apply_rootless_setup(prepared).unwrap();
+        let authorized_keys = fixture.ssh_directory().join("authorized_keys");
+        assert_eq!(
+            fs::read_to_string(&authorized_keys).unwrap(),
+            format!("{VALID_CONTROLLER_KEY}\n")
+        );
+        assert!(first
+            .results()
+            .iter()
+            .any(|result| result.action_id() == "ssh.authorized-keys"
+                && result.status() == ActionExecutionStatus::Applied));
+        let receipt: serde_json::Value = serde_json::from_slice(
+            &fixture
+                .receipt_store()
+                .read_snapshot()
+                .unwrap()
+                .to_json()
+                .unwrap(),
+        )
+        .unwrap();
+        let rendered_receipt = receipt.to_string();
+        assert!(!rendered_receipt.contains(VALID_CONTROLLER_KEY));
+        let key_entry = receipt["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["action"]["parameters"]["action_id"] == "ssh.authorized-keys")
+            .expect("the key-file mutation must be journaled");
+        assert_eq!(key_entry["privilege_used"], "none");
+        assert_eq!(key_entry["files_created"].as_array().unwrap().len(), 1);
+        assert_eq!(key_entry["files_modified"].as_array().unwrap().len(), 0);
+        let before = fs::read(&authorized_keys).unwrap();
+
+        let rerun = prepare_rootless_setup_for_test_with_ssh_directory(
+            fixture.effective_with_authorized_key(),
+            fixture.context(),
+            fixture.layout.clone(),
+            fixture.receipt_store(),
+            fixture.manifest_store(),
+            fixture.ssh_directory(),
+        )
+        .and_then(apply_rootless_setup)
+        .unwrap();
+        assert_eq!(fs::read(&authorized_keys).unwrap(), before);
+        assert!(rerun
+            .results()
+            .iter()
+            .any(|result| result.action_id() == "ssh.authorized-keys"
+                && result.status() == ActionExecutionStatus::Unchanged));
+    }
+
+    #[test]
+    fn rerun_after_the_journaled_ssh_directory_step_finishes_key_publication() {
+        let fixture = Fixture::new("authorized-key-interruption");
+        let _snapshots = SnapshotGuard::healthy();
+        fs::create_dir_all(fixture.ssh_directory().parent().unwrap()).unwrap();
+        let mut prepared = prepare_rootless_setup_for_test_with_ssh_directory(
+            fixture.effective_with_authorized_key(),
+            fixture.context(),
+            fixture.layout.clone(),
+            fixture.receipt_store(),
+            fixture.manifest_store(),
+            fixture.ssh_directory(),
+        )
+        .unwrap();
+        let directory_index = prepared
+            .actions
+            .iter()
+            .position(|action| action.name().as_str() == "ssh.directory")
+            .unwrap();
+        let mut first_step = vec![prepared.actions.remove(directory_index)];
+        let mut metadata = crate::setup::receipt::ReceiptMetadataSource::system();
+        crate::setup::action::apply_plan_with_journal(
+            &mut first_step,
+            &fixture.receipt_store(),
+            &mut metadata,
+        )
+        .unwrap();
+        assert!(fixture.ssh_directory().is_dir());
+        assert!(!fixture.ssh_directory().join("authorized_keys").exists());
+
+        prepare_rootless_setup_for_test_with_ssh_directory(
+            fixture.effective_with_authorized_key(),
+            fixture.context(),
+            fixture.layout.clone(),
+            fixture.receipt_store(),
+            fixture.manifest_store(),
+            fixture.ssh_directory(),
+        )
+        .and_then(apply_rootless_setup)
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(fixture.ssh_directory().join("authorized_keys")).unwrap(),
+            format!("{VALID_CONTROLLER_KEY}\n")
+        );
     }
 
     #[test]
