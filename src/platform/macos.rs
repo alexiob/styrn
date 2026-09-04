@@ -87,23 +87,28 @@ fn tailscale_snapshot(requested_mode: &str) -> super::BaselineProbeSnapshot {
         .then_some(Path::new(
             "/Applications/Tailscale.app/Contents/MacOS/Tailscale",
         ));
-    let (program, mode, unattended, environment): (
-        &Path,
-        super::BaselineTailscaleMode,
-        bool,
-        &[(&str, &str)],
-    ) = match (daemon_program, gui_program) {
-        (Some(program), None) => (program, super::BaselineTailscaleMode::Tailscaled, true, &[]),
-        (None, Some(program)) => (
-            program,
-            super::BaselineTailscaleMode::Gui,
-            false,
-            &[("TAILSCALE_BE_CLI", "1")],
-        ),
-        (None, None) => return super::BaselineProbeSnapshot::Absent,
-        (Some(_), Some(_)) => return super::BaselineProbeSnapshot::Unknowable,
+    let gui_persistent = tailscale_service_is_persistent(super::BaselineTailscaleMode::Gui);
+    let daemon_persistent =
+        tailscale_service_is_persistent(super::BaselineTailscaleMode::Tailscaled);
+    let (mode, persistent) = match select_tailscale_mode(
+        daemon_program.is_some(),
+        gui_program.is_some(),
+        daemon_persistent,
+        gui_persistent,
+    ) {
+        Some(selection) => selection,
+        None if daemon_program.is_none() && gui_program.is_none() => {
+            return super::BaselineProbeSnapshot::Absent;
+        }
+        None => return super::BaselineProbeSnapshot::Unknowable,
     };
-    let persistent = tailscale_service_is_persistent(mode);
+    let (program, unattended, environment): (&Path, bool, &[(&str, &str)]) = match mode {
+        super::BaselineTailscaleMode::Tailscaled => (daemon_program.unwrap(), true, &[]),
+        super::BaselineTailscaleMode::Gui => {
+            (gui_program.unwrap(), false, &[("TAILSCALE_BE_CLI", "1")])
+        }
+        super::BaselineTailscaleMode::Service => unreachable!(),
+    };
     match super::run_fixed_baseline_command_with_env(program, &["status", "--json"], environment) {
         Ok(output) if output.success => {
             parse_tailscale_status(&output.stdout, mode, persistent, unattended, requested_mode)
@@ -111,6 +116,26 @@ fn tailscale_snapshot(requested_mode: &str) -> super::BaselineProbeSnapshot {
         }
         Ok(_) => super::BaselineProbeSnapshot::Unknowable,
         Err(_) => super::BaselineProbeSnapshot::Unknowable,
+    }
+}
+
+fn select_tailscale_mode(
+    daemon_present: bool,
+    gui_present: bool,
+    daemon_persistent: bool,
+    gui_persistent: bool,
+) -> Option<(super::BaselineTailscaleMode, bool)> {
+    use super::BaselineTailscaleMode::{Gui, Tailscaled};
+
+    match (daemon_present, gui_present) {
+        (false, false) => None,
+        (true, false) => Some((Tailscaled, daemon_persistent)),
+        (false, true) => Some((Gui, gui_persistent)),
+        (true, true) => match (daemon_persistent, gui_persistent) {
+            (false, true) => Some((Gui, true)),
+            (true, false) => Some((Tailscaled, true)),
+            (false, false) | (true, true) => None,
+        },
     }
 }
 
@@ -327,7 +352,7 @@ mod baseline_probe_tests {
     };
     use super::{
         authorized_keys_are_ready, git_invocation, parse_git_version, parse_sleep_posture,
-        parse_tailscale_status,
+        parse_tailscale_status, select_tailscale_mode,
     };
     use std::fs;
     use std::os::unix::fs::PermissionsExt;
@@ -491,6 +516,22 @@ mod baseline_probe_tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn tailscale_variant_selection_uses_the_matching_launchd_service() {
+        use super::super::BaselineTailscaleMode::{Gui, Tailscaled};
+
+        assert_eq!(
+            select_tailscale_mode(true, true, false, true),
+            Some((Gui, true))
+        );
+        assert_eq!(
+            select_tailscale_mode(true, true, true, false),
+            Some((Tailscaled, true))
+        );
+        assert_eq!(select_tailscale_mode(true, true, false, false), None);
+        assert_eq!(select_tailscale_mode(true, true, true, true), None);
     }
 
     #[test]

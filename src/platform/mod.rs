@@ -90,7 +90,10 @@ pub(super) fn tailscale_status_snapshot(
         .map(str::to_owned);
     Some(BaselineProbeSnapshot::TailscalePresent {
         version,
-        healthy: backend_healthy && persistent && requested == mode,
+        healthy: backend_healthy
+            && persistent
+            && (mode != BaselineTailscaleMode::Service || unattended)
+            && requested == mode,
         posture: BaselineTailscalePosture {
             mode,
             persistent,
@@ -299,12 +302,7 @@ pub(crate) fn parse_authorized_key_line(line: &str) -> Option<AuthorizedKey<'_>>
     let encoded = fields.next()?;
     if !matches!(
         key_type,
-        "ssh-ed25519"
-            | "ssh-rsa"
-            | "ecdsa-sha2-nistp256"
-            | "ecdsa-sha2-nistp384"
-            | "ecdsa-sha2-nistp521"
-            | "sk-ssh-ed25519@openssh.com"
+        "ssh-ed25519" | "ssh-rsa" | "sk-ssh-ed25519@openssh.com"
     ) || encoded.len() > 16 * 1024
     {
         return None;
@@ -323,16 +321,11 @@ pub(crate) fn parse_authorized_key_line(line: &str) -> Option<AuthorizedKey<'_>>
             }
         }
         "ssh-rsa" => {
-            if take_ssh_wire_string(&mut wire)?.is_empty()
-                || take_ssh_wire_string(&mut wire)?.is_empty()
-            {
-                return None;
-            }
-        }
-        "ecdsa-sha2-nistp256" | "ecdsa-sha2-nistp384" | "ecdsa-sha2-nistp521" => {
-            let expected_curve = key_type.strip_prefix("ecdsa-sha2-")?.as_bytes();
-            if take_ssh_wire_string(&mut wire)? != expected_curve
-                || take_ssh_wire_string(&mut wire)?.is_empty()
+            let exponent = take_positive_ssh_mpint(&mut wire)?;
+            let modulus = take_positive_ssh_mpint(&mut wire)?;
+            if !valid_rsa_exponent(exponent)
+                || ssh_mpint_bit_length(modulus) < 2048
+                || modulus.last().is_none_or(|byte| byte & 1 == 0)
             {
                 return None;
             }
@@ -350,6 +343,33 @@ pub(crate) fn parse_authorized_key_line(line: &str) -> Option<AuthorizedKey<'_>>
         .then_some(AuthorizedKey { key_type, encoded })
 }
 
+fn take_positive_ssh_mpint<'a>(wire: &mut &'a [u8]) -> Option<&'a [u8]> {
+    let encoded = take_ssh_wire_string(wire)?;
+    if encoded.is_empty() || encoded[0] & 0x80 != 0 {
+        return None;
+    }
+    if encoded.len() > 1 && encoded[0] == 0 && encoded[1] & 0x80 == 0 {
+        return None;
+    }
+    let value = encoded.strip_prefix(&[0]).unwrap_or(encoded);
+    (!value.is_empty() && value.iter().any(|byte| *byte != 0)).then_some(value)
+}
+
+fn valid_rsa_exponent(encoded: &[u8]) -> bool {
+    let Some(exponent) = encoded.iter().try_fold(0_u32, |value, byte| {
+        value.checked_mul(256)?.checked_add(u32::from(*byte))
+    }) else {
+        return false;
+    };
+    exponent >= 3 && exponent % 2 == 1
+}
+
+fn ssh_mpint_bit_length(value: &[u8]) -> usize {
+    value.first().map_or(0, |first| {
+        (value.len() - 1) * 8 + (8 - first.leading_zeros() as usize)
+    })
+}
+
 fn take_ssh_wire_string<'a>(wire: &mut &'a [u8]) -> Option<&'a [u8]> {
     let length_bytes: [u8; 4] = wire.get(..4)?.try_into().ok()?;
     let length = usize::try_from(u32::from_be_bytes(length_bytes)).ok()?;
@@ -362,8 +382,10 @@ fn take_ssh_wire_string<'a>(wire: &mut &'a [u8]) -> Option<&'a [u8]> {
 mod baseline_ssh_contract_tests {
     use super::{
         parse_authorized_key_line, parse_effective_sshd_config, tailscale_status_snapshot,
-        BaselineProbeSnapshot, BaselineTailscaleMode, BaselineTailscalePosture,
+        take_positive_ssh_mpint, take_ssh_wire_string, valid_rsa_exponent, BaselineProbeSnapshot,
+        BaselineTailscaleMode, BaselineTailscalePosture,
     };
+    use base64::Engine as _;
 
     const VALID_ED25519: &str =
         "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAABAgMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhscHR4f fixture";
@@ -380,6 +402,109 @@ mod baseline_ssh_contract_tests {
             "ssh-rsa AAAAC3NzaC1lZDI1NTE5AAAAIAABAgMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhscHR4f fixture"
         )
         .is_none());
+    }
+
+    #[test]
+    fn authorized_key_parser_rejects_unusable_rsa_material() {
+        assert!(
+            parse_authorized_key_line("ssh-rsa AAAAB3NzaC1yc2EAAAABAAAAAAEA fixture").is_none()
+        );
+
+        let modulus = rsa_modulus(2048);
+        for exponent in [
+            &[][..],
+            &[0][..],
+            &[0, 1, 0, 1][..],
+            &[0x80, 1][..],
+            &[1][..],
+            &[2][..],
+        ] {
+            assert!(
+                parse_authorized_key_line(&wire_key("ssh-rsa", &[exponent, &modulus])).is_none()
+            );
+        }
+
+        for modulus in [
+            vec![],
+            vec![0],
+            vec![0x80; 256],
+            [vec![0, 0x7f], vec![0x55; 255]].concat(),
+            rsa_modulus(1024),
+            {
+                let mut even = rsa_modulus(2048);
+                *even.last_mut().unwrap() = 2;
+                even
+            },
+        ] {
+            assert!(
+                parse_authorized_key_line(&wire_key("ssh-rsa", &[&[1, 0, 1], &modulus])).is_none()
+            );
+        }
+
+        let accepted = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQC+8BgwvNOvo57ytf+b2Zgrxggw9zCwLzCjw459gUTOYcPkigHwZ5gfvSj7hjv5i94mEpCLtZvPqEO8uLgniV1E4zhNNqi0zn32uP+pK9i9A0UFpDnQhBSi8QVJgWxGJXSh7+1RDx03keJOI9TAluCU7eMvIlu6T5NFR2WXbAAQR0yozvr+crTYaUQEq3YPbvP9j55QrZZpeHvnjFkSfkiaN1PSyTfcp4s0+KJsM0bbzjmnl3shYs5/2baUyjWu7fJh5NVgqCVsdHev0DuzffcRUyWkn5mkjDtw9kNA8mlTVczHY+pY1GtbK1xqa96nIkw5RBXkzj+5qMYmojoV2t5d fixture";
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(accepted.split_ascii_whitespace().nth(1).unwrap())
+            .unwrap();
+        let mut wire = decoded.as_slice();
+        assert_eq!(take_ssh_wire_string(&mut wire).unwrap(), b"ssh-rsa");
+        assert!(valid_rsa_exponent(
+            take_positive_ssh_mpint(&mut wire).unwrap()
+        ));
+        assert_eq!(
+            super::ssh_mpint_bit_length(take_positive_ssh_mpint(&mut wire).unwrap()),
+            2048
+        );
+        assert!(wire.is_empty());
+        assert!(parse_authorized_key_line(accepted).is_some());
+    }
+
+    #[test]
+    fn authorized_key_parser_rejects_unproven_ecdsa_points_but_preserves_ed25519_and_sk() {
+        assert!(parse_authorized_key_line(
+            "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAAABBA== fixture"
+        )
+        .is_none());
+        for (kind, curve, point_length) in [
+            ("ecdsa-sha2-nistp256", "nistp256", 65),
+            ("ecdsa-sha2-nistp384", "nistp384", 97),
+            ("ecdsa-sha2-nistp521", "nistp521", 133),
+        ] {
+            let mut wrong_prefix = vec![0_u8; point_length];
+            wrong_prefix[0] = 2;
+            assert!(
+                parse_authorized_key_line(&wire_key(kind, &[curve.as_bytes(), &wrong_prefix]))
+                    .is_none()
+            );
+            assert!(
+                parse_authorized_key_line(&wire_key(kind, &[curve.as_bytes(), &[4]])).is_none()
+            );
+        }
+
+        assert!(parse_authorized_key_line(VALID_ED25519).is_some());
+        assert!(parse_authorized_key_line(&wire_key(
+            "sk-ssh-ed25519@openssh.com",
+            &[&[7; 32], b"ssh:"]
+        ))
+        .is_some());
+    }
+
+    fn wire_key(kind: &str, fields: &[&[u8]]) -> String {
+        let mut wire = Vec::new();
+        for field in std::iter::once(kind.as_bytes()).chain(fields.iter().copied()) {
+            wire.extend_from_slice(&(field.len() as u32).to_be_bytes());
+            wire.extend_from_slice(field);
+        }
+        format!(
+            "{kind} {} fixture",
+            base64::engine::general_purpose::STANDARD.encode(wire)
+        )
+    }
+
+    fn rsa_modulus(bits: usize) -> Vec<u8> {
+        let mut modulus = vec![0_u8; bits / 8 + 1];
+        modulus[1] = 0x80;
+        modulus[bits / 8] = 1;
+        modulus
     }
 
     #[test]
@@ -449,6 +574,25 @@ mod baseline_ssh_contract_tests {
             ),
             Some(BaselineProbeSnapshot::TailscalePresent { healthy: false, .. })
         ));
+        assert_eq!(
+            tailscale_status_snapshot(
+                status,
+                BaselineTailscaleMode::Service,
+                true,
+                false,
+                "service",
+                BaselineTailscaleMode::Service,
+            ),
+            Some(BaselineProbeSnapshot::TailscalePresent {
+                version: Some("1.90.0".to_owned()),
+                healthy: false,
+                posture: BaselineTailscalePosture {
+                    mode: BaselineTailscaleMode::Service,
+                    persistent: true,
+                    unattended: false,
+                },
+            })
+        );
     }
 }
 
@@ -3877,9 +4021,17 @@ mod setup_execution_tests {
             ManifestOwner::User,
             0o700
         ));
-        assert!(!private_file_parent_mode_is_valid(
+        assert!(private_file_parent_mode_is_valid(
             ManifestOwner::User,
             0o755
+        ));
+        assert!(private_file_parent_mode_is_valid(
+            ManifestOwner::User,
+            0o750
+        ));
+        assert!(!private_file_parent_mode_is_valid(
+            ManifestOwner::User,
+            0o775
         ));
         assert!(private_file_parent_mode_is_valid(
             ManifestOwner::System,
@@ -6385,7 +6537,7 @@ pub(crate) enum ManifestOwner {
 #[cfg(unix)]
 fn private_file_parent_mode_is_valid(owner: ManifestOwner, mode: u32) -> bool {
     match owner {
-        ManifestOwner::User => mode & 0o777 == 0o700,
+        ManifestOwner::User => mode & 0o022 == 0,
         ManifestOwner::System => mode & 0o022 == 0,
         #[cfg(test)]
         ManifestOwner::CurrentProcess | ManifestOwner::CurrentProcessWorker => mode & 0o022 == 0,
@@ -6691,6 +6843,24 @@ pub(crate) fn prepare_verified_private_file_removal(
 #[allow(dead_code)] // Source-including manifest tests omit authorization execution.
 pub(crate) fn consume_verified_private_file(removal: PrivateFileRemoval) -> std::io::Result<()> {
     platform_impl::consume_verified_private_file(removal.0)
+}
+
+#[cfg(all(test, target_os = "windows"))]
+pub(crate) fn trace_private_publication_for_test(enabled: bool) {
+    platform_impl::trace_private_publication_for_test(enabled);
+}
+
+#[cfg(all(test, target_os = "windows"))]
+pub(crate) fn take_private_publication_trace_for_test() -> Vec<&'static str> {
+    platform_impl::take_private_publication_trace_for_test()
+        .into_iter()
+        .map(|phase| match phase {
+            platform_impl::PrivatePublicationPhase::WriteThroughMove => "write_through_move",
+            platform_impl::PrivatePublicationPhase::DestinationIdentityVerified => {
+                "destination_identity_verified"
+            }
+        })
+        .collect()
 }
 
 pub(crate) fn verify_manifest_security(

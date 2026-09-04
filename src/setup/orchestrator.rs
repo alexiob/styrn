@@ -1027,6 +1027,24 @@ mod tests {
             ]);
             Self
         }
+
+        fn windows_service_without_unattended() -> Self {
+            use platform::{BaselineProbeKind as Kind, BaselineProbeSnapshot as Snapshot};
+            let guard = Self::healthy();
+            platform::set_baseline_probe_snapshots_for_test([(
+                Kind::Tailscale,
+                Snapshot::TailscalePresent {
+                    version: Some("1.90.0".to_owned()),
+                    healthy: false,
+                    posture: platform::BaselineTailscalePosture {
+                        mode: platform::BaselineTailscaleMode::Service,
+                        persistent: true,
+                        unattended: false,
+                    },
+                },
+            )]);
+            guard
+        }
     }
 
     impl Drop for SnapshotGuard {
@@ -1163,6 +1181,28 @@ mod tests {
             .unwrap();
         assert_eq!(tailscale.mode, Some(manifest::TailscaleMode::Tailscaled));
         assert_eq!(tailscale.unattended, Some(true));
+    }
+
+    #[test]
+    fn windows_service_without_unattended_stays_pending_and_manifested_false() {
+        let fixture = Fixture::new("windows-unattended-false");
+        let _snapshots = SnapshotGuard::windows_service_without_unattended();
+
+        let outcome =
+            apply_rootless_setup(fixture.prepare(fixture.effective(None)).unwrap()).unwrap();
+        assert_eq!(outcome.pending().len(), 1);
+        assert_eq!(
+            outcome.pending()[0].action_id(),
+            "baseline.tailscale.pending"
+        );
+        let manifest = fixture.manifest_store().read().unwrap().manifest;
+        assert_eq!(
+            manifest.capabilities.unwrap().get("tailscale"),
+            Some(&false)
+        );
+        let tailscale = manifest.tailscale.unwrap();
+        assert_eq!(tailscale.mode, Some(manifest::TailscaleMode::Service));
+        assert_eq!(tailscale.unattended, Some(false));
     }
 
     #[test]

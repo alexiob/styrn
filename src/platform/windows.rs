@@ -94,11 +94,15 @@ fn tailscale_snapshot(requested_mode: &str) -> super::BaselineProbeSnapshot {
             .filter(|output| output.success)
             .and_then(|output| parse_service_auto_start(&output.stdout))
             .unwrap_or(false);
+    let unattended = tailscale_unattended_policy_is_always();
     match super::run_fixed_baseline_command(program, &["status", "--json"]) {
-        Ok(output) if output.success => {
-            parse_tailscale_status(&output.stdout, running && auto_start, requested_mode)
-                .unwrap_or(super::BaselineProbeSnapshot::Unknowable)
-        }
+        Ok(output) if output.success => parse_tailscale_status(
+            &output.stdout,
+            running && auto_start,
+            unattended,
+            requested_mode,
+        )
+        .unwrap_or(super::BaselineProbeSnapshot::Unknowable),
         Ok(_) => super::BaselineProbeSnapshot::Unknowable,
         Err(_) => super::BaselineProbeSnapshot::Unknowable,
     }
@@ -172,16 +176,50 @@ fn parse_git_version(bytes: &[u8]) -> Option<String> {
 fn parse_tailscale_status(
     bytes: &[u8],
     persistent: bool,
+    unattended: bool,
     requested_mode: &str,
 ) -> Option<super::BaselineProbeSnapshot> {
     super::tailscale_status_snapshot(
         bytes,
         super::BaselineTailscaleMode::Service,
         persistent,
-        true,
+        unattended,
         requested_mode,
         super::BaselineTailscaleMode::Service,
     )
+}
+
+const HKEY_LOCAL_MACHINE: *mut c_void = -2_147_483_646_isize as *mut c_void;
+const RRF_RT_REG_SZ: u32 = 0x0000_0002;
+
+fn tailscale_unattended_policy_is_always() -> bool {
+    let sub_key = wide("SOFTWARE\\Policies\\Tailscale");
+    let value_name = wide("UnattendedMode");
+    let mut value = [0_u16; 32];
+    let mut value_type = 0_u32;
+    let mut byte_count = std::mem::size_of_val(&value) as u32;
+    let status = unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            sub_key.as_ptr(),
+            value_name.as_ptr(),
+            RRF_RT_REG_SZ,
+            &mut value_type,
+            value.as_mut_ptr().cast(),
+            &mut byte_count,
+        )
+    };
+    if status != 0 || value_type != 1 || byte_count == 0 || !byte_count.is_multiple_of(2) {
+        return false;
+    }
+    let units = byte_count as usize / 2;
+    units <= value.len() && parse_tailscale_unattended_policy_value(&value[..units])
+}
+
+fn parse_tailscale_unattended_policy_value(value: &[u16]) -> bool {
+    value
+        .strip_suffix(&[0])
+        .is_some_and(|value| value.iter().copied().eq("always".encode_utf16()))
 }
 
 fn parse_service_auto_start(bytes: &[u8]) -> Option<bool> {
@@ -319,7 +357,10 @@ fn path_is_reparse_point(path: &Path) -> bool {
 #[cfg(test)]
 mod baseline_probe_tests {
     use super::super::{BaselineProbeKind, BaselineProbeSnapshot};
-    use super::{canonical_authorized_keys_path, parse_sleep_posture};
+    use super::{
+        canonical_authorized_keys_path, parse_sleep_posture,
+        parse_tailscale_unattended_policy_value, HKEY_LOCAL_MACHINE,
+    };
     use std::path::Path;
 
     #[test]
@@ -353,6 +394,22 @@ mod baseline_probe_tests {
     }
 
     #[test]
+    fn unattended_policy_parser_requires_the_exact_documented_always_value() {
+        assert_eq!(HKEY_LOCAL_MACHINE as isize, -2_147_483_646_isize);
+        let always = "always\0".encode_utf16().collect::<Vec<_>>();
+        assert!(parse_tailscale_unattended_policy_value(&always));
+        for value in [
+            Vec::new(),
+            vec![0],
+            "always".encode_utf16().collect(),
+            "never\0".encode_utf16().collect(),
+            "always\0\0".encode_utf16().collect(),
+        ] {
+            assert!(!parse_tailscale_unattended_policy_value(&value));
+        }
+    }
+
+    #[test]
     #[ignore = "requires a disposable native Windows profile with running OpenSSH and Tailscale, per-user authorized_keys, Git, and AC/DC standby timeout disabled"]
     fn native_rootless_baseline_positive_requires_disposable_configured_host() {
         for kind in [
@@ -383,7 +440,7 @@ type WorkerPrivilegeCleanupHook = fn(io::Result<()>) -> io::Result<()>;
 
 #[cfg(test)]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum PrivatePublicationPhase {
+pub(super) enum PrivatePublicationPhase {
     WriteThroughMove,
     DestinationIdentityVerified,
 }
@@ -417,7 +474,7 @@ pub(super) fn set_worker_node_principal_drift_for_test(drift: bool) {
 }
 
 #[cfg(test)]
-fn trace_private_publication_for_test(enabled: bool) {
+pub(super) fn trace_private_publication_for_test(enabled: bool) {
     TRACE_PRIVATE_PUBLICATION.with(|trace| trace.set(enabled));
     PRIVATE_PUBLICATION_TRACE.with(|phases| phases.borrow_mut().clear());
 }
@@ -432,7 +489,7 @@ fn record_private_publication_phase(phase: PrivatePublicationPhase) {
 }
 
 #[cfg(test)]
-fn take_private_publication_trace_for_test() -> Vec<PrivatePublicationPhase> {
+pub(super) fn take_private_publication_trace_for_test() -> Vec<PrivatePublicationPhase> {
     TRACE_PRIVATE_PUBLICATION.with(|trace| trace.set(false));
     PRIVATE_PUBLICATION_TRACE.with(|phases| std::mem::take(&mut *phases.borrow_mut()))
 }
@@ -889,6 +946,15 @@ struct FileDispositionInformation {
 
 #[link(name = "advapi32")]
 unsafe extern "system" {
+    fn RegGetValueW(
+        key: *mut c_void,
+        sub_key: *const u16,
+        value: *const u16,
+        flags: u32,
+        value_type: *mut u32,
+        data: *mut c_void,
+        data_size: *mut u32,
+    ) -> i32;
     fn ConvertStringSecurityDescriptorToSecurityDescriptorW(
         security_descriptor: *const u16,
         revision: u32,

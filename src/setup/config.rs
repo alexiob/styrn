@@ -477,7 +477,9 @@ fn validate_effective(
     let mut keys = std::collections::BTreeSet::new();
     for key in &effective.authorized_keys {
         if !valid_public_key(key) || !keys.insert(key) {
-            return Err(config_error("config key ssh.authorized_keys is invalid"));
+            return Err(config_error(
+                "config key ssh.authorized_keys is invalid or unsupported; use Ed25519, security-key Ed25519, or RSA with a modulus of at least 2048 bits",
+            ));
         }
     }
     Ok(())
@@ -669,30 +671,13 @@ pub(crate) fn persist_interactive_replay(
                 ));
             }
         };
-        drop(complete);
-        match fs::hard_link(&temporary, destination) {
-            Ok(()) => {
-                crate::platform::sync_parent_directory(parent).map_err(|_| {
-                    SetupInputError::Plan("cannot make interactive replay durable".into())
-                })?;
-                let published_identity = crate::platform::private_file_identity(destination)
-                    .map_err(|_| {
-                        SetupInputError::Plan("cannot verify interactive replay publication".into())
-                    })?;
-                if published_identity != identity
-                    || crate::platform::open_verified_private_file_for_read(
-                        destination,
-                        crate::platform::ManifestOwner::User,
-                        &principal,
-                        identity,
-                    )
-                    .is_err()
-                {
+        match complete.publish_no_replace(destination) {
+            Ok(published) => {
+                if published.path() != destination || published.identity() != identity {
                     return Err(SetupInputError::Plan(
                         "cannot verify interactive replay publication".into(),
                     ));
                 }
-                cleanup_replay_temporary(&temporary, identity, &principal)?;
                 return Ok(());
             }
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -759,53 +744,47 @@ fn cleanup_replay_temporary(
     let parent = temporary
         .parent()
         .ok_or_else(|| SetupInputError::Plan("cannot verify interactive replay cleanup".into()))?;
-    let parent_metadata = fs::symlink_metadata(parent)
-        .map_err(|_| SetupInputError::Plan("cannot verify interactive replay cleanup".into()))?;
-    if !parent_metadata.is_dir() || parent_metadata.file_type().is_symlink() {
-        return Err(SetupInputError::Plan(
-            "cannot verify interactive replay cleanup".into(),
-        ));
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        if parent_metadata.uid()
-            != principal.unix_uid().map_err(|_| {
-                SetupInputError::Plan("cannot verify interactive replay cleanup".into())
-            })?
-            || parent_metadata.permissions().mode() & 0o022 != 0
-        {
-            return Err(SetupInputError::Plan(
-                "cannot verify interactive replay cleanup".into(),
-            ));
-        }
-    }
-    let identity = match crate::platform::private_file_identity(temporary) {
-        Ok(identity) => identity,
+    let removal = match crate::platform::prepare_verified_private_file_removal(
+        temporary,
+        crate::platform::ManifestOwner::User,
+        principal,
+        expected_identity,
+    ) {
+        Ok(removal) => removal,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
         Err(_) => {
             return Err(SetupInputError::Plan(
-                "cannot verify interactive replay cleanup".into(),
+                "cannot prepare interactive replay cleanup".into(),
             ))
         }
     };
-    if identity != expected_identity {
-        return Err(SetupInputError::Plan(
-            "cannot verify interactive replay cleanup".into(),
-        ));
-    }
-    drop(
-        crate::platform::open_verified_private_file_for_read(
-            temporary,
-            crate::platform::ManifestOwner::User,
-            principal,
-            identity,
-        )
-        .map_err(|_| SetupInputError::Plan("cannot prepare interactive replay cleanup".into()))?,
-    );
-    fs::remove_file(temporary)
+    #[cfg(test)]
+    run_before_replay_cleanup_consume_hook();
+    crate::platform::consume_verified_private_file(removal)
         .and_then(|()| crate::platform::sync_parent_directory(parent))
         .map_err(|_| SetupInputError::Plan("cannot complete interactive replay cleanup".into()))
+}
+
+#[cfg(test)]
+std::thread_local! {
+    static BEFORE_REPLAY_CLEANUP_CONSUME_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn set_before_replay_cleanup_consume_hook(hook: impl FnOnce() + 'static) {
+    BEFORE_REPLAY_CLEANUP_CONSUME_HOOK.with(|slot| {
+        assert!(slot.borrow_mut().replace(Box::new(hook)).is_none());
+    });
+}
+
+#[cfg(test)]
+fn run_before_replay_cleanup_consume_hook() {
+    BEFORE_REPLAY_CLEANUP_CONSUME_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook();
+        }
+    });
 }
 
 #[cfg(test)]
@@ -861,6 +840,104 @@ mod tests {
 
         fs::remove_file(destination).unwrap();
         fs::remove_file(target).unwrap();
+        fs::remove_dir(directory).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn interactive_replay_cleanup_stays_bound_to_the_verified_parent_handle() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = std::env::temp_dir().join(format!(
+            "styrn-replay-cleanup-swap-{}-{}",
+            std::process::id(),
+            uuid::Uuid::now_v7()
+        ));
+        let route = root.join("route");
+        fs::create_dir_all(&route).unwrap();
+        fs::set_permissions(&route, fs::Permissions::from_mode(0o700)).unwrap();
+        let temporary = route.join("replay.tmp");
+        let principal = crate::platform::resolve_current_worker_principal().unwrap();
+        let publication = crate::platform::create_private_publication_file(
+            &temporary,
+            crate::platform::ManifestOwner::User,
+            &principal,
+        )
+        .unwrap();
+        let identity = publication.identity();
+        drop(publication);
+
+        let original = root.join("original");
+        let route_for_hook = route.clone();
+        let original_for_hook = original.clone();
+        set_before_replay_cleanup_consume_hook(move || {
+            fs::rename(&route_for_hook, &original_for_hook).unwrap();
+            fs::create_dir(&route_for_hook).unwrap();
+            fs::set_permissions(&route_for_hook, fs::Permissions::from_mode(0o700)).unwrap();
+            fs::write(route_for_hook.join("replay.tmp"), b"must survive").unwrap();
+        });
+
+        cleanup_replay_temporary(&temporary, identity, &principal).unwrap();
+
+        assert!(!original.join("replay.tmp").exists());
+        assert_eq!(fs::read(route.join("replay.tmp")).unwrap(), b"must survive");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn interactive_replay_uses_write_through_move_before_identity_verification() {
+        let directory = std::env::temp_dir().join(format!(
+            "styrn-replay-write-through-{}-{}",
+            std::process::id(),
+            uuid::Uuid::now_v7()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let destination = directory.join("setup-config.toml");
+        let effective =
+            effective_from_interactive_answers("worker".to_owned(), None, None).unwrap();
+        crate::platform::trace_private_publication_for_test(true);
+
+        persist_interactive_replay(&effective, &destination).unwrap();
+
+        assert_eq!(
+            crate::platform::take_private_publication_trace_for_test(),
+            ["write_through_move", "destination_identity_verified"]
+        );
+        fs::remove_file(destination).unwrap();
+        fs::remove_dir(directory).unwrap();
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn interactive_replay_cleanup_blocks_substitution_after_handle_verification() {
+        let directory = std::env::temp_dir().join(format!(
+            "styrn-replay-cleanup-substitution-{}-{}",
+            std::process::id(),
+            uuid::Uuid::now_v7()
+        ));
+        fs::create_dir(&directory).unwrap();
+        let temporary = directory.join("replay.tmp");
+        let displaced = directory.join("displaced.tmp");
+        let principal = crate::platform::resolve_current_worker_principal().unwrap();
+        let publication = crate::platform::create_private_publication_file(
+            &temporary,
+            crate::platform::ManifestOwner::User,
+            &principal,
+        )
+        .unwrap();
+        let identity = publication.identity();
+        drop(publication);
+        let temporary_for_hook = temporary.clone();
+        let displaced_for_hook = displaced.clone();
+        set_before_replay_cleanup_consume_hook(move || {
+            assert!(fs::rename(&temporary_for_hook, &displaced_for_hook).is_err());
+        });
+
+        cleanup_replay_temporary(&temporary, identity, &principal).unwrap();
+
+        assert!(!temporary.exists());
+        assert!(!displaced.exists());
         fs::remove_dir(directory).unwrap();
     }
 
