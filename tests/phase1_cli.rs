@@ -129,6 +129,81 @@ fn invalid_ssh_arguments_are_usage_errors_before_controller_state_or_tools() {
 }
 
 #[test]
+fn failed_first_enrollment_reports_the_public_key_path_and_truthful_next_step() {
+    let environment = IsolatedEnvironment::new("first-enrollment-auth-failure");
+    environment.install_transport_fixture();
+    let user = environment.seed_controller_and_worker_manifests();
+    fs::write(environment.fixture_root.join("ssh-mode"), b"auth-fail\n").unwrap();
+
+    let output = environment.run_owned(&[
+        "--json".to_owned(),
+        "host".to_owned(),
+        "enroll".to_owned(),
+        "worker.example".to_owned(),
+        "--user".to_owned(),
+        user,
+        "--fingerprint".to_owned(),
+        VALID_FINGERPRINT.to_owned(),
+    ]);
+
+    assert_eq!(output.status.code(), Some(4), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    let envelope = exactly_one_envelope(&output);
+    assert_eq!(envelope["errors"][0]["code"], "transport.auth_failed");
+    let identity = environment.home.join(".ssh").join(format!(
+        "styrn_controller_{}_ed25519",
+        CONTROLLER_ID.replace('-', "")
+    ));
+    assert!(identity.is_file());
+    assert_eq!(
+        envelope["errors"][0]["details"]["public_key_path"],
+        path_text(&identity.with_extension("pub"))
+    );
+    assert_eq!(
+        envelope["errors"][0]["details"]["next_step"],
+        "authorize the public key at this path for the requested SSH user, then rerun styrn host enroll"
+    );
+    assert!(!environment.config.join("inventory.toml").exists());
+    assert!(!environment.config.join("known_hosts").exists());
+    assert!(!environment
+        .config
+        .join("manifests")
+        .join(WORKER_ID)
+        .exists());
+    let rendered = String::from_utf8_lossy(&output.stdout);
+    assert!(!rendered.contains("fixture-private-key"));
+    assert!(!rendered.contains("AAAAC3Nza"));
+
+    let human_environment = IsolatedEnvironment::new("first-enrollment-auth-failure-human");
+    human_environment.install_transport_fixture();
+    let human_user = human_environment.seed_controller_and_worker_manifests();
+    fs::write(
+        human_environment.fixture_root.join("ssh-mode"),
+        b"auth-fail\n",
+    )
+    .unwrap();
+    let human = human_environment.run_owned(&[
+        "host".to_owned(),
+        "enroll".to_owned(),
+        "worker.example".to_owned(),
+        "--user".to_owned(),
+        human_user,
+        "--fingerprint".to_owned(),
+        VALID_FINGERPRINT.to_owned(),
+    ]);
+    assert_eq!(human.status.code(), Some(4), "{human:?}");
+    assert!(human.stdout.is_empty(), "{human:?}");
+    let diagnostic = String::from_utf8_lossy(&human.stderr);
+    assert!(diagnostic.contains("Controller public key:"), "{human:?}");
+    assert!(
+        diagnostic.contains("then rerun styrn host enroll"),
+        "{human:?}"
+    );
+    assert!(!diagnostic.contains("fixture-private-key"));
+    assert!(!diagnostic.contains("AAAAC3Nza"));
+}
+
+#[test]
 fn phase1_public_routes_emit_one_typed_json_outcome() {
     let environment = IsolatedEnvironment::new("route-dispatch");
     let cases: &[JsonRouteCase<'_>] = &[
@@ -207,6 +282,356 @@ fn phase1_public_routes_emit_one_typed_json_outcome() {
             None => assert_eq!(envelope["errors"], serde_json::json!([]), "{arguments:?}"),
         }
     }
+}
+
+#[test]
+fn inactive_phase1_routes_fail_closed_in_human_and_json_modes() {
+    let environment = IsolatedEnvironment::new("inactive-routes");
+    let cases: &[(&[&str], &str)] = &[
+        (&["host", "remove", "worker.example"], "host remove"),
+        (
+            &[
+                "host",
+                "authorize-key",
+                "worker.example",
+                "--public-key",
+                "controller.pub",
+            ],
+            "host authorize-key",
+        ),
+        (
+            &[
+                "host",
+                "revoke-key",
+                "worker.example",
+                "--controller",
+                "main",
+            ],
+            "host revoke-key",
+        ),
+        (&["shell", "worker.example"], "shell"),
+        (&["fleet", "status"], "fleet status"),
+        (&["job", "list"], "job list"),
+    ];
+
+    for (arguments, command) in cases {
+        let human = environment.run(arguments);
+        assert_eq!(human.status.code(), Some(7), "{arguments:?}: {human:?}");
+        assert!(human.stdout.is_empty(), "{arguments:?}: {human:?}");
+        assert!(
+            String::from_utf8_lossy(&human.stderr).contains("not available in this build"),
+            "{arguments:?}: {human:?}"
+        );
+
+        let mut json_arguments = vec!["--json"];
+        json_arguments.extend_from_slice(arguments);
+        let json = environment.run(&json_arguments);
+        assert_eq!(json.status.code(), Some(7), "{arguments:?}: {json:?}");
+        assert!(json.stderr.is_empty(), "{arguments:?}: {json:?}");
+        let envelope = exactly_one_envelope(&json);
+        assert_eq!(envelope["command"], *command, "{arguments:?}");
+        assert_eq!(envelope["ok"], false, "{arguments:?}");
+        assert_eq!(
+            envelope["errors"][0]["code"], "capability.unsatisfied",
+            "{arguments:?}"
+        );
+    }
+}
+
+#[test]
+fn doctor_rejects_a_cache_not_bound_to_the_selected_host_and_live_manifest() {
+    let environment = IsolatedEnvironment::new("doctor-cache-binding");
+    environment.install_transport_fixture();
+    let user = environment.seed_controller_and_worker_manifests();
+    enroll_fixture_worker(&environment, &user);
+    let cache_path = environment
+        .config
+        .join("manifests")
+        .join(format!("{WORKER_ID}.toml"));
+    let cache = fs::read_to_string(&cache_path).unwrap();
+    fs::write(
+        &cache_path,
+        cache.replace("worker.example", "substitute.example"),
+    )
+    .unwrap();
+
+    let doctor = assert_json_success(
+        &environment.run(&["--json", "host", "doctor", "worker.example"]),
+        "host doctor",
+    );
+    let finding = finding(&doctor, "controller.cache.state");
+    assert_eq!(finding["state"], "fail", "{doctor}");
+    assert_eq!(finding["severity"], "warning", "{doctor}");
+    assert_eq!(
+        finding["remediation"]["styrn_args"],
+        serde_json::json!(["host", "refresh", "worker.example"]),
+        "{doctor}"
+    );
+}
+
+#[test]
+fn doctor_reports_low_disk_pending_actions_and_remediations() {
+    let environment = IsolatedEnvironment::new("doctor-minimum-findings");
+    environment.install_transport_fixture();
+    let user = environment.seed_controller_and_worker_manifests();
+    let worker_manifest = environment.worker_config.join("machine.toml");
+    let mut document: toml::Value =
+        toml::from_str(&fs::read_to_string(&worker_manifest).unwrap()).unwrap();
+    let additions: toml::Value = toml::from_str(
+        r#"
+[resources.policy]
+reserved_disk_bytes = 9223372036854775807
+
+[[pending_actions]]
+id = "codex-first-login"
+severity = "warning"
+message = "Complete the first Codex login as the selected worker user."
+"#,
+    )
+    .unwrap();
+    document
+        .as_table_mut()
+        .unwrap()
+        .extend(additions.as_table().unwrap().clone());
+    let principal = platform::resolve_current_worker_principal().unwrap();
+    write_manifest(
+        &worker_manifest,
+        &toml::to_string_pretty(&document).unwrap(),
+        &principal,
+    );
+    enroll_fixture_worker(&environment, &user);
+
+    let doctor = assert_json_success(
+        &environment.run(&["--json", "host", "doctor", "worker.example"]),
+        "host doctor",
+    );
+    let disk = finding(&doctor, "worker.disk.floor");
+    assert_eq!(disk["state"], "fail", "{doctor}");
+    assert_eq!(disk["severity"], "error", "{doctor}");
+    assert!(disk["remediation"]["summary"].is_string(), "{doctor}");
+    let pending = finding(&doctor, "worker.pending_actions");
+    assert_eq!(pending["state"], "fail", "{doctor}");
+    assert_eq!(pending["severity"], "warning", "{doctor}");
+    assert!(pending["remediation"]["summary"].is_string(), "{doctor}");
+    assert_eq!(
+        doctor["data"]["pending_actions"][0]["id"], "codex-first-login",
+        "{doctor}"
+    );
+    let worker_pending = doctor["data"]["worker"]["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|finding| finding["id"] == "pending.action-1")
+        .unwrap_or_else(|| panic!("missing worker pending-action projection: {doctor}"));
+    assert_eq!(worker_pending["state"], "fail", "{doctor}");
+    assert_eq!(worker_pending["severity"], "warning", "{doctor}");
+    assert!(
+        worker_pending["remediation"]["summary"].is_string(),
+        "{doctor}"
+    );
+    assert!(
+        doctor["data"]["controller_findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|finding| finding.as_object().unwrap().contains_key("remediation")),
+        "every controller finding must carry a remediation field: {doctor}"
+    );
+}
+
+#[test]
+fn enrollment_transport_and_protocol_failures_are_typed_and_leave_no_host_state() {
+    let cases = [
+        (
+            "keyscan-unreachable",
+            "host-key",
+            "unreachable",
+            3,
+            "transport.unreachable",
+            0,
+        ),
+        (
+            "crash-before-hello",
+            "ssh-mode",
+            "crash-before-hello",
+            4,
+            "transport.auth_failed",
+            1,
+        ),
+        (
+            "malformed-hello",
+            "ssh-mode",
+            "malformed-hello",
+            8,
+            "protocol.malformed",
+            1,
+        ),
+        (
+            "incompatible-hello",
+            "ssh-mode",
+            "incompatible-hello",
+            8,
+            "protocol.incompatible",
+            1,
+        ),
+        (
+            "malformed-manifest",
+            "ssh-mode",
+            "malformed-manifest",
+            2,
+            "machine.manifest_invalid",
+            1,
+        ),
+    ];
+
+    for (label, control, mode, expected_exit, expected_code, expected_ssh_calls) in cases {
+        let environment = IsolatedEnvironment::new(label);
+        environment.install_transport_fixture();
+        let user = environment.seed_controller_and_worker_manifests();
+        fs::write(environment.fixture_root.join(control), format!("{mode}\n")).unwrap();
+        let output = environment.run_owned(&[
+            "--json".to_owned(),
+            "host".to_owned(),
+            "enroll".to_owned(),
+            "worker.example".to_owned(),
+            "--user".to_owned(),
+            user,
+            "--fingerprint".to_owned(),
+            VALID_FINGERPRINT.to_owned(),
+        ]);
+
+        assert_eq!(
+            output.status.code(),
+            Some(expected_exit),
+            "{label}: {output:?}"
+        );
+        assert!(output.stderr.is_empty(), "{label}: {output:?}");
+        let envelope = exactly_one_envelope(&output);
+        assert_eq!(envelope["command"], "host enroll", "{label}: {envelope}");
+        assert_eq!(envelope["ok"], false, "{label}: {envelope}");
+        assert_eq!(
+            envelope["errors"][0]["code"], expected_code,
+            "{label}: {envelope}"
+        );
+        assert!(!String::from_utf8_lossy(&output.stdout).contains("fixture-secret-must-not-escape"));
+        environment.assert_no_enrolled_host_state();
+        assert_eq!(
+            environment.open_ssh_call_count(),
+            expected_ssh_calls,
+            "{label}: a failure must not invoke a later transport step"
+        );
+    }
+}
+
+#[test]
+fn enrolled_worker_identity_substitution_preserves_controller_state() {
+    const SUBSTITUTE_ID: &str = "01991f5d-d72f-7b5e-a43d-9fcb61bd3267";
+    let environment = IsolatedEnvironment::new("bound-worker-substitution");
+    environment.install_transport_fixture();
+    let user = environment.seed_controller_and_worker_manifests();
+    enroll_fixture_worker(&environment, &user);
+    let inventory_path = environment.config.join("inventory.toml");
+    let known_hosts_path = environment.config.join("known_hosts");
+    let cache_path = environment
+        .config
+        .join("manifests")
+        .join(format!("{WORKER_ID}.toml"));
+    let controller_state = [
+        fs::read(&inventory_path).unwrap(),
+        fs::read(&known_hosts_path).unwrap(),
+        fs::read(&cache_path).unwrap(),
+    ];
+    let worker_manifest_path = environment.worker_config.join("machine.toml");
+    let original_manifest = fs::read_to_string(&worker_manifest_path).unwrap();
+    let principal = platform::resolve_current_worker_principal().unwrap();
+
+    for substitution in ["machine-id", "name", "user"] {
+        let mut document: toml::Value = toml::from_str(&original_manifest).unwrap();
+        match substitution {
+            "machine-id" => document["machine_id"] = toml::Value::String(SUBSTITUTE_ID.to_owned()),
+            "name" => document["name"] = toml::Value::String("substitute.example".to_owned()),
+            "user" => {
+                fs::write(
+                    environment.fixture_root.join("ssh-mode"),
+                    b"substitute-user\n",
+                )
+                .unwrap();
+            }
+            _ => unreachable!(),
+        }
+        if substitution == "user" {
+            write_manifest(&worker_manifest_path, &original_manifest, &principal);
+        } else {
+            write_manifest(
+                &worker_manifest_path,
+                &toml::to_string_pretty(&document).unwrap(),
+                &principal,
+            );
+        }
+
+        let output = environment.run(&["--json", "host", "status", "worker.example"]);
+        assert_eq!(output.status.code(), Some(8), "{substitution}: {output:?}");
+        assert!(output.stderr.is_empty(), "{substitution}: {output:?}");
+        let envelope = exactly_one_envelope(&output);
+        assert_eq!(
+            envelope["errors"][0]["code"], "protocol.malformed",
+            "{substitution}: {envelope}"
+        );
+        assert_eq!(fs::read(&inventory_path).unwrap(), controller_state[0]);
+        assert_eq!(fs::read(&known_hosts_path).unwrap(), controller_state[1]);
+        assert_eq!(fs::read(&cache_path).unwrap(), controller_state[2]);
+        fs::write(environment.fixture_root.join("ssh-mode"), b"\n").unwrap();
+    }
+}
+
+#[test]
+fn public_exec_maps_remote_failure_and_redacts_secret_output_in_both_modes() {
+    let environment = IsolatedEnvironment::new("exec-failures-and-redaction");
+    environment.install_transport_fixture();
+    let user = environment.seed_controller_and_worker_manifests();
+    enroll_fixture_worker(&environment, &user);
+    let missing_program = environment.root.join("program-that-does-not-exist");
+
+    let failure = environment.run_owned(&[
+        "--json".to_owned(),
+        "exec".to_owned(),
+        "worker.example".to_owned(),
+        "--".to_owned(),
+        path_text(&missing_program).to_owned(),
+    ]);
+    assert_eq!(failure.status.code(), Some(5), "{failure:?}");
+    assert!(failure.stderr.is_empty(), "{failure:?}");
+    let envelope = exactly_one_envelope(&failure);
+    assert_eq!(envelope["errors"][0]["code"], "remote.execution_failed");
+
+    let exec_arguments = [
+        "exec".to_owned(),
+        "worker.example".to_owned(),
+        "--".to_owned(),
+        path_text(transport_fixture()).to_owned(),
+        "secret-output".to_owned(),
+    ];
+    let mut json_arguments = vec!["--json".to_owned()];
+    json_arguments.extend(exec_arguments.iter().cloned());
+    let json = assert_json_success(&environment.run_owned(&json_arguments), "exec");
+    assert_eq!(json["data"]["stdout"], "[redacted secret-shaped output]");
+    assert_eq!(json["data"]["stderr"], "[redacted secret-shaped output]");
+    assert_eq!(json["data"]["stdout_redacted"], true);
+    assert_eq!(json["data"]["stderr_redacted"], true);
+    let rendered_json = json.to_string();
+    assert!(!rendered_json.contains("fixture-secret-output-value"));
+    assert!(!rendered_json.contains("fixture-secret-error-value"));
+
+    let human = environment.run_owned(&exec_arguments);
+    assert_eq!(human.status.code(), Some(0), "{human:?}");
+    let rendered_human = format!(
+        "{}{}",
+        String::from_utf8_lossy(&human.stdout),
+        String::from_utf8_lossy(&human.stderr)
+    );
+    assert!(rendered_human.contains("[redacted secret-shaped output]"));
+    assert!(!rendered_human.contains("fixture-secret-output-value"));
+    assert!(!rendered_human.contains("fixture-secret-error-value"));
 }
 
 #[test]
@@ -463,6 +888,31 @@ fn assert_json_success(output: &Output, command: &str) -> Value {
     envelope
 }
 
+fn enroll_fixture_worker(environment: &IsolatedEnvironment, user: &str) -> Value {
+    assert_json_success(
+        &environment.run_owned(&[
+            "--json".to_owned(),
+            "host".to_owned(),
+            "enroll".to_owned(),
+            "worker.example".to_owned(),
+            "--user".to_owned(),
+            user.to_owned(),
+            "--fingerprint".to_owned(),
+            VALID_FINGERPRINT.to_owned(),
+        ]),
+        "host enroll",
+    )
+}
+
+fn finding<'a>(doctor: &'a Value, id: &str) -> &'a Value {
+    doctor["data"]["controller_findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|finding| finding["id"] == id)
+        .unwrap_or_else(|| panic!("missing doctor finding {id}: {doctor}"))
+}
+
 fn exactly_one_envelope(output: &Output) -> Value {
     assert!(!output.stdout.is_empty(), "{output:?}");
     assert!(!output.stdout.contains(&0x1b), "{output:?}");
@@ -612,6 +1062,22 @@ impl IsolatedEnvironment {
             assert!(
                 !path.exists(),
                 "unexpected partial controller state: {}",
+                path.display()
+            );
+        }
+    }
+
+    fn assert_no_enrolled_host_state(&self) {
+        for path in [
+            self.config.join("inventory.toml"),
+            self.config.join("known_hosts"),
+            self.config
+                .join("manifests")
+                .join(format!("{WORKER_ID}.toml")),
+        ] {
+            assert!(
+                !path.exists(),
+                "unexpected partial host state: {}",
                 path.display()
             );
         }

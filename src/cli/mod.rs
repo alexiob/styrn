@@ -327,6 +327,167 @@ impl ParsedCli {
     pub(crate) const fn json_output(&self) -> bool {
         self.cli.json
     }
+
+    pub(crate) fn command_name(&self) -> &'static str {
+        match &self.cli.command {
+            RootCommand::Machine {
+                command: MachineCommand::Roles,
+            } => "machine roles",
+            RootCommand::Machine {
+                command:
+                    MachineCommand::Role {
+                        command: MachineRoleCommand::Add { .. },
+                    },
+            } => "machine role add",
+            RootCommand::Machine {
+                command:
+                    MachineCommand::Role {
+                        command: MachineRoleCommand::Remove { .. },
+                    },
+            } => "machine role remove",
+            RootCommand::Machine {
+                command: MachineCommand::Manifest,
+            } => "machine manifest",
+            RootCommand::Machine {
+                command: MachineCommand::Init,
+            } => "machine init",
+            RootCommand::Controller { .. } => "controller init",
+            RootCommand::Host {
+                command: HostCommand::List,
+            } => "host list",
+            RootCommand::Host {
+                command: HostCommand::Show { .. },
+            } => "host show",
+            RootCommand::Host {
+                command: HostCommand::Status { .. },
+            } => "host status",
+            RootCommand::Host {
+                command: HostCommand::Enroll { .. },
+            } => "host enroll",
+            RootCommand::Host {
+                command: HostCommand::Remove { .. },
+            } => "host remove",
+            RootCommand::Host {
+                command: HostCommand::Doctor { .. },
+            } => "host doctor",
+            RootCommand::Host {
+                command: HostCommand::Refresh { .. },
+            } => "host refresh",
+            RootCommand::Host {
+                command: HostCommand::AuthorizeKey { .. },
+            } => "host authorize-key",
+            RootCommand::Host {
+                command: HostCommand::RevokeKey { .. },
+            } => "host revoke-key",
+            RootCommand::Host {
+                command: HostCommand::Trust { .. },
+            } => "host trust",
+            RootCommand::Shell { .. } => "shell",
+            RootCommand::Desktop {
+                command: DesktopCommand::Open { .. },
+            } => "desktop open",
+            RootCommand::Desktop {
+                command: DesktopCommand::Info { .. },
+            } => "desktop info",
+            RootCommand::Admin { .. } => "admin open",
+            RootCommand::Exec(_) => "exec",
+            RootCommand::Agent {
+                command: AgentCommand::List(_),
+            } => "agent list",
+            RootCommand::Agent {
+                command: AgentCommand::Start(_),
+            } => "agent start",
+            RootCommand::Agent {
+                command: AgentCommand::Read { .. },
+            } => "agent read",
+            RootCommand::Agent {
+                command: AgentCommand::Prompt { .. },
+            } => "agent prompt",
+            RootCommand::Agent {
+                command: AgentCommand::Wait(_),
+            } => "agent wait",
+            RootCommand::Agent {
+                command: AgentCommand::Stop { .. },
+            } => "agent stop",
+            RootCommand::Agent {
+                command: AgentCommand::Attach { .. },
+            } => "agent attach",
+            RootCommand::Job {
+                command: JobCommand::List,
+            } => "job list",
+            RootCommand::Job {
+                command: JobCommand::Show { .. },
+            } => "job show",
+            RootCommand::Job {
+                command: JobCommand::Cancel { .. },
+            } => "job cancel",
+            RootCommand::Job {
+                command: JobCommand::Logs(_),
+            } => "job logs",
+            RootCommand::Project {
+                command: ProjectCommand::List,
+            } => "project list",
+            RootCommand::Project {
+                command: ProjectCommand::Inspect { .. },
+            } => "project inspect",
+            RootCommand::Project {
+                command: ProjectCommand::Init { .. },
+            } => "project init",
+            RootCommand::Workflow {
+                command: WorkflowCommand::List { .. },
+            } => "workflow list",
+            RootCommand::Workflow {
+                command: WorkflowCommand::Plan(_),
+            } => "workflow plan",
+            RootCommand::Workflow {
+                command: WorkflowCommand::Run(_),
+            } => "workflow run",
+            RootCommand::Workflow {
+                command: WorkflowCommand::Cancel { .. },
+            } => "workflow cancel",
+            RootCommand::Matrix { .. } => "matrix run",
+            RootCommand::Clean {
+                command: CleanCommand::Plan { .. },
+            } => "clean plan",
+            RootCommand::Clean {
+                command: CleanCommand::Run { .. },
+            } => "clean run",
+            RootCommand::Cache {
+                command: CacheCommand::Status { .. },
+            } => "cache status",
+            RootCommand::Cache {
+                command: CacheCommand::Trim { .. },
+            } => "cache trim",
+            RootCommand::Artifact { .. } => "artifact read",
+            RootCommand::Fleet {
+                command: FleetCommand::Status,
+            } => "fleet status",
+            RootCommand::Fleet {
+                command: FleetCommand::Doctor,
+            } => "fleet doctor",
+            RootCommand::Fleet {
+                command: FleetCommand::Versions,
+            } => "fleet versions",
+            RootCommand::Fleet {
+                command: FleetCommand::Selftest,
+            } => "fleet selftest",
+            RootCommand::Fleet {
+                command: FleetCommand::Controllers,
+            } => "fleet controllers",
+            RootCommand::Fleet {
+                command: FleetCommand::Workers,
+            } => "fleet workers",
+            RootCommand::Harness { .. } => "harness run",
+            RootCommand::HarnessHook { .. } => "harness-hook",
+            RootCommand::Upgrade(_) => "upgrade",
+            RootCommand::Setup(_) => "setup",
+            RootCommand::BootstrapScript { .. } => "bootstrap-script",
+            RootCommand::Env => "env",
+            RootCommand::Monitor(_) => "monitor",
+            RootCommand::Watch(_) => "watch",
+            RootCommand::Rpc { .. } => "rpc serve",
+        }
+    }
 }
 
 #[derive(Debug)]

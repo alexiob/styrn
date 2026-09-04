@@ -539,6 +539,28 @@ struct WorkerDoctorRemediation {
     styrn_args: Option<Vec<String>>,
 }
 
+impl WorkerDoctorFinding {
+    fn from_pending_action(index: usize, action: &crate::manifest::PendingAction) -> Self {
+        let severity = match action.severity {
+            crate::manifest::PendingSeverity::Info => WorkerDoctorSeverity::Info,
+            crate::manifest::PendingSeverity::Warning => WorkerDoctorSeverity::Warning,
+            crate::manifest::PendingSeverity::Error => WorkerDoctorSeverity::Error,
+        };
+        Self {
+            id: format!("pending.action-{}", index + 1),
+            state: WorkerDoctorFindingState::Fail,
+            severity,
+            message: "a worker manifest pending action remains unresolved".to_owned(),
+            remediation: Some(WorkerDoctorRemediation {
+                summary:
+                    "complete the corresponding pending action in the worker manifest, then rerun styrn host doctor"
+                        .to_owned(),
+                styrn_args: None,
+            }),
+        }
+    }
+}
+
 impl WorkerDoctorReport {
     pub(crate) fn from_remote_value(value: Value) -> Result<Self, RpcError> {
         validate_remote_value(&value)?;

@@ -87,81 +87,106 @@ fn run(parsed: cli::ParsedCli) {
         run_exec_command(request, parsed.json_output());
         return;
     }
-    let Some(action) = parsed.machine_action() else {
-        return;
-    };
-    let command = match action {
-        cli::MachineAction::Manifest => "machine manifest",
-        cli::MachineAction::Init => "machine init",
-    };
-    let result = match manifest::configured_manifest_store() {
-        Ok(store) => match action {
-            cli::MachineAction::Manifest => store.read(),
-            cli::MachineAction::Init => store.reconcile(),
-        },
-        Err(error) => Err(error),
-    };
-    match result {
-        Ok(outcome) => {
-            if outcome.machine_id_minted {
-                eprintln!("machine_id was minted and persisted");
-            }
-            if parsed.json_output() {
-                let warnings = if outcome.machine_id_minted {
-                    vec![output::Diagnostic::new(
-                        "machine.machine_id_minted",
-                        "machine_id was minted and persisted",
-                        None,
+    if let Some(action) = parsed.machine_action() {
+        let command = match action {
+            cli::MachineAction::Manifest => "machine manifest",
+            cli::MachineAction::Init => "machine init",
+        };
+        let result = match manifest::configured_manifest_store() {
+            Ok(store) => match action {
+                cli::MachineAction::Manifest => store.read(),
+                cli::MachineAction::Init => store.reconcile(),
+            },
+            Err(error) => Err(error),
+        };
+        match result {
+            Ok(outcome) => {
+                if outcome.machine_id_minted {
+                    eprintln!("machine_id was minted and persisted");
+                }
+                if parsed.json_output() {
+                    let warnings = if outcome.machine_id_minted {
+                        vec![output::Diagnostic::new(
+                            "machine.machine_id_minted",
+                            "machine_id was minted and persisted",
+                            None,
+                        )
+                        .expect("the built-in manifest warning must be valid")]
+                    } else {
+                        Vec::new()
+                    };
+                    let envelope = output::Envelope::success(
+                        command,
+                        chrono::Utc::now(),
+                        outcome
+                            .manifest
+                            .to_json_value()
+                            .expect("validated manifest must serialize"),
+                        warnings,
                     )
-                    .expect("the built-in manifest warning must be valid")]
+                    .expect("the built-in manifest output must be valid");
+                    output::write_json(std::io::stdout().lock(), &envelope)
+                        .expect("writing command output must succeed");
                 } else {
-                    Vec::new()
-                };
-                let envelope = output::Envelope::success(
-                    command,
-                    chrono::Utc::now(),
-                    outcome
-                        .manifest
-                        .to_json_value()
-                        .expect("validated manifest must serialize"),
-                    warnings,
-                )
-                .expect("the built-in manifest output must be valid");
-                output::write_json(std::io::stdout().lock(), &envelope)
-                    .expect("writing command output must succeed");
-            } else {
-                print!(
-                    "{}",
-                    outcome
-                        .manifest
-                        .to_toml()
-                        .expect("validated manifest must serialize")
-                );
+                    print!(
+                        "{}",
+                        outcome
+                            .manifest
+                            .to_toml()
+                            .expect("validated manifest must serialize")
+                    );
+                }
+            }
+            Err(error) => {
+                if parsed.json_output() {
+                    let failure = output::CommandFailure::new(
+                        command,
+                        chrono::Utc::now(),
+                        output::ErrorCode::MachineManifestInvalid,
+                        error.to_string(),
+                    )
+                    .expect("the built-in manifest error must be valid");
+                    output::write_json(std::io::stdout().lock(), failure.envelope())
+                        .expect("writing command output must succeed");
+                    output::exit_process(failure.exit_code());
+                }
+                eprintln!("{error}");
+                output::exit_process(output::StyrnExit::Usage);
             }
         }
-        Err(error) => {
-            if parsed.json_output() {
-                let failure = output::CommandFailure::new(
-                    command,
-                    chrono::Utc::now(),
-                    output::ErrorCode::MachineManifestInvalid,
-                    error.to_string(),
-                )
-                .expect("the built-in manifest error must be valid");
-                output::write_json(std::io::stdout().lock(), failure.envelope())
-                    .expect("writing command output must succeed");
-                output::exit_process(failure.exit_code());
-            }
-            eprintln!("{error}");
-            output::exit_process(output::StyrnExit::Usage);
-        }
+        return;
     }
+
+    fail_phase1(
+        parsed.json_output(),
+        parsed.command_name(),
+        Phase1CommandError::new(
+            output::ErrorCode::CapabilityUnsatisfied,
+            "this command is not available in this build",
+        ),
+    );
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct Phase1CommandError {
     code: output::ErrorCode,
     message: &'static str,
+    recovery_public_key_path: Option<std::path::PathBuf>,
+}
+
+impl Phase1CommandError {
+    const fn new(code: output::ErrorCode, message: &'static str) -> Self {
+        Self {
+            code,
+            message,
+            recovery_public_key_path: None,
+        }
+    }
+
+    fn with_public_key_recovery(mut self, public_key_path: &std::path::Path) -> Self {
+        self.recovery_public_key_path = Some(public_key_path.to_path_buf());
+        self
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -327,26 +352,48 @@ fn host_doctor(name: Option<&str>) -> Result<HostCommandSuccess, Phase1CommandEr
             .map(|worker_time| {
                 (chrono::Utc::now().timestamp() - worker_time.timestamp()).unsigned_abs()
             });
-    let cache_state = cache.as_ref().map_or("invalid", |_| "pass");
     let cache_stale = cache.as_ref().is_ok_and(|cache| {
         chrono::Utc::now().fixed_offset() - cache.cached_at() > chrono::Duration::days(7)
     });
     let version_drift = cache
         .as_ref()
         .is_ok_and(|cache| cache.styrn_version() != version);
+    let cache_bound_to_live_worker = cache.as_ref().is_ok_and(|cache| {
+        cache.manifest().is_ok_and(|cached_manifest| {
+            manifest_matches_host(&cached_manifest, &host)
+                && cached_manifest.to_toml().ok() == manifest.to_toml().ok()
+        })
+    });
+    let cache_healthy = cache_bound_to_live_worker && !cache_stale && !version_drift;
+    let clock_healthy = clock_skew_seconds.is_some_and(|seconds| seconds <= 30);
+    let disk_floor = configured_disk_floor(&manifest);
+    let disk_state = match disk_floor {
+        Some(floor) if status.disk.free_bytes >= floor => "pass",
+        Some(_) => "fail",
+        None => "unknown",
+    };
+    let pending_actions = manifest.pending_actions.as_deref().unwrap_or(&[]);
+    let pending_state = if pending_actions.is_empty() {
+        "pass"
+    } else {
+        "fail"
+    };
     let controller_findings = serde_json::json!([
-        {"id":"controller.transport.ssh","state":"pass","severity":"info","message":"SSH and RPC completed"},
-        {"id":"controller.protocol.compatible","state":"pass","severity":"info","message":"RPC protocol is compatible"},
-        {"id":"controller.manifest.binding","state":"pass","severity":"info","message":"worker identity and manifest are bound"},
-        {"id":"controller.clock.skew","state": if clock_skew_seconds.is_some_and(|seconds| seconds > 30) {"fail"} else {"pass"},"severity": if clock_skew_seconds.is_some_and(|seconds| seconds > 30) {"warning"} else {"info"},"message":"worker clock skew was checked"},
-        {"id":"controller.cache.state","state": if cache_state == "pass" && !cache_stale && !version_drift {"pass"} else {"fail"},"severity": if cache_state == "pass" && !cache_stale && !version_drift {"info"} else {"warning"},"message":"manifest cache age and worker version were checked"},
-        {"id":"controller.coverage.deferred","state":"unknown","severity":"info","message":"remaining fleet and platform-specific checks are deferred"}
+        {"id":"controller.transport.ssh","state":"pass","severity":"info","message":"SSH and RPC completed","remediation":null},
+        {"id":"controller.protocol.compatible","state":"pass","severity":"info","message":"RPC protocol is compatible","remediation":null},
+        {"id":"controller.manifest.binding","state":"pass","severity":"info","message":"worker identity and manifest are bound","remediation":null},
+        {"id":"controller.clock.skew","state": if clock_healthy {"pass"} else {"fail"},"severity": if clock_healthy {"info"} else {"warning"},"message":"worker clock skew was checked","remediation": if clock_healthy {serde_json::Value::Null} else {doctor_remediation("synchronize the controller and worker system clocks, then rerun styrn host doctor", None)}},
+        {"id":"controller.cache.state","state": if cache_healthy {"pass"} else {"fail"},"severity": if cache_healthy {"info"} else {"warning"},"message":"manifest cache binding, age, and worker version were checked","remediation": if cache_healthy {serde_json::Value::Null} else {doctor_remediation("refresh the selected worker manifest cache", Some(vec!["host".to_owned(), "refresh".to_owned(), host.name().to_owned()]))}},
+        {"id":"worker.disk.floor","state":disk_state,"severity":if disk_state == "fail" {"error"} else {"info"},"message":"live free disk space was checked against the configured hard floor","remediation":if disk_state == "pass" {serde_json::Value::Null} else {doctor_remediation("free disk space or correct the worker's configured disk reserve, then rerun styrn host doctor", None)}},
+        {"id":"worker.pending_actions","state":pending_state,"severity":if pending_state == "fail" {"warning"} else {"info"},"message":if pending_state == "fail" {"the worker manifest has unresolved pending actions"} else {"the worker manifest has no unresolved pending actions"},"remediation":if pending_state == "pass" {serde_json::Value::Null} else {doctor_remediation("complete each pending action reported by the worker manifest, then rerun styrn host doctor", None)}},
+        {"id":"controller.coverage.deferred","state":"unknown","severity":"info","message":"remaining fleet and platform-specific checks are deferred","remediation":doctor_remediation("run the documented native platform acceptance checks for the deferred doctor coverage", None)}
     ]);
     let data = serde_json::json!({
         "host": host.name(),
         "coverage": "phase1_minimum",
         "complete": false,
         "controller_findings": controller_findings,
+        "pending_actions": pending_actions,
         "worker": worker,
         "status": status,
     });
@@ -372,106 +419,116 @@ fn host_enroll(
         transport::validate_host_key_fingerprint(fingerprint)
             .map_err(|_| invalid_ssh_argument())?;
     } else if json || !stdin_terminal {
-        return Err(Phase1CommandError {
-            code: output::ErrorCode::UsageInvalidArgument,
-            message: "non-interactive enrollment requires --fingerprint",
-        });
+        return Err(Phase1CommandError::new(
+            output::ErrorCode::UsageInvalidArgument,
+            "non-interactive enrollment requires --fingerprint",
+        ));
     }
 
     let identity = configured_controller_identity()?;
-    let store = inventory::InventoryStore::configured().map_err(inventory_error)?;
-    let snapshot = store.read().map_err(inventory_error)?;
-    let previous = snapshot.host(host).cloned();
-    let scanner = transport::SshTransport::configured(store.known_hosts_path().to_path_buf());
-    let pin = scanner
-        .scan_host_key(host, 22, fingerprint)
-        .map_err(transport_error)?;
-    if fingerprint.is_none() && !confirm_host_key(pin.fingerprint()) {
-        return Err(Phase1CommandError {
-            code: output::ErrorCode::TransportAuthFailed,
-            message: "the worker host key was not confirmed",
-        });
-    }
+    let result = (|| {
+        let store = inventory::InventoryStore::configured().map_err(inventory_error)?;
+        let snapshot = store.read().map_err(inventory_error)?;
+        let previous = snapshot.host(host).cloned();
+        let scanner = transport::SshTransport::configured(store.known_hosts_path().to_path_buf());
+        let pin = scanner
+            .scan_host_key(host, 22, fingerprint)
+            .map_err(transport_error)?;
+        if fingerprint.is_none() && !confirm_host_key(pin.fingerprint()) {
+            return Err(Phase1CommandError::new(
+                output::ErrorCode::TransportAuthFailed,
+                "the worker host key was not confirmed",
+            ));
+        }
 
-    let stored = inventory::StoredSsh::new(
-        host,
-        user,
-        22,
-        identity.private_path().to_path_buf(),
-        pin.clone(),
-    )
-    .map_err(inventory_error)?;
-    if previous
-        .as_ref()
-        .is_some_and(|record| record.transport() != &stored)
-    {
-        return Err(Phase1CommandError {
-            code: output::ErrorCode::UsageConfigInvalid,
-            message: "the enrolled host endpoint or trust binding conflicts with local inventory",
-        });
-    }
-
-    let candidate = store
-        .candidate_known_hosts(host, 22, &pin)
+        let stored = inventory::StoredSsh::new(
+            host,
+            user,
+            22,
+            identity.private_path().to_path_buf(),
+            pin.clone(),
+        )
         .map_err(inventory_error)?;
-    let target = stored.rpc_target().map_err(transport_error)?;
-    let enrollment_transport = transport::SshTransport::configured(candidate.path().to_path_buf());
-    let process = transport::RpcTransport::connect(&enrollment_transport, &target)
-        .map_err(transport_error)?;
-    let mut client = rpc::RpcClient::connect(process).map_err(rpc_error)?;
-    let machine_id = previous
-        .as_ref()
-        .map(inventory::InventoryHost::machine_id)
-        .unwrap_or(client.server_hello().machine_id);
-    let expected = rpc::ExpectedPeer::new(machine_id, host, user).map_err(rpc_error)?;
-    let version = client.server_hello().styrn_version.clone();
-    let manifest = client.machine_manifest(&expected).map_err(rpc_error)?;
-    let record = inventory::InventoryHost::new(host, manifest.machine_id, stored)
-        .map_err(inventory_error)?;
-    validate_manifest_endpoint(&manifest, &record)?;
-    let status = client.machine_status().map_err(rpc_error)?;
-    let doctor = client
-        .machine_doctor(identity.public_line())
-        .map_err(rpc_error)?;
-    client.finish().map_err(rpc_error)?;
-    drop(candidate);
+        if previous
+            .as_ref()
+            .is_some_and(|record| record.transport() != &stored)
+        {
+            return Err(Phase1CommandError::new(
+                output::ErrorCode::UsageConfigInvalid,
+                "the enrolled host endpoint or trust binding conflicts with local inventory",
+            ));
+        }
 
-    if snapshot.hosts().iter().any(|existing| {
-        existing.machine_id() == record.machine_id() && existing.name() != record.name()
-    }) {
-        return Err(Phase1CommandError {
-            code: output::ErrorCode::UsageConfigInvalid,
-            message: "the worker machine identity is already enrolled under another name",
-        });
-    }
-    let cache =
-        inventory::ManifestCache::new(chrono::Utc::now().fixed_offset(), &version, &manifest)
+        let candidate = store
+            .candidate_known_hosts(host, 22, &pin)
             .map_err(inventory_error)?;
-    let (created, known_hosts_failed) = store
-        .with_lock(|locked| {
-            let mut current = locked.read_locked()?;
-            let created = current.upsert_exact(record.clone())?;
-            store.write_cache(&cache)?;
-            if created {
-                locked.replace_inventory(&current)?;
-            }
-            let known_hosts_failed = locked.rebuild_known_hosts(&current).is_err();
-            Ok((created, known_hosts_failed))
-        })
-        .map_err(inventory_error)?;
-    let warnings = known_hosts_failed
-        .then_some(KNOWN_HOSTS_WARNING)
-        .into_iter()
-        .collect();
-    let data = serde_json::json!({
-        "host": record.name(),
-        "machine_id": record.machine_id(),
-        "created": created,
-        "fingerprint": pin.fingerprint(),
-        "status": status,
-        "doctor": doctor,
-    });
-    Ok((data, format!("Enrolled {}\n", record.name()), warnings))
+        let target = stored.rpc_target().map_err(transport_error)?;
+        let enrollment_transport =
+            transport::SshTransport::configured(candidate.path().to_path_buf());
+        let process = transport::RpcTransport::connect(&enrollment_transport, &target)
+            .map_err(transport_error)?;
+        let mut client = rpc::RpcClient::connect(process).map_err(rpc_error)?;
+        let machine_id = previous
+            .as_ref()
+            .map(inventory::InventoryHost::machine_id)
+            .unwrap_or(client.server_hello().machine_id);
+        let expected = rpc::ExpectedPeer::new(machine_id, host, user).map_err(rpc_error)?;
+        let version = client.server_hello().styrn_version.clone();
+        let manifest = client.machine_manifest(&expected).map_err(rpc_error)?;
+        let record = inventory::InventoryHost::new(host, manifest.machine_id, stored)
+            .map_err(inventory_error)?;
+        validate_manifest_endpoint(&manifest, &record)?;
+        let status = client.machine_status().map_err(rpc_error)?;
+        let doctor = client
+            .machine_doctor(identity.public_line())
+            .map_err(rpc_error)?;
+        client.finish().map_err(rpc_error)?;
+        drop(candidate);
+
+        if snapshot.hosts().iter().any(|existing| {
+            existing.machine_id() == record.machine_id() && existing.name() != record.name()
+        }) {
+            return Err(Phase1CommandError::new(
+                output::ErrorCode::UsageConfigInvalid,
+                "the worker machine identity is already enrolled under another name",
+            ));
+        }
+        let cache =
+            inventory::ManifestCache::new(chrono::Utc::now().fixed_offset(), &version, &manifest)
+                .map_err(inventory_error)?;
+        let (created, known_hosts_failed) = store
+            .with_lock(|locked| {
+                let mut current = locked.read_locked()?;
+                let created = current.upsert_exact(record.clone())?;
+                store.write_cache(&cache)?;
+                if created {
+                    locked.replace_inventory(&current)?;
+                }
+                let known_hosts_failed = locked.rebuild_known_hosts(&current).is_err();
+                Ok((created, known_hosts_failed))
+            })
+            .map_err(inventory_error)?;
+        let warnings = known_hosts_failed
+            .then_some(KNOWN_HOSTS_WARNING)
+            .into_iter()
+            .collect();
+        let data = serde_json::json!({
+            "host": record.name(),
+            "machine_id": record.machine_id(),
+            "created": created,
+            "fingerprint": pin.fingerprint(),
+            "status": status,
+            "doctor": doctor,
+        });
+        Ok((data, format!("Enrolled {}\n", record.name()), warnings))
+    })();
+    result.map_err(|error| {
+        if identity.created() {
+            error.with_public_key_recovery(identity.public_path())
+        } else {
+            error
+        }
+    })
 }
 
 fn host_trust(
@@ -527,10 +584,10 @@ fn run_exec_command(request: cli::ExecRequest, json: bool) {
         fail_phase1(
             json,
             "exec",
-            Phase1CommandError {
-                code: output::ErrorCode::UsageInvalidArgument,
-                message: "exec --shell is not available; pass an argv vector after --",
-            },
+            Phase1CommandError::new(
+                output::ErrorCode::UsageInvalidArgument,
+                "exec --shell is not available; pass an argv vector after --",
+            ),
         );
     }
     if let Err(error) = rpc::validate_exec_argv(request.argv()) {
@@ -593,10 +650,10 @@ fn connect_host(
 ) -> Result<(transport::ControllerIdentity, rpc::RpcClient), Phase1CommandError> {
     let identity = configured_controller_identity()?;
     if identity.private_path() != host.transport().identity() {
-        return Err(Phase1CommandError {
-            code: output::ErrorCode::UsageConfigInvalid,
-            message: "the enrolled host refers to a different controller identity",
-        });
+        return Err(Phase1CommandError::new(
+            output::ErrorCode::UsageConfigInvalid,
+            "the enrolled host refers to a different controller identity",
+        ));
     }
     let target = host.rpc_target().map_err(transport_error)?;
     let transport = transport::SshTransport::configured(store.known_hosts_path().to_path_buf());
@@ -620,20 +677,48 @@ fn validate_manifest_endpoint(
     manifest: &manifest::MachineManifest,
     host: &inventory::InventoryHost,
 ) -> Result<(), Phase1CommandError> {
-    let transport = manifest.transport.as_ref().ok_or(Phase1CommandError {
-        code: output::ErrorCode::ProtocolMalformed,
-        message: "the worker manifest has no SSH transport binding",
-    })?;
-    if transport.host != host.transport().host()
-        || transport.port.unwrap_or(22) != host.transport().port()
-        || transport.user.as_deref() != Some(host.transport().user())
-    {
-        return Err(Phase1CommandError {
-            code: output::ErrorCode::ProtocolMalformed,
-            message: "the worker manifest endpoint does not match the selected host",
-        });
+    if !manifest_matches_host(manifest, host) {
+        return Err(Phase1CommandError::new(
+            output::ErrorCode::ProtocolMalformed,
+            "the worker manifest identity and endpoint do not match the selected host",
+        ));
     }
     Ok(())
+}
+
+fn manifest_matches_host(
+    manifest: &manifest::MachineManifest,
+    host: &inventory::InventoryHost,
+) -> bool {
+    let transport = manifest.transport.as_ref();
+    manifest.machine_id == host.machine_id()
+        && manifest.name == host.name()
+        && manifest
+            .worker_identity
+            .as_ref()
+            .is_some_and(|identity| identity.name == host.transport().user())
+        && transport.is_some_and(|transport| {
+            transport.host == host.transport().host()
+                && transport.port.unwrap_or(22) == host.transport().port()
+                && transport.user.as_deref() == Some(host.transport().user())
+        })
+}
+
+fn configured_disk_floor(manifest: &manifest::MachineManifest) -> Option<u64> {
+    let resources = manifest.resources.as_ref()?;
+    let policy = resources.policy.as_ref()?;
+    policy.reserved_disk_bytes.or_else(|| {
+        let percent = u64::from(policy.reserved_disk_percent?);
+        let total = resources.detected.as_ref()?.disk_bytes?;
+        total.checked_mul(percent)?.checked_div(100)
+    })
+}
+
+fn doctor_remediation(summary: &str, styrn_args: Option<Vec<String>>) -> serde_json::Value {
+    serde_json::json!({
+        "summary": summary,
+        "styrn_args": styrn_args,
+    })
 }
 
 fn host_json(host: &inventory::InventoryHost) -> serde_json::Value {
@@ -694,77 +779,91 @@ fn render_phase1_success(
 
 fn fail_phase1(json: bool, command: &str, error: Phase1CommandError) -> ! {
     if json {
-        let failure =
-            output::CommandFailure::new(command, chrono::Utc::now(), error.code, error.message)
-                .expect("built-in phase-1 error must be valid");
-        output::write_json(std::io::stdout().lock(), failure.envelope())
+        let details = error.recovery_public_key_path.as_ref().map(|path| {
+            serde_json::json!({
+                "public_key_path": path,
+                "next_step": "authorize the public key at this path for the requested SSH user, then rerun styrn host enroll",
+            })
+        });
+        let diagnostic = output::ErrorDiagnostic::new(error.code, error.message, details)
+            .expect("built-in phase-1 error must be valid");
+        let envelope =
+            output::Envelope::failure(command, chrono::Utc::now(), vec![diagnostic], Vec::new())
+                .expect("built-in phase-1 failure must be valid");
+        output::write_json(std::io::stdout().lock(), &envelope)
             .expect("writing command output must succeed");
     } else {
         eprintln!("{}", error.message);
+        if let Some(path) = &error.recovery_public_key_path {
+            eprintln!("Controller public key: {}", path.display());
+            eprintln!(
+                "Authorize the public key at this path for the requested SSH user, then rerun styrn host enroll."
+            );
+        }
     }
     output::exit_process(error.code.exit_code())
 }
 
 fn machine_manifest_error() -> Phase1CommandError {
-    Phase1CommandError {
-        code: output::ErrorCode::MachineManifestInvalid,
-        message: "the local machine manifest is invalid; run styrn setup --yes",
-    }
+    Phase1CommandError::new(
+        output::ErrorCode::MachineManifestInvalid,
+        "the local machine manifest is invalid; run styrn setup --yes",
+    )
 }
 
 fn inventory_error(error: inventory::InventoryError) -> Phase1CommandError {
-    Phase1CommandError {
-        code: error.code(),
-        message: match error.code() {
+    Phase1CommandError::new(
+        error.code(),
+        match error.code() {
             output::ErrorCode::UsageInvalidArgument => {
                 "the requested host is not uniquely enrolled"
             }
             _ => "the local host inventory is invalid or insecure",
         },
-    }
+    )
 }
 
 fn invalid_ssh_argument() -> Phase1CommandError {
-    Phase1CommandError {
-        code: output::ErrorCode::UsageInvalidArgument,
-        message: "the SSH host, user, or fingerprint argument is invalid",
-    }
+    Phase1CommandError::new(
+        output::ErrorCode::UsageInvalidArgument,
+        "the SSH host, user, or fingerprint argument is invalid",
+    )
 }
 
 fn identity_error(error: transport::IdentityError) -> Phase1CommandError {
     match error {
-        transport::IdentityError::CapabilityUnavailable => Phase1CommandError {
-            code: output::ErrorCode::CapabilityUnsatisfied,
-            message: "OpenSSH ssh-keygen is unavailable",
-        },
+        transport::IdentityError::CapabilityUnavailable => Phase1CommandError::new(
+            output::ErrorCode::CapabilityUnsatisfied,
+            "OpenSSH ssh-keygen is unavailable",
+        ),
         transport::IdentityError::Invalid => machine_manifest_error(),
         transport::IdentityError::Conflict | transport::IdentityError::OperationFailed => {
-            Phase1CommandError {
-                code: output::ErrorCode::UsageConfigInvalid,
-                message: "the controller SSH identity is invalid or insecure",
-            }
+            Phase1CommandError::new(
+                output::ErrorCode::UsageConfigInvalid,
+                "the controller SSH identity is invalid or insecure",
+            )
         }
     }
 }
 
 fn transport_error(error: transport::TransportError) -> Phase1CommandError {
-    Phase1CommandError {
-        code: error.code(),
-        message: match error.code() {
+    Phase1CommandError::new(
+        error.code(),
+        match error.code() {
             output::ErrorCode::CapabilityUnsatisfied => "a required OpenSSH tool is unavailable",
             output::ErrorCode::TransportAuthFailed => {
                 "the worker SSH identity or authentication could not be verified"
             }
             _ => "the worker host is unreachable",
         },
-    }
+    )
 }
 
 fn rpc_error(error: rpc::RpcError) -> Phase1CommandError {
     let code = error.code();
-    Phase1CommandError {
+    Phase1CommandError::new(
         code,
-        message: match code {
+        match code {
             output::ErrorCode::TransportAuthFailed => "SSH authentication failed before RPC hello",
             output::ErrorCode::TransportSessionLost => "the worker RPC session was lost",
             output::ErrorCode::ProtocolIncompatible => {
@@ -778,7 +877,7 @@ fn rpc_error(error: rpc::RpcError) -> Phase1CommandError {
             output::ErrorCode::UsageInvalidArgument => "the RPC request is invalid",
             _ => "the worker RPC operation failed",
         },
-    }
+    )
 }
 
 fn run_rootless_setup(request: cli::SetupRequest) {

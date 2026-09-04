@@ -2,7 +2,8 @@ mod identity;
 mod local_child;
 mod ssh;
 
-#[allow(unused_imports)] // Source-including contract tests omit the live CLI identity consumer.
+#[allow(unused_imports)]
+// Source-including contract tests omit the live CLI identity consumer.
 pub(crate) use identity::{ControllerIdentity, IdentityError};
 #[allow(unused_imports)]
 // The production CLI uses SSH while the local-child transport remains an integration seam.

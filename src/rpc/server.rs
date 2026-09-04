@@ -175,15 +175,25 @@ fn handle_request(
             let authorized_public_key =
                 canonical_authorized_public_key(&params.authorized_public_key)
                     .map_err(|_| HandlerError::Malformed)?;
-            let findings = crate::setup::worker_doctor_findings(manifest, &authorized_public_key)
-                .map_err(|_| HandlerError::Remote)?
-                .into_iter()
-                .map(|finding| {
-                    serde_json::to_value(finding)
-                        .and_then(serde_json::from_value::<WorkerDoctorFinding>)
-                })
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(|_| HandlerError::Remote)?;
+            let mut findings =
+                crate::setup::worker_doctor_findings(manifest, &authorized_public_key)
+                    .map_err(|_| HandlerError::Remote)?
+                    .into_iter()
+                    .map(|finding| {
+                        serde_json::to_value(finding)
+                            .and_then(serde_json::from_value::<WorkerDoctorFinding>)
+                    })
+                    .collect::<Result<Vec<_>, _>>()
+                    .map_err(|_| HandlerError::Remote)?;
+            findings.extend(
+                manifest
+                    .pending_actions
+                    .as_deref()
+                    .unwrap_or(&[])
+                    .iter()
+                    .enumerate()
+                    .map(|(index, action)| WorkerDoctorFinding::from_pending_action(index, action)),
+            );
             let report = WorkerDoctorReport {
                 findings,
                 coverage: "phase1_minimum".to_owned(),
