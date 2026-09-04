@@ -480,6 +480,60 @@ fn current_user_ssh_append_receipt_binds_only_the_owned_stanza_hash() {
 }
 
 #[test]
+fn receipt_schema_rejects_partial_append_ownership_and_non_ssh_append_effects() {
+    let schema: serde_json::Value = serde_json::from_str(include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/schemas/setup-receipt-v1.schema.json"
+    )))
+    .unwrap();
+    let validator = jsonschema::validator_for(&schema).unwrap();
+
+    let mut appended = current_user_ssh_receipt_value("ssh.authorized-keys");
+    appended["entries"][0]["files_created"] = serde_json::json!([]);
+    appended["entries"][0]["files_appended"] = serde_json::json!([{
+        "path": appended["entries"][0]["action"]["parameters"]["path"].clone(),
+        "stanza_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "appended_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    }]);
+    for retained in ["owned_stanza_id", "owned_stanza_sha256"] {
+        let mut partial = appended.clone();
+        partial["entries"][0]["action"]["parameters"][retained] =
+            serde_json::json!(if retained == "owned_stanza_id" {
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            } else {
+                "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            });
+        assert!(
+            !validator.is_valid(&partial),
+            "schema accepted only {retained}"
+        );
+    }
+
+    let effect = serde_json::json!([{
+        "path": appended["entries"][0]["action"]["parameters"]["path"].clone(),
+        "stanza_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "appended_sha256": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    }]);
+    let mut worker = worker_directory_receipt_value();
+    worker["entries"][0]["files_appended"] = effect.clone();
+    assert!(!validator.is_valid(&worker));
+
+    let mut promotion: serde_json::Value = serde_json::from_str(include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/setup-receipt-scope-promotion.json"
+    )))
+    .unwrap();
+    let promotion_entry = promotion["entries"]
+        .as_array_mut()
+        .unwrap()
+        .iter_mut()
+        .find(|entry| entry["action"]["type"] == "scope_promotion")
+        .unwrap();
+    promotion_entry["files_appended"] = effect;
+    assert!(!validator.is_valid(&promotion));
+}
+
+#[test]
 fn current_user_ssh_receipt_rejects_generic_or_detached_parameters_and_effects() {
     let base = current_user_ssh_receipt_value("ssh.authorized-keys");
     let mut cases = Vec::new();

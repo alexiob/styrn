@@ -7155,29 +7155,83 @@ pub(crate) fn open_verified_private_file_for_read(
     platform_impl::open_verified_private_file_for_read(path, owner, principal, expected_identity)
 }
 
-/// Appends one complete, non-empty byte sequence through a no-follow handle
-/// whose identity and user-owned security were verified before the write.
+/// A no-follow private-file handle held across the final bounded read and the
+/// subsequent append. The append flag ensures unrelated concurrent appends are
+/// not overwritten; user-owned state is not a same-user containment boundary.
 #[allow(dead_code)] // Source-inclusion tests omit current-user SSH setup actions.
-pub(crate) fn append_verified_private_file_once(
+pub(crate) struct VerifiedPrivateAppendFile {
+    file: std::fs::File,
+    expected_identity: PrivateFileIdentity,
+}
+
+#[allow(dead_code)] // Source-inclusion tests omit current-user SSH setup actions.
+impl VerifiedPrivateAppendFile {
+    pub(crate) fn read_bounded(&mut self, max_bytes: usize) -> std::io::Result<Vec<u8>> {
+        use std::io::Seek as _;
+
+        self.file.rewind()?;
+        let mut bytes = Vec::new();
+        Read::by_ref(&mut self.file)
+            .take(max_bytes as u64 + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() > max_bytes {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "private append target exceeds the size limit",
+            ));
+        }
+        self.verify_identity()?;
+        Ok(bytes)
+    }
+
+    pub(crate) fn append_once(&mut self, bytes: &[u8]) -> std::io::Result<()> {
+        use std::io::Write as _;
+
+        if bytes.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "private file append is empty",
+            ));
+        }
+        self.verify_identity()?;
+        if self.file.write(bytes)? != bytes.len() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::WriteZero,
+                "private append was incomplete",
+            ));
+        }
+        self.file.sync_all()?;
+        self.verify_identity()
+    }
+
+    fn verify_identity(&self) -> std::io::Result<()> {
+        if platform_impl::private_file_identity_from_handle(&self.file)? != self.expected_identity {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "private append target identity changed",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[allow(dead_code)] // Source-inclusion tests omit current-user SSH setup actions.
+pub(crate) fn open_verified_private_file_for_append(
     path: &Path,
     owner: ManifestOwner,
     principal: &WorkerPrincipal,
     expected_identity: PrivateFileIdentity,
-    bytes: &[u8],
-) -> std::io::Result<()> {
-    if bytes.is_empty() {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "private file append is empty",
-        ));
-    }
-    platform_impl::append_verified_private_file_once(
+) -> std::io::Result<VerifiedPrivateAppendFile> {
+    let file = platform_impl::open_verified_private_file_for_append(
         path,
         owner,
         principal,
         expected_identity,
-        bytes,
-    )
+    )?;
+    Ok(VerifiedPrivateAppendFile {
+        file,
+        expected_identity,
+    })
 }
 
 #[allow(dead_code)] // Source-including manifest tests omit authorization execution.

@@ -4837,17 +4837,16 @@ pub(super) fn open_verified_private_file_for_read(
     Ok(file)
 }
 
-pub(super) fn append_verified_private_file_once(
+pub(super) fn open_verified_private_file_for_append(
     path: &Path,
     owner: ManifestOwner,
     principal: &WorkerPrincipal,
     expected_identity: PrivateFileIdentity,
-    bytes: &[u8],
-) -> io::Result<()> {
-    use std::io::Write as _;
+) -> io::Result<std::fs::File> {
     use std::os::windows::fs::OpenOptionsExt;
 
-    let mut file = std::fs::OpenOptions::new()
+    let file = std::fs::OpenOptions::new()
+        .read(true)
         .append(true)
         .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE)
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
@@ -4856,17 +4855,7 @@ pub(super) fn append_verified_private_file_once(
         return Err(permission_denied("private append target identity changed"));
     }
     verify_private_file_handle_security(&file, owner, principal)?;
-    if file.write(bytes)? != bytes.len() {
-        return Err(io::Error::new(
-            io::ErrorKind::WriteZero,
-            "private append was incomplete",
-        ));
-    }
-    file.sync_all()?;
-    if private_file_identity_from_handle(&file)? != expected_identity {
-        return Err(permission_denied("private append target identity changed"));
-    }
-    Ok(())
+    Ok(file)
 }
 
 #[allow(dead_code)] // Source-including manifest tests omit authorization execution.

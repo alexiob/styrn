@@ -96,10 +96,15 @@ fn build(
             .iter()
             .flat_map(|key| [key.as_bytes(), b"\n"].concat())
             .collect::<Vec<_>>();
-        let stanza_id = sha256(&payload);
-        let mut stanza = format!("# styrn:begin {stanza_id}\n").into_bytes();
-        stanza.extend_from_slice(&payload);
-        stanza.extend_from_slice(format!("# styrn:end {stanza_id}\n").as_bytes());
+        let (stanza_id, stanza) = if initial_identity.is_some() {
+            let stanza_id = sha256(&payload);
+            let mut stanza = format!("# styrn:begin {stanza_id}\n").into_bytes();
+            stanza.extend_from_slice(&payload);
+            stanza.extend_from_slice(format!("# styrn:end {stanza_id}\n").as_bytes());
+            (Some(stanza_id), stanza)
+        } else {
+            (None, payload)
+        };
         let added = stanza.len() + usize::from(initial_identity.is_some());
         if initial_bytes
             .checked_add(added)
@@ -107,7 +112,7 @@ fn build(
         {
             conflict = true;
         }
-        (Some(stanza_id), stanza)
+        (stanza_id, stanza)
     };
     Ok(vec![
         Action::CurrentUserSsh(Box::new(CurrentUserSshAction::Directory {
@@ -231,11 +236,20 @@ fn analyze_keys(before: &[u8], required: &[String]) -> Option<KeyAnalysis> {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let (identity, is_constrained) = active_key_identity(line)?;
-        if is_constrained {
-            constrained.insert(identity);
-        } else {
-            unrestricted.insert(identity);
+        if let Some((identity, is_constrained)) = active_key_identity(line) {
+            if is_constrained {
+                constrained.insert(identity);
+            } else {
+                unrestricted.insert(identity);
+            }
+        } else if required_identities
+            .iter()
+            .any(|identity| contains_key_identity(line, identity))
+        {
+            return Some(KeyAnalysis {
+                missing: Vec::new(),
+                conflict: true,
+            });
         }
     }
     let conflict = required_identities
@@ -250,6 +264,13 @@ fn analyze_keys(before: &[u8], required: &[String]) -> Option<KeyAnalysis> {
         .map(|(key, _)| key.clone())
         .collect();
     Some(KeyAnalysis { missing, conflict })
+}
+
+fn contains_key_identity(line: &str, identity: &(String, String)) -> bool {
+    let fields = line.split_ascii_whitespace().collect::<Vec<_>>();
+    fields
+        .windows(2)
+        .any(|fields| fields[0] == identity.0 && fields[1] == identity.1)
 }
 
 fn validate_owned_markers(text: &str) -> Option<()> {
@@ -356,7 +377,6 @@ impl CurrentUserSshAction {
                 principal,
                 directory,
                 path,
-                initial_identity,
                 stanza_id,
                 stanza,
                 ..
@@ -366,14 +386,7 @@ impl CurrentUserSshAction {
                 directory.clone(),
                 path.clone(),
                 stanza_id.clone(),
-                (!stanza.is_empty()).then(|| {
-                    let owned = if initial_identity.is_some() {
-                        append_stanza(stanza)
-                    } else {
-                        stanza.clone()
-                    };
-                    sha256(&owned)
-                }),
+                stanza_id.as_ref().map(|_| sha256(&append_stanza(stanza))),
             )),
         }
     }
@@ -483,22 +496,24 @@ impl CurrentUserSshAction {
             } => Ok(directory_effect(path)),
             Self::Keys {
                 path,
-                initial_identity,
+                initial_identity: None,
+                stanza_id: None,
+                stanza,
+                conflict: false,
+                ..
+            } if !stanza.is_empty() => Ok(keys_effect(path, stanza)),
+            Self::Keys {
+                path,
+                initial_identity: Some(_),
                 stanza_id: Some(stanza_id),
                 stanza,
                 conflict: false,
                 ..
-            } if !stanza.is_empty() => {
-                if initial_identity.is_none() {
-                    Ok(keys_effect(path, stanza))
-                } else {
-                    Ok(appended_keys_effect(
-                        path,
-                        stanza_id,
-                        &append_stanza(stanza),
-                    ))
-                }
-            }
+            } if !stanza.is_empty() => Ok(appended_keys_effect(
+                path,
+                stanza_id,
+                &append_stanza(stanza),
+            )),
             _ => Err(ActionError::apply_failed(self.name().clone())),
         }
     }
@@ -522,37 +537,61 @@ impl CurrentUserSshAction {
                 principal,
                 directory,
                 path,
-                initial_identity,
+                initial_identity: None,
+                stanza_id: None,
+                stanza,
+                conflict: false,
+                ..
+            } if !stanza.is_empty() => {
+                if inspect_directory(directory, principal) != DirectoryState::Ready
+                    || read_keys(path, principal)
+                        .map_err(|_| ActionError::apply_failed(name.clone()))?
+                        .is_some()
+                {
+                    return Err(ActionError::apply_failed(name.clone()));
+                }
+                publish_keys(directory, path, principal, stanza, name)?;
+                Ok(keys_effect(path, stanza))
+            }
+            Self::Keys {
+                name,
+                principal,
+                path,
+                initial_identity: Some(initial_identity),
                 required,
                 stanza_id: Some(stanza_id),
                 stanza,
                 conflict: false,
                 ..
             } if !stanza.is_empty() => {
-                if initial_identity.is_none() {
-                    if inspect_directory(directory, principal) != DirectoryState::Ready
-                        || read_keys(path, principal)
-                            .map_err(|_| ActionError::apply_failed(name.clone()))?
-                            .is_some()
-                    {
-                        return Err(ActionError::apply_failed(name.clone()));
-                    }
-                    publish_keys(directory, path, principal, stanza, name)?;
-                    return Ok(keys_effect(path, stanza));
-                }
                 let appended = append_stanza(stanza);
-                platform::append_verified_private_file_once(
+                let mut file = platform::open_verified_private_file_for_append(
                     path,
                     ManifestOwner::User,
                     principal,
-                    initial_identity.expect("existing file identity"),
-                    &appended,
+                    *initial_identity,
                 )
                 .map_err(|_| ActionError::apply_failed(name.clone()))?;
+                let latest = file
+                    .read_bounded(MAX_BYTES)
+                    .map_err(|_| ActionError::apply_failed(name.clone()))?;
+                let latest_analysis = analyze_keys(&latest, required)
+                    .ok_or_else(|| ActionError::apply_failed(name.clone()))?;
+                if latest_analysis.conflict
+                    || latest_analysis.missing.is_empty()
+                    || latest
+                        .len()
+                        .checked_add(appended.len())
+                        .is_none_or(|size| size > MAX_BYTES)
+                {
+                    return Err(ActionError::apply_failed(name.clone()));
+                }
+                file.append_once(&appended)
+                    .map_err(|_| ActionError::apply_failed(name.clone()))?;
                 let verified = read_keys(path, principal)
                     .map_err(|_| ActionError::apply_failed(name.clone()))?
                     .ok_or_else(|| ActionError::apply_failed(name.clone()))?;
-                if verified.identity != initial_identity.expect("existing file identity")
+                if verified.identity != *initial_identity
                     || analyze_keys(&verified.bytes, required)
                         .is_none_or(|analysis| analysis.conflict || !analysis.missing.is_empty())
                 {
@@ -691,6 +730,8 @@ mod tests {
 
     const KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIAABAgMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhscHR4f styrn-controller";
     const OTHER_KEY: &str = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjI unrelated";
+    const ECDSA_KEY: &str = "ecdsa-sha2-nistp256 AAAAE2VjZHNhLXNoYTItbmlzdHAyNTYAAAAIbmlzdHAyNTYAAABBBBv758VSxSS4n8MUARrxVhXcOdN2IPbneesWHi3aqY6F/eR62SRClVCI+qsEXeVqN97axH+BfF4qWlkKmOLc9zo= unrelated-ecdsa";
+    const CERTIFICATE_KEY: &str = "ssh-ed25519-cert-v01@openssh.com AAAAIHNzaC1lZDI1NTE5LWNlcnQtdjAxQG9wZW5zc2guY29tAAAAIMAyy2i16Sp1rHKXmzNRO/Z+oYYVwCYhmwhBymMORjs7AAAAIHkSBu1ocHj8E6vBLP70qtLsffWiX49xLkzU1+/mJROJAAAAAAAAAAAAAAABAAAACXVucmVsYXRlZAAAAAgAAAAEYWxleAAAAABqmp/EAAAAAGqarkYAAAAAAAAAggAAABVwZXJtaXQtWDExLWZvcndhcmRpbmcAAAAAAAAAF3Blcm1pdC1hZ2VudC1mb3J3YXJkaW5nAAAAAAAAABZwZXJtaXQtcG9ydC1mb3J3YXJkaW5nAAAAAAAAAApwZXJtaXQtcHR5AAAAAAAAAA5wZXJtaXQtdXNlci1yYwAAAAAAAAAAAAAAMwAAAAtzc2gtZWQyNTUxOQAAACBUGzk1FGId+VEViGiDBHDqM3qrJuICuqqRaZfLHGrV6QAAAFMAAAALc3NoLWVkMjU1MTkAAABALPZrwaof8FCW1lUrE8dSxkFHse6wF8doet+FRL8EUAUNDY5jM7X6511LUjsxQUP6wLraB48SKFbH3E6p4+dtCA== unrelated-cert";
 
     #[test]
     fn constrained_active_lines_fail_closed_instead_of_becoming_unrestricted_duplicates() {
@@ -701,6 +742,18 @@ mod tests {
     #[test]
     fn unrelated_constrained_keys_do_not_block_an_owned_append() {
         let before = format!("from=\"10.0.0.1\" {OTHER_KEY}\n");
+        let after = append_keys(before.as_bytes(), &[KEY.to_owned()]).unwrap();
+        assert!(after.starts_with(before.as_bytes()));
+        assert!(after
+            .windows(KEY.len())
+            .any(|window| window == KEY.as_bytes()));
+    }
+
+    #[test]
+    fn unrelated_unknown_and_malformed_lines_are_preserved_opaquely() {
+        let before = format!(
+            "{ECDSA_KEY}\n{CERTIFICATE_KEY}\noperator-owned syntax Styrn does not understand\n"
+        );
         let after = append_keys(before.as_bytes(), &[KEY.to_owned()]).unwrap();
         assert!(after.starts_with(before.as_bytes()));
         assert!(after
@@ -862,6 +915,78 @@ mod tests {
                 .collect::<Vec<_>>(),
             [std::ffi::OsString::from("authorized_keys")]
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn execute_rechecks_latest_bytes_and_does_not_append_after_external_convergence() {
+        let principal = platform::resolve_current_worker_principal().unwrap();
+        let root = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join(format!(
+                "styrn-authorized-keys-execute-race-{}",
+                uuid::Uuid::now_v7()
+            ));
+        let directory = root.join(".ssh");
+        fs::create_dir_all(&directory).unwrap();
+        platform::harden_manifest_directory(&root, ManifestOwner::User, &principal).unwrap();
+        platform::harden_manifest_directory(&directory, ManifestOwner::User, &principal).unwrap();
+        let path = directory.join("authorized_keys");
+        fs::write(&path, format!("{OTHER_KEY}\n")).unwrap();
+        platform::harden_manifest_file(&path, ManifestOwner::User, &principal).unwrap();
+        let mut plan =
+            current_user_ssh_action_plan_for_test(principal, directory, &[KEY.to_owned()]).unwrap();
+        let action = plan.remove(1);
+        let externally_converged = format!("{OTHER_KEY}\n{KEY}\n");
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(format!("{KEY}\n").as_bytes())
+            .unwrap();
+
+        let Action::CurrentUserSsh(action) = action else {
+            panic!("SSH key action expected")
+        };
+        assert!(action.execute().is_err());
+        assert_eq!(fs::read(&path).unwrap(), externally_converged.as_bytes());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn execute_rechecks_latest_bytes_and_refuses_a_new_constraint_on_the_requested_key() {
+        let principal = platform::resolve_current_worker_principal().unwrap();
+        let root = std::env::current_dir()
+            .unwrap()
+            .join("target")
+            .join(format!(
+                "styrn-authorized-keys-constraint-race-{}",
+                uuid::Uuid::now_v7()
+            ));
+        let directory = root.join(".ssh");
+        fs::create_dir_all(&directory).unwrap();
+        platform::harden_manifest_directory(&root, ManifestOwner::User, &principal).unwrap();
+        platform::harden_manifest_directory(&directory, ManifestOwner::User, &principal).unwrap();
+        let path = directory.join("authorized_keys");
+        fs::write(&path, format!("{OTHER_KEY}\n")).unwrap();
+        platform::harden_manifest_file(&path, ManifestOwner::User, &principal).unwrap();
+        let mut plan =
+            current_user_ssh_action_plan_for_test(principal, directory, &[KEY.to_owned()]).unwrap();
+        let action = plan.remove(1);
+        let constrained = format!("{OTHER_KEY}\nfrom=\"10.0.0.1\" {KEY}\n");
+        fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(format!("from=\"10.0.0.1\" {KEY}\n").as_bytes())
+            .unwrap();
+
+        let Action::CurrentUserSsh(action) = action else {
+            panic!("SSH key action expected")
+        };
+        assert!(action.execute().is_err());
+        assert_eq!(fs::read(&path).unwrap(), constrained.as_bytes());
         fs::remove_dir_all(root).unwrap();
     }
 

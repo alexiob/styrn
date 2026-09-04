@@ -277,6 +277,7 @@
             "properties": {
               "files_created": { "maxItems": 0 },
               "files_modified": { "maxItems": 0 },
+              "files_appended": { "maxItems": 0 },
               "services": { "maxItems": 0 },
               "accounts": { "maxItems": 0 },
               "registry_keys": { "maxItems": 0 },
@@ -417,10 +418,20 @@
                           },
                           {
                             "properties": {
+                              "action": {
+                                "properties": {
+                                  "parameters": {
+                                    "required": [
+                                      "owned_stanza_id",
+                                      "owned_stanza_sha256"
+                                    ]
+                                  }
+                                }
+                              },
                               "files_created": { "maxItems": 0 },
                               "files_appended": { "minItems": 1, "maxItems": 1 }
                             },
-                            "required": ["files_appended"]
+                            "required": ["action", "files_appended"]
                           }
                         ]
                       }
@@ -473,6 +484,7 @@
               "directories_created": { "maxItems": 0 },
               "files_created": { "maxItems": 0 },
               "files_modified": { "maxItems": 0 },
+              "files_appended": { "maxItems": 0 },
               "services": { "maxItems": 0 },
               "accounts": { "maxItems": 0 },
               "registry_keys": { "maxItems": 0 },
@@ -523,6 +535,10 @@
         "parameters": {
           "type": "object",
           "required": ["action_id", "principal", "directory", "path"],
+          "dependentRequired": {
+            "owned_stanza_id": ["owned_stanza_sha256"],
+            "owned_stanza_sha256": ["owned_stanza_id"]
+          },
           "additionalProperties": false,
           "properties": {
             "action_id": { "enum": ["ssh.directory", "ssh.authorized-keys"] },
