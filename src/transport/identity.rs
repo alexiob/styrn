@@ -1,5 +1,3 @@
-#![allow(dead_code)] // Task 3 is the first production transport consumer.
-
 use crate::manifest::MachineManifest;
 use crate::platform;
 use base64::{engine::general_purpose::STANDARD_NO_PAD, Engine as _};
@@ -49,6 +47,23 @@ impl fmt::Display for IdentityError {
 impl std::error::Error for IdentityError {}
 
 impl ControllerIdentity {
+    pub(crate) fn load_or_create_configured(
+        manifest: &MachineManifest,
+    ) -> Result<Self, IdentityError> {
+        #[cfg(not(target_os = "windows"))]
+        let home = std::env::var_os("HOME");
+        #[cfg(target_os = "windows")]
+        let home = std::env::var_os("USERPROFILE");
+        let directory = home
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
+            .map(|path| path.join(".ssh"))
+            .ok_or(IdentityError::Invalid)?;
+        platform::prepare_controller_identity_directory(&directory)
+            .map_err(|_| IdentityError::Conflict)?;
+        Self::load_or_create(manifest, &directory, Path::new("ssh-keygen"))
+    }
+
     pub(crate) fn load_or_create(
         manifest: &MachineManifest,
         identity_directory: &Path,

@@ -1,3 +1,5 @@
+#![allow(dead_code)] // This test transport is consumed by a separate RPC integration target.
+
 use super::{RpcProcess, RpcTarget, RpcTransport, TransportError};
 #[cfg(test)]
 use std::path::Path;

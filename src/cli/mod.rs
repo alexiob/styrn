@@ -146,6 +146,58 @@ pub(crate) enum MachineAction {
     Init,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ControllerAction {
+    Init,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum HostAction {
+    List,
+    Show {
+        host: String,
+    },
+    Status {
+        host: Option<String>,
+    },
+    Enroll {
+        host: String,
+        user: String,
+        fingerprint: Option<String>,
+    },
+    Doctor {
+        host: Option<String>,
+    },
+    Refresh {
+        host: Option<String>,
+    },
+    Trust {
+        host: String,
+        fingerprint: String,
+    },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct ExecRequest {
+    host: String,
+    argv: Vec<String>,
+    shell: bool,
+}
+
+impl ExecRequest {
+    pub(crate) fn host(&self) -> &str {
+        &self.host
+    }
+
+    pub(crate) fn argv(&self) -> &[String] {
+        &self.argv
+    }
+
+    pub(crate) const fn shell(&self) -> bool {
+        self.shell
+    }
+}
+
 impl ParsedCli {
     pub(crate) fn is_setup_command(&self) -> bool {
         matches!(self.cli.command, RootCommand::Setup(_))
@@ -197,6 +249,70 @@ impl ParsedCli {
             } => Some(MachineAction::Init),
             _ => None,
         }
+    }
+
+    pub(crate) fn controller_action(&self) -> Option<ControllerAction> {
+        matches!(
+            self.cli.command,
+            RootCommand::Controller {
+                command: ControllerCommand::Init
+            }
+        )
+        .then_some(ControllerAction::Init)
+    }
+
+    pub(crate) fn host_action(&self) -> Option<HostAction> {
+        match &self.cli.command {
+            RootCommand::Host {
+                command: HostCommand::List,
+            } => Some(HostAction::List),
+            RootCommand::Host {
+                command: HostCommand::Show { host },
+            } => Some(HostAction::Show { host: host.clone() }),
+            RootCommand::Host {
+                command: HostCommand::Status { host },
+            } => Some(HostAction::Status { host: host.clone() }),
+            RootCommand::Host {
+                command:
+                    HostCommand::Enroll {
+                        host,
+                        user,
+                        fingerprint,
+                    },
+            } => Some(HostAction::Enroll {
+                host: host.clone(),
+                user: user.clone(),
+                fingerprint: fingerprint.clone(),
+            }),
+            RootCommand::Host {
+                command: HostCommand::Doctor { host },
+            } => Some(HostAction::Doctor { host: host.clone() }),
+            RootCommand::Host {
+                command: HostCommand::Refresh { host },
+            } => Some(HostAction::Refresh { host: host.clone() }),
+            RootCommand::Host {
+                command: HostCommand::Trust { host, fingerprint },
+            } => Some(HostAction::Trust {
+                host: host.clone(),
+                fingerprint: fingerprint.clone(),
+            }),
+            _ => None,
+        }
+    }
+
+    pub(crate) fn exec_request(&self) -> Option<ExecRequest> {
+        let RootCommand::Exec(arguments) = &self.cli.command else {
+            return None;
+        };
+        Some(ExecRequest {
+            host: arguments.host.clone(),
+            argv: arguments.command.clone(),
+            shell: arguments.shell,
+        })
+    }
+
+    pub(crate) const fn stdin_terminal(&self) -> bool {
+        self.facts.stdin_terminal
     }
 
     pub(crate) fn rpc_serve_stdio(&self) -> bool {
@@ -629,6 +745,8 @@ enum HostCommand {
     },
     Enroll {
         host: String,
+        #[arg(long, required = true)]
+        user: String,
         #[arg(long)]
         fingerprint: Option<String>,
     },

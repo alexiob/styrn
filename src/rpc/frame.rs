@@ -173,7 +173,6 @@ impl FrameError {
         self.kind
     }
 
-    #[allow(dead_code)] // The Task 1 client transport is exercised by the local-child integration target.
     pub(crate) fn io() -> Self {
         Self::new(FrameErrorKind::Io)
     }

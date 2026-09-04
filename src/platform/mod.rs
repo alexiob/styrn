@@ -6872,6 +6872,58 @@ pub(crate) fn verify_controller_identity_directory(
     Ok(principal)
 }
 
+/// Materializes the one current-user SSH identity directory without following
+/// or taking over an existing path, then returns the freshly verified caller.
+#[allow(dead_code)] // Source-including manifest tests omit the controller identity consumer.
+pub(crate) fn prepare_controller_identity_directory(
+    directory: &Path,
+) -> std::io::Result<WorkerPrincipal> {
+    if !directory.is_absolute()
+        || directory.file_name().is_none()
+        || directory.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::CurDir | std::path::Component::ParentDir
+            )
+        })
+        || directory.components().collect::<PathBuf>().as_os_str() != directory.as_os_str()
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "controller identity directory is invalid",
+        ));
+    }
+    let principal = resolve_current_worker_principal()?;
+    let parent = directory.parent().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "controller identity directory has no parent",
+        )
+    })?;
+    platform_impl::verify_manifest_parent_chain(parent, ManifestOwner::User, &principal)?;
+    match std::fs::symlink_metadata(directory) {
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            match create_private_manifest_staging_directory(
+                directory,
+                ManifestOwner::User,
+                &principal,
+            ) {
+                Ok(_) => {
+                    harden_manifest_directory(directory, ManifestOwner::User, &principal)?;
+                    sync_parent_directory(parent)?;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => return Err(error),
+            }
+        }
+        Err(error) => return Err(error),
+    }
+    platform_impl::verify_manifest_parent_chain(directory, ManifestOwner::User, &principal)?;
+    platform_impl::verify_manifest_directory_security(directory, ManifestOwner::User, &principal)?;
+    Ok(principal)
+}
+
 /// Validates an existing controller identity file without reading its bytes.
 #[allow(dead_code)] // Source-including manifest tests omit the controller identity module.
 pub(crate) fn verify_controller_identity_file(

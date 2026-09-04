@@ -2,15 +2,15 @@ mod identity;
 mod local_child;
 mod ssh;
 
-#[allow(unused_imports)]
-// The live controller CLI consumer lands in this continuous Task 2-4 wave.
+#[allow(unused_imports)] // Source-including contract tests omit the live CLI identity consumer.
 pub(crate) use identity::{ControllerIdentity, IdentityError};
 #[allow(unused_imports)]
-// The Task 1 integration target consumes this before the public host CLI is wired.
+// The production CLI uses SSH while the local-child transport remains an integration seam.
 pub(crate) use local_child::LocalChildTransport;
 #[allow(unused_imports)] // Source-including tests exercise different transport subsets.
 pub(crate) use ssh::{
-    ssh_arguments, ssh_keyscan_arguments, verify_scanned_host_key, PinnedHostKey, SshTransport,
+    ssh_arguments, ssh_keyscan_arguments, validate_host_key_fingerprint, verify_scanned_host_key,
+    PinnedHostKey, SshTransport,
 };
 
 use crate::output::ErrorCode;
@@ -21,7 +21,6 @@ use std::path::PathBuf;
 use std::process::{Child, ChildStdin, ChildStdout, ExitStatus};
 use std::thread::JoinHandle;
 
-#[allow(dead_code)]
 pub(crate) trait RpcTransport {
     fn connect(&self, target: &RpcTarget) -> Result<RpcProcess, TransportError>;
 }
@@ -35,7 +34,6 @@ pub(crate) struct RpcTarget {
     host_key: PinnedHostKey,
 }
 
-#[allow(dead_code)] // The live inventory/CLI consumers land in this continuous Task 2-4 wave.
 impl RpcTarget {
     pub(crate) fn new(
         host: &str,
@@ -99,7 +97,6 @@ pub(crate) enum TransportErrorKind {
     Authentication,
 }
 
-#[allow(dead_code)] // The live CLI error mapping lands in this continuous Task 2-4 wave.
 impl TransportErrorKind {
     pub(crate) const fn code(self) -> ErrorCode {
         match self {
@@ -139,7 +136,6 @@ impl TransportError {
         self.kind
     }
 
-    #[allow(dead_code)] // The live CLI error mapping lands in this continuous Task 2-4 wave.
     pub(crate) const fn code(&self) -> ErrorCode {
         self.kind.code()
     }
@@ -161,15 +157,14 @@ impl fmt::Display for TransportError {
 
 impl std::error::Error for TransportError {}
 
-#[allow(dead_code)] // The Task 1 integration target exercises the controller side of the process boundary.
 pub(crate) struct RpcProcess {
     child: Option<Child>,
     input: Option<ChildStdin>,
     output: FrameReader<ChildStdout>,
     stderr: Option<JoinHandle<Vec<u8>>>,
+    pre_hello_error: ErrorCode,
 }
 
-#[allow(dead_code)] // The Task 1 integration target exercises the controller side of the process boundary.
 impl RpcProcess {
     pub(super) fn new(
         child: Child,
@@ -182,7 +177,23 @@ impl RpcProcess {
             input: Some(input),
             output: FrameReader::new(output),
             stderr: Some(std::thread::spawn(move || drain_bounded(stderr, 64 * 1024))),
+            pre_hello_error: ErrorCode::TransportSessionLost,
         }
+    }
+
+    pub(super) fn new_ssh(
+        child: Child,
+        input: ChildStdin,
+        output: ChildStdout,
+        stderr: impl Read + Send + 'static,
+    ) -> Self {
+        let mut process = Self::new(child, input, output, stderr);
+        process.pre_hello_error = ErrorCode::TransportAuthFailed;
+        process
+    }
+
+    pub(crate) const fn pre_hello_error_code(&self) -> ErrorCode {
+        self.pre_hello_error
     }
 
     #[cfg(test)]
@@ -254,7 +265,6 @@ fn validate_host(host: &str) -> Result<(), TransportError> {
     }
 }
 
-#[allow(dead_code)] // Called by RpcTarget::new once the live inventory consumer lands.
 fn validate_user(user: &str) -> Result<(), TransportError> {
     if !user.is_empty()
         && user.len() <= 255
@@ -267,6 +277,19 @@ fn validate_user(user: &str) -> Result<(), TransportError> {
     } else {
         Err(TransportError::authentication())
     }
+}
+
+pub(crate) fn validate_ssh_destination(
+    host: &str,
+    user: &str,
+    port: u16,
+) -> Result<(), TransportError> {
+    validate_host(host)?;
+    validate_user(user)?;
+    if port == 0 {
+        return Err(TransportError::authentication());
+    }
+    Ok(())
 }
 
 fn validate_transport_path(path: &std::path::Path) -> Result<&str, TransportError> {
@@ -284,7 +307,6 @@ impl Drop for RpcProcess {
     }
 }
 
-#[allow(dead_code)] // Reachable through the Task 1 client in the separate integration target.
 fn closed_pipe_error() -> FrameError {
     FrameError::io()
 }

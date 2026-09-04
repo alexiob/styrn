@@ -1,9 +1,7 @@
-#![allow(dead_code)] // The public host CLI consumes this concrete store in Task 4 of this wave.
-
 use crate::manifest::{contains_secret_shaped_text, MachineManifest};
-use crate::output::{ErrorCode, StyrnExit};
+use crate::output::ErrorCode;
 use crate::platform::{self, ManifestOwner, WorkerPrincipal};
-use crate::transport::{PinnedHostKey, RpcTarget, TransportError};
+use crate::transport::{validate_ssh_destination, PinnedHostKey, RpcTarget, TransportError};
 use chrono::{DateTime, FixedOffset, SecondsFormat};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
@@ -48,10 +46,6 @@ impl InventoryError {
             InventoryErrorKind::InvalidConfig => ErrorCode::UsageConfigInvalid,
         }
     }
-
-    pub(crate) const fn exit_code(self) -> StyrnExit {
-        self.code().exit_code()
-    }
 }
 
 impl fmt::Display for InventoryError {
@@ -82,6 +76,7 @@ impl StoredSsh {
         identity: PathBuf,
         host_key: PinnedHostKey,
     ) -> Result<Self, InventoryError> {
+        validate_ssh_destination(host, user, port).map_err(|_| InventoryError::argument())?;
         RpcTarget::new(host, user, port, identity.clone(), host_key.clone())
             .map_err(|_| InventoryError::argument())?;
         Ok(Self {
@@ -227,6 +222,26 @@ impl InventoryDocument {
         Ok(true)
     }
 
+    pub(crate) fn replace_exact(
+        &mut self,
+        expected: &InventoryHost,
+        replacement: InventoryHost,
+    ) -> Result<(), InventoryError> {
+        if expected.name != replacement.name || expected.machine_id != replacement.machine_id {
+            return Err(InventoryError::argument());
+        }
+        let current = self
+            .hosts
+            .iter_mut()
+            .find(|host| host.name == expected.name)
+            .ok_or_else(InventoryError::config)?;
+        if current != expected {
+            return Err(InventoryError::config());
+        }
+        *current = replacement;
+        Ok(())
+    }
+
     fn canonical_toml(&self) -> Result<String, InventoryError> {
         validate_hosts(&self.hosts).map_err(|_| InventoryError::config())?;
         let wire = InventoryWireRef {
@@ -303,24 +318,12 @@ impl ManifestCache {
         Ok(cache)
     }
 
-    pub(crate) const fn machine_id(&self) -> Uuid {
-        self.machine_id
-    }
-
     pub(crate) const fn cached_at(&self) -> DateTime<FixedOffset> {
         self.cached_at
     }
 
     pub(crate) fn styrn_version(&self) -> &str {
         &self.styrn_version
-    }
-
-    pub(crate) const fn manifest_schema_version(&self) -> u64 {
-        self.manifest_schema_version
-    }
-
-    pub(crate) fn manifest_toml(&self) -> &str {
-        &self.manifest_toml
     }
 
     pub(crate) fn manifest(&self) -> Result<MachineManifest, InventoryError> {
@@ -392,9 +395,7 @@ impl InventoryStore {
         validate_root_path(root)?;
         let principal =
             platform::resolve_current_worker_principal().map_err(|_| InventoryError::config())?;
-        prepare_private_directory(root, &principal)?;
         let manifests = root.join("manifests");
-        prepare_private_directory(&manifests, &principal)?;
         Ok(Self {
             root: root.to_path_buf(),
             inventory: root.join("inventory.toml"),
@@ -404,16 +405,18 @@ impl InventoryStore {
         })
     }
 
-    pub(crate) fn inventory_path(&self) -> &Path {
-        &self.inventory
-    }
-
     pub(crate) fn known_hosts_path(&self) -> &Path {
         &self.known_hosts
     }
 
     pub(crate) fn read(&self) -> Result<InventoryDocument, InventoryError> {
-        self.verify_root()?;
+        match fs::symlink_metadata(&self.root) {
+            Ok(_) => self.verify_inventory_root()?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(InventoryDocument::empty());
+            }
+            Err(_) => return Err(InventoryError::config()),
+        }
         match read_verified(&self.inventory, &self.root, &self.principal) {
             Ok(input) => InventoryDocument::parse(&input),
             Err(ReadVerifiedError::Missing) => Ok(InventoryDocument::empty()),
@@ -425,7 +428,7 @@ impl InventoryStore {
         &self,
         operation: impl FnOnce(&mut InventoryLock<'_>) -> Result<T, InventoryError>,
     ) -> Result<T, InventoryError> {
-        self.verify_root()?;
+        self.ensure_for_write()?;
         let lock_path = self.root.join(".inventory.toml.lock");
         let lock = platform::open_manifest_lock(&lock_path, ManifestOwner::User, &self.principal)
             .map_err(|_| InventoryError::config())?;
@@ -438,12 +441,14 @@ impl InventoryStore {
     }
 
     pub(crate) fn write_cache(&self, cache: &ManifestCache) -> Result<(), InventoryError> {
+        self.ensure_for_write()?;
         let bytes = cache.canonical_toml()?;
         let path = self.cache_path(cache.machine_id)?;
         write_verified(&path, &bytes, &self.root, &self.principal)
     }
 
     pub(crate) fn read_cache(&self, machine_id: Uuid) -> Result<ManifestCache, InventoryError> {
+        self.verify_root()?;
         let path = self.cache_path(machine_id)?;
         let input = read_verified(&path, &self.root, &self.principal)
             .map_err(|_| InventoryError::config())?;
@@ -456,6 +461,7 @@ impl InventoryStore {
         port: u16,
         pin: &PinnedHostKey,
     ) -> Result<CandidateKnownHosts, InventoryError> {
+        self.ensure_for_write()?;
         let contents = pin
             .known_hosts_line(host, port)
             .map_err(|_| InventoryError::argument())?;
@@ -477,6 +483,16 @@ impl InventoryStore {
     }
 
     fn verify_root(&self) -> Result<(), InventoryError> {
+        self.verify_inventory_root()?;
+        platform::verify_manifest_directory_security(
+            &self.manifests,
+            ManifestOwner::User,
+            &self.principal,
+        )
+        .map_err(|_| InventoryError::config())
+    }
+
+    fn verify_inventory_root(&self) -> Result<(), InventoryError> {
         platform::verify_manifest_parent_chain(&self.root, ManifestOwner::User, &self.principal)
             .and_then(|()| {
                 platform::verify_manifest_directory_security(
@@ -485,14 +501,13 @@ impl InventoryStore {
                     &self.principal,
                 )
             })
-            .and_then(|()| {
-                platform::verify_manifest_directory_security(
-                    &self.manifests,
-                    ManifestOwner::User,
-                    &self.principal,
-                )
-            })
             .map_err(|_| InventoryError::config())
+    }
+
+    fn ensure_for_write(&self) -> Result<(), InventoryError> {
+        prepare_private_directory(&self.root, &self.principal)?;
+        prepare_private_directory(&self.manifests, &self.principal)?;
+        self.verify_root()
     }
 }
 
@@ -548,6 +563,16 @@ impl InventoryLock<'_> {
                     .known_hosts_line(&host.transport.host, host.transport.port)
                     .map_err(|_| InventoryError::config())?,
             );
+        }
+        if matches!(
+            read_verified(
+                &self.store.known_hosts,
+                &self.store.root,
+                &self.store.principal,
+            ),
+            Ok(existing) if existing == contents
+        ) {
+            return Ok(());
         }
         write_verified(
             &self.store.known_hosts,

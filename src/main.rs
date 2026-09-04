@@ -75,6 +75,18 @@ fn run(parsed: cli::ParsedCli) {
             "setup user-phase execution is not available in this build",
         );
     }
+    if let Some(action) = parsed.controller_action() {
+        run_controller_command(action, parsed.json_output());
+        return;
+    }
+    if let Some(action) = parsed.host_action() {
+        run_host_command(action, parsed.json_output(), parsed.stdin_terminal());
+        return;
+    }
+    if let Some(request) = parsed.exec_request() {
+        run_exec_command(request, parsed.json_output());
+        return;
+    }
     let Some(action) = parsed.machine_action() else {
         return;
     };
@@ -143,6 +155,629 @@ fn run(parsed: cli::ParsedCli) {
             eprintln!("{error}");
             output::exit_process(output::StyrnExit::Usage);
         }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct Phase1CommandError {
+    code: output::ErrorCode,
+    message: &'static str,
+}
+
+#[derive(Clone, Copy)]
+struct Phase1Warning {
+    code: &'static str,
+    message: &'static str,
+}
+
+const KNOWN_HOSTS_WARNING: Phase1Warning = Phase1Warning {
+    code: "inventory.known_hosts_rebuild_failed",
+    message: "the host was committed but the derived known-hosts file needs repair",
+};
+
+fn run_controller_command(action: cli::ControllerAction, json: bool) {
+    match action {
+        cli::ControllerAction::Init => match configured_controller_identity() {
+            Ok(identity) => {
+                let data = serde_json::json!({
+                    "created": identity.created(),
+                    "private_path": identity.private_path(),
+                    "public_path": identity.public_path(),
+                    "public_key": identity.public_line(),
+                    "fingerprint": identity.fingerprint(),
+                });
+                let human = format!(
+                    "Controller identity {}\nPublic key: {}\nFingerprint: {}\n",
+                    identity.public_path().display(),
+                    identity.public_line(),
+                    identity.fingerprint()
+                );
+                render_phase1_success(json, "controller init", data, &human, &[]);
+            }
+            Err(error) => fail_phase1(json, "controller init", error),
+        },
+    }
+}
+
+fn run_host_command(action: cli::HostAction, json: bool, stdin_terminal: bool) {
+    let command = match &action {
+        cli::HostAction::List => "host list",
+        cli::HostAction::Show { .. } => "host show",
+        cli::HostAction::Status { .. } => "host status",
+        cli::HostAction::Enroll { .. } => "host enroll",
+        cli::HostAction::Doctor { .. } => "host doctor",
+        cli::HostAction::Refresh { .. } => "host refresh",
+        cli::HostAction::Trust { .. } => "host trust",
+    };
+    let result = match action {
+        cli::HostAction::List => host_list(),
+        cli::HostAction::Show { host } => host_show(&host),
+        cli::HostAction::Status { host } => host_status(host.as_deref()),
+        cli::HostAction::Enroll {
+            host,
+            user,
+            fingerprint,
+        } => host_enroll(&host, &user, fingerprint.as_deref(), json, stdin_terminal),
+        cli::HostAction::Doctor { host } => host_doctor(host.as_deref()),
+        cli::HostAction::Refresh { host } => host_refresh(host.as_deref()),
+        cli::HostAction::Trust { host, fingerprint } => host_trust(&host, &fingerprint),
+    };
+    match result {
+        Ok((data, human, warnings)) => {
+            render_phase1_success(json, command, data, &human, &warnings)
+        }
+        Err(error) => fail_phase1(json, command, error),
+    }
+}
+
+type HostCommandSuccess = (serde_json::Value, String, Vec<Phase1Warning>);
+
+fn host_list() -> Result<HostCommandSuccess, Phase1CommandError> {
+    let store = inventory::InventoryStore::configured().map_err(inventory_error)?;
+    let document = store.read().map_err(inventory_error)?;
+    let hosts = document.hosts().iter().map(host_json).collect::<Vec<_>>();
+    let human = if document.hosts().is_empty() {
+        "No enrolled hosts.\n".to_owned()
+    } else {
+        let mut text = String::new();
+        for host in document.hosts() {
+            text.push_str(host.name());
+            text.push('\n');
+        }
+        text
+    };
+    Ok((serde_json::json!({ "hosts": hosts }), human, Vec::new()))
+}
+
+fn host_show(name: &str) -> Result<HostCommandSuccess, Phase1CommandError> {
+    let store = inventory::InventoryStore::configured().map_err(inventory_error)?;
+    let document = store.read().map_err(inventory_error)?;
+    let host = document.select(Some(name)).map_err(inventory_error)?;
+    let data = host_json(host);
+    let human = format!(
+        "{}\n  machine_id  {}\n  endpoint    {}:{}\n  user        {}\n  fingerprint {}\n",
+        host.name(),
+        host.machine_id(),
+        host.transport().host(),
+        host.transport().port(),
+        host.transport().user(),
+        host.transport().host_key().fingerprint(),
+    );
+    Ok((data, human, Vec::new()))
+}
+
+fn host_status(name: Option<&str>) -> Result<HostCommandSuccess, Phase1CommandError> {
+    let store = inventory::InventoryStore::configured().map_err(inventory_error)?;
+    let host = select_host_for_network(&store, name)?;
+    let (_identity, mut client) = connect_host(&store, &host)?;
+    let expected = expected_peer(&host)?;
+    let manifest = client.machine_manifest(&expected).map_err(rpc_error)?;
+    validate_manifest_endpoint(&manifest, &host)?;
+    let status = client.machine_status().map_err(rpc_error)?;
+    client.finish().map_err(rpc_error)?;
+    let data = serde_json::json!({ "host": host.name(), "status": status });
+    let human = format!(
+        "{}: {} CPUs, {} bytes available memory, {} bytes free disk\n",
+        host.name(),
+        status.cpu.logical,
+        status.memory.available_bytes,
+        status.disk.free_bytes
+    );
+    Ok((data, human, Vec::new()))
+}
+
+fn host_refresh(name: Option<&str>) -> Result<HostCommandSuccess, Phase1CommandError> {
+    let store = inventory::InventoryStore::configured().map_err(inventory_error)?;
+    let host = select_host_for_network(&store, name)?;
+    let (_identity, mut client) = connect_host(&store, &host)?;
+    let expected = expected_peer(&host)?;
+    let version = client.server_hello().styrn_version.clone();
+    let manifest = client.machine_manifest(&expected).map_err(rpc_error)?;
+    validate_manifest_endpoint(&manifest, &host)?;
+    client.finish().map_err(rpc_error)?;
+    let cache =
+        inventory::ManifestCache::new(chrono::Utc::now().fixed_offset(), &version, &manifest)
+            .map_err(inventory_error)?;
+    store.write_cache(&cache).map_err(inventory_error)?;
+    Ok((
+        serde_json::json!({ "host": host.name(), "machine_id": host.machine_id(), "refreshed": true }),
+        format!("Refreshed {}\n", host.name()),
+        Vec::new(),
+    ))
+}
+
+fn host_doctor(name: Option<&str>) -> Result<HostCommandSuccess, Phase1CommandError> {
+    let store = inventory::InventoryStore::configured().map_err(inventory_error)?;
+    let host = select_host_for_network(&store, name)?;
+    let cache = store.read_cache(host.machine_id());
+    let (identity, mut client) = connect_host(&store, &host)?;
+    let expected = expected_peer(&host)?;
+    let version = client.server_hello().styrn_version.clone();
+    let manifest = client.machine_manifest(&expected).map_err(rpc_error)?;
+    validate_manifest_endpoint(&manifest, &host)?;
+    let status = client.machine_status().map_err(rpc_error)?;
+    let worker = client
+        .machine_doctor(identity.public_line())
+        .map_err(rpc_error)?;
+    client.finish().map_err(rpc_error)?;
+
+    let clock_skew_seconds =
+        chrono::DateTime::parse_from_rfc3339(&status.time)
+            .ok()
+            .map(|worker_time| {
+                (chrono::Utc::now().timestamp() - worker_time.timestamp()).unsigned_abs()
+            });
+    let cache_state = cache.as_ref().map_or("invalid", |_| "pass");
+    let cache_stale = cache.as_ref().is_ok_and(|cache| {
+        chrono::Utc::now().fixed_offset() - cache.cached_at() > chrono::Duration::days(7)
+    });
+    let version_drift = cache
+        .as_ref()
+        .is_ok_and(|cache| cache.styrn_version() != version);
+    let controller_findings = serde_json::json!([
+        {"id":"controller.transport.ssh","state":"pass","severity":"info","message":"SSH and RPC completed"},
+        {"id":"controller.protocol.compatible","state":"pass","severity":"info","message":"RPC protocol is compatible"},
+        {"id":"controller.manifest.binding","state":"pass","severity":"info","message":"worker identity and manifest are bound"},
+        {"id":"controller.clock.skew","state": if clock_skew_seconds.is_some_and(|seconds| seconds > 30) {"fail"} else {"pass"},"severity": if clock_skew_seconds.is_some_and(|seconds| seconds > 30) {"warning"} else {"info"},"message":"worker clock skew was checked"},
+        {"id":"controller.cache.state","state": if cache_state == "pass" && !cache_stale && !version_drift {"pass"} else {"fail"},"severity": if cache_state == "pass" && !cache_stale && !version_drift {"info"} else {"warning"},"message":"manifest cache age and worker version were checked"},
+        {"id":"controller.coverage.deferred","state":"unknown","severity":"info","message":"remaining fleet and platform-specific checks are deferred"}
+    ]);
+    let data = serde_json::json!({
+        "host": host.name(),
+        "coverage": "phase1_minimum",
+        "complete": false,
+        "controller_findings": controller_findings,
+        "worker": worker,
+        "status": status,
+    });
+    Ok((
+        data,
+        format!(
+            "Doctor completed for {} (phase1 minimum; incomplete)\n",
+            host.name()
+        ),
+        Vec::new(),
+    ))
+}
+
+fn host_enroll(
+    host: &str,
+    user: &str,
+    fingerprint: Option<&str>,
+    json: bool,
+    stdin_terminal: bool,
+) -> Result<HostCommandSuccess, Phase1CommandError> {
+    transport::validate_ssh_destination(host, user, 22).map_err(|_| invalid_ssh_argument())?;
+    if let Some(fingerprint) = fingerprint {
+        transport::validate_host_key_fingerprint(fingerprint)
+            .map_err(|_| invalid_ssh_argument())?;
+    } else if json || !stdin_terminal {
+        return Err(Phase1CommandError {
+            code: output::ErrorCode::UsageInvalidArgument,
+            message: "non-interactive enrollment requires --fingerprint",
+        });
+    }
+
+    let identity = configured_controller_identity()?;
+    let store = inventory::InventoryStore::configured().map_err(inventory_error)?;
+    let snapshot = store.read().map_err(inventory_error)?;
+    let previous = snapshot.host(host).cloned();
+    let scanner = transport::SshTransport::configured(store.known_hosts_path().to_path_buf());
+    let pin = scanner
+        .scan_host_key(host, 22, fingerprint)
+        .map_err(transport_error)?;
+    if fingerprint.is_none() && !confirm_host_key(pin.fingerprint()) {
+        return Err(Phase1CommandError {
+            code: output::ErrorCode::TransportAuthFailed,
+            message: "the worker host key was not confirmed",
+        });
+    }
+
+    let stored = inventory::StoredSsh::new(
+        host,
+        user,
+        22,
+        identity.private_path().to_path_buf(),
+        pin.clone(),
+    )
+    .map_err(inventory_error)?;
+    if previous
+        .as_ref()
+        .is_some_and(|record| record.transport() != &stored)
+    {
+        return Err(Phase1CommandError {
+            code: output::ErrorCode::UsageConfigInvalid,
+            message: "the enrolled host endpoint or trust binding conflicts with local inventory",
+        });
+    }
+
+    let candidate = store
+        .candidate_known_hosts(host, 22, &pin)
+        .map_err(inventory_error)?;
+    let target = stored.rpc_target().map_err(transport_error)?;
+    let enrollment_transport = transport::SshTransport::configured(candidate.path().to_path_buf());
+    let process = transport::RpcTransport::connect(&enrollment_transport, &target)
+        .map_err(transport_error)?;
+    let mut client = rpc::RpcClient::connect(process).map_err(rpc_error)?;
+    let machine_id = previous
+        .as_ref()
+        .map(inventory::InventoryHost::machine_id)
+        .unwrap_or(client.server_hello().machine_id);
+    let expected = rpc::ExpectedPeer::new(machine_id, host, user).map_err(rpc_error)?;
+    let version = client.server_hello().styrn_version.clone();
+    let manifest = client.machine_manifest(&expected).map_err(rpc_error)?;
+    let record = inventory::InventoryHost::new(host, manifest.machine_id, stored)
+        .map_err(inventory_error)?;
+    validate_manifest_endpoint(&manifest, &record)?;
+    let status = client.machine_status().map_err(rpc_error)?;
+    let doctor = client
+        .machine_doctor(identity.public_line())
+        .map_err(rpc_error)?;
+    client.finish().map_err(rpc_error)?;
+    drop(candidate);
+
+    if snapshot.hosts().iter().any(|existing| {
+        existing.machine_id() == record.machine_id() && existing.name() != record.name()
+    }) {
+        return Err(Phase1CommandError {
+            code: output::ErrorCode::UsageConfigInvalid,
+            message: "the worker machine identity is already enrolled under another name",
+        });
+    }
+    let cache =
+        inventory::ManifestCache::new(chrono::Utc::now().fixed_offset(), &version, &manifest)
+            .map_err(inventory_error)?;
+    let (created, known_hosts_failed) = store
+        .with_lock(|locked| {
+            let mut current = locked.read_locked()?;
+            let created = current.upsert_exact(record.clone())?;
+            store.write_cache(&cache)?;
+            if created {
+                locked.replace_inventory(&current)?;
+            }
+            let known_hosts_failed = locked.rebuild_known_hosts(&current).is_err();
+            Ok((created, known_hosts_failed))
+        })
+        .map_err(inventory_error)?;
+    let warnings = known_hosts_failed
+        .then_some(KNOWN_HOSTS_WARNING)
+        .into_iter()
+        .collect();
+    let data = serde_json::json!({
+        "host": record.name(),
+        "machine_id": record.machine_id(),
+        "created": created,
+        "fingerprint": pin.fingerprint(),
+        "status": status,
+        "doctor": doctor,
+    });
+    Ok((data, format!("Enrolled {}\n", record.name()), warnings))
+}
+
+fn host_trust(
+    host_name: &str,
+    fingerprint: &str,
+) -> Result<HostCommandSuccess, Phase1CommandError> {
+    transport::validate_host_key_fingerprint(fingerprint).map_err(|_| invalid_ssh_argument())?;
+    let store = inventory::InventoryStore::configured().map_err(inventory_error)?;
+    let snapshot = store.read().map_err(inventory_error)?;
+    let existing = snapshot
+        .select(Some(host_name))
+        .map_err(inventory_error)?
+        .clone();
+    let scanner = transport::SshTransport::configured(store.known_hosts_path().to_path_buf());
+    let pin = scanner
+        .scan_host_key(
+            existing.transport().host(),
+            existing.transport().port(),
+            Some(fingerprint),
+        )
+        .map_err(transport_error)?;
+    let stored = inventory::StoredSsh::new(
+        existing.transport().host(),
+        existing.transport().user(),
+        existing.transport().port(),
+        existing.transport().identity().to_path_buf(),
+        pin.clone(),
+    )
+    .map_err(inventory_error)?;
+    let replacement = inventory::InventoryHost::new(existing.name(), existing.machine_id(), stored)
+        .map_err(inventory_error)?;
+    let known_hosts_failed = store
+        .with_lock(|locked| {
+            let mut current = locked.read_locked()?;
+            current.replace_exact(&existing, replacement.clone())?;
+            locked.replace_inventory(&current)?;
+            Ok(locked.rebuild_known_hosts(&current).is_err())
+        })
+        .map_err(inventory_error)?;
+    let warnings = known_hosts_failed
+        .then_some(KNOWN_HOSTS_WARNING)
+        .into_iter()
+        .collect();
+    Ok((
+        serde_json::json!({ "host": existing.name(), "fingerprint": pin.fingerprint() }),
+        format!("Updated host-key trust for {}\n", existing.name()),
+        warnings,
+    ))
+}
+
+fn run_exec_command(request: cli::ExecRequest, json: bool) {
+    if request.shell() {
+        fail_phase1(
+            json,
+            "exec",
+            Phase1CommandError {
+                code: output::ErrorCode::UsageInvalidArgument,
+                message: "exec --shell is not available; pass an argv vector after --",
+            },
+        );
+    }
+    if let Err(error) = rpc::validate_exec_argv(request.argv()) {
+        fail_phase1(json, "exec", rpc_error(error));
+    }
+    let result = (|| {
+        let store = inventory::InventoryStore::configured().map_err(inventory_error)?;
+        let host = select_host_for_network(&store, Some(request.host()))?;
+        let (_identity, mut client) = connect_host(&store, &host)?;
+        let expected = expected_peer(&host)?;
+        let manifest = client.machine_manifest(&expected).map_err(rpc_error)?;
+        validate_manifest_endpoint(&manifest, &host)?;
+        let result = client.exec(request.argv()).map_err(rpc_error)?;
+        client.finish().map_err(rpc_error)?;
+        Ok::<_, Phase1CommandError>(result)
+    })();
+    let result = match result {
+        Ok(result) => result,
+        Err(error) => fail_phase1(json, "exec", error),
+    };
+    if json {
+        let outcome = output::ExecOutcome::new_sanitized(
+            chrono::Utc::now(),
+            result.exit_code,
+            &result.stdout,
+            &result.stderr,
+            result.duration_ms,
+            result.stdout_lossy,
+            result.stderr_lossy,
+            result.stdout_redacted,
+            result.stderr_redacted,
+        )
+        .expect("validated RPC exec output must form an envelope");
+        output::write_json(std::io::stdout().lock(), outcome.envelope())
+            .expect("writing exec output must succeed");
+        std::process::exit(outcome.process_exit_code());
+    }
+    print!("{}", result.stdout);
+    eprint!("{}", result.stderr);
+    std::process::exit(result.exit_code);
+}
+
+fn select_host_for_network(
+    store: &inventory::InventoryStore,
+    name: Option<&str>,
+) -> Result<inventory::InventoryHost, Phase1CommandError> {
+    store
+        .with_lock(|locked| {
+            let document = locked.read_locked()?;
+            let host = locked.select(&document, name)?;
+            locked.rebuild_known_hosts(&document)?;
+            Ok(host)
+        })
+        .map_err(inventory_error)
+}
+
+fn connect_host(
+    store: &inventory::InventoryStore,
+    host: &inventory::InventoryHost,
+) -> Result<(transport::ControllerIdentity, rpc::RpcClient), Phase1CommandError> {
+    let identity = configured_controller_identity()?;
+    if identity.private_path() != host.transport().identity() {
+        return Err(Phase1CommandError {
+            code: output::ErrorCode::UsageConfigInvalid,
+            message: "the enrolled host refers to a different controller identity",
+        });
+    }
+    let target = host.rpc_target().map_err(transport_error)?;
+    let transport = transport::SshTransport::configured(store.known_hosts_path().to_path_buf());
+    let process = transport::RpcTransport::connect(&transport, &target).map_err(transport_error)?;
+    let client = rpc::RpcClient::connect(process).map_err(rpc_error)?;
+    Ok((identity, client))
+}
+
+fn expected_peer(host: &inventory::InventoryHost) -> Result<rpc::ExpectedPeer, Phase1CommandError> {
+    rpc::ExpectedPeer::new(host.machine_id(), host.name(), host.transport().user())
+        .map_err(rpc_error)
+}
+
+fn configured_controller_identity() -> Result<transport::ControllerIdentity, Phase1CommandError> {
+    let store = manifest::configured_manifest_store().map_err(|_| machine_manifest_error())?;
+    let manifest = store.read().map_err(|_| machine_manifest_error())?.manifest;
+    transport::ControllerIdentity::load_or_create_configured(&manifest).map_err(identity_error)
+}
+
+fn validate_manifest_endpoint(
+    manifest: &manifest::MachineManifest,
+    host: &inventory::InventoryHost,
+) -> Result<(), Phase1CommandError> {
+    let transport = manifest.transport.as_ref().ok_or(Phase1CommandError {
+        code: output::ErrorCode::ProtocolMalformed,
+        message: "the worker manifest has no SSH transport binding",
+    })?;
+    if transport.host != host.transport().host()
+        || transport.port.unwrap_or(22) != host.transport().port()
+        || transport.user.as_deref() != Some(host.transport().user())
+    {
+        return Err(Phase1CommandError {
+            code: output::ErrorCode::ProtocolMalformed,
+            message: "the worker manifest endpoint does not match the selected host",
+        });
+    }
+    Ok(())
+}
+
+fn host_json(host: &inventory::InventoryHost) -> serde_json::Value {
+    serde_json::json!({
+        "name": host.name(),
+        "machine_id": host.machine_id(),
+        "manifest_cache": host.manifest_cache(),
+        "transport": {
+            "kind": "ssh",
+            "host": host.transport().host(),
+            "user": host.transport().user(),
+            "port": host.transport().port(),
+            "identity": host.transport().identity(),
+            "host_key_algorithm": host.transport().host_key().algorithm(),
+            "host_key_fingerprint": host.transport().host_key().fingerprint(),
+        }
+    })
+}
+
+fn confirm_host_key(fingerprint: &str) -> bool {
+    use std::io::Write as _;
+    eprint!("Trust worker host key {fingerprint}? [y/N] ");
+    if std::io::stderr().flush().is_err() {
+        return false;
+    }
+    let mut answer = String::new();
+    std::io::stdin()
+        .read_line(&mut answer)
+        .is_ok_and(|_| matches!(answer.trim(), "y" | "yes"))
+}
+
+fn render_phase1_success(
+    json: bool,
+    command: &str,
+    data: serde_json::Value,
+    human: &str,
+    warnings: &[Phase1Warning],
+) {
+    if json {
+        let warnings = warnings
+            .iter()
+            .map(|warning| {
+                output::Diagnostic::new(warning.code, warning.message, None)
+                    .expect("built-in phase-1 warning must be valid")
+            })
+            .collect();
+        let envelope = output::Envelope::success(command, chrono::Utc::now(), data, warnings)
+            .expect("built-in phase-1 output must be valid");
+        output::write_json(std::io::stdout().lock(), &envelope)
+            .expect("writing command output must succeed");
+    } else {
+        print!("{human}");
+        for warning in warnings {
+            eprintln!("warning: {}", warning.message);
+        }
+    }
+}
+
+fn fail_phase1(json: bool, command: &str, error: Phase1CommandError) -> ! {
+    if json {
+        let failure =
+            output::CommandFailure::new(command, chrono::Utc::now(), error.code, error.message)
+                .expect("built-in phase-1 error must be valid");
+        output::write_json(std::io::stdout().lock(), failure.envelope())
+            .expect("writing command output must succeed");
+    } else {
+        eprintln!("{}", error.message);
+    }
+    output::exit_process(error.code.exit_code())
+}
+
+fn machine_manifest_error() -> Phase1CommandError {
+    Phase1CommandError {
+        code: output::ErrorCode::MachineManifestInvalid,
+        message: "the local machine manifest is invalid; run styrn setup --yes",
+    }
+}
+
+fn inventory_error(error: inventory::InventoryError) -> Phase1CommandError {
+    Phase1CommandError {
+        code: error.code(),
+        message: match error.code() {
+            output::ErrorCode::UsageInvalidArgument => {
+                "the requested host is not uniquely enrolled"
+            }
+            _ => "the local host inventory is invalid or insecure",
+        },
+    }
+}
+
+fn invalid_ssh_argument() -> Phase1CommandError {
+    Phase1CommandError {
+        code: output::ErrorCode::UsageInvalidArgument,
+        message: "the SSH host, user, or fingerprint argument is invalid",
+    }
+}
+
+fn identity_error(error: transport::IdentityError) -> Phase1CommandError {
+    match error {
+        transport::IdentityError::CapabilityUnavailable => Phase1CommandError {
+            code: output::ErrorCode::CapabilityUnsatisfied,
+            message: "OpenSSH ssh-keygen is unavailable",
+        },
+        transport::IdentityError::Invalid => machine_manifest_error(),
+        transport::IdentityError::Conflict | transport::IdentityError::OperationFailed => {
+            Phase1CommandError {
+                code: output::ErrorCode::UsageConfigInvalid,
+                message: "the controller SSH identity is invalid or insecure",
+            }
+        }
+    }
+}
+
+fn transport_error(error: transport::TransportError) -> Phase1CommandError {
+    Phase1CommandError {
+        code: error.code(),
+        message: match error.code() {
+            output::ErrorCode::CapabilityUnsatisfied => "a required OpenSSH tool is unavailable",
+            output::ErrorCode::TransportAuthFailed => {
+                "the worker SSH identity or authentication could not be verified"
+            }
+            _ => "the worker host is unreachable",
+        },
+    }
+}
+
+fn rpc_error(error: rpc::RpcError) -> Phase1CommandError {
+    let code = error.code();
+    Phase1CommandError {
+        code,
+        message: match code {
+            output::ErrorCode::TransportAuthFailed => "SSH authentication failed before RPC hello",
+            output::ErrorCode::TransportSessionLost => "the worker RPC session was lost",
+            output::ErrorCode::ProtocolIncompatible => {
+                "the controller and worker RPC versions are incompatible"
+            }
+            output::ErrorCode::ProtocolMalformed => "the worker RPC response was malformed",
+            output::ErrorCode::RemoteExecutionFailed => {
+                "the worker could not execute the RPC method"
+            }
+            output::ErrorCode::MachineManifestInvalid => "the worker machine manifest is invalid",
+            output::ErrorCode::UsageInvalidArgument => "the RPC request is invalid",
+            _ => "the worker RPC operation failed",
+        },
     }
 }
 

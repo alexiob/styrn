@@ -103,8 +103,27 @@ fn inventory_store_round_trips_in_deterministic_name_order() {
             .collect::<Vec<_>>(),
         ["alpha.example", "zeta.example"]
     );
-    let bytes = fs::read_to_string(store.inventory_path()).unwrap();
+    let bytes = fs::read_to_string(root.path().join("inventory.toml")).unwrap();
     assert!(bytes.find("alpha.example").unwrap() < bytes.find("zeta.example").unwrap());
+}
+
+#[test]
+fn empty_inventory_read_is_strictly_non_mutating() {
+    let root = TestRoot::new();
+    let before = fs::read_dir(root.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<Vec<_>>();
+    let store = InventoryStore::at(root.path()).unwrap();
+
+    assert!(store.read().unwrap().hosts().is_empty());
+
+    let after = fs::read_dir(root.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<Vec<_>>();
+    assert_eq!(after, before);
+    assert!(!root.path().join("manifests").exists());
 }
 
 #[test]
@@ -135,11 +154,12 @@ fn inventory_corruption_is_never_silently_reset_or_echoed() {
         .unwrap();
 
     let hostile = "token = 'this-must-never-be-echoed-or-reset'\n";
-    fs::write(store.inventory_path(), hostile).unwrap();
+    let inventory_path = root.path().join("inventory.toml");
+    fs::write(&inventory_path, hostile).unwrap();
     let error = store.read().unwrap_err();
     assert_eq!(error.code(), ErrorCode::UsageConfigInvalid);
     assert!(!error.to_string().contains("never-be-echoed"));
-    assert_eq!(fs::read_to_string(store.inventory_path()).unwrap(), hostile);
+    assert_eq!(fs::read_to_string(&inventory_path).unwrap(), hostile);
     assert!(fs::read_dir(root.path()).unwrap().all(|entry| !entry
         .unwrap()
         .file_name()
@@ -200,7 +220,7 @@ fn inventory_cache_and_known_hosts_are_bound_deterministic_documents() {
     let cache = ManifestCache::new(cached_at, "0.1.0", &manifest).unwrap();
     store.write_cache(&cache).unwrap();
     let restored = store.read_cache(manifest.machine_id).unwrap();
-    assert_eq!(restored.machine_id(), manifest.machine_id);
+    assert_eq!(restored.manifest().unwrap().machine_id, manifest.machine_id);
     assert_eq!(restored.styrn_version(), "0.1.0");
     assert_eq!(restored.manifest().unwrap().machine_id, manifest.machine_id);
 
@@ -223,7 +243,7 @@ fn inventory_link_is_rejected_without_touching_its_target() {
     let store = InventoryStore::at(root.path()).unwrap();
     let target = root.path().join("outside.toml");
     fs::write(&target, b"do-not-touch\n").unwrap();
-    symlink(&target, store.inventory_path()).unwrap();
+    symlink(&target, root.path().join("inventory.toml")).unwrap();
 
     let error = store.read().unwrap_err();
     assert_eq!(error.code(), ErrorCode::UsageConfigInvalid);

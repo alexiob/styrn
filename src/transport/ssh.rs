@@ -94,7 +94,6 @@ impl PinnedHostKey {
         Ok(selected)
     }
 
-    #[allow(dead_code)] // The inventory deserializer consumer lands in Task 3 of this wave.
     pub(crate) fn from_parts(
         algorithm: &str,
         base64: &str,
@@ -105,12 +104,10 @@ impl PinnedHostKey {
         Ok(selected)
     }
 
-    #[allow(dead_code)] // The inventory serializer consumer lands in Task 3 of this wave.
     pub(crate) fn algorithm(&self) -> &str {
         &self.algorithm
     }
 
-    #[allow(dead_code)] // The inventory serializer consumer lands in Task 3 of this wave.
     pub(crate) fn base64(&self) -> &str {
         &self.base64
     }
@@ -119,7 +116,6 @@ impl PinnedHostKey {
         &self.fingerprint
     }
 
-    #[allow(dead_code)] // The known_hosts cache consumer lands in Task 3 of this wave.
     pub(crate) fn known_hosts_line(&self, host: &str, port: u16) -> Result<String, TransportError> {
         validate_host(host)?;
         if port == 0 {
@@ -153,7 +149,6 @@ pub(crate) struct SshTransport {
 }
 
 impl SshTransport {
-    #[allow(dead_code)] // Test fixtures and the live controller consumer land later in this wave.
     pub(crate) fn new(ssh: PathBuf, keyscan: PathBuf, known_hosts: PathBuf) -> Self {
         Self {
             ssh,
@@ -162,7 +157,6 @@ impl SshTransport {
         }
     }
 
-    #[allow(dead_code)] // The live controller CLI consumer lands in Task 4 of this wave.
     pub(crate) fn configured(known_hosts: PathBuf) -> Self {
         let ssh = std::env::var_os("STYRN_SSH")
             .filter(|value| !value.is_empty())
@@ -171,7 +165,6 @@ impl SshTransport {
         Self::new(ssh, PathBuf::from("ssh-keyscan"), known_hosts)
     }
 
-    #[allow(dead_code)] // The enrollment consumer lands in Task 3 of this wave.
     pub(crate) fn scan_host_key(
         &self,
         host: &str,
@@ -238,7 +231,7 @@ impl RpcTransport for SshTransport {
             .stderr
             .take()
             .ok_or_else(TransportError::authentication)?;
-        Ok(RpcProcess::new(child, input, output, stderr))
+        Ok(RpcProcess::new_ssh(child, input, output, stderr))
     }
 }
 
@@ -300,6 +293,10 @@ fn validate_fingerprint(value: &str) -> Result<&str, TransportError> {
     } else {
         Err(TransportError::authentication())
     }
+}
+
+pub(crate) fn validate_host_key_fingerprint(value: &str) -> Result<(), TransportError> {
+    validate_fingerprint(value).map(|_| ())
 }
 
 fn algorithm_priority(algorithm: &str) -> u8 {

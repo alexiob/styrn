@@ -219,6 +219,10 @@ rather than a review stop for every small internal edit.
 
 ## 1.A Transport and protocol
 
+Checked Phase 1 subitems below are covered by the finite local/fake-SSH slice;
+the parent tasks explicitly left open still require the documented native
+three-OS or later-protocol acceptance.
+
 - [ ] **T1.1** — `Transport` trait with a local-child test implementation (1.5, 16.6 layer 3)
       `rpc`, `exec`, `interactive_shell`. The test impl spawns `styrn rpc serve --stdio` as a local child — this is what makes layers 3 and 4 possible without SSH.
   - [ ] + positive: the same test suite passes against both the local-child and SSH implementations.
@@ -253,23 +257,23 @@ rather than a review stop for every small internal edit.
 - [ ] **T1.8** — SSH transport implementation
       System OpenSSH per 1.5; identity is controller-local and never copied to a worker (2.6).
   - [ ] + positive: RPC over SSH to each of the three worker OSes.
-  - [ ] − negative: host-key mismatch aborts the connection (exit 4) and does not fall back to trust-on-first-use after enrollment.
+  - [x] − negative: host-key mismatch aborts the connection (exit 4) and does not fall back to trust-on-first-use after enrollment.
 
 ## 1.B Enrollment and inventory
 
 - [ ] **T1.9** — Lazy controller key generation (4.3.1, S-30)
       Keys minted on first need, not demanded up front.
-  - [ ] + positive: a controller with no prior key material enrolls a host without a separate keygen step.
-  - [ ] − negative: an existing key is never overwritten or regenerated silently.
+  - [x] + positive: a controller with no prior key material enrolls a host without a separate keygen step.
+  - [x] − negative: an existing key is never overwritten or regenerated silently.
 
 - [ ] **T1.10** — `host enroll` with host-key pinning (6.1, 4.4)
       Require `--user`, pin the host key at enrollment, and bound TOFU to that moment. The setup card supplies the complete paste.
-  - [ ] + positive: enroll connects as the explicit transport user, validates protocol, fetches and schema-checks a matching stable worker identity, runs doctor, and writes the inventory entry and manifest cache.
+  - [x] + positive: enroll connects as the explicit transport user, validates protocol, fetches and schema-checks a matching stable worker identity, runs doctor, and writes the inventory entry and manifest cache.
   - [ ] − negative: a missing user, transport/identity mismatch, changed host key, or incompatible protocol aborts without an inventory entry. A later key change is refused (exit 4), never re-pinned.
 
 - [ ] **T1.11** — Inventory storage (2.6)
       `~/.config/styrn/inventory.toml`; `%APPDATA%\Styrn\inventory.toml` on Windows.
-  - [ ] + positive: round-trips; the identity path stays controller-local.
+  - [x] + positive: round-trips; the identity path stays controller-local.
   - [ ] − negative: a corrupt inventory file fails with a clear parse error naming the file — it is never silently reinitialized, which would drop the fleet.
 
 - [ ] **T1.12** — `host remove` semantics (6.2)
@@ -281,8 +285,8 @@ rather than a review stop for every small internal edit.
 
 - [ ] **T1.13** — `host list / show / status / refresh` (10.5, 2.5)
       Status is ephemeral and must not rewrite the static manifest (2.5).
-  - [ ] + positive: status returns live CPU/memory/disk/job counts, including the ephemeral `substrate` field (11.0.3); refresh updates the manifest cache.
-  - [ ] − negative: repeated `status` calls leave the manifest file's mtime unchanged.
+  - [x] + positive: status returns live CPU/memory/disk/job counts, including the ephemeral `substrate` field (11.0.3); refresh updates the manifest cache.
+  - [x] − negative: repeated `status` calls leave the manifest file's mtime unchanged.
 
 - [ ] **T1.14** — `doctor`, both layers (6.5)
       Controller-side checks and worker-local probes, kept distinct.
@@ -292,7 +296,7 @@ rather than a review stop for every small internal edit.
 
 - [ ] **T1.15** — `exec` (10.5, D-6)
       Mirrors the remote command's exit code, ssh-convention.
-  - [ ] + positive: `exec` returns the remote code and `data.{exit_code,stdout,stderr,duration_ms}` under `--json`.
+  - [x] + positive: `exec` returns the remote code and `data.{exit_code,stdout,stderr,duration_ms}` under `--json`.
   - [ ] − negative: argv crosses the RPC boundary without shell re-interpretation — adversarial arguments (spaces, quotes, `%VAR%`, trailing backslashes) arrive verbatim on Windows (16.6 layer 5).
 
 - [ ] **T1.16** — `fleet status / versions` (6.6)

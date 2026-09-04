@@ -6,10 +6,10 @@ Styrn is a planned cross-platform command-line tool for operating a fleet of mac
 
 > [!IMPORTANT]
 > **Styrn is early software, not a supported release.** The rootless
-> current-user `styrn setup` path is runnable from a built checkout, but Phase 0
-> is incomplete and there is no released or installable binary. Fleet, job,
-> agent, enrollment, and most other commands below still describe the intended
-> interface rather than available end-to-end behavior.
+> current-user `styrn setup` path and the first finite Phase 1 controller journey
+> are runnable from a built checkout, but Phase 0 and Phase 1 remain incomplete
+> and there is no released or installable binary. Fleet fanout, persistent jobs,
+> agents, and most other commands below still describe the intended interface.
 
 ## Runnable rootless setup
 
@@ -54,6 +54,35 @@ request sudo/UAC, emit setup scripts, enroll the machine, or make it remotely
 job-ready. System scope, controller/both roles, dedicated identity, privileged
 and user phases, uninstall, and enrollment output remain unavailable and fail
 closed.
+
+## Runnable controller-to-worker slice
+
+After rootless setup has produced a local manifest, `controller init` lazily
+creates one current-user ED25519 identity with system `ssh-keygen`. Authorize
+the printed public key for an ordinary account on a prepared worker, then pin
+that worker's host key during enrollment:
+
+```console
+styrn controller init
+styrn host enroll worker.example --user alex \
+  --fingerprint SHA256:<verified-fingerprint>
+styrn host list
+styrn host show worker.example
+styrn host status worker.example
+styrn host refresh worker.example
+styrn host doctor worker.example
+styrn exec worker.example -- program "one argument"
+```
+
+Enrollment without `--fingerprint` is allowed only at an interactive terminal
+and requires one explicit host-key confirmation. JSON and non-terminal calls
+must provide the fingerprint. Later connections use the pinned key and refuse
+a change; `host trust --fingerprint ...` is the explicit recovery operation.
+Each command opens one bounded system-OpenSSH session to the fixed remote
+`styrn rpc serve --stdio` command. There is no daemon, shell interpolation,
+fanout, retry framework, or persistent remote job in this slice. Doctor reports
+`phase1_minimum`/`complete: false`; the native real-sshd journey is not yet
+certified across all three supported operating systems.
 
 ## Why Styrn?
 
@@ -176,14 +205,16 @@ Styrn is not literally dependency-free: v1 relies on system OpenSSH for transpor
 
 ## Repository status
 
-Implementation includes the runnable rootless portion of **Phase 0** and the
-first internal slice of **Phase 1**. The Phase 1 slice provides bounded,
-sequential JSON RPC over a real local child process for manifest, status,
-worker-doctor, and exact-argv execution, including the hidden on-demand stdio
-server. SSH transport, enrollment, inventory, and the public host/status/doctor/
-exec dispatch remain unimplemented, so this is not yet an end-to-end fleet
-surface. The repository defines a three-OS CI matrix for formatting, build,
-tests, and lints; there is no release or supported installation path yet.
+Implementation includes the runnable rootless portion of **Phase 0** and a
+finite vertical slice of **Phase 1**. Phase 1 now includes bounded sequential
+JSON RPC, lazy controller identity creation, pinned system-OpenSSH transport,
+atomic TOML inventory and manifest cache, controller initialization,
+enrollment/list/show/status/refresh/partial-doctor/trust, and exact-argv remote
+execution. The fixture-backed process journey is tested end to end, but native
+real-sshd acceptance on macOS, Linux, and Windows remains outstanding; this is
+not yet the complete Phase 1 fleet surface. The repository defines a three-OS
+CI matrix for formatting, build, tests, and lints; there is no release or
+supported installation path yet.
 
 | Phase | Intended outcome |
 |---:|---|
@@ -211,7 +242,8 @@ When documents disagree, `docs/design.md` wins. Historical examples described by
 
 ## Contributing
 
-The Rust workspace is scaffolded, but Styrn is still an early Phase-0 project.
+The Rust workspace remains early software with incomplete Phase 0 and Phase 1
+delivery slices.
 To contribute:
 
 1. Read the [canonical design](docs/design.md), especially the part governing the subsystem you plan to change.

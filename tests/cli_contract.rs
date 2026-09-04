@@ -268,13 +268,27 @@ fn representative_paths_from_every_command_family_parse() {
         &["host", "list"][..],
         &["host", "show", "alpha"][..],
         &["host", "status"][..],
-        &["host", "enroll", "alpha", "--fingerprint", "SHA256"][..],
+        &[
+            "host",
+            "enroll",
+            "alpha",
+            "--user",
+            "worker",
+            "--fingerprint",
+            "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        ][..],
         &["host", "remove", "alpha", "--revoke"][..],
         &["host", "doctor", "alpha"][..],
         &["host", "refresh"][..],
         &["host", "authorize-key", "alpha", "--public-key", "key.pub"][..],
         &["host", "revoke-key", "alpha", "--controller", "main"][..],
-        &["host", "trust", "alpha", "--fingerprint", "SHA256"][..],
+        &[
+            "host",
+            "trust",
+            "alpha",
+            "--fingerprint",
+            "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+        ][..],
         &["shell", "alpha"][..],
         &["desktop", "open", "alpha"][..],
         &["desktop", "info", "alpha"][..],
@@ -341,9 +355,12 @@ fn representative_paths_from_every_command_family_parse() {
 
     for args in cases {
         let output = run(args);
-        assert!(output.status.success(), "{}: {output:?}", display(args));
-        assert!(output.stdout.is_empty(), "{}", display(args));
-        assert!(output.stderr.is_empty(), "{}", display(args));
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !stderr.contains("Usage:") && !stderr.contains("try '--help'"),
+            "{} did not parse: {output:?}",
+            display(args)
+        );
     }
 }
 

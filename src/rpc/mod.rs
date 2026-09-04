@@ -27,7 +27,6 @@ pub(crate) fn serve_stdio() -> Result<(), RpcError> {
     server::serve(stdin.lock(), stdout.lock())
 }
 
-#[allow(dead_code)] // The Task 1 local-child integration target exercises controller negotiation.
 pub(crate) fn highest_protocol_intersection(
     ours: RangeInclusive<u32>,
     theirs: RangeInclusive<u32>,
@@ -93,7 +92,6 @@ impl RpcError {
         Self::new(ErrorCode::ProtocolMalformed, message)
     }
 
-    #[allow(dead_code)] // Controller-side integration assertions inspect the typed code.
     pub(crate) const fn code(&self) -> ErrorCode {
         self.code
     }
@@ -111,7 +109,6 @@ impl fmt::Display for RpcError {
 
 impl std::error::Error for RpcError {}
 
-#[allow(dead_code)] // The Task 1 local-child integration target binds the expected peer.
 #[derive(Clone, Debug)]
 pub(crate) struct ExpectedPeer {
     machine_id: Uuid,
@@ -119,7 +116,6 @@ pub(crate) struct ExpectedPeer {
     user: String,
 }
 
-#[allow(dead_code)] // The Task 1 local-child integration target binds the expected peer.
 impl ExpectedPeer {
     pub(crate) fn new(machine_id: Uuid, name: &str, user: &str) -> Result<Self, RpcError> {
         if machine_id.get_version_num() != 7
@@ -142,12 +138,12 @@ impl ExpectedPeer {
         })
     }
 
+    #[allow(dead_code)] // Source-including non-protocol targets omit peer-binding assertions.
     pub(crate) const fn machine_id(&self) -> Uuid {
         self.machine_id
     }
 }
 
-#[allow(dead_code)] // The Task 1 local-child integration target is the current controller consumer.
 pub(crate) struct RpcClient {
     process: RpcProcess,
     hello: ServerHello,
@@ -155,7 +151,6 @@ pub(crate) struct RpcClient {
     terminated: bool,
 }
 
-#[allow(dead_code)] // The Task 1 local-child integration target is the current controller consumer.
 impl RpcClient {
     pub(crate) fn connect(mut process: RpcProcess) -> Result<Self, RpcError> {
         let hello = match process.read_frame().map_err(RpcError::frame)? {
@@ -167,7 +162,7 @@ impl RpcClient {
             }
             None => {
                 return Err(RpcError::new(
-                    ErrorCode::TransportSessionLost,
+                    process.pre_hello_error_code(),
                     "the RPC server closed before hello",
                 ))
             }
@@ -377,11 +372,13 @@ impl RpcClient {
     }
 
     #[cfg(test)]
+    #[allow(dead_code)] // Source-including non-protocol targets omit hostile-peer assertions.
     pub(crate) fn request_for_test(&mut self, method: &str) -> Result<Value, RpcError> {
         self.request(method, json!({}))
     }
 
     #[cfg(test)]
+    #[allow(dead_code)] // Source-including non-protocol targets omit hostile-peer assertions.
     pub(crate) const fn terminated_for_test(&self) -> bool {
         self.terminated
     }
@@ -397,7 +394,6 @@ fn is_remote_execution_failure(errors: &[RpcDiagnostic]) -> bool {
     )
 }
 
-#[allow(dead_code)] // The Task 1 local-child integration target exercises substitution rejection.
 pub(crate) fn validate_hello_manifest_binding(
     hello: &ServerHello,
     manifest: &crate::manifest::MachineManifest,
