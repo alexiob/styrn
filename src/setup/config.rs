@@ -910,7 +910,10 @@ mod tests {
 
     #[cfg(target_os = "windows")]
     #[test]
-    fn interactive_replay_cleanup_blocks_substitution_after_handle_verification() {
+    fn interactive_replay_cleanup_removes_the_verified_file_and_preserves_its_substitute() {
+        const ORIGINAL: &[u8] = b"verified original";
+        const SUBSTITUTE: &[u8] = b"replacement must survive";
+
         let directory = std::env::temp_dir().join(format!(
             "styrn-replay-cleanup-substitution-{}-{}",
             std::process::id(),
@@ -920,24 +923,35 @@ mod tests {
         let temporary = directory.join("replay.tmp");
         let displaced = directory.join("displaced.tmp");
         let principal = crate::platform::resolve_current_worker_principal().unwrap();
-        let publication = crate::platform::create_private_publication_file(
+        let mut publication = crate::platform::create_private_publication_file(
             &temporary,
             crate::platform::ManifestOwner::User,
             &principal,
         )
         .unwrap();
+        publication.write_all(ORIGINAL).unwrap();
         let identity = publication.identity();
         drop(publication);
         let temporary_for_hook = temporary.clone();
         let displaced_for_hook = displaced.clone();
+        let principal_for_hook = principal.clone();
         set_before_replay_cleanup_consume_hook(move || {
-            assert!(fs::rename(&temporary_for_hook, &displaced_for_hook).is_err());
+            fs::rename(&temporary_for_hook, &displaced_for_hook).unwrap();
+            let mut substitute = crate::platform::create_private_publication_file(
+                &temporary_for_hook,
+                crate::platform::ManifestOwner::User,
+                &principal_for_hook,
+            )
+            .unwrap();
+            substitute.write_all(SUBSTITUTE).unwrap();
+            drop(substitute);
         });
 
         cleanup_replay_temporary(&temporary, identity, &principal).unwrap();
 
-        assert!(!temporary.exists());
+        assert_eq!(fs::read(&temporary).unwrap(), SUBSTITUTE);
         assert!(!displaced.exists());
+        fs::remove_file(temporary).unwrap();
         fs::remove_dir(directory).unwrap();
     }
 
