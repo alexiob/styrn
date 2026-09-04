@@ -1,6 +1,6 @@
 # Styrn implementation plan
 
-Derived from `docs/design.md` revision H (Part 16.3 phases, Part 16.6 testing strategy, Part 16.1 layout).
+Derived from `docs/design.md` revision I (Part 16.3 phases, Part 16.6 testing strategy, Part 16.1 layout).
 Every task cites the design Part that specifies it. If a task and the design disagree, **the design wins** — fix the plan.
 
 ## How to use this document
@@ -99,8 +99,8 @@ rather than a review stop for every small internal edit.
 
 - [ ] **T0.3** — Exit-code table and error-code registry (10.4, 10.6)
       Codes 0–13 exactly as tabulated. `workflow run` never propagates an inner code (always 12 + `data.exit_code`); `exec` mirrors the remote code per D-6.
-  - [ ] + positive: each code is produced by at least one integration test; every `errors[].code` maps to a documented registry entry. The registry includes `capability.substrate_unregistered` (11.0.3), first *produced* by Phase-4 tests like other late-phase codes.
-  - [ ] − negative: a workflow command exiting 101 yields Styrn exit 12 with `data.exit_code == 101` — **not** exit 101. An unmapped internal panic yields exit 1, not a masquerading domain code.
+  - [ ] + positive: each code is produced by at least one integration test; every `errors[].code` maps to a documented registry entry. The registry includes `capability.substrate_unregistered` (11.0.3), first *produced* by Phase-4 tests like other late-phase codes, and maps Linux WSL refusal to exit 13 / `setup.unsupported_os`.
+  - [ ] − negative: a workflow command exiting 101 yields Styrn exit 12 with `data.exit_code == 101` — **not** exit 101. An unmapped internal panic yields exit 1, not a masquerading domain code; WSL never degrades to a generic `setup.probe_failed` or a success warning.
 
 - [ ] **T0.4** — CLI skeleton, global flags, TTY detection (10.5)
       clap-based; global `--json`, `--jsonl` where streaming; `--json` disables ANSI colour.
@@ -128,56 +128,57 @@ rather than a review stop for every small internal edit.
 ## 0.C Setup engine
 
 - [ ] **T0.8** — Capability probe layer, shared with doctor (15.2, 6.5)
-      One probe implementation; `doctor` renders it, `setup` diffs against it. Note the 6.5 split: controller-side checks vs. worker-local probes are distinct layers; the one-to-one rule applies to the latter.
-  - [ ] + positive: every worker-local doctor check is expressible as a probe result; adding a probe automatically surfaces in both commands.
-  - [ ] − negative: a probe that cannot run (tool absent, permission denied) yields `Unknown` rather than `false` — the plan must never silently treat "could not determine" as "not installed".
+      One probe implementation; `doctor` renders it, `setup` diffs against it. Note the 6.5 split: controller-side checks vs. worker-local probes are distinct layers; the one-to-one rule applies to the latter. Linux adds a private kernel disposition plus independent `LinuxCapability` values for distribution, package, system-service, and user-service evidence: they degrade independently, and only kernel disposition (native vs. WSL) is globally blocking. Parse bounded `os-release` from fixed secure paths with exact-ID authority; prove apt (`apt-get` + `dpkg-query`), DNF (`dnf`/`dnf5`), Pacman, and system/user managers from fixed executable identities and bounded queries.
+  - [ ] + positive: every worker-local doctor check is expressible as a probe result; adding a probe automatically surfaces in both commands. Literal fixtures cover Debian/Ubuntu, Fedora/RHEL derivatives, Arch/Omarchy, `Other`, fixed-path fallback only on `ENOENT`, all accepted escapes and ceilings, and every independent capability combination.
+  - [ ] − negative: a probe that cannot run (tool absent, permission denied) yields `Unknowable` rather than `false` — the plan must never silently treat "could not determine" as "not installed". Reject WSL, unsafe/replaced files, invalid UTF-8/NUL/size/token/quote/escape input, duplicate keys, contradictory cross-family `ID_LIKE`, fake `PATH` managers, incomplete apt evidence, manager query contradictions, and executable drift without erasing unrelated capabilities or writing state.
 
 - [ ] **T0.9** — `Action` trait (15.2.3)
       `check() -> Done|Todo|NeedsHuman`, `apply()`, `revert()`, `privilege()`, `describe()`. `revert` and the two `render_*` methods may be `unimplemented!()` until Phase 7, but the slots exist now.
-  - [ ] + positive: an action reports `Done` when its effect is already present, `Todo` otherwise.
-  - [ ] − negative: `apply()` on an action whose `check()` returns `Done` is a no-op, not a repeat mutation (idempotency is per-action, not just per-run).
+  - [ ] + positive: an action reports `Done` when its effect is already present, `Todo` otherwise; a Linux package Action contains a closed component/backend/package mapping and exact argv, never a caller-supplied package string.
+  - [ ] − negative: `apply()` on an action whose `check()` returns `Done` is a no-op, not a repeat mutation (idempotency is per-action, not just per-run). An unsupported dependent Linux capability returns `NeedsHuman`; unknowable required evidence refuses that Action without suppressing independent siblings.
 
 - [ ] **T0.10** — Plan computation and `--dry-run` rendering (15.2)
       Diff observed vs. desired; render with privilege badges.
-  - [ ] + positive: `--dry-run` prints the ordered action list with privilege annotations and mutates nothing.
-  - [ ] − negative: after `--dry-run`, a subsequent probe shows byte-identical system state; no receipt entry was written.
+  - [ ] + positive: `--dry-run` on proved native Linux prints the ordered action list with privilege annotations and mutates nothing; unsupported capabilities appear only on their dependent lines.
+  - [ ] − negative: after `--dry-run`, a subsequent probe shows byte-identical system state; no receipt entry was written. On WSL, dry-run itself refuses with exit 13 / `setup.unsupported_os`, one JSON envelope, and no plan Action or partial state.
 
 - [ ] **T0.11** — Receipt journal (15.6)
       Scope-aware append-only record of every applied action with provenance. User scope is the no-elevation default and provides crash/concurrency integrity, not same-user containment; system scope preserves worker non-writability.
-  - [ ] + positive: a non-admin user completes a journaled run in the native user-state directory; a second converged run prints "nothing to do". System scope retains protected ACLs. `NeedsHuman` is reported distinctly, never as a no-op.
-  - [ ] − negative: interruption leaves exactly the durably acknowledged prefix. `succeeded`-before-append recovers from its stored finalized entry even when pre-state cannot be recomputed or the action left the current plan; `prepared` plus already-`Done` refuses ownership. Private intent reads are opened no-follow and verified by handle.
+      A Linux package entry records backend, verified executable identity, closed component and package identifier, scope, and finalized effect; it never records a raw command or privilege capability.
+  - [ ] + positive: a non-admin user completes a journaled run in the native user-state directory; a second converged run prints "nothing to do". System scope retains protected ACLs. `NeedsHuman` is reported distinctly, never as a no-op. A package receipt round-trips every required Linux field and recovery replays the same typed Action after revalidation.
+  - [ ] − negative: interruption leaves exactly the durably acknowledged prefix. `succeeded`-before-append recovers from its stored finalized entry even when pre-state cannot be recomputed or the action left the current plan; `prepared` plus already-`Done` refuses ownership. Private intent reads are opened no-follow and verified by handle. Reject a receipt containing a serialized authorization token, raw argv, unknown backend/package mapping, or executable identity inconsistent with the finalized effect before mutation.
 
 - [ ] **T0.12** — Elevation strategy (15.5)
-      Rootless user work never needs privilege. When displayed machine-wide actions are necessary, interactive setup offers exactly one optional OS-owned authorization; system/dedicated scope uses the same closed runner.
-  - [ ] + positive: a non-admin completes all user actions with zero auth calls. If the user accepts the one grouped system delta, sudo/UAC—not Styrn—collects credentials and only the displayed closed actions run; user-level effects remain under the original principal.
-  - [ ] − negative: declining/`--no-elevate` still completes independent user work and preserves system actions as pending. `--yes` never grants privilege. The runner rejects arbitrary commands/paths/URLs, secrets, tampered/expired/replayed requests, action drift, missing original principal, and wrong token before privileged mutation.
+      Rootless user work never needs privilege. When displayed machine-wide actions are necessary, interactive setup offers exactly one optional OS-owned authorization; system/dedicated scope uses the same closed runner. Successful authorization yields a non-cloneable, non-serializable, lifetime-bound capability structurally bound to request digest, privilege, exact parameters, and expected effect and consumed once with the typed Action.
+  - [ ] + positive: a non-admin completes all user actions with zero auth calls. If the user accepts the one grouped system delta, sudo/UAC—not Styrn—collects credentials and only the displayed closed actions run; user-level effects remain under the original principal. The privileged runner revalidates Linux profile/executable identity immediately before mutation.
+  - [ ] − negative: declining/`--no-elevate` still completes independent user work and preserves system actions as pending. `--yes` never grants privilege. The runner rejects arbitrary commands/paths/URLs, secrets, serialized/cloned/tampered/expired/replayed capabilities or requests, digest/privilege/parameter/effect mismatch, action or executable drift, missing original principal, and wrong token before privileged mutation.
 
 - [ ] **T0.13** — `NeedsHuman` pending actions (15.2.4, 3.4)
       Non-automatable residue (macOS Sharing toggle, Tailscale login, Codex/Claude first login) reported as structured pending actions, never as false success.
-  - [ ] + positive: a machine needing consent completes setup with `pending_actions[]` populated and a zero-or-13 exit per the specified semantics.
-  - [ ] − negative: setup **never** reports success for a step it could not perform. Test: revoke the ability to enable Remote Login and assert the run reports `NeedsHuman`, not `Done`.
+  - [ ] + positive: a machine needing consent or a conclusively unsupported Linux package/service capability completes independent work with only the dependent `pending_actions[]` populated and a zero-or-13 exit per the specified semantics.
+  - [ ] − negative: setup **never** reports success for a step it could not perform. Test: revoke the ability to enable Remote Login and assert the run reports `NeedsHuman`, not `Done`; make required Linux evidence unknowable and assert dependency-scoped `setup.probe_failed`, not `NeedsHuman`, `Absent`, or a global abort.
 
 ## 0.D Component actions
 
 - [ ] **T0.14** — Directory tree and worker identity (15.7, 4.1)
-      `repos/ jobs/ cache/ artifacts/ logs/` under the scope-selected per-OS root. User/current-user is the no-account, no-elevation default; optional dedicated mode accepts a configurable non-administrator account and implies system scope.
-  - [ ] + positive: an ordinary user gets the tree in XDG data / Application Support / LocalAppData without privilege or account creation; system/dedicated mode creates or adopts the configured account and owns only the intended tree.
-  - [ ] − negative: no implementation or native test requires a literal username. Dedicated mode cannot read controller key material or write outside `paths.root`; current-user mode reports that it provides no such OS-account isolation. Re-running never recursively resets ownership of pre-existing files.
+      `repos/ jobs/ cache/ artifacts/ logs/` under the scope-selected per-OS root. User/current-user is the no-account, no-elevation default; optional dedicated mode accepts a configurable non-administrator account and implies system scope. Linux account-policy generalization is independent of host profiling/package work and requires affirmative non-root, non-service, non-admin, usable shell, unique secure home, NSS identity, and trustworthy sudo origin proofs.
+  - [ ] + positive: an ordinary user gets the tree in XDG data / Application Support / LocalAppData without privilege or account creation; system/dedicated mode creates or adopts the configured account and owns only the intended tree. On Linux, NSS name/uid round-trip, secure uniquely owned home/path chain, accepted shell policy, privilege/group policy, and OS-owned original-user evidence all pass affirmatively for each accepted principal.
+  - [ ] − negative: no implementation or native test requires a literal username. Dedicated mode cannot read controller key material or write outside `paths.root`; current-user mode reports that it provides no such OS-account isolation. Re-running never recursively resets ownership of pre-existing files. Reject uid 0, service/system accounts, admin/sudo-equivalent membership, unusable shells, shared/insecure/mismatched homes, ambiguous NSS identities, and absent/forged sudo-origin evidence; distro/backend identity may never waive one proof.
 
 - [ ] **T0.15** — sshd component (15.7)
-      User scope probes existing sshd and uses the ordinary per-user key path without elevation; missing machine configuration is `NeedsHuman`. System scope owns OpenSSH install/service/config plus protected account-specific key files.
-  - [ ] + positive: a non-admin user with working sshd can authorize and log in without privilege. System scope succeeds for ordinary and Administrators-member Windows principals without authorizing any other account.
-  - [ ] − negative: user scope never edits machine sshd/firewall/service config or shared `administrators_authorized_keys`; it reports the exact missing capability. System scope detects/corrects protected-key ACLs, and a same-identity unprivileged job cannot modify them. Password auth is refused where Styrn manages configuration.
+      User scope probes existing sshd and uses the ordinary per-user key path without elevation; missing machine configuration is `NeedsHuman`. System scope owns OpenSSH install/service/config plus protected account-specific key files. Linux stock packages are `openssh-server` on apt/DNF and `openssh` on Pacman, with service work gated separately on the system-service capability.
+  - [ ] + positive: a non-admin user with working sshd can authorize and log in without privilege. Linux system scope selects the exact family backend/package, proves installed state with its closed query, and enables the unit through the independently verified manager. Windows system scope succeeds for ordinary and Administrators-member principals without authorizing any other account.
+  - [ ] − negative: user scope never edits machine sshd/firewall/service config or shared `administrators_authorized_keys`; it reports the exact missing capability. Unsupported package or service evidence affects only SSH; unknowable required evidence gives exit 13 / `setup.probe_failed` before mutation. System scope detects/corrects protected-key ACLs, and a same-identity unprivileged job cannot modify them. Password auth is refused where Styrn manages configuration.
 
 - [ ] **T0.16** — Tailscale component (15.7)
-      Per-OS unattended operation; interactive browser flow vs. `--auth-key`/`TS_AUTHKEY` chosen by interactivity.
-  - [ ] + positive: node joins the tailnet and survives reboot/logout on Linux and Windows.
-  - [ ] − negative: a machine marked `headless = true` whose Tailscale cannot run before login is flagged by doctor rather than silently accepted (3.2). An auth key is never written to the manifest or receipt.
+      Per-OS unattended operation; interactive browser flow vs. `--auth-key`/`TS_AUTHKEY` chosen by interactivity. On Linux, adopt an existing compatible installation, but stock apt/DNF/Pacman provisioning is unsupported until a separately specified vendor-repository Action exists.
+  - [ ] + positive: an already-installed node joins the tailnet; when the independent service capability exists, native Linux/Windows gates prove the service survives reboot/logout.
+  - [ ] − negative: a machine marked `headless = true` whose Tailscale cannot run before login is flagged by doctor rather than silently accepted (3.2). Linux never invents a stock package or adds a vendor URL/key/repository; only the Tailscale dependency becomes `NeedsHuman`. An auth key is never written to the manifest or receipt.
 
 - [ ] **T0.17** — git, sleep-policy, and remaining baseline components (15.7, S-38)
-      Including scope-first package-channel selection and sleep-policy/doctor. Prefer existing → verified per-user → one optional system authorization delta; never silently change scope.
-  - [ ] + positive: as a non-admin, compatible components install through user channels and report `Done` on re-run. Accepting the grouped system delta invokes native authorization once and completes only displayed machine actions.
-  - [ ] − negative: cancelled/failed authorization leaves user installs intact and system actions pending; no password enters Styrn and no user installer runs elevated. A worker configured to sleep is flagged by doctor with the exact remediation.
+      Including scope-first package-channel selection and sleep-policy/doctor. Prefer existing → verified per-user → one optional system authorization delta; never silently change scope. Linux stock mappings are Git `git` everywhere and Cockpit `cockpit` on apt/DNF but unsupported on Pacman; component backends never extend `[install].channel`.
+  - [ ] + positive: as a non-admin, compatible components install through user channels and report `Done` on re-run. Linux system scope uses exact apt/DNF/Pacman install and installed-query argv, records all package receipt fields, then uses an independently verified service capability where required. Accepting the grouped system delta invokes native authorization once and completes only displayed machine actions.
+  - [ ] − negative: cancelled/failed authorization leaves user installs intact and system actions pending; no password enters Styrn and no user installer runs elevated. Pacman never receives `-Sy`; unsupported Cockpit affects only Cockpit, and backend/query/executable contradictions stop only dependents before mutation. A worker configured to sleep is flagged by doctor with the exact remediation.
 
 - [ ] **T0.18** — Windows worker identity modes: current-user + hardened transient logon (15.8, rev. G)
       Current-user is the no-account-creation default. Optional dedicated mode accepts a configurable account, generates its password in memory, uses it for the profile-materializing user phase via `CreateProcessWithLogonW`, then discards it.
@@ -193,8 +194,8 @@ rather than a review stop for every small internal edit.
 
 - [ ] **T0.20** — Three invocation modes and the zero-argument path (15.4, 15.4.1)
       `--scope user|system`, `--install a,b --role both`, `--account current-user|dedicated[:NAME]`, config, interactive, and bare setup. Zero-arg = rootless user-scope probe → plan → one confirmation → apply.
-  - [ ] + positive: bare setup as a non-admin creates no account and yields a useful local worker; it asks for native authorization at most once and only when missing system capabilities are needed. Declining remains supported. The dedicated flag accepts a non-literal configured name.
-  - [ ] − negative: with no TTY and no `--yes`, it prints the plan and exits 13 rather than guessing consent. `--install` naming an unknown component exits 2 listing valid components.
+  - [ ] + positive: bare setup as a non-admin on proved native Linux creates no account and yields a useful local worker despite unrelated unsupported distro/package/service capabilities; it asks for native authorization at most once and only when missing system capabilities are needed. Declining remains supported. The dedicated flag accepts a non-literal configured name. Help/version and controller-side rendering remain available on WSL.
+  - [ ] − negative: with no TTY and no `--yes`, it prints the plan and exits 13 rather than guessing consent. Every local setup mode, apply, `--dry-run`, and worker-role selection on WSL returns exit 13 / `setup.unsupported_os`, one JSON envelope, and leaves no manifest, receipt, intent, lock, Action, or worker eligibility. `--install` naming an unknown component exits 2 listing valid components.
 
 - [ ] **T0.21** — `--interactive` wizard (15.4.2)
       `inquire`-style prompt sequence, five questions maximum. **Not** ratatui — decision recorded, do not reopen.
@@ -758,14 +759,14 @@ three-OS or later-protocol acceptance.
 
 These are not phase tasks; they must hold at every commit from Phase 0 onward (16.6).
 
-- [ ] **C1** — Unit test layer: manifest/profile parsing, variable expansion, admission arithmetic, exit/error mapping, revision resolution (16.6 layer 1).
+- [ ] **C1** — Unit test layer: manifest/profile parsing, variable expansion, admission arithmetic, exit/error mapping, revision resolution, and deterministic Linux host fixtures for every family, WSL disposition, bounded `os-release` rule, executable identity, manager query, and independent capability combination (16.6 layer 1).
 - [ ] **C2** — Protocol golden tests over in-memory pipes, both peer roles, including version-window rejection and oversized-frame handling (layer 2).
 - [ ] **C3** — Fake-worker harness: local-child `rpc serve --stdio` exercising submit → supervise → tail → reattach → cancel (layer 3).
 - [ ] **C4** — Concurrency tests: two controllers, one worker, budgets never exceeded (layer 4; the S-03 regression).
-- [ ] **C5** — Platform CI matrix on ubuntu/macos/windows latest, including Windows argv round-trip, Job-Object tree-kill, long paths (layer 5).
+- [ ] **C5** — Platform CI matrix on ubuntu/macos/windows latest, including Windows argv round-trip, Job-Object tree-kill, long paths, and WSL fixture refusal with exit 13 / `setup.unsupported_os`, one JSON envelope, no partial setup state, and help/version/controller rendering still available (layer 5).
 - [ ] **C6** — `fleet selftest` green on the real fleet after every upgrade (layer 6).
 - [ ] **C7** — Herdr parity conformance wherever Herdr is installable, i.e. wherever the substrate is `active` (layer 7; 11.0.1).
-- [ ] **C8** — Setup and rendered-script conformance on the three-OS VM matrix (layer 8; Phase 7 gate).
+- [ ] **C8** — Setup and rendered-script conformance on the three-OS VM matrix (layer 8; Phase 7 gate). Linux ARM64 containers cover distro/parser/backend/query/dry-run and rootless filesystem behavior but never certify services; a real systemd VM/host owns package transactions, user-manager/linger, logout/reboot and service lifecycle, SSH/Tailscale/sleep/sudo, and account-policy gates. Real Omarchy ARM64, user-manager/linger, and service lifecycle remain unavailable until run and must be reported that way.
 - [ ] **C9** — Every new command added to the Part 10.5 canonical surface in the same change.
 - [ ] **C10** — Every new component placed in exactly one Part 16.3 phase in the same change (the 16.3 placement rule).
 - [ ] **C11** — Secret-scanning test over generated manifests, receipts, logs, audit entries, and rendered scripts.

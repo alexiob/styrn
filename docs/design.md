@@ -1,8 +1,8 @@
 # Styrn: Cross-Platform Agent and Development Machine Control Plane — Consolidated Design
 
 **Status:** Specification. Nothing described here is implemented. There is no source code, no `Cargo.toml`, and no release. Every statement about behavior is a design decision to be implemented, not a description of an existing system.
-**Revision:** H (consolidated; rootless user scope is the primary/default installation)
-**Date:** 2026-09-02
+**Revision:** I (consolidated; native Linux host profiles and package-backend adaptation)
+**Date:** 2026-09-04
 **Primary use case:** centrally control heterogeneous macOS, Linux, and native Windows development machines and persistent coding-agent harnesses from any enrolled controller machine.
 **Initial project profile:** FriCOS / Rust development.
 **Project name:** `Styrn`
@@ -16,7 +16,7 @@
 
 This document **supersedes** the original design, revision A (`styrn-complete-design.md`), together with its companion example files and the five bootstrap/install scripts. Those files were **removed from the repository as obsolete** after rev. E; this document is now the sole design of record, and nothing in the repository depends on them. The `(orig. §N)` annotations throughout, and Appendix A, are retained as **provenance** — they record where each decision originated and that no original material was dropped — but they no longer point at a file in this repository. Where this document and any recovered copy of the original disagree, this document wins. The original's bootstrap scripts are superseded outright by the `styrn setup` subsystem (Part 15, esp. 15.12).
 
-This revision was produced by an adversarial architecture review of revision A. The review found five blocker-level defects (jobs die when the controller's SSH session drops; workers cannot fetch private repositories under the stated credential policy; resource admission has no atomicity story; the RPC protocol has no framing or negotiation specification; and the security claims made for MCP and project-declared workflows do not hold against the stated threat model). All are resolved inline in the relevant sections and cross-referenced from the consolidated **issues register** (Part 18). The pass-1 follow-up (rev. C) raised one further blocker — S-33, Herdr launcher parity — likewise resolved inline (12.9.1, 12.10). Questions that revision B left open have since been decided and are recorded in the **decision log** (Part 19). Rev. G made current-user the identity default; rev. H makes rootless user scope the installation default. Dedicated/system scope remains optional hardening.
+This revision was produced by an adversarial architecture review of revision A. The review found five blocker-level defects (jobs die when the controller's SSH session drops; workers cannot fetch private repositories under the stated credential policy; resource admission has no atomicity story; the RPC protocol has no framing or negotiation specification; and the security claims made for MCP and project-declared workflows do not hold against the stated threat model). All are resolved inline in the relevant sections and cross-referenced from the consolidated **issues register** (Part 18). The pass-1 follow-up (rev. C) raised one further blocker — S-33, Herdr launcher parity — likewise resolved inline (12.9.1, 12.10). Questions that revision B left open have since been decided and are recorded in the **decision log** (Part 19). Rev. G made current-user the identity default; rev. H makes rootless user scope the installation default; rev. I closes the native Linux host-profile, WSL-refusal, and package-backend contracts. Dedicated/system scope remains optional hardening.
 
 ### 0.2 Traceability conventions
 
@@ -57,8 +57,10 @@ To stop terminology drift, the following forms are canonical everywhere in this 
 | `styrn machine …` = local-machine commands; `styrn host …` = inventory/remote commands | undocumented split (orig. §19 vs §25) | S-20 |
 | Herdr headless invocation: `HERDR_SESSION=fleet herdr server` (env-var form) | "depending on the invocation style you standardize on" (orig. §11) | S-23 |
 | Exit code `1` = unexpected internal error | undefined (orig. §24) | S-11 |
-| **"session substrate"** (Herdr; per host; optional — Part 11.0). *"Package substrate"* (15.2.1, 15.7.6) is a different thing; bare "substrate" is never used alone | "persistent execution substrate" as an unconditional description (11.1 title, rev. A–E) | S-40 |
+| **"session substrate"** (Herdr; per host; optional — Part 11.0). Component provisioning uses a **package backend** (15.2.1, 15.7.6); bare "substrate" is never used alone | "persistent execution substrate" as an unconditional description (11.1 title, rev. A–E); older component-provisioning terminology | S-40, S-41 |
 | Substrate state `none \| registered \| active` (11.0.1) | the undefined mix of manifest `[herdr]`, `[components] herdr`, and plugin-install as implicit signals | S-40 |
+| Linux **kernel disposition** (`native \| WSL \| unknowable`) and independent `LinuxCapability` evidence for distribution, package, system service, and user service | distro label as a global platform verdict; Ubuntu/apt/systemctl assumptions | S-41 |
+| Linux component **package backend** (`apt-get \| DNF \| pacman`) | extending the Styrn binary `[install].channel` with component package managers | S-41 |
 
 ### 0.5 Summary of the major revisions (new in rev. B)
 
@@ -115,7 +117,7 @@ Applied in this revision at: 4.3.1 (lazy key generation), 6.1 (transport default
 
 1. **Scope decision recorded:** `docs/design-review-D.md` — a fresh adversarial review of rev. D — proposed a proportionality cut line alongside correctness findings. The operator chose **"correctness only, cut nothing"**: every mechanism stays in scope and fully specified; the cut-line analysis is preserved in that file as context for a later decision (Part 18 preamble).
 2. **Every correctness finding fixed** (consolidated as S-39; each fix annotated "(rev. E; review D §…)" at its site): the 12.9/12.10 exit-status contradiction, the LSA-credential honesty drift, the doctor/probe unification scoped to worker-local probes, `styrn_workflow_cancel` defined, Part 10.5 completed (machine/controller/harness/selftest/upgrade/cancel commands), admission-formula defaults pinned, workflow cwd stated, list fan-outs exit 0 with warnings (exit 9 reserved for required participants), the error registry fully exit-mapped and the envelope given its N/N−1 window, `submission_id` dedupe retention, `--host` override semantics, log files inside the quota walk, and enrollment-card channel sensitivity.
-3. **Packaging and upgrade specified** (Part 15.14; resolves S-37, the review's "most significant absence"): per-platform channels own `styrn` binary upgrades — GitHub Releases substrate, Homebrew tap, winget (human-present only, S-35 nuance preserved), `.deb` asset, `cargo install` fallback; `[install]` provenance in the manifest; `fleet versions` channel column with per-host upgrade commands; `styrn upgrade` as a channel *delegator* (never self-update); replacement mechanics safe under running jobs; **N/N−1 declared load-bearing** (mixed versions are the expected steady state) with all compatibility contracts binding from the first tagged release (2.8).
+3. **Packaging and upgrade specified** (Part 15.14; resolves S-37, the review's "most significant absence"): per-platform channels own `styrn` binary upgrades — direct GitHub Releases, Homebrew tap, winget (human-present only, S-35 nuance preserved), an APT-installed Debian package asset, and a `cargo install` fallback; `[install]` provenance in the manifest; `fleet versions` channel column with per-host upgrade commands; `styrn upgrade` as a channel *delegator* (never self-update); replacement mechanics safe under running jobs; **N/N−1 declared load-bearing** (mixed versions are the expected steady state) with all compatibility contracts binding from the first tagged release (2.8).
 4. **Phase plan rebuilt** (16.3): nine phases 0–8, every specified component placed exactly once, each phase independently useful, jobs before agents; 16.4's integration phases absorbed with an explicit mapping.
 5. **`styrn watch` specified** (14.5): five Tier-1 views (live matrix grid, job view with resource traces against budgets, the 11.10 fleet board, a host-labelled all-agents superset board making 11.12 a hierarchy, doctor view), Tier-2 review panes, normative Herdr-citizenship constraints, the absolute projection rule — and the not-TUI decisions (setup prompts, headless monitor, static fleet versions) preserved, not reopened.
 6. **`sleep-policy` worker component** (S-38): laptops that sleep were an unstated availability assumption.
@@ -183,6 +185,33 @@ Raised by a new operator requirement, verbatim and binding:
    and broker behavior within the login-session guarantees of each OS. Always-
    on, pre-login, or logout-surviving service guarantees require explicit
    system scope and are advertised as separate capabilities.
+
+### 0.13 Revision I changelog (pass 7 — native Linux host profiles) (new in rev. I)
+
+1. **Only kernel disposition is globally blocking.** Linux setup first proves
+   native Linux versus WSL; distribution, package, system-service, and
+   user-service evidence are independent typed capabilities that degrade only
+   their consumers (15.2.1, 15.7.4–15.7.6).
+2. **Distribution parsing is bounded and non-executing.** Fixed-path
+   `os-release` precedence, exact fallback and escape rules, exact-ID authority,
+   and strict size/token limits close the classifier contract (15.2.1).
+3. **Package backends and stock mappings are closed.** Debian/apt, Red Hat/DNF,
+   and Arch/Pacman use verified executable identities, exact installed queries,
+   and a compiled component/package table; Tailscale remains unsupported until
+   its vendor-repository action is separately specified (15.7.2, 15.7.6).
+4. **Authorization is a capability, not serialized intent.** Privileged Linux
+   mutations require a non-cloneable, non-serializable, lifetime-bound token
+   bound to the request digest, privilege, exact parameters, and expected
+   effect, with immediate executable/profile revalidation (15.5–15.6).
+5. **WSL is refused narrowly.** Every local setup mode, including apply and
+   dry-run, and worker eligibility return exit 13 / `setup.unsupported_os`;
+   help, version, and controller-side rendering stay available (10.3, 15.2,
+   15.7.7).
+6. **Truthful native gates are explicit.** ARM64 containers cover parsing,
+   backend discovery, and dry-run planning but never certify service lifecycle;
+   real systemd host/VM gates own user-manager, linger, and lifecycle evidence
+   (16.6). Linux account-policy generalization remains independent T0.14 work.
+7. **Register grows to 41 issues** (6 blocker / 18 major / 17 minor).
 
 ---
 
@@ -2096,13 +2125,13 @@ Human (CHANNEL and the upgrade hints are rev. E; Part 15.14):
 
 ```text
 HOST            styrn    CHANNEL   herdr    codex     claude    rustc
-linux-macpro    0.3.0    deb            ...      ...       ...       ...
+linux-macpro    0.3.0    apt            ...      ...       ...       ...
 win-mini        0.3.0    direct         ...      ...       ...       ...
 win-hp          0.4.0    winget         ...      ...       ...       ...
-mbp-main        0.4.0    brew           ...      ...       ...       ...
+mbp-main        0.4.0    homebrew       ...      ...       ...       ...
 
 styrn drift: linux-macpro, win-mini behind 0.4.0
-  linux-macpro:  styrn upgrade linux-macpro     (delegates: apt install ./styrn_0.4.0_amd64.deb)
+  linux-macpro:  styrn upgrade linux-macpro     (delegates: APT local-package install)
   win-mini:      styrn upgrade win-mini         (delegates: stage-zero download + verify)
 ```
 
@@ -3082,7 +3111,9 @@ setup.confirmation_required     (rev. D; exit 13)
 setup.elevation_required        (rev. D; exit 13)
 setup.apply_failed              (rev. D; exit 13)
 setup.needs_human               (rev. D; warning, or exit 13 under fail_on_pending)
-setup.unsupported_os            (rev. D; exit 13)
+setup.unsupported_os            unsupported setup target, including all local
+                                WSL setup modes and worker eligibility
+                                (rev. I; exit 13; 15.2.1, 15.7.7)
 setup.receipt_conflict          (rev. D; exit 13)
 setup.adopt_mismatch            (rev. D; exit 13)
 ```
@@ -3332,7 +3363,13 @@ Styrn has **two execution layers**, and only one of them is Styrn's own. Batch w
 
 A fleet on which no host has a substrate is a fully healthy Styrn fleet: every command in Parts 5–10 works, enrollment succeeds, doctor is green, and `fleet selftest` passes. What such a fleet lacks is exactly and only the `agent`-lifecycle surface, and it refuses that surface cleanly (11.0.3) without degrading anything else. This is §0.6 applied in both directions: a Herdr-less developer is never nagged about Herdr, and a Herdr user loses nothing specified elsewhere in this Part.
 
-Terminology (§0.4): **"session substrate"** is always written qualified. It is unrelated to the *package substrates* of 15.2.1/15.7.6 (`SubstrateProbe{winget, brew, apt}`), and the unqualified word "substrate" is not used on its own.
+Terminology (§0.4): **"session substrate"** is always written qualified. It is unrelated to the package backends of 15.2.1/15.7.6, and the unqualified word "substrate" is not used on its own.
+
+Rev. I sharpens the platform boundary independently of this model. A native
+Linux worker may have unsupported or unknowable distribution, package,
+system-service, or user-service evidence without changing its session-substrate
+state. Only an unknowable native-versus-WSL kernel disposition, or conclusive
+WSL, prevents worker eligibility; it does not disable controller-only commands.
 
 ### 11.0.1 Substrate state (normative)
 
@@ -5041,7 +5078,10 @@ DesiredState  ───┘
 
 ### 15.2.1 The probe layer
 
-One `Capability` probe per concern — `TailscaleProbe`, `SshdProbe`, `ServiceAccountProbe`, `DirTreeProbe`, `ToolProbe{git, rustup, sccache, codex, claude, herdr}`, `SubstrateProbe{winget, brew, apt}`, `ServiceProbe{styrnd}` — each returning a typed status:
+One `Capability` probe per concern — `TailscaleProbe`, `SshdProbe`,
+`ServiceAccountProbe`, `DirTreeProbe`, `ToolProbe{git, rustup, sccache, codex,
+claude, herdr}`, platform package-backend probes, and `ServiceProbe{styrnd}` —
+each returning a typed status:
 
 ```rust
 enum ProbeStatus {
@@ -5053,6 +5093,91 @@ enum ProbeStatus {
 ```
 
 Probes **never mutate and never require elevation** [judgment]. A tool that demands admin just to *look* is the §0.6 anti-pattern.
+
+**Native Linux disposition and capabilities (rev. I; S-41).** The Linux
+adapter first distinguishes native Linux from WSL, then observes four
+independent capabilities:
+
+```rust
+enum LinuxDisposition {
+    Native(LinuxHostProfile),
+    UnsupportedWsl,
+    Unknowable(LinuxObservationError),
+}
+
+struct LinuxHostProfile {
+    distribution: LinuxCapability<LinuxDistribution>,
+    package: LinuxCapability<LinuxPackageBackend>,
+    system_service: LinuxCapability<LinuxSystemServiceBackend>,
+    user_service: LinuxCapability<LinuxUserServiceBackend>,
+}
+
+enum LinuxCapability<T> {
+    Available(T),
+    Unsupported,
+    Unknowable(LinuxObservationError),
+}
+```
+
+Only inability to distinguish native Linux from WSL is globally blocking.
+Distribution, package, system-service, and user-service evidence degrade
+independently. `Unsupported` makes only a dependent action `NeedsHuman`;
+`Unknowable` makes only a dependent required precondition fail with exit 13 /
+`setup.probe_failed`. Independent rootless actions continue. The profile is a
+private, in-memory platform value: rev. I adds no manifest or RPC field.
+
+**Kernel disposition and WSL refusal** [verified: S48]. Read the kernel release with `uname(2)`,
+not a subprocess. A case-insensitive `microsoft` marker, or presence of the
+fixed kernel-owned `/proc/sys/fs/binfmt_misc/WSLInterop` entry, proves WSL;
+caller-controlled `WSL_*` environment variables have no authority. Unreadable
+or contradictory kernel evidence is `LinuxDisposition::Unknowable`, never
+native by default. Conclusive WSL refuses every local setup mode, including
+apply and `--dry-run`, and worker eligibility with exit 13 /
+`setup.unsupported_os` before any manifest, receipt, intent, lock, or action is
+created. Help, version, and controller-side rendering remain available.
+
+**Distribution evidence** [verified: S41]. Read `/etc/os-release`; fall back to
+`/usr/lib/os-release` only when opening the first path returns `ENOENT`. Never
+combine or shell-source the files. Permit the standard relative symlink only
+when the resolved target is a root-owned regular file and no target/directory
+in the chain is group/world writable; detect replacement across inspection and
+read. Reject special files, unsafe links, NUL, non-UTF-8, more than 16 KiB for
+the whole file, or more than 255 bytes in any classification field.
+
+Parse only comments, blank lines, assignments, unquoted values, single/double
+quotes, and the exact `\\`, `\"`, `\'`, `\$`, and ``\` `` escapes; perform no
+expansion, substitution, concatenation, or execution. `ID` and every `ID_LIKE`
+token must be ASCII `[a-z0-9._-]+`; duplicate classification keys, invalid
+syntax/tokens, unknown escapes, or unterminated quotes are `Unknowable`.
+Unknown unrelated keys are ignored. Exact `ID` is authoritative: `debian` or
+`ubuntu` selects Debian, `fedora`/`rhel`/`centos` selects Red Hat, and
+`arch`/`omarchy` selects Arch. Only an otherwise unknown exact ID consults
+ordered `ID_LIKE` ancestry. Contradictory cross-family ancestry — including an
+exact supported-family ID contradicted by `ID_LIKE` — is `Unknowable`; it never
+silently chooses one family. Other valid distributions remain useful but have
+no automatic privileged package backend.
+
+**Executable evidence.** A `LinuxExecutableIdentity` contains canonical path,
+device, inode, owner UID, file type, mode, size, and modification/change
+timestamps. A candidate is available only when its fixed absolute path resolves
+to a root-owned regular executable through a secure path/target chain. Caller
+`PATH`, aliases, home-directory wrappers, and unrelated installed managers are
+ignored. Revalidate the complete identity from an opened handle immediately
+before mutation; any drift is `Unknowable` and stops that dependent action.
+Debian requires both verified `/usr/bin/apt-get` and
+`/usr/bin/dpkg-query`; Red Hat accepts verified `/usr/bin/dnf`, or separately
+recognized `/usr/bin/dnf5` only when the canonical entry is absent; Arch
+requires verified `/usr/bin/pacman`.
+
+**Service evidence** [verified: S43]. System and user managers are distinct capabilities. The
+system service capability requires `/run/systemd/system`, a verified
+`/usr/bin/systemctl`, and `/usr/bin/systemctl show --property=Version --value`
+returning one nonempty bounded UTF-8 line. The user-manager query uses the same
+shape with `--user` and executes under the recovered original-user token, never
+an elevated identity or reconstructed environment. The existing strict
+`is-active`/`is-enabled` parsers remain authoritative for unit state;
+contradictions are `Unknowable`. A binary present in a container is not proof
+of a live manager.
 
 ### 15.2.2 `doctor` and `setup` are two frontends of one probe layer (amends Part 6.5)
 
@@ -5066,7 +5191,7 @@ Every planned change is a variant of one typed `Action` enum implementing:
 
 ```rust
 trait ActionImpl {
-    fn check(&self) -> Done | Todo;               // idempotency gate
+    fn check(&self) -> Done | Todo | NeedsHuman;  // idempotency/capability gate
     fn apply(&mut self) -> Result<ReceiptEntry>;  // performs the change
     fn revert(&self, e: &ReceiptEntry) -> Result<()>;  // uninstall path
     fn privilege(&self) -> None | Root | Admin;   // what apply() needs
@@ -5264,12 +5389,21 @@ Symbols: `+` create/install, `~` reconfigure, `✓` already satisfied, `!` needs
   by root remains `NeedsHuman` with a System Settings instruction.
 - **The privileged runner is closed.** It accepts a versioned, size-bounded,
   short-lived request containing only closed Action variants and non-secret
-  normalized parameters. It runs no project code, plugin, shell fragment,
-  user PATH executable, arbitrary URL/path/argv, or setup renderer. It uses the
-  absolute current executable, re-probes every action, and requires the
+  normalized parameters. Successful OS authorization yields a
+  `PrivilegedAuthorization<'plan>` capability that is deliberately
+  non-cloneable, non-serializable, lifetime-bound, and consumed once. Its type
+  and constructor structurally bind the request digest, requested privilege,
+  exact normalized action parameters, and expected effect; callers cannot
+  construct, persist, replay, or retarget one. The runner accepts that
+  capability together with the matching typed action, never a bearer boolean
+  or deserialized token. It runs no project code, plugin, shell fragment, user
+  PATH executable, arbitrary URL/path/argv, or setup renderer. It uses the
+  absolute current executable, re-probes every action, immediately revalidates
+  any Linux host profile and `LinuxExecutableIdentity`, and requires the
   recomputed privileged set to be an exact subset of the plan the user saw;
   drift that adds or changes an action aborts for re-confirmation. Results
-  return over a typed local channel and are journaled by the owning scope.
+  return over a typed local channel and are journaled by the owning scope; the
+  authorization capability itself is never written or logged.
 - **Noninteractive behavior is deterministic.** `--yes` confirms ordinary
   actions but never implies privilege consent. Without an already-elevated
   process or an explicit future `--authorize-system` policy flag, privileged
@@ -5293,7 +5427,15 @@ JSON, schema-versioned, one entry per applied action, modeled on `/nix/receipt.j
 - files created (paths + hashes); files modified (path + before-hash + backup location);
 - services, accounts, registry keys, firewall rules created;
 - download provenance (URL, version, SHA-256);
+- for a Linux package action: selected backend, verified executable identity,
+  closed component and package identifier, scope, and finalized effect;
 - status: `applied | pending | adopted` (adopted = applied by a generated script and reconciled later; 15.11.2).
+
+The receipt records the authorized action and its finalized effect, never the
+`PrivilegedAuthorization` capability or any representation from which that
+lifetime-bound capability could be reconstructed. Recovery replays the closed
+typed action after fresh probes; it never reconstructs a raw shell command or
+turns receipt data into privilege authority.
 
 **Durable apply protocol (rev. G):** the private transaction intent is not a receipt entry and conveys no ownership. Before dispatch it is fsynced as `prepared` with the closed action and expected effect. After `apply` returns success and the finalized effect exactly matches, the intent is atomically/fsync transitioned to `succeeded`; only then may the applied receipt entry be appended. Recovery may finalize a `succeeded` intent after revalidating the stored intent's schema, scope, integrity, and receipt prefix. The succeeded intent is already the durable finalized-effect authority: recovery does not require the action to remain in the current desired plan or recompute pre-mutation fields that the successful mutation necessarily changed. A `prepared` intent whose probe remains `Todo` may retry; a `prepared` intent whose probe is already `Done`, `NeedsHuman`, or inconsistent is an explicit `setup.receipt_conflict`, never automatic ownership or adoption.
 
@@ -5355,7 +5497,16 @@ capability is unavailable.
 
 - **Auth model** [verified: S9]: non-interactive registration via `tailscale up --auth-key=tskey-...`; interactive via bare `tailscale up`, which prints a login URL — setup surfaces the URL and waits. Key facts: one-off vs reusable keys; ephemeral/pre-approved/tagged attributes; keys expire 1–90 days (default 90); a device registered by an expired key stays authorized until node-key expiry (default 180 days); tagged devices disable expiry by default. **Handling [judgment; adopted]:** the key is accepted ONLY via `--auth-key` or the `TS_AUTHKEY` env var, never persisted to config or receipt; one-off pre-approved keys are the documented default recommendation.
 - **Footgun rule:** re-running `tailscale up` with a new flag requires re-specifying previously-set flags (modern versions error and point at `--reset`) [well-established]. Setup always issues `up` with the **complete intended flag set**, never incrementally.
-- **Linux** [verified: S8]: the official one-liner (`curl ... | sh`) adds the distro repo and installs. Styrn does **not** shell out to a remote script (supply-chain bar, 15.7.6): it writes Tailscale's apt keyring to `/usr/share/keyrings/` and a sources entry itself, then `apt-get update && apt-get install -y tailscale` — exact repo/keyring URLs at pkgs.tailscale.com are **[unverified — implementer must confirm]**. Packaged installs run `tailscaled` under systemd [well-established]; probe via `systemctl is-active tailscaled` and `tailscale status --json` [verified: S10].
+- **Linux** [verified: S8, S51]: the official distribution-specific paths add
+  Tailscale's vendor repository before installing. Rev. I therefore marks
+  Tailscale package provisioning **unsupported on apt, DNF, and Pacman** until
+  a separately specified vendor-repository Action closes repository URL,
+  signing-key identity, supported distribution/version set, rollback, and
+  receipt effect. Styrn neither pretends the stock repository contains the
+  package nor shells out to the official remote script. An existing compatible
+  installation is still adopted; its `tailscaled` unit is probed only through
+  the independent system-service capability, and `tailscale status --json`
+  remains the application health probe [verified: S10].
 - **Windows** [verified: S15, S16]: silent install `msiexec.exe /i tailscale-setup-<ver>-amd64.msi /quiet /norestart`; MSI properties land as REG_SZ under `HKLM\SOFTWARE\Policies\Tailscale` — set `TS_UNATTENDEDMODE = always` so connectivity survives logout/no-login, and `TS_NOCLOSEONSIGNALIN` to suppress GUI launch during silent install. Post-install alternative: `tailscale up --unattended=true` (Windows-specific flag; Linux is system-level by default; macOS lacks unattended mode entirely [verified: S8]). The winget id `Tailscale.Tailscale` is **[unverified — confirm via `winget search`]** and only relevant to the opportunistic path (15.7.6).
 - **macOS** [verified: S11, S10]: three variants — App Store (sandboxed), Standalone (Tailscale's recommended default), open-source `tailscaled`; **only `tailscaled` can run before login**, and Tailscale recommends it only for experienced-admin unattended installs. GUI-variant CLI lives at `/Applications/Tailscale.app/Contents/MacOS/Tailscale`; Standalone can install a `/usr/local/bin/tailscale` launcher. **Decision [judgment; adopted]:** default = Standalone GUI (dev Macs are interactive anyway), with the before-login gap recorded in the manifest (`[tailscale] mode = "gui", unattended = false` — Part 3.2's model, unchanged); `tailscaled`-under-launchd is the explicit opt-in headless mode (`[tailscale] mode = "tailscaled"` in setup-config). GUI variants need first-launch human approval (VPN configuration consent) — modeled as `NeedsHuman`; the exact per-version approval sequence is **[unverified — walk through on current macOS]**.
 
@@ -5375,14 +5526,22 @@ The design degrades gracefully if item 2 is dead on current macOS: the chain sim
 
 | OS | Mechanism | Privilege |
 |---|---|---|
-| Linux user | write a systemd user unit and `systemctl --user enable --now styrnd`; without linger its guarantee is the user-manager lifetime, which doctor reports | none |
+| Linux user | after the independent user-manager capability is available, write a systemd user unit and run verified `systemctl --user enable --now styrnd` under the recovered original-user token; without linger its guarantee is the user-manager lifetime, which doctor reports | none |
 | macOS user | write `~/Library/LaunchAgents/dev.styrn.styrnd.plist`; `launchctl bootstrap gui/<uid> <plist>`; login-session guarantee only | none |
 | Windows user | register a per-user logon task/startup entry using the current interactive token, with no stored password; login-session guarantee only | none |
-| Linux system | write `/etc/systemd/system/styrnd.service`; `systemctl daemon-reload && systemctl enable --now styrnd` | root [well-established: S28] |
+| Linux system | after the independent system-manager capability is available, write `/etc/systemd/system/styrnd.service`; run verified `systemctl daemon-reload` and `systemctl enable --now styrnd` | root [well-established: S28; manager proof: S43] |
 | macOS system | write `/Library/LaunchDaemons/dev.styrn.styrnd.plist`; LaunchDaemon runs at boot with `UserName` set to the resolved worker principal and survives logout | root [well-established: S29] |
 | Windows system | a credential-free LocalSystem SCM service implements only the narrow admission/spawn broker; selected-principal maintenance remains separate | Administrator |
 
 **Normative content is the unit/plist/service definitions themselves** — they are files, written directly by Styrn and recorded in the receipt. The `service-manager` crate (v0.10; wraps sc.exe/launchd/systemd/OpenRC with install/uninstall/start/stop [verified: S17]) may be *evaluated* as an implementation backend, but its fitness is **[unverified — API verified from README only; prototype before committing]**; worst case Styrn vendors its own three small templates, which also keeps them receipt-visible [judgment].
+
+On Linux, a missing service capability is dependency-scoped: its service Action
+is `NeedsHuman`; unknowable required manager evidence is
+`setup.probe_failed`. Neither result erases package, distribution, or the other
+service capability. A container can exercise unit rendering and strict output
+parsing, but an installed `systemctl` inside it does not certify manager or
+service lifecycle; start/enable/restart/logout/reboot behavior requires the
+real systemd VM/host gates in 16.6.
 
 **Herdr autostart carried forward:** the rev. B Linux mechanism — a systemd *user* service (`styrn-herdr.service`, `Environment=HERDR_SESSION=fleet`, `ExecStart=<herdr> server`) plus `loginctl enable-linger <worker-principal>` — is retained as the `herdr` component's Linux autostart action (`[herdr] autostart = "systemd-user"`); macOS/Windows remain `on-demand`/`on-demand-ssh` as in Part 2.4.
 
@@ -5392,9 +5551,22 @@ The design degrades gracefully if item 2 is dead on current macOS: the chain sim
 
 **Dedicated mode (optional):** create or adopt the configured, non-administrator local account. The suggested name is `styrn`, but no platform adapter or test may assume it. Linux uses an ordinary local user with a real shell and home because workers accept SSH and may run lingering user services. macOS uses the validated native account mechanism selected by T0.14; its account-creation path remains an honest native gate until proven end to end. Windows uses native local-account APIs, generates a 32+-byte password in memory, and keeps the transient-logon and SCM behavior in 15.8. Re-running must adopt the exact configured principal without recursively taking ownership of pre-existing files.
 
+**Linux account-policy generalization is independent T0.14 work.** Neither a
+distribution family nor a package backend proves that an account is safe for
+jobs. Current-user selection and dedicated-account creation/adoption must each
+produce affirmative non-root, non-service, non-admin, usable shell, unique
+secure home, NSS identity, and trustworthy sudo origin proofs before worker
+eligibility. Name lookups use NSS and must round-trip to one stable uid; the
+home is uniquely assigned, owned by that uid, and reached through a secure
+directory chain; shell acceptance is an explicit usable-shell policy rather
+than string inequality with one hard-coded path. An elevated setup must derive
+the original principal from OS-owned sudo metadata/session state and refuse
+ambiguous or caller-forged origins. This security-sensitive policy is not
+implemented as a side effect of Linux host-profile or package-manager work.
+
 In either mode, the worker principal is a typed value validated before native calls. Names containing NULs, separators, ambiguous domain syntax, or platform-invalid forms are rejected. Security-sensitive records prefer stable uid/SID identity and retain the display name for diagnostics. Deleting or renaming a configured OS account is drift, not a reason to silently switch users.
 
-### 15.7.6 Package substrates and component channels
+### 15.7.6 Package backends and component channels
 
 **Scope-first channel selection (rev. H; binding):** for every requested package
 or application, the planner chooses in this order:
@@ -5428,21 +5600,60 @@ intact.
   [verified: S4, S21]. Exact package ids and scope support are probed at plan
   time, not assumed.
 - **Direct download + silent MSI/EXE (`msiexec /quiet /norestart`) is the dependable path Styrn specs against** on Windows [verified: S13, S14 for the rationale].
-- **Homebrew** [verified: S5]: never install brew itself (its installer wants interaction/sudo; absence = "substrate unavailable", not an error). Detect at `/opt/homebrew/bin/brew` (Apple Silicon) / `/usr/local/bin/brew` (Intel); `brew install` is non-interactive; bottles/casks need no Xcode CLT, source builds do.
-- **apt (Ubuntu)** [well-established: S33]: `DEBIAN_FRONTEND=noninteractive apt-get install -y <pkg>` (use `apt-get`, not `apt`, in automation); exit 0 ok / 100 error; root required; third-party repos = keyring in `/usr/share/keyrings/` + sources entry + `apt-get update`.
+- **Homebrew** [verified: S5]: never install Homebrew itself (its installer wants interaction/sudo; absence = "backend unavailable", not an error). Detect the fixed Homebrew executable for the architecture; its package-install operation is non-interactive; bottles/casks need no Xcode CLT, source builds do.
+- **apt backend (Debian family)** [verified: S42, S45]: availability
+  requires both verified `/usr/bin/apt-get` and `/usr/bin/dpkg-query`.
+  Installation is `DEBIAN_FRONTEND=noninteractive /usr/bin/apt-get install -y
+  <closed-package>`; exit 0 succeeds and exit 100 fails. Installed state is
+  `/usr/bin/dpkg-query --show --showformat=${Status} <closed-package>` with the
+  exact installed status required.
+- **DNF backend (Red Hat family)** [verified: S44]: use verified
+  `/usr/bin/dnf`, or `/usr/bin/dnf5` only when the canonical entry is absent.
+  Installation is the selected executable plus `install -y <closed-package>`;
+  installed state is `list --installed <closed-package>`.
+- **Pacman backend (Arch family)** [verified: S46, S47]: use verified
+  `/usr/bin/pacman`. Installation is `/usr/bin/pacman -S --needed --noconfirm
+  <closed-package>` and installed state is `/usr/bin/pacman -Q
+  <closed-package>`. Styrn never issues `pacman -Sy <package>`: refreshing the
+  database without a full system upgrade creates an unsupported Arch partial
+  upgrade, and a component-install authorization does not authorize a broad
+  system upgrade.
+
+Distribution identity only narrows the allowed backend; every fixed executable
+and its secure root-owned path chain must still pass 15.2.1. An absent expected
+backend is `Unsupported`; unsafe, conflicting, changed, malformed, or
+exit/output-contradictory evidence is `Unknowable`. Styrn never selects an
+unrelated manager merely because it is installed. It revalidates the complete
+`LinuxExecutableIdentity` immediately before each package mutation.
+
+The initial stock-repository table is closed [package names corroborated by the
+official distribution catalogs: S49; support boundaries are judgment]:
+
+| Component | apt | DNF | Pacman |
+|---|---|---|---|
+| SSH | `openssh-server` | `openssh-server` | `openssh` |
+| Git | `git` | `git` | `git` |
+| Cockpit | `cockpit` | `cockpit` | unsupported |
+| Tailscale | unsupported | unsupported | unsupported |
+
+An unsupported cell makes only that component Action `NeedsHuman`. Tailscale
+package provisioning remains unsupported until the separately specified
+vendor-repository Action required by 15.7.2 exists. Component package backends
+do not add values to or otherwise extend the Styrn binary's
+`[install].channel` in 15.14.
 
 **The supply-chain bar (normative for every component action) [judgment; adopted]:** (1) HTTPS-only downloads via rustls, no plaintext fallback; (2) pinned versions — a compiled-in (or styrn-repo-fetched) component table of `{version, url, sha256}` per platform, verified before execution; (3) prefer channels with built-in signing (Windows capability/MSI Authenticode, apt repo signatures) over raw binaries; (4) provenance (url, version, digest) recorded in the receipt; (5) **never pipe a remote script to a shell at runtime** — piped payloads are server-detectable and swappable [verified: S34, S35], and docker's own script tells users to read, pin, and dry-run first [verified: S36]. No sigstore/TUF machinery — disproportionate for a personal fleet. Where a vendor updater exists (Tailscale, Claude Code self-update), it owns upgrades; Styrn pins only the initial install. This bar **retires the rev. A `curl | sh` pattern for runtime installs entirely**; the sole surviving piped script is stage zero (15.11.4).
 
 **Component channels** (each an Action bound by the bar above):
 
-- **Git:** apt / direct installer on Windows (winget `Git.Git` opportunistically, id unverified) / on macOS via Xcode CLT — `xcode-select --install` triggers a GUI consent → `NeedsHuman` if absent [well-established].
+- **Git:** the closed Linux table above / direct installer on Windows (winget `Git.Git` opportunistically, id unverified) / on macOS via Xcode CLT — `xcode-select --install` triggers a GUI consent → `NeedsHuman` if absent [well-established].
 - **Rust:** download `rustup-init` per platform from static.rust-lang.org and run `rustup-init -y --no-modify-path --default-toolchain <pin>` [verified: S22] — never pipe sh. rustup's Windows PATH mechanism (user registry env) is **[unverified from primary docs — confirm before depending on it]**; Styrn owns PATH itself regardless (below).
 - **sccache:** GitHub-release static binary → styrn bin dir; `RUSTC_WRAPPER` set per-job by the launcher/supervisor (7.12), never in global shell config [well-established; judgment].
 - **Claude Code:** native installers exist, no Node required [verified via secondary sources: S24 — **confirm exact official URLs at implement time**]; self-updates in background — the vendor updater owns upgrades, Styrn pins only the initial install (supply-chain bar, 15.7.6).
 - **Codex CLI:** Rust binary; channels = standalone installer / Homebrew cask / GitHub-release binaries; the npm channel needs Node 22+ and is **rejected outright** — Styrn requires no language runtime for any component [verified: S24, S25; asset naming settling — pin at implement time].
 - **Herdr:** project-internal, no public distribution documented — **the spec defines it**: GitHub-release per-platform binaries + SHA-256, installed by Styrn like sccache [judgment].
 - **rdp** (Windows only, default off; the orig. §48 mechanics as an Action): set `HKLM:\System\CurrentControlSet\Control\Terminal Server` `fDenyTSConnections = 0` and enable the "Remote Desktop" firewall rule group `[admin]`; revert restores the prior value. Updates `[desktop]` in the manifest (Part 2.4).
-- **cockpit** (Linux only, default off; the orig. §47 mechanics as an Action): `apt-get install -y cockpit` + `systemctl enable --now cockpit.socket` `[sudo]`; updates `[admin]` in the manifest (Part 2.7) and reminds about the optional tailnet grant (Part 3.1).
+- **cockpit** (Linux only, default off; the orig. §47 mechanics as an Action): package install follows the closed table (unsupported on Pacman), then the independently verified system-service backend enables `cockpit.socket` `[sudo]`; updates `[admin]` in the manifest (Part 2.7) and reminds about the optional tailnet grant (Part 3.1).
 - **sleep-policy** (workers, default on; rev. E — resolves S-38, review D §6.2): a machine that accepts jobs must not suspend while unattended. Windows: `powercfg /change standby-timeout-ac 0` plus lid-close-on-AC action "do nothing" `[admin]`; Linux: mask `sleep.target suspend.target hibernate.target hybrid-sleep.target` `[sudo]`; macOS: `pmset -c sleep 0` [well-established in outline; exact per-OS incantations implementer-confirm]. Laptop workers (win-hp, mbp-main) are exactly why this exists: "heavy Windows validation" otherwise silently depends on an unstated the-lid-is-open assumption. Remote *wake* stays out of scope (power providers, 3.5/D-4, are recovery, not wake); doctor warns when a manifest says `accept_jobs = true` but the OS sleep policy would suspend the machine.
 
 **PATH strategy [judgment; adopted]:** silently editing rc files across bash/zsh/fish/PowerShell is the classic tarpit (rustup maintains env files; starship instead has the user add one line [verified: S23]). Styrn uses `.local/bin` under the resolved worker profile, changes PATH only for that identity, and provides `styrn env` printing shell-appropriate export lines for other users.
@@ -5450,6 +5661,15 @@ intact.
 ### 15.7.7 Install ordering (absorbs orig. §111)
 
 Orig. §111's ordering rule — integrations only after the tools and their user config dirs exist — becomes a **dependency edge in the plan**, not documentation: `integrate-herdr-codex` depends on `herdr` and `codex` actions (and on the user-phase context on Windows, 15.8); `integrate-claude` likewise; the Styrn Herdr plugin and MCP registrations depend on their hosts. The planner orders by dependencies; a failed prerequisite skips its dependents with an explicit `skipped: dependency failed` plan-result line. The orig. §111 sequence (install Herdr → Codex → Claude → init config dirs → Herdr integrations → Styrn plugin → MCP registrations → integration doctor) is exactly the topological order the graph produces.
+
+**Linux preflight edge (rev. I).** Kernel disposition precedes every Linux
+setup dependency edge. `UnsupportedWsl` and an unknowable native-versus-WSL
+result refuse setup apply and `--dry-run` before constructing an Action graph;
+conclusive WSL also makes the host ineligible for the worker role. This narrow
+refusal does not block help, version, or controller-side plan/script rendering
+for an explicitly selected native target.
+Once native Linux is proved, distribution, package, system-service, and
+user-service capabilities are dependency-local and never abort the whole graph.
 
 ## 15.8 Windows worker identity strategy (D-3 superseded by rev. G; absorbs orig. §112)
 
@@ -5606,6 +5826,11 @@ Their open defect registers are **superseded, not silently dropped**:
 - **S-27** (macOS dscl Secure-Token/FDA caveats): folded into 15.7.5's account decision and 15.7.3's fallback chain, still flagged for end-to-end testing.
 - **S-35** (the winget foundation): resolved by 15.7.6 — winget demoted to opportunistic, direct MSI/EXE primary.
 
+Revision I also supersedes the removed Ubuntu script's apt-only assumptions:
+native Linux now routes Debian, Red Hat, and Arch families through the private
+host profile and closed package table in 15.2.1/15.7.6. No removed script,
+distro label, container image, or `PATH` lookup is normative backend evidence.
+
 ## 15.13 Command surface, JSON behavior, and codes (new in rev. D)
 
 ```text
@@ -5626,6 +5851,13 @@ styrn daemon run                              (internal plumbing; the styrnd loo
 styrn env                                     (prints shell-appropriate PATH/env lines, 15.7.6)
 ```
 
+The private request file in `setup privileged-phase --request PATH` is only a
+size-bounded startup locator for the already-authorized local handshake; it is
+not privilege authority. The elevated runner verifies the request digest and
+peer/session binding, then mints the non-cloneable, non-serializable,
+lifetime-bound `PrivilegedAuthorization<'plan>` in memory. No invocation flag,
+file, environment value, receipt, or rendered script can carry that capability.
+
 **JSON contract:** `styrn setup --json` follows the standard envelope (Part 10.2) with `data = { plan: [...], results: [...], pending: [...], manifest: <path>, receipt: <path> }`; `--dry-run --json` carries `plan` only (this is the machine-readable plan — the brief's `--plan-json` is spelled `--dry-run --json`, one flag fewer). `--emit-script` writes the script to its target and keeps stdout clean for the envelope (script path + sha256 in `data`). All finite; no `--jsonl` surface in setup.
 
 **Exit codes:** the Part 10.4 table gains one addition (additive, allowed within v1 per 2.8):
@@ -5636,6 +5868,12 @@ styrn env                                     (prints shell-appropriate PATH/env
 
 Success with only pending-human items remaining is exit 0 with `warnings[]` naming them (`fail_on_pending = true` flips that to 13).
 
+On WSL, every local setup mode including apply and `--dry-run` returns exit 13 /
+`setup.unsupported_os` with exactly one envelope and no manifest, receipt,
+intent, lock, or Action. Worker eligibility is false. `--help`, `--version`, and
+controller-side rendering for an explicitly selected native target remain
+available and do not run Linux host detection.
+
 **Error codes** (appended to the Part 10.3 registry): `setup.probe_failed`, `setup.plan_invalid`, `setup.confirmation_required`, `setup.elevation_required`, `setup.apply_failed`, `setup.needs_human`, `setup.unsupported_os`, `setup.receipt_conflict`, `setup.adopt_mismatch`.
 
 ## 15.14 Packaging and upgrade of the `styrn` binary (new in rev. E; resolves S-37)
@@ -5644,24 +5882,31 @@ Operator requirement, verbatim and binding:
 
 > "Styrn at regime should be installable and upgradeable via the different package managers available for each platform"
 
-The principle is the one 15.7.6 already applies to third-party components — vendor updaters own Tailscale and Claude Code; Styrn pins only initial installs — now applied to Styrn itself: **the platform package channel owns upgrades of the `styrn` binary. Styrn never self-updates.** This was the most significant absence in rev. D (review D §6.2 item 1): `fleet versions` observed drift, 2.8 tolerated mixed versions, `fleet selftest` validated "after every upgrade" — and nothing performed one.
+The principle is the one 15.7.6 already applies to third-party components — vendor updaters own Tailscale and Claude Code; Styrn pins only initial installs — now applied to Styrn itself: **the platform package channel owns upgrades of the `styrn` binary. Styrn never self-updates.** Linux component package backends are a separate concern and do not extend `[install].channel`. This was the most significant absence in rev. D (review D §6.2 item 1): `fleet versions` observed drift, 2.8 tolerated mixed versions, `fleet selftest` validated "after every upgrade" — and nothing performed one.
 
 ### 15.14.1 Channels, mapped to the Part 1.5 release targets
 
 | Channel | Platforms | Status | Notes |
 |---|---|---|---|
-| GitHub Releases: raw binaries + `SHA256SUMS` (orig. §114 asset list) | all six 1.5 targets | **v1 — the substrate** | consumed by stage zero, by non-interactive provisioning, and by every other channel's manifests |
-| Homebrew tap: `brew install <org>/tap/styrn` | macOS (both arches); Linuxbrew where present | **v1** | tap formula generated by release CI; homebrew-core is aspirational |
+| `direct`: GitHub Releases raw binaries + `SHA256SUMS` (orig. §114 asset list) | all six 1.5 targets | **v1 — base artifact path** | consumed by stage zero, by non-interactive provisioning, and by every other channel's manifests |
+| `homebrew`: Homebrew tap package | macOS (both arches); Linuxbrew where present | **v1** | tap formula generated by release CI; homebrew-core is aspirational |
 | winget manifest: `winget install styrn` | Windows | **v1** | **human-present contexts only** — S-35 stands: winget is unusable from SYSTEM/service/SSH-non-interactive contexts |
-| `.deb` release asset: `apt install ./styrn_<ver>_amd64.deb` | Ubuntu/Debian | **v1 (asset only)** | dpkg-native install/uninstall without hosting; a signed hosted apt *repository* is aspirational |
-| `cargo install styrn --locked` | anywhere with a Rust toolchain | **v1 (universal fallback)** | slowest; builds from source |
+| `apt`: Debian package release asset installed through APT | Ubuntu/Debian | **v1 (asset only)** | local package install/uninstall without hosting; a signed hosted apt *repository* is aspirational |
+| `cargo`: `cargo install styrn --locked` | anywhere with a Rust toolchain | **v1 (universal fallback)** | slowest; builds from source |
 | apt repository, Scoop, Chocolatey, homebrew-core | — | aspirational | a channel is promised only when someone will maintain it [judgment] |
 
-These channels also carry the signing the raw-binary path lacks — Homebrew formula checksums, winget manifest hashes, dpkg integrity, Authenticode where MSI/EXE is used — satisfying 15.7.6's prefer-signed-channels rule for Styrn itself.
+The schema-backed channel values remain `direct | homebrew | winget | scoop |
+chocolatey | apt | cargo | unknown`; the table above distinguishes current v1
+support from aspirational channels and honest unknown provenance. DNF and
+Pacman are not Styrn binary installation channels in rev. I.
+These channels also carry the signing the raw-binary path lacks — Homebrew
+formula checksums, winget manifest hashes, Debian package integrity,
+Authenticode where MSI/EXE is used — satisfying 15.7.6's
+prefer-signed-channels rule for Styrn itself.
 
 ### 15.14.2 Stage zero prefers a package manager when a human is present (amends 15.11.4)
 
-`install.sh` / `install.ps1` first detect a usable package channel *in the invoking context* — brew on macOS/Linux, winget in an interactive Windows console — and prefer `brew install` / `winget install`, then chain into `styrn setup` exactly as before. They fall back to the verified direct download when no channel is present **or the context is non-interactive**. The S-35 nuance is preserved intact: package-manager install is the *human-present* path; direct download remains the path for remote, non-interactive worker provisioning, and scripts emitted by `styrn bootstrap-script` always use direct download because they run unattended.
+`install.sh` / `install.ps1` first detect a usable package channel *in the invoking context* — `homebrew` on macOS/Linux, `winget` in an interactive Windows console — and prefer the channel's native package install, then chain into `styrn setup` exactly as before. They fall back to the verified direct download when no channel is present **or the context is non-interactive**. The S-35 nuance is preserved intact: package-manager install is the *human-present* path; direct download remains the path for remote, non-interactive worker provisioning, and scripts emitted by `styrn bootstrap-script` always use direct download because they run unattended.
 
 ### 15.14.3 `[install]` provenance in the manifest
 
@@ -5669,7 +5914,7 @@ Setup and stage zero record how the binary arrived (a setup-owned manifest regio
 
 ```toml
 [install]
-channel = "winget"                       # "brew" | "winget" | "deb" | "cargo" | "direct"
+channel = "winget"                       # direct | homebrew | winget | scoop | chocolatey | apt | cargo | unknown
 version = "0.4.0"
 installed_at = "2026-09-01T10:00:00+02:00"
 ```
@@ -5680,7 +5925,12 @@ installed_at = "2026-09-01T10:00:00+02:00"
 
 Adopted [judgment; §0.6 — one command that does the right thing everywhere]: `styrn upgrade` exists, and it is a **delegator, never an updater**:
 
-- **Local:** shells out to the owning channel from `[install]` — `brew upgrade styrn`; `winget upgrade styrn`; for `deb`, download the new asset and invoke `apt install ./styrn_<ver>_amd64.deb`; for `cargo`, `cargo install --locked styrn`; for `direct`, re-run the stage-zero download-verify-replace. It never bypasses or races the channel that owns the install.
+- **Local:** delegates to the owning channel from `[install]` — Homebrew's
+  package upgrade for `homebrew`; `winget upgrade styrn` for `winget`; download
+  the new Debian package asset and invoke APT's local-package install for
+  `apt`; `cargo install --locked styrn` for `cargo`; re-run the stage-zero
+  download-verify-replace for `direct`. It never bypasses or races the channel
+  that owns the install.
 - **Remote:** `styrn upgrade <host>` (or `--all` over workers) invokes each worker's own `styrn upgrade` delegator over RPC, **workers first**; it then prompts the operator to upgrade the controller last and reminds them to run `styrn fleet selftest` (16.6 item 6) — the upgrade acceptance test.
 
 The rejected alternative — self-update machinery — would contradict channel ownership (the operator requirement), the supply-chain bar (15.7.6), and §63's no-resident-updater instincts, for no gain over delegation.
@@ -5729,6 +5979,35 @@ The [verified: Sn] tags above cite the setup research pass (2026-09-01). Because
 - S38 chezmoi.io/install — install+init chaining
 - S39 alembic offline mode — emit-for-review precedent
 - S40 nix-installer README — one-liner form, TLS constraints, no script checksum
+- S41 github.com/systemd/systemd/blob/main/man/os-release.xml — authoritative
+  `os-release` precedence, assignment grammar, escape/UTF-8 rules, `ID`, and
+  `ID_LIKE`
+- S42 manpages.debian.org/bookworm/apt/apt-get.8.en.html — `apt-get install`,
+  noninteractive `--assume-yes`, and exit status
+- S43 github.com/systemd/systemd/blob/main/man/systemctl.xml — manager
+  `show`, `--property`, `--value`, and `--user` query semantics
+- S44 dnf.readthedocs.io/en/stable/command_ref.html,
+  dnf5.readthedocs.io/en/latest/commands/install.8.html, and
+  dnf5.readthedocs.io/en/latest/commands/list.8.html — DNF/DNF5
+  `install`, `--assumeyes`, and `list --installed`
+- S45 manpages.debian.org/bookworm/dpkg/dpkg-query.1.en.html — `--show`,
+  `--showformat`, and dpkg status-database queries
+- S46 man.archlinux.org/man/pacman.8.en — Pacman query/sync operations,
+  `--needed`, and `--noconfirm`
+- S47 wiki.archlinux.org/title/System_maintenance — Arch's explicit prohibition
+  on partial upgrades and `pacman -Sy <package>`
+- S48 learn.microsoft.com/en-us/windows/wsl/kernel-release-notes and
+  learn.microsoft.com/en-us/windows/wsl/filesystems — Microsoft-owned WSL
+  kernel release names and the `WSLInterop` kernel interface
+- S49 packages.debian.org, packages.fedoraproject.org, and archlinux.org/packages
+  — official stock-package catalogs corroborating the SSH/Git/Cockpit package
+  identifiers; Pacman Cockpit support remains deliberately out of scope
+- S50 docs.podman.io/en/stable/markdown/podman-machine-info.1.html and
+  docs.podman.io/en/latest/markdown/podman-run.1.html — Podman machine/selected
+  image architecture observations
+- S51 tailscale.com/docs/install/linux — official Linux installation paths add
+  vendor-package configuration or use a static binary; basis for deferring a
+  repository-backed Action until separately specified
 
 ---
 
@@ -5817,6 +6096,14 @@ fs4 / windows-rs  advisory file locks & Job Objects (rev. B: Parts 7.3, 7.8)
 
 Avoid pulling in a database in v1. Inventory is small enough for TOML files. Jobs are filesystem objects.
 
+Revision I's Linux host profile uses the existing crate set and private
+`platform` adapter: bounded file reads, metadata/handle identity, `uname(2)`,
+and closed child-process execution do not justify a new dependency. It also
+adds no runtime schema. If implementation later proves a crate necessary,
+Part 16.2, `Cargo.toml`, `Cargo.lock`, and the dependency/toolchain contract
+tests must change together; if any profile field becomes serialized, the
+schemas, examples, manifest/RPC types, and compatibility text change atomically.
+
 ## 16.3 Implementation phases (orig. §59; rebuilt in rev. E — review D §2.2)
 
 The rev. B five-phase plan predated three revisions of additions: Phase 1 had silently absorbed all of Part 15, and `styrnd`, `harness run`, audit logging, `monitor`, and `fleet selftest` were placed in no phase at all. Rebuilt: **every specified component sits in exactly one phase; each phase ends in something independently useful; jobs come before agents** (deliberately inverting rev. B's integration-first ordering — the flagship scenario of 13.10/16.7 runs entirely on jobs and workflows, and `ssh -t <host> herdr` already gives crude agent access today, while nothing today gives governed cross-platform validation). Scope note: the operator declined the independent review's proposed cut line (Part 18 preamble), so these phases *order* the full rev. E surface; they do not remove any of it.
@@ -5827,10 +6114,14 @@ The rev. B five-phase plan predated three revisions of additions: Phase 1 had si
 CLI skeleton; envelope, exit codes, error registry            (Part 10)
 manifest + machine_id minting                                 (2.4)
 setup engine: probes, Actions, plan/apply, receipt, elevation (15.2–15.6)
+Linux host profile, WSL refusal, and package-backend adaptation:
+  Debian, Red Hat, and Arch families; apt-get/dpkg-query, dnf/dnf5,
+  pacman; setup.unsupported_os                                (15.2.1, 15.7.2, 15.7.4–15.7.7)
 worker baseline components: account, sshd, tailscale, dirs,
   git, sleep-policy; Windows hardened user phase + fallback   (15.7, 15.8)
+Linux account-policy generalization, independently proven     (15.7.5; T0.14)
 all three setup modes, incl. --interactive; zero-arg path     (15.4)
-enrollment card; stage-zero shims; GitHub Releases substrate  (15.10, 15.11.4, 15.14.1)
+enrollment card; stage-zero shims; GitHub Releases base path  (15.10, 15.11.4, 15.14.1)
 session-substrate registration: [herdr].enabled, capability tie,
   session-liveness probe                                      (11.0.1-11.0.2, 15.2.1-15.2.2)
 ```
@@ -5892,7 +6183,7 @@ then, gated on approval-behavior maturity:
 **Phase 6 — Packaging and upgrade.** *v0.N+1 reaches four machines without ceremony.*
 
 ```text
-brew tap, winget manifest, .deb asset from release CI         (15.14.1)
+homebrew tap, winget manifest, apt package asset from release CI (15.14.1)
 [install] provenance; fleet versions channel column           (15.14.3, 6.6)
 styrn upgrade (local delegation + remote orchestration)       (15.14.4–15.14.5)
 compatibility windows become binding (first tagged release)   (2.8)
@@ -6010,14 +6301,30 @@ This remains the recommended boundary after considering Herdr/MCP integration.
 
 A product whose entire value is cross-platform correctness cannot rely on "works on my Mac." The strategy, cheapest layer first:
 
-1. **Pure unit tests** — manifest/profile parsing and validation (including the exactly-one-disk-key rule), variable expansion (undefined-variable error, `$${` escape, path rendering per OS via injected separators), admission arithmetic (budget bookkeeping tables, heavy exclusivity), exit-code/error-code mapping, revision-resolution rules against fixture repos.
+1. **Pure unit tests** — manifest/profile parsing and validation (including the exactly-one-disk-key rule), variable expansion (undefined-variable error, `$${` escape, path rendering per OS via injected separators), admission arithmetic (budget bookkeeping tables, heavy exclusivity), exit-code/error-code mapping, revision-resolution rules against fixture repos. Rev. I adds byte fixtures for Debian/Ubuntu, Fedora/RHEL derivatives, Arch/Omarchy, exact-ID/`ID_LIKE` contradictions, WSL1/WSL2 releases, both `os-release` paths, every size/grammar/escape boundary, unsafe/replaced files, fixed executable identities, missing/unsafe managers, and independent `LinuxCapability` combinations.
 2. **Protocol golden tests** — recorded NDJSON conversations (hello negotiation including version-window rejection, request/response, streams, chunk reassembly with checksum, cancel, oversized-frame rejection) replayed against both peer roles. The protocol module must be testable with in-memory pipes, no SSH.
 3. **Fake-worker harness** — `styrn rpc serve --stdio` run as a *local child process* with a temp `paths.root`, exercising the full controller↔worker path (submit → detached supervisor → status/log tailing → reattach after killing the controller-side session → cancel) on whatever OS CI is running. This single harness covers S-01's fix on all three platforms.
 4. **Concurrency tests** — two controller processes hammering one fake worker with simultaneous submissions; assert committed budgets never exceed policy and `max_heavy_jobs` never over-admits (S-03's regression test).
-5. **Platform CI matrix** — GitHub Actions (or equivalent) on `ubuntu-latest`, `macos-latest`, `windows-latest` running layers 1–4, plus Windows-specific tests: Job-Object tree-kill actually reaps grandchildren, long-path job root, argv round-trip through `CreateProcess` for adversarial arguments (spaces, quotes, `%VAR%`, trailing backslashes).
+5. **Platform CI matrix** — GitHub Actions (or equivalent) on `ubuntu-latest`, `macos-latest`, `windows-latest` running layers 1–4, plus Windows-specific tests: Job-Object tree-kill actually reaps grandchildren, long-path job root, argv round-trip through `CreateProcess` for adversarial arguments (spaces, quotes, `%VAR%`, trailing backslashes). The cross-platform fixture suite also covers WSL refusal: setup apply/`--dry-run` and worker eligibility produce exit 13 / `setup.unsupported_os`, exactly one JSON envelope, and no manifest, receipt, intent, lock, or Action; help/version/controller rendering remain available.
 6. **End-to-end smoke on the real fleet** — a `styrn fleet selftest` command (new): trivially small project profile (`echo`-level workflows) run as a real matrix across all enrolled machines; used after every upgrade, doubling as the acceptance test for enrollment, push, admission, supervision, and artifact retrieval. This is also the dogfooding loop: Styrn's own repository gets a `.styrn.toml` so the fleet validates Styrn. Selftest passes unchanged on a Herdr-less fleet: the enrollment, push, admission, supervision and artifact legs run on every host, and the agent/parity leg reports `skipped (substrate: none)` per host rather than failing — item 7's conformance runs only where the substrate is `active`, as it already says.
 7. **Herdr parity conformance (rev. C; S-33)** — on every OS where Herdr is present in the test environment: start the same harness (or a stand-in binary with the harness's process signature) twice in Herdr panes — once manually, once via `styrn harness run` — and assert Herdr reports identical detection and an identical lifecycle-transition sequence for both, and that the wrapped child's environment is a superset of the manual one's (no `HERDR_*` variable lost or altered). Runs in CI where Herdr can be installed, and always as part of `styrn fleet selftest` (item 6). This is the check that keeps the 12.9.1 invariant from rotting.
-8. **Setup and rendered-script conformance (rev. D; amended rev. G; Part 15)** — on the three-OS VM matrix: fresh-machine `styrn setup --yes` in current-user mode creates no account and converges (second run prints "nothing to do"); `--uninstall` leaves no Styrn-owned residue while sparing pre-existing tools (receipt-ownership test); an environmental dedicated-mode run uses an explicitly selected disposable account whose name is not `styrn`; Windows proves both identity modes with real SSH key login and proves that a same-SID hostile process cannot use the spawn broker; and for each OS, emitted `--emit-script` output on an identical fresh VM converges to the **same probe results** as direct `apply` — the drift check that makes the third renderer trustworthy (15.11).
+8. **Setup and rendered-script conformance (rev. D; amended rev. I; Part 15)** — on the three-OS VM matrix: fresh-machine `styrn setup --yes` in current-user mode creates no account and converges (second run prints "nothing to do"); `--uninstall` leaves no Styrn-owned residue while sparing pre-existing tools (receipt-ownership test); an environmental dedicated-mode run uses an explicitly selected disposable account whose name is not `styrn`; Windows proves both identity modes with real SSH key login and proves that a same-SID hostile process cannot use the spawn broker; and for each OS, emitted `--emit-script` output on an identical fresh VM converges to the **same probe results** as direct `apply` — the drift check that makes the third renderer trustworthy (15.11). Linux adds real-system gates for affirmative current/dedicated account policy, package transactions through every supported backend, the recovered-token user-manager query, linger/logout/reboot persistence, sshd login, Tailscale TUN, sleep policy, sudo handoff, and service enable/start/restart lifecycle.
+
+**Linux ARM64/container boundary (rev. I; S50).** A native ARM64 Podman harness
+uses pinned manifests for Ubuntu 24.04, Debian Bookworm, stable Fedora, and UBI
+9; the Arch-family image is built from a checksummed Arch Linux ARM rootfs.
+Every run proves the Podman machine is arm64, the image manifest includes
+`linux/arm64`, `uname -m` in the container is `aarch64`, and the Styrn harness
+reports an AArch64 target. Run mapped non-root, with read-only source and a
+job-scoped native Linux volume; no privileged mode, host socket, or TUN.
+Containers cover distro parsing, fixed backend discovery, package query and
+dry-run planning, rootless XDG behavior, and native filesystem/ACL mechanics;
+containers **do not certify service lifecycle**. A **real systemd VM/host** is
+required for manager and service enable/start/restart, user-manager/linger and
+logout/reboot persistence, SSH login, Tailscale TUN, sleep policy, sudo
+handoff, and dedicated-account acceptance. Real Omarchy ARM64, user-manager/
+linger, and service-lifecycle gates remain explicitly unavailable until run;
+neither emulation nor a container result may be reported as passed evidence.
 
 Mocked-SSH transport tests (orig. §2.5) fall out of layer 3 for free: the `Transport` trait's test implementation is "spawn local child," and the ssh implementation is thin enough to be covered by layer 6.
 
@@ -6482,7 +6789,34 @@ Every issue cites the original section(s) it derives from; resolutions name the 
 
 ---
 
-**Register totals: 6 blockers, 17 major, 17 minor — 40 issues** (S-29–S-33 added in rev. C; S-34–S-36 in rev. D; S-37–S-39 in rev. E; S-40 in rev. F).
+**S-41 · major · rev. H Parts 0.4, 10.3, 11.0, 15.2,
+15.5–15.7, 15.12–15.15, 16.2–16.3/16.6 (raised by the native Linux host-profile
+review)**
+**Problem:** Linux setup was specified as Ubuntu/apt/systemctl-shaped prose. It
+had no bounded authoritative distro parser, WSL disposition, typed separation
+between distro/package/system-service/user-service evidence, closed DNF/Pacman
+command surface, stock component table, executable-identity revalidation,
+installed-state query contract, or honest container/VM evidence boundary. A
+serialized short-lived privileged request was also insufficiently distinguished
+from privilege authority, and Part 15.14 used channel spellings that disagreed
+with the manifest schema.
+**Impact:** implementations could select a privileged manager from attacker-
+controlled or contradictory evidence, globally disable useful Linux behavior
+when one capability was missing, treat WSL or a container like a native worker,
+authorize broader mutations than the plan displayed, and write invalid install
+provenance.
+**Resolution:** revision I's private `LinuxDisposition`/`LinuxHostProfile`,
+bounded `os-release` contract, full `LinuxExecutableIdentity`, independent
+capability degradation, exact manager and systemd queries, closed stock-package
+table, dependency-scoped `NeedsHuman`/probe failure, non-cloneable lifetime-
+bound authorization capability, narrow WSL refusal, schema-backed install
+channel vocabulary, and truthful ARM64 container versus real-systemd gates.
+Linux account-policy generalization stays independent T0.14 work. Parts 10.3,
+11.0, 15.2, 15.5–15.7, 15.12–15.15, and 16.2–16.3/16.6.
+
+---
+
+**Register totals: 6 blockers, 18 major, 17 minor — 41 issues** (S-29–S-33 added in rev. C; S-34–S-36 in rev. D; S-37–S-39 in rev. E; S-40 in rev. F; S-41 in rev. I).
 
 ---
 
@@ -6611,5 +6945,24 @@ Rev. C additions (pass 1): §0.6–0.7, the Part 19 decision log (D-1…D-8), th
 Rev. D additions (pass 2): §0.8, the whole `styrn setup` subsystem (Part 15: engine, config schema, elevation, receipts/uninstall, per-OS mechanics, hardened-Windows default, `styrnd`, enrollment card, script generation, stage zero, command surface), exit code 13 and the `setup.*` error family (10.3–10.4), the 6.5 doctor unification note, the 6.8/7.8 styrnd wiring, 16.6 item 8, and register entries S-34–S-36.
 
 Rev. E additions (pass 3): §0.9, the Part 18 preamble's independent-review pointer, packaging and upgrade (15.14, with sources renumbered to 15.15), the `styrn watch` specification (14.5), the rebuilt phase plan (16.3, absorbing 16.4), the `sleep-policy` component, admission defaults and the completed error/exit mapping (7.2, 10.3), the fan-out exit-code change (6.7), `styrn workflow cancel` and the 10.5 command-surface completion, and register entries S-37–S-39.
+
+Rev. F additions (pass 4): §0.10, the optional session-substrate model and
+degradation contract (11.0), substrate-aware status/doctor/agent/MCP/board/
+selftest behavior, standalone `harness run`, the canonical `herdr` command
+group, D-9, and register entry S-40.
+
+Rev. G additions (pass 5): §0.11, configurable `WorkerPrincipal`, current-user
+identity as the default, dedicated-account optional hardening, scope-sensitive
+security claims, and the superseding D-3 decision.
+
+Rev. H additions (pass 6): §0.12, user scope as the rootless default, one
+optional OS-owned machine authorization, scope-aware storage boundaries,
+durable pending publication, and first-class user services.
+
+Rev. I additions (pass 7): §0.13, canonical Linux kernel disposition and
+independent capability model, bounded distro parsing, verified apt/DNF/Pacman
+backends and stock package table, WSL refusal, lifetime-bound authorization,
+schema-backed Styrn install-channel vocabulary, ARM64 container versus native
+service gates, Phase-0 ownership, and register entry S-41.
 
 *End of consolidated design.*

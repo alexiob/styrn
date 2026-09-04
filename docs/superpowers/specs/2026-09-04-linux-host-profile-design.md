@@ -1,18 +1,19 @@
 # Native Linux host profiles and distribution adaptation
 
-Status: in-chat direction approved on 2026-09-04; written design pending review.
+Status: approved supporting design; canonical contracts incorporated into
+`docs/design.md` revision I on 2026-09-04.
 
 ## Purpose
 
 Styrn must adapt safely to native Linux distributions in the Debian, Red Hat,
 and Arch families without teaching generic code about distro-specific commands.
-The first supported package backends are `apt-get`, `dnf`, and `pacman`.
+The first supported package backends are `apt-get`, DNF (`dnf` or `dnf5`), and `pacman`.
 Systemd is the only service backend in this first slice. Omarchy is treated as
 an Arch-family system. WSL is detected only so Styrn can reject it; it is not a
 platform backend.
 
 This design extends the native-platform and probe contracts in
-`docs/design.md` Parts 7.10, 15.2, and 15.7. It keeps Podman and container
+`docs/design.md` Parts 15.2, 15.5–15.7, and 16. It keeps Podman and container
 images in the test harness and adds no container dependency to Styrn itself.
 
 ## Scope
@@ -53,7 +54,7 @@ enum LinuxDisposition {
 }
 
 struct LinuxHostProfile {
-    distribution: LinuxDistribution,
+    distribution: LinuxCapability<LinuxDistribution>,
     package_backend: LinuxCapability<LinuxPackageBackend>,
     system_service_backend: LinuxCapability<LinuxServiceBackend>,
     user_service_backend: LinuxCapability<LinuxUserServiceBackend>,
@@ -67,9 +68,12 @@ enum LinuxFamily {
 }
 
 enum LinuxPackageBackend {
-    AptGet { executable: VerifiedExecutable },
-    Dnf { executable: VerifiedExecutable },
-    Pacman { executable: VerifiedExecutable },
+    AptGet {
+        apt_get: LinuxExecutableIdentity,
+        dpkg_query: LinuxExecutableIdentity,
+    },
+    Dnf { executable: LinuxExecutableIdentity },
+    Pacman { executable: LinuxExecutableIdentity },
 }
 
 enum LinuxServiceBackend {
@@ -81,12 +85,35 @@ enum LinuxCapability<T> {
     Unsupported,
     Unknowable(LinuxObservationError),
 }
+
+struct LinuxExecutableIdentity {
+    canonical_path: PathBuf,
+    device: u64,
+    inode: u64,
+    owner_uid: u32,
+    file_type: FileType,
+    mode: u32,
+    size: u64,
+    modified_at: SystemTime,
+    changed_at: SystemTime,
+}
 ```
 
 `LinuxDistribution` retains bounded `ID`, `ID_LIKE`, and `VERSION_ID` values
 for classification and diagnostics. It is not serialized into the machine
 manifest or RPC protocol in this slice. The capability types carry verified
 fixed paths, not executable names resolved through `PATH`.
+
+Only inability to distinguish native Linux from WSL is globally blocking.
+Distribution, package, system-service, and user-service evidence are separate
+`LinuxCapability` values and degrade independently: a failure to classify the
+distribution does not erase already proved service evidence, and unavailable
+user services do not disable portable/rootless work.
+
+Every `LinuxExecutableIdentity` contains canonical path, device, inode, owner
+UID, file type, mode, size, and modification/change timestamps. It is compared
+against a fresh handle-derived identity immediately before every mutation; any
+change is `Unknowable` and stops that dependent action.
 
 The profile should live in a small private child module owned by
 `src/platform/linux.rs`, such as `src/platform/linux/host.rs`. Package command
@@ -104,10 +131,12 @@ also conclusive. Caller-controlled `WSL_*` environment variables are ignored:
 they may be recorded by a diagnostic test, but they can neither select a
 backend nor force a production authorization decision.
 
-Conclusive WSL produces `LinuxDisposition::UnsupportedWsl`. Platform-dependent
-setup fails before creating a manifest, receipt, intent, lock, or action with
-exit 13 and `setup.unsupported_os`, explaining that native Windows or native
-Linux is required. Help and version rendering remain available.
+Conclusive WSL produces `LinuxDisposition::UnsupportedWsl`. Every local
+`styrn setup` mode, including apply and `--dry-run`, and worker eligibility fail
+before creating a manifest, receipt, intent, lock, or action with exit 13 and
+`setup.unsupported_os`, explaining that native Windows or native Linux is
+required. Help, version, and controller-side rendering remain available because
+they do not make this host a worker or rely on native Linux mutations.
 
 An unreadable kernel observation is `Unknowable`, not native by default.
 
@@ -116,7 +145,7 @@ An unreadable kernel observation is `Unknowable`, not native by default.
 The production reader uses fixed paths:
 
 1. `/etc/os-release`;
-2. `/usr/lib/os-release` only when the first path is absent.
+2. `/usr/lib/os-release` only when opening the first path returns `ENOENT`.
 
 It never combines the files and never sources either file through a shell. The
 reader accepts the standard relative symlink arrangement only when the final
@@ -127,12 +156,16 @@ The byte limit is 16 KiB.
 
 The parser implements only the `os-release` assignment grammar needed to read
 values safely: comments, blank lines, unquoted values, single/double quotes,
-and specified backslash escapes. It performs no expansion, substitution, or
-execution. Duplicate classification keys, unterminated quoting, invalid key
-syntax, and invalid `ID`/`ID_LIKE` tokens make classification `Unknowable`.
-Unknown unrelated keys are ignored.
+and only the exact `\\`, `\"`, `\'`, `\$`, and ``\` `` backslash escapes. It
+performs no expansion, substitution, or execution. The reader accepts at most
+16 KiB for the whole file and at most 255 bytes for each classification field.
+`ID` and each `ID_LIKE` token must be ASCII and match `[a-z0-9._-]+`.
+Duplicate classification keys, unterminated quoting, invalid key syntax,
+unknown escapes, and invalid `ID`/`ID_LIKE` tokens make distribution evidence
+`Unknowable`. Unknown unrelated keys are ignored.
 
-Classification checks exact `ID` first and then ordered `ID_LIKE` ancestry:
+Classification gives exact `ID` authority and consults ordered `ID_LIKE`
+ancestry only for an otherwise unknown exact ID:
 
 - Debian family: `debian`, `ubuntu`, or a derivative whose `ID_LIKE` contains
   `debian`;
@@ -142,21 +175,25 @@ Classification checks exact `ID` first and then ordered `ID_LIKE` ancestry:
   `arch`;
 - otherwise `Other`.
 
-Conflicting ancestry across supported families is `Unknowable`. Omarchy must
-work both when it exposes ordinary Arch metadata and if it later exposes
-`ID=omarchy` with `ID_LIKE=arch`.
+An exact supported-family ID combined with contradictory cross-family
+`ID_LIKE`, or ancestry that names more than one supported family, is
+`Unknowable`; ancestry never overrides the exact ID. Omarchy must work both
+when it exposes ordinary Arch metadata and if it later exposes `ID=omarchy`
+with `ID_LIKE=arch`.
 
 ### 3. Corroborate package capabilities
 
 Distro identity narrows the allowed backend; it never proves the backend is
 usable. The adapter then inspects only closed absolute candidates:
 
-- Debian: `/usr/bin/apt-get`;
+- Debian: both `/usr/bin/apt-get` and `/usr/bin/dpkg-query`;
 - Red Hat: `/usr/bin/dnf`, with `/usr/bin/dnf5` as a separately recognized
   implementation when the canonical `dnf` entry is absent;
 - Arch: `/usr/bin/pacman`.
 
-A candidate must resolve to a regular executable with a secure root-owned
+A package capability is available only when every executable required by its
+backend is verified, so apt requires both `apt-get` and `dpkg-query`. A
+candidate must resolve to a regular executable with a secure root-owned
 path/target chain. A caller-controlled `PATH`, alias, wrapper in a home
 directory, or unrelated installed package manager is ignored. If the expected
 backend is absent, the capability is `Unsupported`. Conflicting or unsafe
@@ -171,11 +208,13 @@ package table, fixtures, and a truthful native gate.
 
 ### 4. Detect the service backend independently
 
-Systemd is available only when all of these observations agree:
+The system-service systemd capability is available only when all of these
+observations agree:
 
 - `/run/systemd/system` is a directory;
 - `/usr/bin/systemctl` is a verified executable;
-- a bounded read-only manager query succeeds and returns a valid value.
+- `/usr/bin/systemctl show --property=Version --value` succeeds and returns a
+  nonempty single bounded UTF-8 line.
 
 The existing strict `systemctl is-active`/`is-enabled` state parsers remain the
 boundary for unit observations. An installed `systemctl` in a container or on
@@ -184,7 +223,10 @@ and status/state contradictions remain `Unknowable` under Part 15.2.1.
 
 System and user service capabilities are separate because a running system
 manager does not prove that the current user's manager or login session is
-available. User-service persistence and linger remain real-host gates.
+available. The user-manager query has the same `show --property=Version
+--value` shape, uses `--user`, and runs only under the recovered original-user
+token, never the elevated identity or a reconstructed environment.
+User-service persistence and linger remain real-host gates.
 
 ## Package actions
 
@@ -192,7 +234,23 @@ The generic planner requests a closed component, not a package name. The Linux
 adapter maps that component to a backend-specific package identifier and exact
 argv. Backend implementations never accept arbitrary package strings.
 
-Initial command shapes are:
+The stock-repository component table is closed and exact:
+
+| Component | apt | DNF | Pacman |
+|---|---|---|---|
+| SSH | `openssh-server` | `openssh-server` | `openssh` |
+| Git | `git` | `git` | `git` |
+| Cockpit | `cockpit` | `cockpit` | unsupported |
+| Tailscale | unsupported | unsupported | unsupported |
+
+Tailscale package provisioning remains unsupported until a separately
+specified vendor-repository action defines the repository URL, signing key,
+supported distribution/version set, rollback, and receipt effect. The fact
+that some distribution or third-party repository happens to contain a package
+does not extend this table. Likewise, the Pacman decision for Cockpit is an
+explicit v1 support boundary, not a claim that no Arch package exists.
+
+Initial install command shapes are:
 
 - apt: `/usr/bin/apt-get install -y <closed-package>` with the existing
   noninteractive environment contract;
@@ -210,11 +268,25 @@ Each action records the selected backend, verified executable identity, closed
 component/package identifier, scope, and finalized receipt effect. Recovery
 replays the typed action; it never stores or reconstructs a raw shell command.
 
+Installed-state queries are equally closed: apt uses `/usr/bin/dpkg-query
+--show --showformat=${Status} <package>` and accepts only the exact installed
+status; DNF uses the verified DNF executable with `list --installed <package>`;
+Pacman uses `/usr/bin/pacman -Q <package>`. Exit/output contradictions,
+malformed output, or a query executable whose identity changed are
+`Unknowable`, never absent.
+
 ## Probe and planning behavior
 
 The host profile is captured once during setup preflight and bound to the setup
 execution context. It is revalidated before any privileged package or service
 mutation. Backend or executable drift stops before mutation.
+
+Privilege approval returns a non-cloneable, non-serializable, lifetime-bound
+authorization capability. It is structurally bound to the request digest,
+privilege, exact parameters, and expected effect. The privileged runner accepts
+the capability plus its typed action, revalidates both profile and
+`LinuxExecutableIdentity`, consumes the capability once, and cannot accept an arbitrary argv,
+package, path, URL, or caller-constructed token.
 
 Existing Linux SSH, Tailscale, and sleep-policy probes consume the system
 service capability. Existing Git/tool probes remain executable probes, but
@@ -225,10 +297,11 @@ instead of leaving an unused detector abstraction.
 Outcomes are closed and fail-safe:
 
 - WSL: `setup.unsupported_os`, exit 13, no partial state;
-- observation failure or contradictory evidence: `Unknowable`; a required
-  planning precondition becomes `setup.probe_failed`, exit 13, before mutation;
+- observation failure or contradictory evidence: `Unknowable`; only an action
+  that requires that evidence becomes `setup.probe_failed`, exit 13, before
+  mutation, while independent capabilities and actions continue;
 - conclusively unsupported package/service backend: unrelated rootless actions
-  continue and the dependent system action becomes `NeedsHuman`;
+  continue and only the dependent system action becomes `NeedsHuman`;
 - package-manager failure after authorization: `setup.apply_failed`, exit 13,
   preserving only the durable acknowledged receipt prefix.
 
@@ -284,7 +357,8 @@ privileged mode, host sockets, or TUN for parser/package planning tests.
 
 Containers truthfully cover distro metadata, backend discovery, pure planning,
 package query/dry-run behavior, rootless XDG behavior, and native Linux
-filesystem/ACL semantics. A real systemd VM/host is still required for service
+filesystem/ACL semantics. Containers do not certify service lifecycle. A real
+systemd VM/host is still required for service
 enable/start, user managers, linger/logout/reboot persistence, sshd login,
 Tailscale TUN, sleep policy, sudo handoff, and dedicated-account acceptance.
 
@@ -299,17 +373,19 @@ gates run scheduled/release and report unavailable prerequisites honestly.
 
 ## Documentation, phases, and compatibility
 
-The implementation must amend the canonical `docs/design.md` before or with
-code:
+Revision I of canonical `docs/design.md` owns **Linux host profile, WSL refusal,
+and package-backend adaptation** in Part 16.3 Phase 0. Its synchronized contract
+is:
 
-- Part 15.2.1: replace the apt-only substrate list with the typed Linux host
+- Part 15.2.1: replace the apt-only backend list with the typed Linux host
   profile and capability rules;
 - Parts 15.7.2 and 15.7.4-15.7.6: define family-specific package handling,
   systemd-first service behavior, WSL rejection, and exact failure semantics;
 - Part 16.3 Phase 0: place host profiling, backend probes, and baseline package
   adaptation exactly once;
 - Part 16.6: add the truthful distro/ARM64 and WSL-rejection gates;
-- Part 15.14 only when Styrn itself gains RPM/Pacman/DNF distribution channels.
+- Part 15.14 remains limited to its schema-backed Styrn binary channels;
+  component package backends do not extend `[install].channel`.
 
 The implementation plan receives corresponding Phase 0 tasks and positive and
 negative tests. The first vertical slice is host-profile parsing plus WSL
