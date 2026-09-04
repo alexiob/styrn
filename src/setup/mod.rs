@@ -111,6 +111,28 @@ pub(crate) mod receipt;
 #[allow(unused_imports)]
 pub(crate) use probe_wire::{DoctorFinding, DoctorFindingState, ObservedState, ProbeObservation};
 
+#[cfg(not(any(
+    action_core_fixture,
+    action_compile_fixture,
+    plan_pending_authority_forge_fixture,
+    plan_pending_publication_forge_fixture,
+    plan_completed_execution_construct_fixture,
+    plan_completed_execution_mutate_fixture,
+    plan_completed_execution_clone_fixture,
+    plan_completed_execution_serialize_fixture,
+    plan_pending_projection_fixture,
+)))]
+pub(crate) fn worker_doctor_findings(
+    manifest: &crate::manifest::MachineManifest,
+    authorized_public_key: &str,
+) -> Result<Vec<DoctorFinding>, probe::ProbeCatalogError> {
+    Ok(
+        probe::production_worker_doctor_catalog(manifest, authorized_public_key)?
+            .observe()
+            .doctor_findings(),
+    )
+}
+
 fn observe_worker_probes(probes: &[Box<dyn probe::WorkerProbe>]) -> ObservedState {
     probe_wire::observe(probes)
 }

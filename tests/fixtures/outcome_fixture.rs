@@ -17,6 +17,7 @@ fn main() {
         "registry" => registry(arguments.next().expect("registry code is required")),
         "workflow-101" => workflow_101(),
         "exec-101" => exec_101(),
+        "exec-sanitized" => exec_sanitized(),
         "panic" => panic_boundary(),
         _ => panic!("unknown fixture scenario"),
     }
@@ -43,6 +44,23 @@ fn workflow_101() -> ! {
 fn exec_101() -> ! {
     let outcome =
         output::ExecOutcome::new(timestamp(), 101, "fixture stdout", "fixture stderr", 12).unwrap();
+    output::write_json(std::io::stdout(), outcome.envelope()).unwrap();
+    std::process::exit(outcome.process_exit_code())
+}
+
+fn exec_sanitized() -> ! {
+    let outcome = output::ExecOutcome::new_sanitized(
+        timestamp(),
+        0,
+        "replacement output",
+        "[redacted secret-shaped output]",
+        12,
+        true,
+        false,
+        false,
+        true,
+    )
+    .unwrap();
     output::write_json(std::io::stdout(), outcome.envelope()).unwrap();
     std::process::exit(outcome.process_exit_code())
 }

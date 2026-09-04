@@ -1,0 +1,4 @@
+{"id":"hello","type":"hello","protocol_min":1,"protocol_max":1,"styrn_version":"0.1.0","machine_id":"01991f5d-d72f-7b5e-a43d-9fcb61bd3265","name":"worker","manifest_schema_version":1}
+{"id":"hello","type":"hello","protocol":1,"styrn_version":"0.1.0"}
+{"id":"c1","type":"request","method":"machine.manifest","params":{}}
+{"id":"c1","type":"response","ok":true,"data":{"toml":"schema_version = 1\n"}}

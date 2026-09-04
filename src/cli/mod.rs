@@ -199,6 +199,15 @@ impl ParsedCli {
         }
     }
 
+    pub(crate) fn rpc_serve_stdio(&self) -> bool {
+        matches!(
+            self.cli.command,
+            RootCommand::Rpc {
+                command: RpcCommand::Serve(RpcServeArgs { stdio: true })
+            }
+        )
+    }
+
     pub(crate) const fn json_output(&self) -> bool {
         self.cli.json
     }
@@ -337,6 +346,25 @@ impl Cli {
                 error: Self::command().error(
                     clap::error::ErrorKind::ArgumentConflict,
                     "--interactive cannot be used with JSON output",
+                ),
+                policy: error_policy,
+                setup_invocation,
+                json_output: true,
+                setup_class,
+            });
+        }
+        if cli.json
+            && matches!(
+                cli.command,
+                RootCommand::Rpc {
+                    command: RpcCommand::Serve(_)
+                }
+            )
+        {
+            return Err(ParseFailure {
+                error: Self::command().error(
+                    clap::error::ErrorKind::ArgumentConflict,
+                    "--json cannot be used with rpc serve --stdio",
                 ),
                 policy: error_policy,
                 setup_invocation,
@@ -544,6 +572,22 @@ enum RootCommand {
     Env,
     Monitor(MonitorArgs),
     Watch(WatchArgs),
+    #[command(hide = true)]
+    Rpc {
+        #[command(subcommand)]
+        command: RpcCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum RpcCommand {
+    Serve(RpcServeArgs),
+}
+
+#[derive(Args, Debug)]
+struct RpcServeArgs {
+    #[arg(long, required = true)]
+    stdio: bool,
 }
 
 #[derive(Debug, Subcommand)]

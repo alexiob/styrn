@@ -38,6 +38,21 @@ fn root_help_exposes_only_the_canonical_command_set() {
 }
 
 #[test]
+fn hidden_rpc_stdio_route_is_exact_and_rejects_machine_output() {
+    let help = run(&["--help"]);
+    assert!(help.status.success());
+    assert!(!String::from_utf8_lossy(&help.stdout).contains("rpc"));
+
+    for args in [
+        &["rpc", "serve"][..],
+        &["rpc", "serve", "--stdio", "unexpected"][..],
+        &["--json", "rpc", "serve", "--stdio"][..],
+    ] {
+        assert_usage_error(args);
+    }
+}
+
+#[test]
 fn version_is_a_normal_success_response_on_stdout() {
     let output = run(&["--version"]);
 

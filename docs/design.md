@@ -1833,6 +1833,13 @@ Rules:
 - Requests are **concurrent**: a controller may issue new requests while others are outstanding; responses correlate by `id`. Workers process cheap queries concurrently but serialize mutating job-registry operations internally (Part 7.3).
 - Errors use the same `{code, message, details}` shape as the CLI envelope (Part 10.2); the error-code registry (Part 10.3) is shared between CLI and RPC.
 
+**Phase 1 finite slice:** the first executable RPC slice accepts exactly
+`machine.manifest`, `machine.status`, `machine.doctor`, and `exec.run`, with one
+outstanding request and sequential handling. It is deliberately finite: no
+stream, cancellation, liveness, chunk, or multiplexing behavior is claimed by
+that slice. Those protocol surfaces remain assigned to their later Part 16.3
+work.
+
 ## 5.4 Streaming: `event` and `log` frames
 
 A request whose result is a stream (e.g. `events.subscribe`, `job.logs` with `follow: true`, `exec.run` with streaming output) is answered by zero or more `event`/`log` frames carrying the request's `id`, followed by a terminal `response`:
@@ -3045,6 +3052,7 @@ transport.auth_failed           SSH auth or host-key pin failure (exit 4)
 transport.session_lost          RPC session dropped mid-operation (exit 3)
 protocol.incompatible           version/schema window violation (exit 8)
 protocol.malformed              unparseable or oversized frame (exit 8)
+remote.execution_failed         finite RPC method failed on the worker (exit 5)
 machine.manifest_invalid        manifest fails validation (exit 2)
 resource.memory_admission_denied   (exit 6)
 resource.cpu_admission_denied      (exit 6)
@@ -3165,6 +3173,15 @@ JSON result:
   "duration_ms": 1462
 }
 ```
+
+### Internal RPC plumbing
+
+```text
+styrn rpc serve --stdio                              (hidden; NDJSON only)
+```
+
+This on-demand worker route rejects `--json`; its stdout is reserved exclusively
+for Part 5 protocol frames and its stderr exclusively for diagnostics.
 
 ### Agents
 

@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::OnceLock;
 
-const EXPECTED_REGISTRY: [(&str, i32); 38] = [
+const EXPECTED_REGISTRY: [(&str, i32); 39] = [
     ("usage.invalid_argument", 2),
     ("usage.config_invalid", 2),
     ("transport.unreachable", 3),
@@ -19,6 +19,7 @@ const EXPECTED_REGISTRY: [(&str, i32); 38] = [
     ("transport.session_lost", 3),
     ("protocol.incompatible", 8),
     ("protocol.malformed", 8),
+    ("remote.execution_failed", 5),
     ("machine.manifest_invalid", 2),
     ("resource.memory_admission_denied", 6),
     ("resource.cpu_admission_denied", 6),
@@ -151,6 +152,21 @@ fn exec_remote_exit_is_mirrored_and_remains_explicit_in_json() {
     assert_eq!(value["ok"], true);
     assert_eq!(value["command"], "exec");
     assert_eq!(value["data"]["exit_code"], 101);
+    assert_schema_valid(&value);
+}
+
+#[test]
+fn exec_sanitization_flags_are_additive_and_explicit_when_needed() {
+    let fixture = fixture();
+    let output = run_fixture(fixture, &["exec-sanitized"]);
+
+    assert!(output.status.success());
+    assert!(output.stderr.is_empty());
+    let value: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["data"]["stdout_lossy"], true);
+    assert_eq!(value["data"]["stderr_lossy"], false);
+    assert_eq!(value["data"]["stdout_redacted"], false);
+    assert_eq!(value["data"]["stderr_redacted"], true);
     assert_schema_valid(&value);
 }
 

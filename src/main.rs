@@ -50,6 +50,13 @@ fn main() {
 }
 
 fn run(parsed: cli::ParsedCli) {
+    if parsed.rpc_serve_stdio() {
+        if let Err(error) = rpc::serve_stdio() {
+            eprintln!("{error}");
+            output::exit_process(error.exit_code());
+        }
+        return;
+    }
     if parsed.privileged_setup_request().is_some() {
         fail_unavailable_setup(
             &parsed,

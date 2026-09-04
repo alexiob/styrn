@@ -92,6 +92,7 @@ define_error_codes! {
     TransportSessionLost => ("transport.session_lost", Unreachable),
     ProtocolIncompatible => ("protocol.incompatible", Protocol),
     ProtocolMalformed => ("protocol.malformed", Protocol),
+    RemoteExecutionFailed => ("remote.execution_failed", RemoteExecution),
     MachineManifestInvalid => ("machine.manifest_invalid", Usage),
     ResourceMemoryAdmissionDenied => ("resource.memory_admission_denied", ResourceAdmission),
     ResourceCpuAdmissionDenied => ("resource.cpu_admission_denied", ResourceAdmission),
@@ -343,17 +344,46 @@ impl ExecOutcome {
         stderr: impl Into<String>,
         duration_ms: u64,
     ) -> Result<Self, OutputError> {
-        let envelope = Envelope::success(
-            "exec",
+        Self::new_sanitized(
             timestamp,
-            json!({
-                "exit_code": remote_exit_code,
-                "stdout": stdout.into(),
-                "stderr": stderr.into(),
-                "duration_ms": duration_ms,
-            }),
-            Vec::new(),
-        )?;
+            remote_exit_code,
+            stdout,
+            stderr,
+            duration_ms,
+            false,
+            false,
+            false,
+            false,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn new_sanitized(
+        timestamp: DateTime<Utc>,
+        remote_exit_code: i32,
+        stdout: impl Into<String>,
+        stderr: impl Into<String>,
+        duration_ms: u64,
+        stdout_lossy: bool,
+        stderr_lossy: bool,
+        stdout_redacted: bool,
+        stderr_redacted: bool,
+    ) -> Result<Self, OutputError> {
+        let mut data = serde_json::Map::from_iter([
+            ("exit_code".to_owned(), json!(remote_exit_code)),
+            ("stdout".to_owned(), json!(stdout.into())),
+            ("stderr".to_owned(), json!(stderr.into())),
+            ("duration_ms".to_owned(), json!(duration_ms)),
+        ]);
+        for (name, value) in [
+            ("stdout_lossy", stdout_lossy),
+            ("stderr_lossy", stderr_lossy),
+            ("stdout_redacted", stdout_redacted),
+            ("stderr_redacted", stderr_redacted),
+        ] {
+            data.insert(name.to_owned(), Value::Bool(value));
+        }
+        let envelope = Envelope::success("exec", timestamp, Value::Object(data), Vec::new())?;
 
         Ok(Self {
             envelope,

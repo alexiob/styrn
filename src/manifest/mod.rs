@@ -10,6 +10,8 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 use uuid::Uuid;
 
+const MACHINE_ID_REQUIRED: &str = "machine_id is required";
+
 #[derive(Clone, Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct MachineManifest {
@@ -801,9 +803,7 @@ impl MachineManifest {
             .map(parse_canonical_uuid)
             .transpose()?;
         let Some(machine_id) = machine_id else {
-            return Err(ManifestError::Validation(
-                "machine_id is required".to_owned(),
-            ));
+            return Err(ManifestError::Validation(MACHINE_ID_REQUIRED.to_owned()));
         };
         let manifest = raw.into_manifest(machine_id);
         manifest.validate()?;
@@ -1887,14 +1887,33 @@ impl MachineManifestStore {
             .as_deref()
             .map(parse_canonical_uuid)
             .transpose()?;
-        let machine_id = machine_id
-            .ok_or_else(|| ManifestError::Validation("machine_id is required".to_owned()))?;
+        let machine_id =
+            machine_id.ok_or_else(|| ManifestError::Validation(MACHINE_ID_REQUIRED.to_owned()))?;
         let manifest = raw.into_manifest(machine_id);
         manifest.validate()?;
         self.validate_manifest_binding(&manifest)?;
         Ok(ReadOutcome {
             manifest,
             machine_id_minted: false,
+        })
+    }
+
+    /// Reads without mutation, except for the legacy missing-machine-id repair
+    /// required at RPC startup. The lock-side reread prevents concurrent
+    /// servers from minting or rewriting a second identity.
+    pub(crate) fn read_or_reconcile_missing_machine_id(
+        &self,
+    ) -> Result<ReadOutcome, ManifestError> {
+        match self.read() {
+            Ok(outcome) => return Ok(outcome),
+            Err(error) if is_missing_machine_id_error(&error) => {}
+            Err(error) => return Err(error),
+        }
+        self.preflight_document_binding(true)?;
+        self.with_mutation_lock(|| match self.read() {
+            Ok(outcome) => Ok(outcome),
+            Err(error) if is_missing_machine_id_error(&error) => self.reconcile_locked(),
+            Err(error) => Err(error),
         })
     }
 
@@ -2543,7 +2562,7 @@ impl MachineManifestStore {
             .map(parse_canonical_uuid)
             .transpose()?;
         if !allow_missing_id && machine_id.is_none() {
-            return invalid("machine_id is required");
+            return invalid(MACHINE_ID_REQUIRED);
         }
         let manifest = raw.into_manifest(machine_id.unwrap_or_else(Uuid::now_v7));
         manifest.validate()?;
@@ -2560,6 +2579,10 @@ impl MachineManifestStore {
         }
         Ok(())
     }
+}
+
+fn is_missing_machine_id_error(error: &ManifestError) -> bool {
+    matches!(error, ManifestError::Validation(message) if message == MACHINE_ID_REQUIRED)
 }
 
 #[allow(dead_code)] // Source-including manifest tests omit receipt publication recovery.
@@ -2948,6 +2971,145 @@ fn scan_secret_free(value: &Value, path: &str) -> Result<(), ManifestError> {
         _ => {}
     }
     Ok(())
+}
+
+/// Shared pre-serialization guard for finite RPC arguments and captured text.
+/// It deliberately reports only a boolean so rejected material is never echoed.
+#[allow(dead_code)] // Source-including manifest tests omit the RPC module that consumes this guard.
+pub(crate) fn contains_secret_shaped_text(value: &str) -> bool {
+    let uppercase = value.to_ascii_uppercase();
+    if is_private_key(value)
+        || [
+            "-----BEGIN PRIVATE KEY-----",
+            "-----BEGIN RSA PRIVATE KEY-----",
+            "-----BEGIN EC PRIVATE KEY-----",
+            "-----BEGIN DSA PRIVATE KEY-----",
+            "-----BEGIN OPENSSH PRIVATE KEY-----",
+        ]
+        .iter()
+        .any(|marker| uppercase.contains(marker))
+        || is_compact_jwt(value.trim())
+        || contains_credential_prefix(value)
+        || contains_labeled_credential(value)
+    {
+        return true;
+    }
+    value.split_whitespace().any(|word| {
+        let word = word.trim_matches(|character: char| {
+            matches!(
+                character,
+                ',' | ';' | '\'' | '"' | '(' | ')' | '[' | ']' | '{' | '}'
+            )
+        });
+        if is_compact_jwt(word) {
+            return true;
+        }
+        let flag = word.trim_start_matches('-');
+        let (name, has_value) = flag
+            .split_once('=')
+            .map_or((flag, false), |(name, _)| (name, true));
+        (word.starts_with('-') || has_value) && is_forbidden_secret_name(name)
+    })
+}
+
+fn contains_labeled_credential(value: &str) -> bool {
+    const LABELS: &[&str] = &[
+        "private_key",
+        "api_key",
+        "auth_key",
+        "tailscale_auth_key",
+        "token",
+        "access_token",
+        "refresh_token",
+        "bearer_token",
+        "password",
+        "passphrase",
+        "secret",
+    ];
+    const SAFE_VALUES: &[&str] = &[
+        "none",
+        "null",
+        "absent",
+        "missing",
+        "unset",
+        "redacted",
+        "unavailable",
+        "disabled",
+        "managed",
+        "status",
+    ];
+
+    let lowercase = value.to_ascii_lowercase();
+    LABELS.iter().any(|label| {
+        lowercase.match_indices(label).any(|(start, _)| {
+            let left_boundary = lowercase[..start]
+                .chars()
+                .next_back()
+                .is_none_or(|character| {
+                    !character.is_ascii_alphanumeric() && !matches!(character, '_' | '-' | '.')
+                });
+            let mut remainder = &lowercase[start + label.len()..];
+            let right_boundary = remainder.chars().next().is_none_or(|character| {
+                !character.is_ascii_alphanumeric() && !matches!(character, '_' | '-' | '.')
+            });
+            if !left_boundary || !right_boundary {
+                return false;
+            }
+
+            if remainder.starts_with(['\'', '"']) {
+                remainder = &remainder[1..];
+            }
+            remainder = remainder.trim_start_matches(char::is_whitespace);
+            if remainder.starts_with([':', '=']) {
+                remainder = &remainder[1..];
+            } else {
+                return false;
+            }
+            remainder = remainder.trim_start_matches(|character: char| {
+                character.is_whitespace() || matches!(character, '\'' | '"' | '[' | '{' | '(')
+            });
+            let candidate = remainder.trim_end_matches(|character: char| {
+                character.is_whitespace()
+                    || matches!(character, '\'' | '"' | ',' | ';' | ']' | '}' | ')')
+            });
+            !candidate.is_empty() && !SAFE_VALUES.contains(&candidate)
+        })
+    })
+}
+
+fn contains_credential_prefix(value: &str) -> bool {
+    const MIN_CREDENTIAL_SUFFIX_LEN: usize = 16;
+
+    let lowercase = value.to_ascii_lowercase();
+    [
+        "sk-",
+        "sk_",
+        "ghp_",
+        "gho_",
+        "ghu_",
+        "ghs_",
+        "github_pat_",
+        "tskey-",
+        "tskey_",
+    ]
+    .iter()
+    .any(|prefix| {
+        lowercase.match_indices(prefix).any(|(start, _)| {
+            let left_boundary = lowercase[..start]
+                .chars()
+                .next_back()
+                .is_none_or(|character| !character.is_ascii_alphanumeric());
+            left_boundary
+                && lowercase[start + prefix.len()..]
+                    .chars()
+                    .take_while(|character| {
+                        character.is_ascii_alphanumeric() || matches!(character, '-' | '_')
+                    })
+                    .take(MIN_CREDENTIAL_SUFFIX_LEN)
+                    .count()
+                    == MIN_CREDENTIAL_SUFFIX_LEN
+        })
+    })
 }
 
 fn secret_shaped_key_reason(key: &str) -> Option<&'static str> {

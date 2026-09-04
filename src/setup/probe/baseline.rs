@@ -85,6 +85,91 @@ pub(in crate::setup) fn production_rootless_catalog(
     ProbeCatalog::new(probes)
 }
 
+pub(in crate::setup) fn production_worker_doctor_catalog(
+    manifest: &crate::manifest::MachineManifest,
+    authorized_public_key: &str,
+) -> Result<ProbeCatalog, ProbeCatalogError> {
+    let mut components = vec!["ssh-server", "git"];
+    if manifest.tailscale.is_some() {
+        components.push("tailscale");
+    }
+    if manifest
+        .worker
+        .as_ref()
+        .and_then(|worker| worker.accept_jobs)
+        == Some(true)
+    {
+        components.push("sleep-policy");
+    }
+    for (configured, component) in [
+        (
+            manifest
+                .toolchains
+                .as_ref()
+                .and_then(|items| items.get("rust"))
+                .and_then(|item| item.installed)
+                == Some(true),
+            "rust",
+        ),
+        (
+            manifest
+                .caches
+                .as_ref()
+                .and_then(|items| items.get("sccache"))
+                .and_then(|item| item.installed)
+                == Some(true),
+            "sccache",
+        ),
+        (
+            manifest.herdr.as_ref().and_then(|item| item.installed) == Some(true),
+            "herdr",
+        ),
+        (
+            manifest
+                .agents
+                .as_ref()
+                .and_then(|items| items.get("codex"))
+                .and_then(|item| item.installed)
+                == Some(true),
+            "codex",
+        ),
+        (
+            manifest
+                .agents
+                .as_ref()
+                .and_then(|items| items.get("claude"))
+                .and_then(|item| item.installed)
+                == Some(true),
+            "claude",
+        ),
+    ] {
+        if configured {
+            components.push(component);
+        }
+    }
+    let tailscale_mode = manifest
+        .tailscale
+        .as_ref()
+        .and_then(|tailscale| tailscale.mode.as_ref())
+        .map_or("service", |mode| match mode {
+            crate::manifest::TailscaleMode::Service => "service",
+            crate::manifest::TailscaleMode::Gui => "gui",
+            crate::manifest::TailscaleMode::Tailscaled => "tailscaled",
+        });
+    let probes = components
+        .into_iter()
+        .map(|component| {
+            Box::new(BaselineProbe {
+                descriptor: descriptor(component),
+                kind: probe_kind(component),
+                authorized_public_keys: vec![authorized_public_key.to_owned()],
+                tailscale_mode: tailscale_mode.to_owned(),
+            }) as Box<dyn WorkerProbe>
+        })
+        .collect();
+    ProbeCatalog::new(probes)
+}
+
 pub(in crate::setup) fn rootless_baseline_desired_state(
     effective: &EffectiveRootlessSetup,
 ) -> Result<DesiredState, crate::setup::plan::PlanError> {

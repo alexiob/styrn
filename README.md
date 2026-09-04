@@ -176,15 +176,14 @@ Styrn is not literally dependency-free: v1 relies on system OpenSSH for transpor
 
 ## Repository status
 
-Implementation is in **early Phase 0 of nine phases (0–8)**. The crate,
-command-line and output contracts, manifest, setup engine, and the first
-runnable rootless setup slice exist. The broader sshd, Tailscale, baseline
-component, config/invocation, and interactive tasks remain partial and
-unchecked because their deferred system mutation, dedicated identity,
-service, enrollment, and fresh-host acceptance work has not landed. The
-repository defines a three-OS CI matrix for formatting, build, tests, and
-lints. Everything from Phase 1 onward is unstarted; there is no release or
-supported installation path yet.
+Implementation includes the runnable rootless portion of **Phase 0** and the
+first internal slice of **Phase 1**. The Phase 1 slice provides bounded,
+sequential JSON RPC over a real local child process for manifest, status,
+worker-doctor, and exact-argv execution, including the hidden on-demand stdio
+server. SSH transport, enrollment, inventory, and the public host/status/doctor/
+exec dispatch remain unimplemented, so this is not yet an end-to-end fleet
+surface. The repository defines a three-OS CI matrix for formatting, build,
+tests, and lints; there is no release or supported installation path yet.
 
 | Phase | Intended outcome |
 |---:|---|
