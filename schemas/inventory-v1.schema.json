@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://styrn.dev/schemas/inventory-v1.schema.json",
+  "title": "Styrn controller inventory v1",
+  "type": "object",
+  "required": ["schema_version", "hosts"],
+  "properties": {
+    "schema_version": { "const": 1 },
+    "hosts": {
+      "type": "array",
+      "maxItems": 1024,
+      "items": { "$ref": "#/$defs/host" }
+    }
+  },
+  "$defs": {
+    "host": {
+      "type": "object",
+      "required": ["name", "machine_id", "manifest_cache", "transport"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1, "maxLength": 255 },
+        "machine_id": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$"
+        },
+        "manifest_cache": {
+          "type": "string",
+          "pattern": "^manifests/[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\\.toml$"
+        },
+        "transport": { "$ref": "#/$defs/ssh_transport" }
+      }
+    },
+    "ssh_transport": {
+      "type": "object",
+      "required": [
+        "kind",
+        "host",
+        "user",
+        "port",
+        "identity",
+        "host_key_algorithm",
+        "host_key_base64",
+        "host_key_fingerprint"
+      ],
+      "properties": {
+        "kind": { "const": "ssh" },
+        "host": { "type": "string", "minLength": 1, "maxLength": 255 },
+        "user": { "type": "string", "minLength": 1, "maxLength": 255 },
+        "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "identity": { "type": "string", "minLength": 1 },
+        "host_key_algorithm": {
+          "enum": ["ssh-ed25519", "ecdsa-sha2-nistp256", "ssh-rsa"]
+        },
+        "host_key_base64": {
+          "type": "string",
+          "pattern": "^[A-Za-z0-9+/]+={0,2}$"
+        },
+        "host_key_fingerprint": {
+          "type": "string",
+          "pattern": "^SHA256:[A-Za-z0-9+/]{43}$"
+        }
+      }
+    }
+  }
+}

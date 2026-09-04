@@ -1,0 +1,16 @@
+schema_version = 1
+
+[[hosts]]
+name = "worker.example"
+machine_id = "01991f5d-d72f-7b5e-a43d-9fcb61bd3265"
+manifest_cache = "manifests/01991f5d-d72f-7b5e-a43d-9fcb61bd3265.toml"
+
+[hosts.transport]
+kind = "ssh"
+host = "worker.example"
+user = "alex"
+port = 22
+identity = "/home/alex/.ssh/styrn_controller_ed25519"
+host_key_algorithm = "ssh-ed25519"
+host_key_base64 = "AAAAC3NzaC1lZDI1NTE5AAAAIAABAgMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhscHR4f"
+host_key_fingerprint = "SHA256:ZkAslGjFiUHdGf/WUL8rQvkib4PTvQatUV0OUQSncCA"
